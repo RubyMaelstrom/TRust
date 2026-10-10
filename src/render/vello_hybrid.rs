@@ -1960,6 +1960,7 @@ mod tests {
                 clip: None,
                 node: 0,
                 link: None,
+                selection: Default::default(),
             }];
             for _ in 0..20 {
                 let frame = hybrid

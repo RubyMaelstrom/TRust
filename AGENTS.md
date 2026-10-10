@@ -465,6 +465,44 @@ current behavior and limits; consult the governing standards before changing it.
   Vello CPU. `--renderer=cpu` forces the reference renderer, while
   `--renderer=hybrid` reports initial GPU failure. Backend selection must not
   change DOM, CSS, layout, hit testing, or display-list output.
+- Page text selection (Selection API §2 "User Interactions", CSS UI 4
+  `user-select`, CSS Pseudo 4 `::selection`): layout attributes every glyph
+  run's text to the DOM Text data it lays out (`RunSelection` spans of
+  `TextSourceSpan`, `layout2::inline`'s `SourceCursor`), so selections are
+  anchored to `TextPoint`s (Text node, UTF-16 offset), never to display-list
+  indices. trust-desktop's primary press, drag (with autoscroll), double and
+  triple click, Shift+click and Ctrl+A select; a hyperlink's press stays its
+  activation unless Alt is held. A live page owns its Document's selection:
+  the gesture rides `PointerMetadata::selection` and runs as the default
+  action of mousedown/motion/release in the prelude (`userSelectionPress`,
+  one `selectstart` per gesture, user-select none/contain/all constraints);
+  the actor reports what the selection selects (`dom/selection.rs`,
+  `PageEvt::Selection`) after a gesture, a script change, or a DOM change
+  under a selected range, and the frontend paints its own gesture until the
+  report has caught up with the gesture's serial. Static pages and line
+  documents (whose lines are synthetic sources) select in paint order in
+  the frontend alone. `Scene::append_page_with_selection` paints the
+  highlight in paint order directly below each selected run: without author
+  colors a translucent scheme `Highlight` under text that keeps its color,
+  with author `::selection` color/background-color (highlight inheritance,
+  paired defaults) exactly those, slicing runs at cluster boundaries;
+  replaced content gets a wash. `::selection` text-shadow and decorations
+  are not implemented. Copying runs a live page's copy action
+  (`PageCmd::Copy`, `trust.userCopy`: `copy` event, else the range's
+  rendered text) and otherwise the frontend's text, where soft wraps join
+  with a space (`LineStart`). The terminal frontend has no page selection.
+- trust-desktop's context menu (`src/render/context_menu.rs`,
+  `src/bin/trust-desktop/context_menu.rs`) is browser chrome like COMMAND:
+  Copy (with a selection), Reload, Open COMMAND, Kill Page (live pages) and
+  Add/Remove Bookmark (`bookmarks::Operation::Lookup`/`RemoveUrl`). Pointer
+  Events #maybe-show-context-menu decides: a secondary release (or the menu
+  key / Shift+F10, as the key's default) fires `contextmenu`, and the menu
+  shows when the page's answer (`PageEvt::ContextMenu`) is uncanceled;
+  Shift+secondary click bypasses the page and fires none. While it shows it
+  takes the pointer and keys and is an AccessKit menu; opening, highlighting
+  and closing repaint only its rectangle over the retained scene
+  (`draw_overlay`), never recomposing or relaying out the page. Telnet keeps
+  the secondary button for the remote host.
 - COMMAND overlays the page without changing layout or the JavaScript viewport.
   Its image-cache readout counts decoded pixel bytes, excluding GPU copies,
   chrome, and other allocations; do not add heap scans or a reporting timer.

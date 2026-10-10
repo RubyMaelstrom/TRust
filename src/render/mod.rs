@@ -14,15 +14,21 @@ use crate::core::{BrowserSnapshot, CssPoint, CssSize, PhysicalSize, ViewportMetr
 use crate::doc::Link;
 
 mod command_panel;
+mod context_menu;
 pub mod documents;
 pub mod filter_graph;
 pub mod headless;
 mod hit_index;
 pub(crate) mod matrix3d;
 mod media_controls;
+pub mod selection;
 pub use command_panel::{CommandPanelGeometry, CommandResponse};
+pub use context_menu::{ContextMenuGeometry, ContextMenuIcon, ContextMenuItem, paint_context_menu};
 pub use filter_graph::FilterGraph;
 pub(crate) use hit_index::PageHitIndex;
+pub use selection::{
+    HighlightPaint, PageSelection, RunSelection, SelectionSegments, TextSourceSpan,
+};
 pub mod vello_cpu;
 pub mod vello_hybrid;
 
@@ -671,6 +677,7 @@ impl PagePaint {
             scroll_containers,
             sticky_constraints,
             timeline_origin_ms,
+            replaced_images,
         } = self;
         let _ = (
             width,
@@ -723,6 +730,11 @@ impl PagePaint {
                 sticky_constraints
                     .capacity()
                     .saturating_mul(std::mem::size_of::<StickyConstraint>()),
+            )
+            .saturating_add(
+                replaced_images
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<usize>() * 2),
             );
         let mut opaque = false;
         bytes = bytes.saturating_add(browser_media.capacity() * std::mem::size_of::<Primitive>());
@@ -853,11 +865,13 @@ impl DisplayCommand {
                 shaped,
                 shadows,
                 link,
+                selection,
                 ..
             } => {
                 let mut bytes = shaped
                     .retained_bytes()
-                    .saturating_add(shadows.capacity() * std::mem::size_of::<TextShadowPaint>());
+                    .saturating_add(shadows.capacity() * std::mem::size_of::<TextShadowPaint>())
+                    .saturating_add(std::mem::size_of_val(selection.spans()));
                 if let Some(link) = link {
                     let (link_bytes, link_opaque) = link.retained_memory();
                     bytes = bytes.saturating_add(link_bytes);
@@ -1414,6 +1428,8 @@ pub enum DisplayCommand {
         /// DOM/layout identity retained for selection, hit testing, and links.
         node: usize,
         link: Option<Link>,
+        /// The DOM text this run lays out and its `::selection` paint.
+        selection: RunSelection,
     },
     Image {
         rect: CssRect,
@@ -1951,6 +1967,10 @@ pub struct PagePaint {
     /// clock, when a page actor timed this paint's animations. Frontends
     /// sample paint-composited animations on that same timeline.
     pub timeline_origin_ms: Option<f64>,
+    /// Elements whose `Image` commands paint replaced content (not a
+    /// background or border image): what a selection's highlight washes
+    /// (CSS Pseudo 4 #highlight-replaced).
+    pub replaced_images: HashSet<usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2484,6 +2504,11 @@ pub(crate) fn intersect_css_rect(a: CssRect, b: CssRect) -> Option<CssRect> {
     (right > left && bottom > top).then(|| CssRect::new(left, top, right - left, bottom - top))
 }
 
+/// The smallest rectangle containing both.
+pub fn union_css_rects(a: CssRect, b: CssRect) -> CssRect {
+    union_rect(a, b)
+}
+
 pub(crate) fn union_rect(a: CssRect, b: CssRect) -> CssRect {
     let left = a.x.min(b.x);
     let top = a.y.min(b.y);
@@ -2976,6 +3001,23 @@ impl Scene {
         elapsed_seconds: f32,
         offsets: &HashMap<usize, CssPoint>,
     ) {
+        self.append_page_with_selection(page, scroll, elapsed_seconds, offsets, None);
+    }
+
+    /// Compose page paint with a selection's highlight painted in paint
+    /// order (CSS Pseudo 4 #highlight-painting): each selected run's
+    /// highlight background directly below its text, so content painted
+    /// later (a sticky header, a positioned overlay) still covers it, and
+    /// clips and transforms apply to it as to the text.
+    pub fn append_page_with_selection(
+        &mut self,
+        page: &PagePaint,
+        scroll: CssPoint,
+        elapsed_seconds: f32,
+        offsets: &HashMap<usize, CssPoint>,
+        selection: Option<&PageSelection>,
+    ) {
+        let mut cursor = selection.and_then(|selection| selection::cursor(page, selection));
         let scroll_containers = scroll_container_index(page, offsets);
         self.canvas_images.extend(
             page.canvas_images
@@ -3035,6 +3077,8 @@ impl Scene {
                 &scroll_containers,
                 CssPoint::default(),
                 elapsed_seconds,
+                &mut cursor,
+                &page.replaced_images,
             );
             self.primitives.push(Primitive::PopTransform);
         }
@@ -3048,6 +3092,8 @@ impl Scene {
             &scroll_containers,
             scroll,
             elapsed_seconds,
+            &mut cursor,
+            &page.replaced_images,
         );
         self.primitives.push(Primitive::PopTransform);
 
@@ -3064,6 +3110,8 @@ impl Scene {
                 &scroll_containers,
                 CssPoint::default(),
                 elapsed_seconds,
+                &mut cursor,
+                &page.replaced_images,
             );
             self.primitives.push(Primitive::PopTransform);
         }
@@ -3086,6 +3134,8 @@ impl Scene {
                 &scroll_containers,
                 entry_scroll,
                 elapsed_seconds,
+                &mut cursor,
+                &page.replaced_images,
             );
             self.primitives.push(Primitive::PopTransform);
         }
@@ -3098,12 +3148,34 @@ impl Scene {
         scroll_containers: &HashMap<usize, ScrollProperty>,
         viewport_scroll: CssPoint,
         elapsed_seconds: f32,
+        selection: &mut Option<selection::SelectionCursor<'_>>,
+        replaced_images: &HashSet<usize>,
     ) {
         // CSS Overflow scroll scopes retain their offsets between paints.
         // Resolve each scope by identity, without scanning every unrelated
         // scrollport for every command on a large page.
         let mut animation_layers = Vec::new();
         for command in commands {
+            // A new coordinate space ends the line a highlight could join.
+            if let Some(cursor) = selection.as_mut()
+                && matches!(
+                    command,
+                    Primitive::PushTransform(_)
+                        | Primitive::PopTransform
+                        | Primitive::BeginSticky(_)
+                        | Primitive::EndSticky
+                        | Primitive::BeginScroll(_)
+                        | Primitive::EndScroll
+                        | Primitive::BeginFixed
+                        | Primitive::EndFixed
+                        | Primitive::BeginCssAnimation(_)
+                        | Primitive::EndCssAnimation
+                        | Primitive::BeginMarquee(_)
+                        | Primitive::EndMarquee
+                )
+            {
+                cursor.line_tail = None;
+            }
             match command {
                 Primitive::BeginSticky(constraint) => {
                     let (scroll, viewport) = constraint
@@ -3180,6 +3252,30 @@ impl Scene {
                         )));
                 }
                 Primitive::EndMarquee => self.primitives.push(Primitive::PopTransform),
+                Primitive::GlyphRun {
+                    shaped,
+                    selection: run,
+                    ..
+                } if let Some(cursor) = selection.as_mut() => {
+                    let selected = cursor.next_run(&shaped.text, run);
+                    self.push_highlighted_run(command, &selected, &mut cursor.line_tail);
+                }
+                Primitive::Image {
+                    rect, clip, node, ..
+                } if replaced_images.contains(node)
+                    && let Some(cursor) = selection.as_mut() =>
+                {
+                    self.primitives.push(command.clone());
+                    if cursor.next_replaced(*node)
+                        && let Some(rect) =
+                            clip.map_or(Some(*rect), |clip| intersect_css_rect(*rect, clip))
+                    {
+                        self.primitives.push(Primitive::FillRect {
+                            rect,
+                            color: cursor.wash(),
+                        });
+                    }
+                }
                 other => self.primitives.push(other.clone()),
             }
         }
@@ -4473,6 +4569,7 @@ pub fn paint_native_input(
         clip: Some(clip),
         node,
         link,
+        selection: Default::default(),
     });
     if layer {
         replacement.push(Primitive::PopLayer);
@@ -4554,6 +4651,7 @@ pub fn paint_pending_editor_text(
             clip: None,
             node: pending.nodes[0],
             link: None,
+            selection: Default::default(),
         });
         origin.y += height;
     }
@@ -4657,6 +4755,7 @@ fn paint_chrome_text(
         clip: None,
         node: 0,
         link: None,
+        selection: Default::default(),
     });
 }
 
@@ -4695,6 +4794,7 @@ fn paint_ui_text(
         clip: None,
         node: 0,
         link: None,
+        selection: Default::default(),
     });
 }
 
@@ -6050,6 +6150,7 @@ mod tests {
             clip: None,
             node: 1,
             link: None,
+            selection: Default::default(),
         });
         scene.append_page(&page, CssPoint::default());
         let command = scene

@@ -9,7 +9,7 @@ use icu_properties::props::{GeneralCategory, GeneralCategoryGroup};
 use unicode_segmentation::UnicodeSegmentation;
 
 use super::is_collapsible_space;
-use super::tree::{Content, Inline};
+use super::tree::{Content, Inline, TextOrigin};
 use crate::dom::PseudoEl;
 
 /// Where a text run's first-letter text is, if it has one.
@@ -126,18 +126,33 @@ pub(super) fn wrap(content: &mut Content, wrap: &mut dyn FnMut(Vec<Inline>) -> I
 fn wrap_inlines(inlines: &mut Vec<Inline>, wrap: &mut dyn FnMut(Vec<Inline>) -> Inline) -> Search {
     for index in 0..inlines.len() {
         match &mut inlines[index] {
-            Inline::Text(text) => match scan(text) {
+            Inline::Text(text, origin) => match scan(text) {
                 Scan::Letter(range) => {
+                    // The letter and the text after it keep their places in
+                    // the Text node's data.
+                    let origin = *origin;
+                    let at = |byte: usize| {
+                        if origin.is_none() {
+                            TextOrigin::NONE
+                        } else {
+                            TextOrigin {
+                                node: origin.node,
+                                offset: origin.offset
+                                    + crate::render::selection::utf16_len(&text[..byte]),
+                            }
+                        }
+                    };
+                    let (letter_origin, after_origin) = (at(range.start), at(range.end));
                     let after = text[range.end..].to_string();
                     let letter = text[range.clone()].to_string();
                     text.truncate(range.start);
                     let mut replacement = Vec::with_capacity(3);
                     if !text.is_empty() {
-                        replacement.push(Inline::Text(std::mem::take(text)));
+                        replacement.push(Inline::Text(std::mem::take(text), origin));
                     }
-                    replacement.push(wrap(vec![Inline::Text(letter)]));
+                    replacement.push(wrap(vec![Inline::Text(letter, letter_origin)]));
                     if !after.is_empty() {
-                        replacement.push(Inline::Text(after));
+                        replacement.push(Inline::Text(after, after_origin));
                     }
                     inlines.splice(index..=index, replacement);
                     return Search::Wrapped;

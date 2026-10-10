@@ -155,7 +155,7 @@ impl Ownership {
 
     fn inline(&mut self, inline: &Inline, edges: &mut Vec<Key>) -> usize {
         match inline {
-            Inline::Text(text) => text.capacity(),
+            Inline::Text(text, _) => text.capacity(),
             Inline::Atom(atom) => atom_bytes(atom),
             Inline::Br => 0,
             Inline::OutOfFlow(b) | Inline::Float(b) | Inline::AtomBox(b) => {
@@ -222,7 +222,13 @@ mod tests {
     #[test]
     fn nested_entries_charge_and_visit_each_shared_allocation_once() {
         let mut graph = Ownership::default();
-        let mut b = box_with(0, Content::Inlines(vec![Inline::Text("x".repeat(65536))]));
+        let mut b = box_with(
+            0,
+            Content::Inlines(vec![Inline::Text(
+                "x".repeat(65536),
+                crate::layout2::tree::TextOrigin::NONE,
+            )]),
+        );
         let mut retained = vec![];
         for depth in 0..256 {
             let built = Built::Block(b.clone());
@@ -257,11 +263,18 @@ mod tests {
         let inline = Inline::Box {
             node: 1,
             style: Arc::new(BoxStyle::anonymous()),
-            kids: vec![Inline::Text("payload".repeat(1000))].into(),
+            kids: vec![Inline::Text(
+                "payload".repeat(1000),
+                crate::layout2::tree::TextOrigin::NONE,
+            )]
+            .into(),
         };
         let first = Built::Hoist(vec![
             Built::Inline(inline.clone()),
-            Built::Inline(Inline::Text("owned".repeat(10))),
+            Built::Inline(Inline::Text(
+                "owned".repeat(10),
+                crate::layout2::tree::TextOrigin::NONE,
+            )),
         ]);
         let second = first.clone();
         let mut graph = Ownership::default();

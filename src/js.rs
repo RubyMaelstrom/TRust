@@ -390,6 +390,10 @@ pub enum PageCmd {
     /// canceling every fetch of theirs, scripts' fetch() and XMLHttpRequest
     /// included. The page and its scripts keep running.
     StopLoading,
+    /// The user's copy action (Clipboard API #copy-action): the page fires
+    /// `copy`, then the selection's text, or the data its listeners set,
+    /// reaches the frontend as a `PageEvt::ClipboardWrite`.
+    Copy,
     /// The frontend's answer to `PageEvt::FullscreenRequest` (whether its
     /// viewport now fills the screen) or `PageEvt::FullscreenExit`, sent after
     /// the resized viewport.
@@ -546,6 +550,7 @@ impl PageCmd {
                 | Self::Scroll { .. }
                 | Self::Hover { .. }
                 | Self::SetScroll { .. }
+                | Self::Copy
         )
     }
 }
@@ -626,6 +631,64 @@ pub(crate) struct PageHover {
 pub struct PointerMetadata {
     pub screen: Option<(f64, f64)>,
     pub modifiers: crate::core::Modifiers,
+    /// The frontend's text selection under the pointer, for a frontend that
+    /// lets the user select page text: the page runs Selection API §2's
+    /// user interactions as the default actions of the primary button's
+    /// press, the motion while it is held, and its release.
+    pub selection: Option<PointerSelection>,
+    /// Pointer Events #maybe-show-context-menu, bypassed by the user (the
+    /// desktop's Shift+secondary button): the user agent shows its own menu
+    /// without firing `contextmenu`, which the page could cancel.
+    pub bypass_context_menu: bool,
+}
+
+/// The boundary point the frontend's layout paints nearest the pointer
+/// (`None` where no selectable text is), and the serial of the frontend's
+/// selection gesture, which the page's `PageEvt::Selection` reports echo.
+/// Kept flat so pointer commands stay small enough to queue by value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PointerSelection {
+    node: usize,
+    offset: u32,
+    pub serial: u32,
+}
+
+impl PointerSelection {
+    pub fn new(point: Option<crate::core::TextPoint>, serial: u32) -> Self {
+        let (node, offset) = point.map_or((usize::MAX, 0), |point| (point.node, point.offset));
+        Self {
+            node,
+            offset,
+            serial,
+        }
+    }
+
+    pub fn point(&self) -> Option<crate::core::TextPoint> {
+        (self.node != usize::MAX).then_some(crate::core::TextPoint {
+            node: self.node,
+            offset: self.offset,
+        })
+    }
+}
+
+impl Default for PointerSelection {
+    fn default() -> Self {
+        Self::new(None, 0)
+    }
+}
+
+/// The selections of a page's Documents for its frontend to paint and copy
+/// (Selection API §2): the selected parts of each Text node and the
+/// replaced elements selected whole, with `user-select: none` content left
+/// out, and the anchor and focus where they are in Text nodes.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SelectionReport {
+    /// The last frontend selection gesture (`PointerSelection::serial`) the
+    /// page processed before this report.
+    pub serial: u32,
+    pub segments: std::sync::Arc<crate::render::SelectionSegments>,
+    pub anchor: Option<crate::core::TextPoint>,
+    pub focus: Option<crate::core::TextPoint>,
 }
 
 impl PointerMetadata {
@@ -735,6 +798,15 @@ pub enum PageEvt {
     CloseRequestHandled {
         consumed: bool,
     },
+    /// Pointer Events #maybe-show-context-menu: the page fired `contextmenu`
+    /// for the user's secondary button or menu key; `show` when no listener
+    /// canceled it, so the frontend shows its own context menu.
+    ContextMenu {
+        show: bool,
+    },
+    /// The page's selection changed (Selection API §2), by the user or by
+    /// script, or the DOM changed under a selected range.
+    Selection(SelectionReport),
     /// Fullscreen API #dom-element-requestfullscreen: resize the top-level
     /// viewport to the screen (the frontend's fullscreen presentation) and
     /// answer with `PageCmd::FullscreenResult`.

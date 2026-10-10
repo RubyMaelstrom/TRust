@@ -392,6 +392,7 @@ fn label(
         clip: Some(rect),
         node: 0,
         link: None,
+        selection: Default::default(),
     });
 }
 

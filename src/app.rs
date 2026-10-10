@@ -6677,6 +6677,9 @@ impl App {
                 Some(PageEvt::CloseRequestHandled { consumed }) => {
                     close_request_unconsumed |= !consumed;
                 }
+                // The terminal has no page text selection or context menu of
+                // its own; it never asks the page for either.
+                Some(PageEvt::ContextMenu { .. } | PageEvt::Selection(_)) => {}
                 // Fullscreen API: the terminal is the top-level viewport. The
                 // page fills it with TRust's chrome rows hidden; the request
                 // is answered after the page learns the new viewport.

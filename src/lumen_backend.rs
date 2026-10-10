@@ -842,6 +842,17 @@ struct HostState {
     clipboard_requests: Vec<(u64, String)>,
     clipboard_settlers: HashMap<u64, Value>,
     next_clipboard_request: u64,
+    /// Selection API §2 for the frontend: a Document's selection changed
+    /// since the last `PageEvt::Selection` (`__selection_changed`).
+    selection_dirty: bool,
+    /// The last frontend selection gesture an input task carried
+    /// (`PointerSelection::serial`), which the next report echoes.
+    selection_serial: u32,
+    /// The last report sent, with the DOM epoch it was computed at: a DOM
+    /// change under a selected range changes what it selects.
+    selection_report: Option<(u64, crate::js::SelectionReport)>,
+    /// Pointer Events #maybe-show-context-menu results awaiting delivery.
+    context_menus: Vec<bool>,
     /// Fullscreen API viewport changes for the frontend: `(request, true)`
     /// enters fullscreen and is answered with `PageCmd::FullscreenResult`;
     /// `(_, false)` restores the normal viewport.
@@ -988,6 +999,10 @@ impl HostState {
             clipboard_requests: Vec::new(),
             clipboard_settlers: HashMap::new(),
             next_clipboard_request: 1,
+            selection_dirty: false,
+            selection_serial: 0,
+            selection_report: None,
+            context_menus: Vec::new(),
             fullscreen_requests: Vec::new(),
             file_picker_requests: Vec::new(),
             file_picker_settlers: HashMap::new(),
@@ -1296,6 +1311,10 @@ impl RetainedMemory for HostState {
             clipboard_requests,
             clipboard_settlers,
             next_clipboard_request: _,
+            selection_dirty: _,
+            selection_serial: _,
+            selection_report: _,
+            context_menus: _,
             fullscreen_requests: _,
             file_picker_requests,
             file_picker_settlers,
@@ -5796,6 +5815,14 @@ mod desktop {
                 checkpoint(page, "stop loading");
                 finish_task_with_ack(page, events, false)
             }
+            PageCmd::Copy => {
+                // Clipboard API #copy-action, user-initiated: the prelude
+                // fires `copy` and queues what the clipboard receives.
+                prepare_interaction(page, interrupt);
+                let _ = call_trust(page, "userCopy", &[], "copy");
+                checkpoint(page, "copy");
+                finish_task_with_ack(page, events, false)
+            }
             PageCmd::FullscreenResult { request, ok } => {
                 prepare_interaction(page, interrupt);
                 let _ = call_trust(
@@ -5950,6 +5977,7 @@ mod desktop {
                     let target = node.filter(|&node| pressed && dom.is_valid(node));
                     dom.set_active_element(target);
                 }
+                let (text_node, text_offset) = note_selection_gesture(page, metadata);
                 let _ = call_trust(
                     page,
                     "pointerButton",
@@ -5962,6 +5990,11 @@ mod desktop {
                         Value::Num(finite_or_zero(metadata.screen.map_or(y, |p| p.1))),
                         Value::Num(f64::from(button)),
                         Value::Num(f64::from(metadata.modifier_bits())),
+                        Value::Bool(false),
+                        text_node,
+                        text_offset,
+                        Value::Bool(metadata.selection.is_some()),
+                        Value::Bool(metadata.bypass_context_menu),
                     ],
                     "pointer button",
                 );
@@ -6192,6 +6225,7 @@ mod desktop {
                 let node = node
                     .filter(|node| page.dom.borrow().is_valid(*node))
                     .map_or(Value::Null, |node| Value::Num(node as f64));
+                let (text_node, text_offset) = note_selection_gesture(page, metadata);
                 let _ = call_trust(
                     page,
                     "hover",
@@ -6202,6 +6236,10 @@ mod desktop {
                         Value::Num(finite_or_zero(metadata.screen.map_or(x, |p| p.0))),
                         Value::Num(finite_or_zero(metadata.screen.map_or(y, |p| p.1))),
                         Value::Num(f64::from(metadata.modifier_bits())),
+                        Value::Bool(false),
+                        Value::Bool(true),
+                        text_node,
+                        text_offset,
                     ],
                     "hover",
                 );
@@ -6386,6 +6424,112 @@ mod desktop {
                 }
             }
         }
+    }
+
+    /// Record the frontend selection gesture an input task carries, for the
+    /// next `PageEvt::Selection`, and the prelude arguments naming the Text
+    /// boundary point under the pointer (null and 0 where there is none).
+    fn note_selection_gesture(
+        page: &mut LumenPage,
+        metadata: crate::js::PointerMetadata,
+    ) -> (Value, Value) {
+        let Some(selection) = metadata.selection else {
+            return (Value::Null, Value::Num(0.0));
+        };
+        if let Some(state) = page.engine.ctx().host_mut::<HostState>() {
+            state.selection_serial = state.selection_serial.max(selection.serial);
+        }
+        match selection.point() {
+            Some(point) if page.dom.borrow().is_valid(point.node) => (
+                Value::Num(point.node as f64),
+                Value::Num(f64::from(point.offset)),
+            ),
+            _ => (Value::Null, Value::Num(0.0)),
+        }
+    }
+
+    /// Selection API §2 for the frontend: when a Document's selection
+    /// changed, or the DOM changed under a selected range, report what the
+    /// page's selections select (`Dom::add_selection_segments`). Unchanged
+    /// reports are not sent again.
+    fn selection_report(page: &mut LumenPage) -> Option<crate::js::SelectionReport> {
+        let epoch = page.dom.borrow().epoch();
+        let (dirty, serial, previous) = {
+            let state = page.engine.ctx().host_mut::<HostState>()?;
+            (
+                std::mem::take(&mut state.selection_dirty),
+                state.selection_serial,
+                state.selection_report.clone(),
+            )
+        };
+        let stale = previous
+            .as_ref()
+            .is_some_and(|(at, report)| *at != epoch && !report.segments.is_empty());
+        // A gesture the frontend painted ahead of the page is answered even
+        // when it left the selection as it was (a canceled `selectstart`).
+        let serial_moved = previous
+            .as_ref()
+            .map_or(serial != 0, |(_, report)| report.serial != serial);
+        if !dirty && !stale && !serial_moved {
+            return None;
+        }
+        // `[startNode, startOffset, endNode, endOffset, anchorNode,
+        // anchorOffset, focusNode, focusOffset]` for each Document's range.
+        let boundaries = call_trust(page, "selectionBoundaries", &[], "selection report")
+            .map(|value| {
+                let ctx = page.engine.ctx();
+                let length = ctx
+                    .member_get(&value, "length")
+                    .ok()
+                    .and_then(|v| v.as_num_opt())
+                    .unwrap_or(0.0) as usize;
+                (0..length.min(8 * 256))
+                    .map(|index| {
+                        ctx.member_get(&value, &index.to_string())
+                            .ok()
+                            .and_then(|v| v.as_num_opt())
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut segments = crate::render::SelectionSegments::default();
+        let (mut anchor, mut focus) = (None, None);
+        {
+            let dom = page.dom.borrow();
+            let text_point = |node: Option<f64>, offset: Option<f64>| {
+                let node = node? as usize;
+                (dom.is_valid(node) && dom.tag_name(node).is_none()).then(|| {
+                    crate::core::TextPoint {
+                        node,
+                        offset: offset.unwrap_or(0.0).max(0.0) as u32,
+                    }
+                })
+            };
+            for range in boundaries.as_chunks::<8>().0 {
+                let (Some(start), Some(end)) = (range[0], range[2]) else {
+                    continue;
+                };
+                dom.add_selection_segments(
+                    (start as usize, range[1].unwrap_or(0.0).max(0.0) as u32),
+                    (end as usize, range[3].unwrap_or(0.0).max(0.0) as u32),
+                    &mut segments,
+                );
+                if anchor.is_none() {
+                    anchor = text_point(range[4], range[5]);
+                    focus = text_point(range[6], range[7]);
+                }
+            }
+        }
+        let report = crate::js::SelectionReport {
+            serial,
+            segments: Arc::new(segments),
+            anchor,
+            focus,
+        };
+        let state = page.engine.ctx().host_mut::<HostState>()?;
+        let unchanged = previous.is_some_and(|(_, previous)| previous == report);
+        state.selection_report = Some((epoch, report.clone()));
+        (!unchanged).then_some(report)
     }
 
     fn prepare_interaction(page: &mut LumenPage, interrupt: &Arc<lumen::RuntimeInterrupt>) {
@@ -6650,6 +6794,22 @@ mod desktop {
             {
                 return false;
             }
+        }
+        let context_menus = page
+            .engine
+            .ctx()
+            .host_mut::<HostState>()
+            .map(|state| std::mem::take(&mut state.context_menus))
+            .unwrap_or_default();
+        for show in context_menus {
+            if events.blocking_send(PageEvt::ContextMenu { show }).is_err() {
+                return false;
+            }
+        }
+        if let Some(report) = selection_report(page)
+            && events.blocking_send(PageEvt::Selection(report)).is_err()
+        {
+            return false;
         }
         let fullscreen_requests = page
             .engine
@@ -11807,6 +11967,9 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__storage_len", 1, host_storage_len),
     ("__storage_manager", 2, host_storage_manager),
     ("__clipboard_write", 2, host_clipboard_write),
+    ("__selection_changed", 0, host_selection_changed),
+    ("__dom_user_select", 1, guarded_user_select),
+    ("__context_menu_result", 1, host_context_menu_result),
     ("__fullscreen_frontend", 2, host_fullscreen_frontend),
     ("__file_picker", 4, host_file_picker),
     ("__file_read", 3, host_file_read),
@@ -12618,6 +12781,7 @@ node_access_guards! {
     guarded_top_layer = host_dom_top_layer, [0], Invalidate;
     guarded_inert = host_dom_inert, [0], Invalidate;
     guarded_open_dialogs = host_dom_open_dialogs, [0], Invalidate;
+    guarded_user_select = host_user_select, [0], Invalidate;
     guarded_template_content = host_template_content, [0], Invalidate;
     guarded_shadow_root = host_shadow_root, [0], Invalidate;
     guarded_attach_shadow = host_attach_shadow, [0], Invalidate;
@@ -21783,6 +21947,9 @@ fn host_css_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
                     ) => Some(crate::dom::PseudoEl::Placeholder),
                     // CSS Position 4 #backdrop.
                     Some("::backdrop") => Some(crate::dom::PseudoEl::Backdrop),
+                    // CSS Pseudo 4 #getComputedStyle: as if the highlight
+                    // were active.
+                    Some("::selection") => Some(crate::dom::PseudoEl::Selection),
                     _ => None,
                 };
                 if !dom.is_valid(id) || !dom.is_connected(id) || pseudo.is_some() && which.is_none()
@@ -23220,6 +23387,43 @@ fn host_clipboard_write(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
     state.next_clipboard_request = request.wrapping_add(1);
     state.clipboard_requests.push((request, text));
     state.clipboard_settlers.insert(request, settle);
+    Ok(Value::Undefined)
+}
+
+/// `__selection_changed()`: a Document's selection was dissociated from its
+/// range, associated with a new one, or had a boundary point mutated
+/// (Selection API §2, where `selectionchange` is scheduled). The frontend
+/// paints the selection the next report describes.
+fn host_selection_changed(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+    if let Some(state) = ctx.host_mut::<HostState>() {
+        state.selection_dirty = true;
+    }
+    Ok(Value::Undefined)
+}
+
+/// `__dom_user_select(node)`: CSS UI 4 #content-selection's used value of
+/// `user-select` on an element, or on a Text node's parent element.
+fn host_user_select(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let dom = host_dom(ctx);
+    let dom = dom.borrow();
+    let Some(id) = host_arg_node(&dom, args, 0) else {
+        return Ok(Value::Null);
+    };
+    Ok(Value::from_engine_text(match dom.user_select(id) {
+        crate::dom::UserSelect::Text => "text",
+        crate::dom::UserSelect::None => "none",
+        crate::dom::UserSelect::Contain => "contain",
+        crate::dom::UserSelect::All => "all",
+    }))
+}
+
+/// `__context_menu_result(show)`: Pointer Events #maybe-show-context-menu
+/// dispatched `contextmenu`; `show` when it was not canceled.
+fn host_context_menu_result(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let show = args.first().is_some_and(|value| ctx.to_boolean(value));
+    if let Some(state) = ctx.host_mut::<HostState>() {
+        state.context_menus.push(show);
+    }
     Ok(Value::Undefined)
 }
 
@@ -26693,6 +26897,181 @@ mod tests {
             ),
             "0|None||Caret|1|true|none|Range|ello wor|forward|3|backward|h|backward|llo wo|true|true|1|true|2|hello world|true|3|0|true"
         );
+    }
+
+    #[test]
+    fn user_selection_gestures_follow_the_selection_api_and_css_ui() {
+        // Selection API §2 "User Interactions" (local w3c/selection-api
+        // b475d4b) and CSS UI 4 #content-selection: a primary press starts a
+        // gesture that drags, doubles to a word, triples to a paragraph,
+        // extends with Shift, fires selectstart once from a collapsed
+        // selection, keeps links to activation, and honors user-select.
+        let mut engine = platform_engine_with_body();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+                    document.body.innerHTML = '<p id=p>Hello brave world</p><p id=q>Second line</p>' +
+                        '<p id=n style="user-select:none">no select</p><p><a id=l href="/x">link text</a></p>' +
+                        '<p id=all style="user-select:all">all <b id=b>of it</b></p>';
+                    const el = (id) => document.getElementById(id);
+                    const t = el('p').firstChild, q = el('q').firstChild;
+                    const sel = getSelection(), out = [];
+                    let starts = 0;
+                    document.addEventListener('selectstart', () => starts++);
+                    const press = (target, node, offset, x, mods = 0) => __trust.pointerButton(
+                        target.__id, true, x, 5, x, 5, 0, mods, false, node.__id, offset, true, false);
+                    const release = (target, node, offset, x) => __trust.pointerButton(
+                        target.__id, false, x, 5, x, 5, 0, 0, false, node.__id, offset, true, false);
+                    const move = (node, offset) => __trust.hover(el('p').__id, 9, 9, 9, 9, 0, false, true, node.__id, offset);
+                    press(el('p'), t, 2, 10); out.push(sel.type, sel.anchorOffset, starts);
+                    move(t, 11); out.push(sel.toString(), sel.direction);
+                    move(t, 0); out.push(sel.toString(), sel.direction);
+                    release(el('p'), t, 0, 10); out.push(starts);
+                    // A click on other text only collapses: no selectstart from
+                    // a non-collapsed selection.
+                    press(el('q'), q, 3, 40); release(el('q'), q, 3, 40); out.push(sel.type, starts);
+                    press(el('q'), q, 1, 40); out.push(sel.toString(), starts); release(el('q'), q, 1, 40);
+                    press(el('q'), q, 1, 40); out.push(sel.toString()); release(el('q'), q, 1, 40);
+                    press(el('p'), t, 5, 80, 1); out.push(JSON.stringify(sel.toString()), sel.direction);
+                    release(el('p'), t, 5, 80);
+                    press(el('n'), el('n').firstChild, 2, 120); out.push(JSON.stringify(sel.toString()));
+                    release(el('n'), el('n').firstChild, 2, 120);
+                    const link = el('l').firstChild;
+                    press(el('l'), link, 2, 160); move(link, 6); out.push(sel.type);
+                    release(el('l'), link, 6, 160);
+                    press(el('l'), link, 0, 200, 4); move(link, 4); out.push(sel.toString());
+                    release(el('l'), link, 4, 200);
+                    press(el('b'), el('b').firstChild, 1, 240); out.push(sel.toString());
+                    release(el('b'), el('b').firstChild, 1, 240);
+                    __trust.key(null, 'a', 'KeyA', false, false, false, true, false, false);
+                    out.push(sel.anchorNode === document.body, sel.focusOffset === document.body.childNodes.length);
+                    sel.removeAllRanges();
+                    document.addEventListener('selectstart', (e) => e.preventDefault());
+                    press(el('p'), t, 2, 280); move(t, 8); out.push(sel.type);
+                    return out.join('|');
+                })()"#
+            ),
+            "Caret|2|1|llo brave|forward|He|backward|1|Caret|1|Second|2|Second line|\" brave world\"|backward|\" brave world\"|Caret|link|all of it|true|true|None"
+        );
+    }
+
+    #[test]
+    fn triple_click_selects_the_rendered_paragraph() {
+        // A triple click's granule is the paragraph (Selection API
+        // #dom-selection-modify boundaries): a segment break that the text's
+        // white-space collapses is a space, not a break, while a <br> and a
+        // preserved newline (CSS Text 3 #white-space-processing) are.
+        let mut engine = platform_engine_with_body();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+                    document.body.innerHTML = '<p id=p>First line of\n  the paragraph<br>after break</p>' +
+                        '<pre id=pre>one\ntwo</pre>';
+                    const el = (id) => document.getElementById(id);
+                    const text = el('p').firstChild, after = el('p').lastChild, pre = el('pre').firstChild;
+                    const sel = getSelection(), out = [];
+                    const triple = (target, node, offset, x) => {
+                        for (let i = 0; i < 3; i++) {
+                            __trust.pointerButton(target.__id, true, x, 5, x, 5, 0, 0, false, node.__id, offset, true, false);
+                            __trust.pointerButton(target.__id, false, x, 5, x, 5, 0, 0, false, node.__id, offset, true, false);
+                        }
+                        out.push(JSON.stringify(sel.toString()));
+                    };
+                    triple(el('p'), text, 18, 10);
+                    triple(el('p'), after, 2, 60);
+                    triple(el('pre'), pre, 5, 110);
+                    sel.collapse(text, 18);
+                    sel.modify('extend', 'forward', 'paragraphboundary');
+                    out.push(JSON.stringify(sel.toString()));
+                    return out.join('|');
+                })()"#
+            ),
+            "\"First line of\\n  the paragraph\"|\"after break\"|\"two\"|\"e paragraph\""
+        );
+    }
+
+    #[test]
+    fn the_users_copy_action_fires_copy_and_writes_rendered_text() {
+        // Clipboard API #copy-action and #fire-a-clipboard-event: an
+        // uncanceled copy writes the selection as HTML's rendered text
+        // collection steps produce it (CSS UI 4: user-select:none content
+        // left out); a canceled one writes the data its listener set.
+        let mut engine = platform_engine_with_body();
+        let written = |engine: &mut lumen::Engine| {
+            engine
+                .ctx()
+                .host_mut::<HostState>()
+                .map(|state| std::mem::take(&mut state.clipboard_requests))
+                .unwrap()
+                .into_iter()
+                .map(|(_, text)| text)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+                    document.body.innerHTML = '<p id=a>One <b>two</b>  words</p>' +
+                        '<p>Three<span style="user-select:none"> hidden</span><br>four</p>';
+                    const sel = getSelection();
+                    sel.setBaseAndExtent(document.getElementById('a').firstChild, 1, document.body.lastChild.lastChild, 2);
+                    window.copies = 0;
+                    document.addEventListener('copy', (e) => { copies++; });
+                    __trust.userCopy();
+                    return String(copies);
+                })()"#
+            ),
+            "1"
+        );
+        assert_eq!(
+            written(&mut engine),
+            vec!["ne two words\n\nThree\nfo".to_string()]
+        );
+        string_value(
+            &mut engine,
+            r#"(() => {
+                document.addEventListener('copy', (e) => { e.clipboardData.setData('text/plain', 'mine'); e.preventDefault(); });
+                __trust.userCopy();
+                return '';
+            })()"#,
+        );
+        assert_eq!(written(&mut engine), vec!["mine".to_string()]);
+    }
+
+    #[test]
+    fn context_menus_follow_maybe_show_context_menu() {
+        // Pointer Events #maybe-show-context-menu: the UA menu shows when
+        // contextmenu is not canceled; the user's bypass fires none; the menu
+        // key fires it at the focused element from no pointing device.
+        let mut engine = platform_engine_with_body();
+        let results = |engine: &mut lumen::Engine| {
+            engine
+                .ctx()
+                .host_mut::<HostState>()
+                .map(|state| std::mem::take(&mut state.context_menus))
+                .unwrap()
+        };
+        let seen = string_value(
+            &mut engine,
+            r#"(() => {
+                document.body.innerHTML = '<p id=a>plain</p><p id=b>own menu</p>';
+                const a = document.getElementById('a'), b = document.getElementById('b'), out = [];
+                document.addEventListener('contextmenu', (e) => out.push(e.target.id || e.target.localName,
+                    e.pointerId, JSON.stringify(e.pointerType)));
+                b.addEventListener('contextmenu', (e) => e.preventDefault());
+                const click = (el, bypass) => {
+                    __trust.pointerButton(el.__id, true, 5, 5, 5, 5, 2, 0, false, null, 0, true, bypass);
+                    __trust.pointerButton(el.__id, false, 5, 5, 5, 5, 2, 0, false, null, 0, true, bypass);
+                };
+                click(a, false); click(b, false); click(a, true);
+                __trust.key(null, 'ContextMenu', 'ContextMenu', false, false, false, false, false, false);
+                return out.join('|');
+            })()"#,
+        );
+        assert_eq!(seen, "a|1|\"mouse\"|b|1|\"mouse\"|body|-1|\"\"");
+        assert_eq!(results(&mut engine), vec![true, false, true]);
     }
 
     #[test]
@@ -31652,6 +32031,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn actor_reports_the_users_selection_and_context_menu() {
+        // Selection API §2 "User Interactions" and Pointer Events
+        // #maybe-show-context-menu, end to end: a frontend's press, drag and
+        // release select the page's text, and the page answers the gesture
+        // with what its selection selects (user-select:none text left out);
+        // a secondary click asks whether the frontend shows its menu.
+        let html = "<p id=p>Hello brave world</p><p id=n style='user-select:none'>skip</p>\
+            <p id=q>more text</p><script>document.getElementById('p').addEventListener('click',()=>{});\
+            document.getElementById('n').addEventListener('contextmenu',(e)=>e.preventDefault());</script>";
+        let dom = Dom::parse_document(html);
+        let element = |id| dom.get_by_id(id).unwrap();
+        let text = |id| dom.children(element(id))[0];
+        let (p, n, q) = (text("p"), text("n"), text("q"));
+        let mut env = crate::js::PageEnv::bare(DEFAULT_URL);
+        env.terminal_presentation = false;
+        let (handle, mut events) = spawn_page(html.into(), env);
+        let metadata = |node, offset, serial| crate::js::PointerMetadata {
+            selection: Some(crate::js::PointerSelection::new(
+                Some(crate::core::TextPoint { node, offset }),
+                serial,
+            )),
+            ..Default::default()
+        };
+        let button = |node, pressed, button, metadata| crate::js::PageCmd::PointerButton {
+            node: Some(node),
+            pressed,
+            x: 10.0,
+            y: 10.0,
+            button,
+            metadata,
+        };
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while !matches!(
+                events.recv().await,
+                Some(crate::js::PageEvt::Updated { .. })
+            ) {}
+            handle
+                .try_send_user(button(element("p"), true, 0, metadata(p, 2, 1)))
+                .unwrap();
+            handle.send_hover_with_metadata(Some(element("q")), 10.0, 40.0, metadata(q, 4, 2));
+            handle
+                .try_send_user(button(element("q"), false, 0, metadata(q, 4, 3)))
+                .unwrap();
+            let report = loop {
+                match events.recv().await {
+                    Some(crate::js::PageEvt::Selection(report)) if report.serial == 3 => {
+                        break report;
+                    }
+                    Some(crate::js::PageEvt::Trouble(errors)) => panic!("{errors:?}"),
+                    Some(_) => {}
+                    None => panic!("actor ended before reporting the selection"),
+                }
+            };
+            assert_eq!(report.segments.text.get(&p), Some(&vec![(2, 17)]));
+            assert_eq!(report.segments.text.get(&n), None);
+            assert_eq!(report.segments.text.get(&q), Some(&vec![(0, 4)]));
+            assert_eq!(
+                report.anchor,
+                Some(crate::core::TextPoint { node: p, offset: 2 })
+            );
+            assert_eq!(
+                report.focus,
+                Some(crate::core::TextPoint { node: q, offset: 4 })
+            );
+            for (target, show) in [(element("p"), true), (element("n"), false)] {
+                let ask = crate::js::PointerMetadata {
+                    selection: Some(Default::default()),
+                    ..Default::default()
+                };
+                handle.try_send_user(button(target, true, 2, ask)).unwrap();
+                handle.try_send_user(button(target, false, 2, ask)).unwrap();
+                loop {
+                    match events.recv().await {
+                        Some(crate::js::PageEvt::ContextMenu { show: shown }) => {
+                            assert_eq!(shown, show);
+                            break;
+                        }
+                        Some(crate::js::PageEvt::Trouble(errors)) => panic!("{errors:?}"),
+                        Some(_) => {}
+                        None => panic!("actor ended before answering the context menu"),
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn contenteditable_key_default_uses_live_selection_and_input_events() {
         // Selection API §3 and Input Events 2 §6: keydown/keypress precede
         // beforeinput, the native edit, and input at the focused editing host.
@@ -33101,7 +33569,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 246, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 249, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -33112,7 +33580,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 246);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 249);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(

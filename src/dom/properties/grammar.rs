@@ -88,6 +88,8 @@ pub(in crate::dom) fn valid(property: &str, value: &str) -> Option<bool> {
         "color-interpolation" => one_of(&["auto", "srgb", "linearrgb"]),
         // CSS Masking 1 #the-mask-type.
         "mask-type" => one_of(&["luminance", "alpha"]),
+        // CSS UI 4 #content-selection.
+        "user-select" => one_of(&["auto", "text", "none", "contain", "all"]),
         "pointer-events" => one_of(&[
             "auto",
             "bounding-box",

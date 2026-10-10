@@ -26,8 +26,9 @@ use super::float::{FloatBox, FloatCtx, FloatPlace};
 use super::style::{
     Align2, BOTTOM, BoxStyle, InlineStyle, LEFT, RIGHT, TOP, TabSize, VerticalAlign,
 };
-use super::tree::{Atom, AtomKind, BoxNode, Inline};
+use super::tree::{Atom, AtomKind, BoxNode, Inline, TextOrigin};
 use super::value::Vp;
+use crate::render::selection::{TextSourceSpan, utf16_len};
 
 /// The float environment an IFC lays its line boxes against: the block
 /// formatting context's [`FloatCtx`] (queried per line and appended to when an
@@ -134,6 +135,13 @@ pub(crate) struct Piece {
     /// replacement character) in its bidi paragraph's text, `u32::MAX` when
     /// no paragraph text is kept (intrinsic probes, sideways text).
     pub(super) bidi_pos: u32,
+    /// The DOM text this text piece lays out (Selection API §2): byte
+    /// ranges of `item.text` and the Text data they came from. Empty for
+    /// generated text, controls and intrinsic probes.
+    pub(crate) sources: Vec<TextSourceSpan>,
+    /// How this piece's line started, on the logically first text piece of
+    /// each line (`flow::emit_lines`).
+    pub(crate) line_start: crate::render::selection::LineStart,
 }
 
 /// The box of an inline-level replaced element or form control, as edge
@@ -220,7 +228,7 @@ impl ControlText {
             static BASE: std::sync::LazyLock<Url> =
                 std::sync::LazyLock::new(|| Url::parse("about:blank").expect("valid URL"));
             let images = ImageSizes::new();
-            let content = [Inline::Text(rest.text.clone())];
+            let content = [Inline::Text(rest.text.clone(), TextOrigin::NONE)];
             let mut ifc = Ifc::new(
                 dom,
                 &BASE,
@@ -562,6 +570,27 @@ pub(crate) struct InlineItem {
 }
 
 impl Piece {
+    /// Replace this text piece's text by `text`, a prefix or suffix of it
+    /// (an ellipsis cut, trimmed white space), keeping the sources of what
+    /// remains.
+    pub(crate) fn retain_text(&mut self, text: String) {
+        if !self.sources.is_empty() {
+            let old = self.item.text.as_str();
+            self.sources = if old.starts_with(text.as_str()) {
+                crate::render::selection::slice_sources(old, &self.sources, 0..text.len())
+            } else if old.ends_with(text.as_str()) {
+                crate::render::selection::slice_sources(
+                    old,
+                    &self.sources,
+                    old.len() - text.len()..old.len(),
+                )
+            } else {
+                Vec::new()
+            };
+        }
+        self.item.text = text;
+    }
+
     /// Whether this piece is a run of text (not an atomic inline).
     pub(crate) fn is_text(&self) -> bool {
         self.text_style.is_some() && !self.atom_box
@@ -583,6 +612,7 @@ impl Piece {
 
     pub(super) fn retained_bytes(&self) -> usize {
         self.item.text.capacity()
+            + self.sources.capacity() * std::mem::size_of::<TextSourceSpan>()
             + [
                 &self.item.terminal_text,
                 &self.item.graphical_image,
@@ -648,6 +678,8 @@ impl Piece {
             shift: [0.0; 2],
             bidi_level: 0,
             bidi_pos: u32::MAX,
+            sources: Vec::new(),
+            line_start: Default::default(),
         }
     }
 
@@ -681,6 +713,8 @@ impl Piece {
             shift: [0.0; 2],
             bidi_level: 0,
             bidi_pos: u32::MAX,
+            sources: Vec::new(),
+            line_start: Default::default(),
         }
     }
 }
@@ -929,6 +963,88 @@ pub(crate) struct Ifc<'a, 'f, 't> {
     /// #bidi-algo), kept for a block container's laid content; `None` in
     /// intrinsic probes and other formatting contexts.
     bidi: Option<Box<bidi::BidiState>>,
+    /// The DOM text being placed, while `text_followed` places a Text
+    /// node's run in a painted (not intrinsic or terminal) layout.
+    source: Option<SourceCursor>,
+}
+
+/// Where the text being placed came from (`TextOrigin`). Laid-out text is
+/// the Text data after `text-transform` and segment-break normalization;
+/// this maps each placed segment back to its UTF-16 range of the data, in
+/// placement order. Text that kept its characters maps exactly; text whose
+/// transform changed their number maps proportionally.
+struct SourceCursor {
+    node: NodeId,
+    /// The UTF-16 offset of the laid-out text's start in the data.
+    origin: u32,
+    /// The UTF-16 length of the data the laid-out text came from.
+    units: u32,
+    /// The laid-out text's byte length.
+    len: usize,
+    exact: bool,
+    /// Both texts are ASCII: a byte is a UTF-16 code unit (the common case,
+    /// mapped without decoding any text).
+    ascii: bool,
+    /// The next byte to place, and (exactly mapped) its UTF-16 offset.
+    byte: usize,
+    unit: u32,
+}
+
+impl SourceCursor {
+    fn new(origin: TextOrigin, data: &str, laid: &str) -> Self {
+        let ascii = data.is_ascii() && laid.is_ascii();
+        let units = if ascii {
+            data.len() as u32
+        } else {
+            utf16_len(data)
+        };
+        Self {
+            node: origin.node,
+            origin: origin.offset,
+            units,
+            len: laid.len(),
+            exact: laid.len() == data.len() && (ascii || utf16_len(laid) == units),
+            ascii,
+            byte: 0,
+            unit: 0,
+        }
+    }
+
+    fn unit_at(&self, byte: usize) -> u32 {
+        if self.exact {
+            self.unit
+        } else if self.len == 0 {
+            0
+        } else {
+            (f64::from(self.units) * byte.min(self.len) as f64 / self.len as f64).round() as u32
+        }
+    }
+
+    /// Pass over laid-out text that is not placed (collapsed white space,
+    /// segment breaks, tabs).
+    fn skip(&mut self, text: &str) {
+        if self.exact {
+            self.unit += if self.ascii {
+                text.len() as u32
+            } else {
+                utf16_len(text)
+            };
+        }
+        self.byte += text.len();
+    }
+
+    /// The span of the next placed segment, `text`.
+    fn take(&mut self, text: &str) -> TextSourceSpan {
+        let offset = self.origin + self.unit_at(self.byte);
+        self.skip(text);
+        TextSourceSpan {
+            start: 0,
+            end: text.len() as u32,
+            node: self.node,
+            offset,
+            offset_end: self.origin + self.unit_at(self.byte),
+        }
+    }
 }
 
 impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
@@ -1023,6 +1139,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             line_budget: None,
             cells: crate::text::cell_metrics(),
             bidi: None,
+            source: None,
         };
         ifc.begin_line();
         ifc
@@ -1316,7 +1433,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
 
     fn walk(&mut self, inl: &'t Inline, ctx: &InlineStyle, following: &Following<'_, 't>) {
         match inl {
-            Inline::Text(t) => self.text_followed(t, ctx, Some(following)),
+            Inline::Text(t, origin) => self.text_followed(t, *origin, ctx, Some(following)),
             Inline::Br => self.forced_break(),
             // An inline-level replaced box: its margin/border/padding edges
             // take real inline space around the content box (§9.4.2/§10.8),
@@ -1551,7 +1668,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
 
     /// Emit a text run under `ctx`.
     pub fn text(&mut self, t: &str, ctx: &InlineStyle) {
-        self.text_followed(t, ctx, None);
+        self.text_followed(t, TextOrigin::NONE, ctx, None);
     }
 
     /// Whether the line budget is laid: what follows cannot be seen.
@@ -1564,12 +1681,19 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
     /// continued by the following items: CSS Text 3 #line-breaking provides
     /// no soft wrap opportunity at an inline box boundary itself, so
     /// `<a>link</a>.` or `<b>W</b>ord` wraps as one word.
-    fn text_followed(&mut self, t: &str, ctx: &InlineStyle, following: Option<&Following<'_, 't>>) {
+    fn text_followed(
+        &mut self,
+        t: &str,
+        origin: TextOrigin,
+        ctx: &InlineStyle,
+        following: Option<&Following<'_, 't>>,
+    ) {
         if ctx.font_zero {
             // `font-size:0` text occupies no CSS geometry (the copyable-but-unseen
             // idiom); it neither paints nor owes spaces.
             return;
         }
+        let data = t;
         let t = ctx.transform.apply(t);
         let t = if ctx.ws.converts_to_spaces() {
             std::borrow::Cow::Owned(t.replace("\r\n", " ").replace(['\t', '\n', '\r'], " "))
@@ -1578,6 +1702,26 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         } else {
             t
         };
+        // Painted layouts keep where each placed segment came from.
+        self.source = (!origin.is_none() && !self.measuring && self.cells.is_none())
+            .then(|| SourceCursor::new(origin, data, &t));
+        self.place_text(&t, ctx, following);
+        self.source = None;
+    }
+
+    fn skip_source(&mut self, text: &str) {
+        if let Some(source) = self.source.as_mut() {
+            source.skip(text);
+        }
+    }
+
+    fn take_source(&mut self, text: &str) -> Option<TextSourceSpan> {
+        self.source.as_mut().map(|source| source.take(text))
+    }
+
+    /// `text_followed`'s laid-out text `t`, placed word by word or as
+    /// preserved segments.
+    fn place_text(&mut self, t: &str, ctx: &InlineStyle, following: Option<&Following<'_, 't>>) {
         if ctx.ws.collapses_spaces() {
             let mut word = String::new();
             for c in t.chars() {
@@ -1589,6 +1733,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                         self.word(&word, ctx, 0.0);
                         word.clear();
                     }
+                    self.skip_source(c.encode_utf8(&mut [0; 4]));
                     if c == '\n' && ctx.ws.preserves_newlines() {
                         self.forced_break();
                     } else {
@@ -1625,10 +1770,12 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                     return;
                 }
                 if i > 0 {
+                    self.skip_source("\n");
                     self.forced_break();
                 }
                 for (j, piece) in seg.split('\t').enumerate() {
                     if j > 0 {
+                        self.skip_source("\t");
                         let tab = self.tab_advance(ctx);
                         if tab > 0.0 {
                             // A preserved tab is a UAX #9 segment separator.
@@ -1771,7 +1918,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
     ) -> Continues {
         for item in items {
             match item {
-                Inline::Text(text) => {
+                Inline::Text(text, _) => {
                     if !ctx.ws.collapses_spaces() || ctx.font_zero {
                         return Continues::Stopped;
                     }
@@ -2148,6 +2295,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
     ) {
         let w = shaped.advance;
         if w <= 0.0 {
+            self.skip_source(seg);
             return;
         }
         let space = spaced && self.pending_space && self.pen > self.line_start;
@@ -2169,6 +2317,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             self.place(seg, ctx, false, false);
             return;
         }
+        let source = self.take_source(seg);
         // Merge adjacent same-styled words into one retained shaped run so
         // shaping can cross ordinary whitespace and selection/hit testing
         // keeps useful run granularity. Justified lines keep spaces
@@ -2195,6 +2344,12 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         {
             if space {
                 last.item.text.push(' ');
+            }
+            if let Some(mut span) = source {
+                let at = last.item.text.len() as u32;
+                span.start += at;
+                span.end += at;
+                last.sources.push(span);
             }
             last.item.text.push_str(seg);
             if let Some(bidi) = self.bidi.as_mut() {
@@ -2259,6 +2414,8 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             shift: [0.0; 2],
             bidi_level: 0,
             bidi_pos,
+            sources: source.into_iter().collect(),
+            line_start: Default::default(),
         });
         self.attach_boxes(gap);
         self.pen = x + w;
@@ -2475,7 +2632,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             })
             .and_then(|length| length.resolve(Some(width)))
             .unwrap_or(0.0);
-        let content = [Inline::Text(text.to_string())];
+        let content = [Inline::Text(text.to_string(), TextOrigin::NONE)];
         let mut ifc = Ifc::new(
             self.dom,
             self.base,
@@ -3064,6 +3221,8 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             shift: [0.0; 2],
             bidi_level: 0,
             bidi_pos,
+            sources: Vec::new(),
+            line_start: Default::default(),
         });
         self.attach_boxes(gap);
         self.pen = x + geometry.box_width;
@@ -3909,7 +4068,7 @@ pub(super) fn text_overflow_ellipsis(
                 {
                     prefix = crate::text::shape(&prefix.text, style);
                 }
-                piece.item.text = prefix.text.clone();
+                piece.retain_text(prefix.text.clone());
                 piece.box_width = prefix.advance;
                 piece.paint_width = prefix.advance;
                 piece.shaped = Some(prefix);
@@ -4019,7 +4178,7 @@ fn text_overflow_ellipsis_rtl(line: &mut super::flow::LineFrag, root: &InlineSty
                 let suffix = shaped.visual_suffix(cut);
                 piece.x += piece.paint_x + cut;
                 piece.paint_x = 0.0;
-                piece.item.text = suffix.text.clone();
+                piece.retain_text(suffix.text.clone());
                 piece.box_width = suffix.advance;
                 piece.paint_width = suffix.advance;
                 piece.shaped = Some(suffix);
@@ -4131,7 +4290,7 @@ pub(super) fn block_ellipsis(
             }
             let shortened = crate::text::shape(text, style);
             if !text.is_empty() && piece.x + shortened.advance <= available + 0.01 {
-                piece.item.text = text.to_owned();
+                piece.retain_text(text.to_owned());
                 piece.box_width = shortened.advance;
                 piece.paint_width = shortened.advance;
                 piece.shaped = Some(shortened);

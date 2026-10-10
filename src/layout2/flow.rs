@@ -1952,7 +1952,7 @@ impl Flow<'_> {
     pub(super) fn vertical_text(&self, b: &BoxNode) -> bool {
         fn text_only(inls: &[Inline], sideways: bool) -> bool {
             inls.iter().all(|inline| match inline {
-                Inline::Text(text) => {
+                Inline::Text(text, _) => {
                     sideways
                         || text
                             .chars()
@@ -2049,7 +2049,25 @@ impl Flow<'_> {
     }
 
     fn emit_lines(&self, lines: Vec<LineOut>, x: f32, cur: &mut Cursor, out: &mut Vec<Frag>) {
-        for line in lines {
+        use crate::render::selection::LineStart;
+        let mut start = LineStart::Block;
+        for mut line in lines {
+            // The logically first text of each line records how the line
+            // began, which copying a selection turns into a space or a
+            // line break.
+            if let Some(piece) = line
+                .pieces
+                .iter_mut()
+                .filter(|piece| !piece.sources.is_empty())
+                .min_by_key(|piece| piece.bidi_pos)
+            {
+                piece.line_start = start;
+            }
+            start = if line.forced {
+                LineStart::Forced
+            } else {
+                LineStart::Soft
+            };
             cur.y += line.gap_before;
             let hpx = line.height;
             let line_frag = LineFrag {
@@ -6747,7 +6765,7 @@ fn float_only_run(b: &BoxNode) -> bool {
     b.node == NO_NODE
         && matches!(&b.content, Content::Inlines(items) if !items.is_empty() && items.iter().all(|item| match item {
             Inline::Float(_) | Inline::OutOfFlow(_) => true,
-            Inline::Text(text) => text.chars().all(|c| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0c')),
+            Inline::Text(text, _) => text.chars().all(|c| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0c')),
             _ => false,
         }) && items.iter().any(|item| matches!(item, Inline::Float(_))))
 }

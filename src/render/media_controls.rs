@@ -138,6 +138,7 @@ fn append_button(commands: &mut Vec<Primitive>, hit: &HitRegion, anchor: CssRect
         clip: None,
         node: hit.node,
         link: None,
+        selection: Default::default(),
     });
     commands.push(Primitive::HitRegion(HitRegion {
         rect,
@@ -188,6 +189,8 @@ impl Scene {
             &scroll_container_index(page, offsets),
             scroll,
             elapsed_seconds,
+            &mut None,
+            &page.replaced_images,
         );
         self.primitives.push(Primitive::PopTransform);
         self.primitives.push(Primitive::PopClip);

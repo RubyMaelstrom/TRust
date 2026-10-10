@@ -252,6 +252,7 @@ pub fn paint_doc_selected(
         .peekable();
         let mut continuation = false;
         let mut paragraph_offset = 0;
+        let mut paragraph_units = 0;
         while let Some(mut shaped) = pieces.next() {
             let more = pieces.peek().is_some();
             soft_wrapped |= more;
@@ -286,6 +287,33 @@ pub fn paint_doc_selected(
                 backgrounds,
             });
             paragraph_offset += shaped.text.len();
+            // A line of the document stands for a Text node of its own:
+            // selections anchor to (line, UTF-16 offset) as they would to
+            // DOM text, so one selection model serves every page.
+            let units = super::selection::utf16_len(&shaped.text);
+            let selection = if truncated {
+                super::RunSelection::default()
+            } else {
+                super::RunSelection {
+                    sources: Some(std::sync::Arc::from([super::TextSourceSpan {
+                        start: 0,
+                        end: shaped.text.len() as u32,
+                        node: line_index + 1,
+                        offset: paragraph_units,
+                        offset_end: paragraph_units + units,
+                    }])),
+                    highlight: super::HighlightPaint::Ua,
+                    // A document line ends with a line break; its wrapped
+                    // continuations are soft.
+                    line_start: if paragraph_units == 0 {
+                        super::selection::LineStart::Forced
+                    } else {
+                        super::selection::LineStart::Soft
+                    },
+                    unselectable: false,
+                }
+            };
+            paragraph_units += units;
             paint.lines.push(PaintLine {
                 rect,
                 baseline: y + shaped.baseline,
@@ -306,6 +334,7 @@ pub fn paint_doc_selected(
                 clip: None,
                 node: line_index + 1,
                 link: link.clone(),
+                selection,
             });
             paint.primitives.push(DisplayCommand::HitRegion(HitRegion {
                 rect,

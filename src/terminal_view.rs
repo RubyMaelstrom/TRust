@@ -238,6 +238,7 @@ impl TerminalView {
                         clip: Some(rect),
                         node: usize::from(row) * usize::from(cols) + usize::from(col),
                         link: None,
+                        selection: Default::default(),
                     });
                 }
             }

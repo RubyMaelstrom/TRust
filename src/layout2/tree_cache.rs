@@ -126,7 +126,7 @@ fn atom_bytes(atom: &Atom) -> usize {
 
 fn inline_bytes(inline: &Inline, child: &mut dyn FnMut(&SharedBox) -> usize) -> usize {
     match inline {
-        Inline::Text(t) => t.capacity(),
+        Inline::Text(t, _) => t.capacity(),
         Inline::Box { style, kids, .. } => {
             size_of::<super::style::BoxStyle>()
                 + 4 * size_of::<usize>()
@@ -537,7 +537,10 @@ mod tests {
     fn tree_cache_bounds_and_replacement_account_for_shared_ownership() {
         let _inputs = crate::layout2::stable_global_layout_inputs();
         let mut cache = BoxTreeCache::default();
-        let value = Built::Inline(Inline::Text("x".repeat(16384)));
+        let value = Built::Inline(Inline::Text(
+            "x".repeat(16384),
+            crate::layout2::tree::TextOrigin::NONE,
+        ));
         for node in 0..5000 {
             cache.insert(node, vec![(node as i64, 1)], &[], &value);
             assert!(cache.entries.len() <= MAX_ENTRIES);

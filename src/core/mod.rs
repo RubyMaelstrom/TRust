@@ -18,6 +18,16 @@ use crate::{gemini, gopher, http, oneshot};
 
 mod events;
 
+/// A DOM boundary point in a Text node (DOM #concept-boundary-point): the
+/// node's arena id and an offset in UTF-16 code units of its data. Layout
+/// attributes painted text to these points, so a user's selection is the
+/// same in the frontend that paints it and the page that owns it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct TextPoint {
+    pub node: usize,
+    pub offset: u32,
+}
+
 /// A position in logical/CSS pixels relative to the content viewport.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct CssPoint {
@@ -269,6 +279,10 @@ pub enum UserAction {
     Stop,
     /// Drop the resident page and stop its scripts (the `kill` command).
     Kill,
+    /// The user's copy action on the live page (Clipboard API
+    /// #copy-action): its `copy` listeners decide what reaches the
+    /// clipboard, delivered like a page clipboard write.
+    Copy,
     /// A close request (HTML #close-requests: the Escape key). With a live
     /// page the page runs the close request steps first; when nothing there
     /// consumes it, the controller stops loading ("alternative processing").
@@ -704,6 +718,13 @@ pub struct BrowserController {
     /// has one opts in with `set_clipboard_available`; otherwise requests are refused here.
     clipboard_available: bool,
     pending_clipboard_writes: VecDeque<(u64, String)>,
+    /// The live page's selections as it last reported them (Selection API
+    /// §2), and a generation that changes with each report.
+    page_selection: Option<crate::js::SelectionReport>,
+    page_selection_generation: u64,
+    /// Pointer Events #maybe-show-context-menu answers from the live page:
+    /// whether the frontend shows its context menu.
+    context_menu_results: VecDeque<bool>,
     /// HTML #show-the-picker,-if-applicable prompts for a frontend that can show a file
     /// picker (`set_file_picker_available`); otherwise each prompt is dismissed at once.
     file_picker_available: bool,
@@ -749,6 +770,8 @@ fn event_variant_name(event: &crate::js::PageEvt) -> &'static str {
         crate::js::PageEvt::Settled => "Settled",
         crate::js::PageEvt::Focused { .. } => "Focused",
         crate::js::PageEvt::CloseRequestHandled { .. } => "CloseRequestHandled",
+        crate::js::PageEvt::ContextMenu { .. } => "ContextMenu",
+        crate::js::PageEvt::Selection(_) => "Selection",
         crate::js::PageEvt::FullscreenRequest { .. } => "FullscreenRequest",
         crate::js::PageEvt::FullscreenExit { .. } => "FullscreenExit",
         _ => "Other",
@@ -799,6 +822,9 @@ impl BrowserController {
             file_picker_available: false,
             pending_file_pickers: VecDeque::new(),
             pending_clipboard_writes: VecDeque::new(),
+            page_selection: None,
+            page_selection_generation: 0,
+            context_menu_results: VecDeque::new(),
             external_media: VecDeque::new(),
             download_offer: None,
             prompt: None,
@@ -1425,6 +1451,19 @@ impl BrowserController {
         self.pending_clipboard_writes.pop_front()
     }
 
+    /// The live page's selection as last reported, with the generation of
+    /// that report (it changes whenever the report does, including when the
+    /// live page goes away).
+    pub fn page_selection(&self) -> (u64, Option<&crate::js::SelectionReport>) {
+        (self.page_selection_generation, self.page_selection.as_ref())
+    }
+
+    /// The live page's next answer to a context menu request: whether the
+    /// frontend shows its own menu (`contextmenu` was not canceled).
+    pub fn take_context_menu_result(&mut self) -> Option<bool> {
+        self.context_menu_results.pop_front()
+    }
+
     /// Declare whether this frontend can display a file picker. Without one, a page's file
     /// prompt is dismissed (HTML: the control then receives `cancel`).
     pub fn set_file_picker_available(&mut self, available: bool) {
@@ -1550,6 +1589,10 @@ impl BrowserController {
             }
             UserAction::Stop => self.stop_loading(),
             UserAction::Kill => self.stop(),
+            UserAction::Copy => {
+                self.send_user(crate::js::PageCmd::Copy);
+                false
+            }
             UserAction::CloseRequest(modifiers) => {
                 if self.live_page.is_some() && self.pending.is_none() && self.prompt.is_none() {
                     self.close_requests_in_flight = self.close_requests_in_flight.saturating_add(1);
@@ -3286,6 +3329,10 @@ impl BrowserController {
     fn drop_live_page(&mut self) {
         self.pending_pointer_lock.clear();
         self.pending_clipboard_writes.clear();
+        self.context_menu_results.clear();
+        if self.page_selection.take().is_some() {
+            self.page_selection_generation = self.page_selection_generation.wrapping_add(1);
+        }
         // A retired page leaves fullscreen (Fullscreen API #unloading-document-
         // cleanup-steps fully exits it); unanswered close requests end too.
         self.pending_fullscreen.clear();
@@ -3629,6 +3676,15 @@ impl BrowserController {
                     });
                     false
                 }
+            }
+            PageEvt::ContextMenu { show } => {
+                self.context_menu_results.push_back(show);
+                true
+            }
+            PageEvt::Selection(report) => {
+                self.page_selection = Some(report);
+                self.page_selection_generation = self.page_selection_generation.wrapping_add(1);
+                true
             }
             PageEvt::ClipboardWrite { request, text } => {
                 if self.clipboard_available {
@@ -6119,6 +6175,7 @@ mod tests {
                 alt: false,
                 meta: true,
             },
+            ..Default::default()
         };
         browser.handle_action(UserAction::PageHover {
             actor: Some(42),

@@ -1066,6 +1066,11 @@ fn reorder_line(
         for (n, (range, level)) in runs.into_iter().enumerate() {
             let mut part = piece.clone();
             part.item.text = piece.item.text[range.clone()].to_owned();
+            part.sources = crate::render::selection::slice_sources(
+                &piece.item.text,
+                &piece.sources,
+                range.clone(),
+            );
             part.bidi_pos = piece.bidi_pos + range.start as u32;
             if n > 0 {
                 part.space_before = false;

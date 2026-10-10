@@ -88,6 +88,7 @@ impl TerminalInputView {
             clip: Some(self.clip),
             node: 0,
             link: None,
+            selection: Default::default(),
         });
         for rect in &line.underlines {
             commands.push(DisplayCommand::FillRect {

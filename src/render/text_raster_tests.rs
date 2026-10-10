@@ -77,6 +77,7 @@ fn glyph_scene_with(scale: f64, synth_bold: bool) -> Scene {
             clip: None,
             node: 1,
             link: None,
+            selection: Default::default(),
         }],
         controls: Vec::new(),
         content_viewport: CssRect::new(0.0, 0.0, 64.0, 64.0),

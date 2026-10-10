@@ -53,6 +53,9 @@ const ACCESS_FIND: AccessNodeId = AccessNodeId(6);
 const ACCESS_COMMAND: AccessNodeId = AccessNodeId(7);
 const ACCESS_TERMINAL: AccessNodeId = AccessNodeId(8);
 const ACCESS_TERMINAL_INPUT: AccessNodeId = AccessNodeId(9);
+/// The page's context menu and, from the next id on, its items.
+const ACCESS_CONTEXT_MENU: AccessNodeId = AccessNodeId(20);
+const ACCESS_CONTEXT_MENU_ITEMS: u64 = 21;
 const IMAGE_FETCH_CONCURRENCY: usize = 8;
 /// How long a page's fullscreen request waits for the window manager's resize.
 const FULLSCREEN_REPLY_DEADLINE: std::time::Duration = std::time::Duration::from_millis(750);
@@ -164,6 +167,8 @@ enum DesktopEvent {
     FileDragTick {
         session: u64,
     },
+    /// A selection drag beyond the content viewport scrolls it.
+    SelectionAutoscroll,
 }
 
 /// A drag of native files from another application over the window. winit reports the files
@@ -206,6 +211,11 @@ impl NativeFileDrag {
         drag.dropped.get_or_insert_with(Vec::new).push(path);
     }
 }
+
+#[path = "trust-desktop/context_menu.rs"]
+mod context_menu;
+#[path = "trust-desktop/text_selection.rs"]
+mod text_selection;
 
 /// The pointer's position in the window while another application's drag holds the pointer
 /// grab (winit 0.30 delivers no motion then), in physical pixels.
@@ -1892,8 +1902,24 @@ struct DesktopApp {
     css_animation_generation: u64,
     css_animation_started: Instant,
     link_preview: String,
-    selection: Option<TextSelection>,
-    selecting: bool,
+    /// The user's selection of page text (`text_selection`).
+    text_selection: text_selection::TextSelectionState,
+    /// The page's context menu, while it shows (`context_menu`).
+    context_menu: Option<context_menu::PageContextMenu>,
+    /// A secondary click or the menu key asked a live page whether the
+    /// context menu shows (it fires `contextmenu`): where to show it.
+    context_menu_request: Option<(CssPoint, bool)>,
+    /// The button whose press closed the context menu; its release is
+    /// consumed with it.
+    context_menu_swallow: Option<MouseButton>,
+    /// The bookmark store's last answer about an address: its bookmarks.
+    page_bookmark: Option<(String, Vec<u64>)>,
+    /// Only the overlay needs repainting (`draw_overlay`).
+    overlay_redraw_pending: bool,
+    /// Where the overlay's commands start in the retained scene, and the
+    /// rectangle they painted.
+    overlay_start: usize,
+    overlay_damage: Option<CssRect>,
     find_matches: Vec<TextSelection>,
     find_index: usize,
     clipboard: Option<arboard::Clipboard>,
@@ -2258,8 +2284,14 @@ impl DesktopApp {
             css_animation_generation: 0,
             css_animation_started: Instant::now(),
             link_preview: String::new(),
-            selection: None,
-            selecting: false,
+            text_selection: Default::default(),
+            context_menu: None,
+            context_menu_request: None,
+            context_menu_swallow: None,
+            page_bookmark: None,
+            overlay_redraw_pending: false,
+            overlay_start: 0,
+            overlay_damage: None,
             find_matches: Vec::new(),
             find_index: 0,
             clipboard,
@@ -3021,6 +3053,7 @@ impl DesktopApp {
     /// queue along with the old page.
     fn process_browser_events(&mut self) -> trust::core::ActionOutcome {
         let outcome = self.browser.process_async_events();
+        self.sync_context_menu_requests();
         self.sync_actor_focus();
         self.sync_pointer_lock();
         self.sync_page_fullscreen();
@@ -3242,6 +3275,7 @@ impl DesktopApp {
                 f64::from(self.screen_origin.1) + f64::from(self.pointer.y),
             )),
             modifiers: translate_modifiers(self.modifiers),
+            ..Default::default()
         }
     }
 
@@ -3796,6 +3830,13 @@ impl DesktopApp {
         let trace = std::env::var_os("TRUST_DESKTOP_TRACE").is_some();
         let frame_started = std::time::Instant::now();
         let snapshot = self.browser.snapshot();
+        if self.text_selection.document_generation != self.browser.document_generation() {
+            // A new document: the context menu acted on the old one.
+            self.context_menu = None;
+            self.context_menu_request = None;
+            self.refresh_page_bookmark();
+        }
+        self.sync_page_selection();
         let initial_chrome = self.chrome_model(&snapshot);
         let initial_scene = desktop_chrome(self.metrics, &snapshot, &initial_chrome);
         let page_viewport = CssSize::new(
@@ -3880,14 +3921,21 @@ impl DesktopApp {
                 terminal.line_input.selecting = false;
             }
         } else if let Some(page) = &self.page_layout {
-            scene.append_page_with_scroll_offsets(
+            scene.append_page_with_selection(
                 &page.layout.paint,
                 self.browser.interaction().scroll,
                 css_animation_elapsed,
                 &page.scroll_offsets,
+                self.text_selection.paint.as_ref(),
             );
         } else if let Some(page) = &self.protocol_page {
-            scene.append_page(&page.layout.paint, self.browser.interaction().scroll);
+            scene.append_page_with_selection(
+                &page.layout.paint,
+                self.browser.interaction().scroll,
+                0.0,
+                &HashMap::new(),
+                self.text_selection.paint.as_ref(),
+            );
         }
 
         if let Some(page) = &self.page_layout {
@@ -3924,14 +3972,6 @@ impl DesktopApp {
                         .primitives
                         .push(DisplayCommand::FillRect { rect, color });
                 }
-            }
-        }
-        if let Some(selection) = self.selection {
-            for rect in scene.selection_rects(selection) {
-                scene.primitives.push(DisplayCommand::FillRect {
-                    rect,
-                    color: PaintColor::Rgba(72, 128, 240, 105),
-                });
             }
         }
         self.paint_focused_form(&mut scene);
@@ -3986,9 +4026,13 @@ impl DesktopApp {
                     clip: Some(rect),
                     node: 0,
                     link: None,
+                    selection: Default::default(),
                 });
             }
         }
+        // The context menu is the topmost chrome, last in the scene, so an
+        // overlay-only repaint can replace it alone.
+        self.paint_page_context_menu(&mut scene);
 
         if trace {
             eprintln!(
@@ -4311,6 +4355,15 @@ impl DesktopApp {
         }
         self.command.select_all();
         self.set_focus(FocusTarget::Command);
+    }
+
+    /// Close COMMAND when it has focus, otherwise open it.
+    fn toggle_command(&mut self, replace_with_address: bool) {
+        if self.focus == FocusTarget::Command {
+            self.close_command();
+        } else {
+            self.open_command(replace_with_address);
+        }
     }
 
     fn close_command(&mut self) {
@@ -4646,20 +4699,22 @@ impl DesktopApp {
         let selected = self
             .active_editor_mut()
             .and_then(|editor| editor.selected_text().map(str::to_string))
-            .or_else(|| {
-                let scene = self.scene.as_ref()?;
-                self.selection
-                    .map(|selection| scene.selected_text(selection))
-            });
-        if let Some(text) = selected.filter(|text| !text.is_empty())
-            && let Some(clipboard) = &mut self.clipboard
-        {
-            let _ = clipboard.set_text(text);
-            if cut && let Some(editor) = self.active_editor_mut() {
-                editor.delete_selection();
-                self.finish_text_edit_as(Some("deleteByCut"));
-                self.request_redraw();
+            .filter(|text| !text.is_empty());
+        if let Some(text) = selected {
+            if let Some(clipboard) = &mut self.clipboard {
+                let _ = clipboard.set_text(text);
+                if cut && let Some(editor) = self.active_editor_mut() {
+                    editor.delete_selection();
+                    self.finish_text_edit_as(Some("deleteByCut"));
+                    self.request_redraw();
+                }
             }
+            return;
+        }
+        // The page's selection is document text: it copies, but cutting it
+        // is no edit (Clipboard API #cut-action needs an editable context).
+        if !cut {
+            self.copy_page_selection();
         }
     }
 
@@ -4972,8 +5027,44 @@ impl DesktopApp {
             }
             return;
         }
+        // Every key belongs to the context menu while it shows.
+        if self.context_menu.is_some() {
+            self.context_menu_key(&KeyInput {
+                key: translate_key(&event.logical_key),
+                code: String::new(),
+                location: 0,
+                state: if pressed {
+                    KeyState::Pressed
+                } else {
+                    KeyState::Released
+                },
+                modifiers: translate_modifiers(self.modifiers),
+                repeat: event.repeat,
+                composing: false,
+            });
+            return;
+        }
         if pressed {
             self.protocol_pointer_selection = false;
+        }
+        // The platform's context menu keys (the menu key, Shift+F10): a live
+        // page fires `contextmenu` at its focused element as the key's
+        // default action, which decides whether the menu shows.
+        let menu_key = event.logical_key == WinitKey::Named(NamedKey::ContextMenu)
+            || (event.logical_key == WinitKey::Named(NamedKey::F10)
+                && self.modifiers.shift_key()
+                && !self.modifiers.control_key()
+                && !self.modifiers.alt_key());
+        if pressed
+            && !event.repeat
+            && menu_key
+            && matches!(self.focus, FocusTarget::Page | FocusTarget::Form { .. })
+            && self.context_menu_available()
+        {
+            self.request_page_context_menu(false, true);
+            if self.context_menu.is_some() {
+                return;
+            }
         }
         if pressed
             && self.terminal.is_none()
@@ -4999,8 +5090,10 @@ impl DesktopApp {
             && command
             && let WinitKey::Character(character) = &event.logical_key
         {
+            // Ctrl+L toggles COMMAND, as Tab and Ctrl+] do; opening it
+            // shows the address.
             if character.eq_ignore_ascii_case("l") {
-                self.open_command(true);
+                self.toggle_command(true);
                 return;
             }
             if character.eq_ignore_ascii_case("f") {
@@ -5020,6 +5113,15 @@ impl DesktopApp {
             }
             if character.eq_ignore_ascii_case("c") {
                 self.copy(false);
+                return;
+            }
+            // Select-all of a page without a live Document; a live page
+            // selects its own as the key's default action.
+            if character.eq_ignore_ascii_case("a")
+                && self.focus == FocusTarget::Page
+                && self.terminal.is_none()
+                && self.select_all_page_text()
+            {
                 return;
             }
             if character.eq_ignore_ascii_case("x") {
@@ -5104,11 +5206,7 @@ impl DesktopApp {
             && input.modifiers.control
             && matches!(&input.key, Key::Character(text) if text == "]")
         {
-            if self.focus == FocusTarget::Command {
-                self.close_command();
-            } else {
-                self.open_command(false);
-            }
+            self.toggle_command(false);
             return;
         }
         if pressed && self.focus == FocusTarget::Download {
@@ -5711,7 +5809,17 @@ impl DesktopApp {
 
     fn on_bookmark(&mut self, completion: trust::bookmarks::Completion) {
         match completion.result {
+            // The store's answer for the context menu: no status message.
+            Ok(trust::bookmarks::Outcome {
+                lookup: Some((address, ids)),
+                ..
+            }) => {
+                self.page_bookmark_answer(address, ids);
+                return;
+            }
             Ok(outcome) => {
+                // A change: what the menu offers for the page may follow.
+                self.refresh_page_bookmark();
                 if let Some(source) = outcome.listing {
                     if self.terminal.is_some() {
                         self.bookmark_terminal = self.terminal.take();
@@ -6950,6 +7058,7 @@ impl DesktopApp {
                     clip: Some(clip),
                     node: 0,
                     link: None,
+                    selection: Default::default(),
                 }
             };
         scene.primitives.push(DisplayCommand::FillRect {
@@ -7660,7 +7769,8 @@ impl DesktopApp {
                         }
                         window.set_cursor_visible(false);
                         self.cursor_visible = false;
-                        self.selecting = false;
+                        self.text_selection.gesture = None;
+                        self.close_context_menu();
                         self.pressed_hit = None;
                         self.pressed_control = None;
                         self.browser.set_status("Mouse captured · Esc to release");
@@ -7888,6 +7998,12 @@ impl DesktopApp {
         if self.select_popup_hover(point) {
             return;
         }
+        // The context menu holds the pointer while it shows: the page sees
+        // no motion or hover until it closes.
+        if self.context_menu.is_some() {
+            self.context_menu_pointer_moved();
+            return;
+        }
         let dragging_input = self
             .terminal
             .as_ref()
@@ -7957,16 +8073,13 @@ impl DesktopApp {
             self.heart_hover = heart_hover;
             visual_changed = true;
         }
-        if self.selecting
-            && let Some(position) = self
-                .scene
-                .as_ref()
-                .and_then(|scene| scene.text_position_at(point))
-            && let Some(selection) = &mut self.selection
-        {
-            selection.focus = position;
-            visual_changed = true;
-        }
+        // Selection API §2: motion with the primary button held extends the
+        // selection gesture; a live page hears of it with the motion. A
+        // re-hit-test after a new scene is no motion of the user's.
+        let selection_motion = event_loop
+            .is_some()
+            .then(|| self.extend_selection_gesture())
+            .flatten();
         let over_chrome = self
             .scene
             .as_ref()
@@ -8002,17 +8115,17 @@ impl DesktopApp {
                     point.y - scene.content_viewport.y,
                 )
             });
+            let mut metadata = self.pointer_metadata();
+            metadata.selection = selection_motion;
             self.dispatch(UserAction::PageHover {
                 actor,
                 position: viewport,
-                metadata: self.pointer_metadata(),
+                metadata,
             });
         }
+        let selecting = self.text_selection.gesture.is_some();
         if let Some(cache) = &mut self.protocol_page
-            && cache.hover(
-                hit.as_ref(),
-                self.protocol_pointer_selection && !self.selecting,
-            )
+            && cache.hover(hit.as_ref(), self.protocol_pointer_selection && !selecting)
         {
             self.keyboard_target = None;
             visual_changed = true;
@@ -8031,6 +8144,13 @@ impl DesktopApp {
         }
         let cursor = if self.heart_hover.is_some() {
             CursorIcon::Grab
+        } else if self
+            .text_selection
+            .gesture
+            .is_some_and(|gesture| gesture.drag)
+            && self.page_pointer_buttons & 1 != 0
+        {
+            CursorIcon::Text
         } else if matches!(
             self.scene
                 .as_ref()
@@ -8069,8 +8189,7 @@ impl DesktopApp {
                 None if self
                     .scene
                     .as_ref()
-                    .and_then(|scene| scene.text_position_at(point))
-                    .is_some() =>
+                    .is_some_and(|scene| scene.selectable_text_at(point)) =>
                 {
                     CursorIcon::Text
                 }
@@ -8098,6 +8217,9 @@ impl DesktopApp {
                 button == MouseButton::Left,
             )
         {
+            return;
+        }
+        if self.context_menu_pointer_button(state, button) {
             return;
         }
         if self.pointer_lock.is_some() {
@@ -8131,8 +8253,7 @@ impl DesktopApp {
                     if self.focus != FocusTarget::Page {
                         self.set_focus(FocusTarget::Page);
                     }
-                    self.selection = None;
-                    self.selecting = false;
+                    self.clear_text_selection();
                     self.pressed_control = None;
                     self.pressed_hit = None;
                     self.move_terminal_input_pointer(self.modifiers.shift_key());
@@ -8186,23 +8307,37 @@ impl DesktopApp {
                 self.page_pointer_buttons &= !button_mask;
             }
             {
-                let actor = self
+                let hit = self
                     .scene
                     .as_ref()
-                    .and_then(|scene| scene.page_hit_at(self.pointer))
-                    .and_then(|hit| hit.actor);
+                    .and_then(|scene| scene.page_hit_at(self.pointer));
+                let actor = hit.as_ref().and_then(|hit| hit.actor);
                 let position = self.scene.as_ref().map_or(self.pointer, |scene| {
                     CssPoint::new(
                         self.pointer.x - scene.content_viewport.x,
                         self.pointer.y - scene.content_viewport.y,
                     )
                 });
+                let pressed = state == ElementState::Pressed;
+                let mut metadata = self.pointer_metadata();
+                // Selection API §2: the primary press and release carry the
+                // selection gesture; a secondary release asks the page
+                // whether the context menu shows, unless Shift bypasses it.
+                metadata.selection = match (button_id, pressed) {
+                    (0, true) => self.page_press_selection(hit.as_ref()),
+                    (0, false) => self.end_selection_gesture(),
+                    (2, false) if self.context_menu_available() => Some(
+                        trust::js::PointerSelection::new(None, self.text_selection.serial),
+                    ),
+                    _ => None,
+                };
+                metadata.bypass_context_menu = button_id == 2 && self.modifiers.shift_key();
                 self.dispatch(UserAction::PagePointerButton {
                     actor,
                     position,
-                    pressed: state == ElementState::Pressed,
+                    pressed,
                     button: button_id,
-                    metadata: self.pointer_metadata(),
+                    metadata,
                 });
             }
             self.dispatch(UserAction::PointerButton {
@@ -8216,7 +8351,7 @@ impl DesktopApp {
             });
         }
         if state == ElementState::Released {
-            self.selecting = false;
+            self.text_selection.gesture = None;
             if self.heart_drag.take().is_some() {
                 self.request_redraw();
                 return;
@@ -8224,6 +8359,9 @@ impl DesktopApp {
             match button {
                 PointerButton::Back => self.dispatch(UserAction::Back),
                 PointerButton::Forward => self.dispatch(UserAction::Forward),
+                PointerButton::Secondary if !chrome_owned => {
+                    self.request_page_context_menu(self.modifiers.shift_key(), false);
+                }
                 PointerButton::Primary => {
                     let control = self
                         .scene
@@ -8377,23 +8515,8 @@ impl DesktopApp {
             self.set_focus(FocusTarget::Page);
         }
         // A live page's pointerdown/mousedown task performs focusing only if
-        // its default was not canceled. Static pages have no DOM focus task.
-        if self.pressed_hit.is_some() {
-            return;
-        }
-        if let Some(position) = self
-            .scene
-            .as_ref()
-            .and_then(|scene| scene.text_position_at(self.pointer))
-        {
-            self.selection = Some(TextSelection {
-                anchor: position,
-                focus: position,
-            });
-            self.selecting = true;
-        } else {
-            self.selection = None;
-        }
+        // its default was not canceled. Static pages have no DOM focus task;
+        // the selection gesture began with the page's press above.
     }
 
     fn handle_scroll(&mut self, delta: MouseScrollDelta) {
@@ -8409,6 +8532,12 @@ impl DesktopApp {
             return;
         }
         if self.select_popup_scroll(delta) {
+            return;
+        }
+        // Scrolling dismisses the context menu, as a platform menu's
+        // outside interaction does.
+        if self.context_menu.is_some() {
+            self.close_context_menu();
             return;
         }
         if self
@@ -8592,6 +8721,7 @@ impl DesktopApp {
                                 terminal.view.terminal.remote_echo(),
                             )
                         }),
+                    context_menu: self.context_menu.as_ref(),
                 },
                 initial,
             )
@@ -8600,6 +8730,26 @@ impl DesktopApp {
 
     fn handle_access_action(&mut self, request: ActionRequest) {
         match request.target_node {
+            AccessNodeId(id)
+                if id >= ACCESS_CONTEXT_MENU_ITEMS
+                    && self.context_menu.as_ref().is_some_and(|menu| {
+                        ((id - ACCESS_CONTEXT_MENU_ITEMS) as usize) < menu.items.len()
+                    }) =>
+            {
+                let index = (id - ACCESS_CONTEXT_MENU_ITEMS) as usize;
+                match request.action {
+                    AccessAction::Click => self.activate_context_menu_item(index),
+                    AccessAction::Focus => {
+                        if let Some(menu) = &mut self.context_menu
+                            && menu.items[index].enabled
+                        {
+                            menu.highlighted = Some(index);
+                            self.request_overlay_redraw();
+                        }
+                    }
+                    _ => {}
+                }
+            }
             ACCESS_TERMINAL | ACCESS_TERMINAL_INPUT if request.action == AccessAction::Focus => {
                 self.set_focus(FocusTarget::Page)
             }
@@ -8861,6 +9011,7 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
                 self.request_redraw();
             }
             DesktopEvent::FileDragTick { session } => self.file_drag_iteration(session),
+            DesktopEvent::SelectionAutoscroll => self.selection_autoscroll_tick(),
             DesktopEvent::ImageLoaded {
                 generation,
                 image_epoch,
@@ -9108,6 +9259,7 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
                 if std::env::var_os("TRUST_DESKTOP_TRACE").is_some() {
                     eprintln!("desktop: window resized");
                 }
+                self.close_context_menu();
                 self.update_metrics(None);
                 // The resized viewport went to the page first, on the same
                 // channel, so its fullscreenchange observes the new size.
@@ -9133,10 +9285,17 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
                 self.request_redraw();
             }
             WindowEvent::RedrawRequested => {
-                if !consume_pending_redraw(&mut self.redraw_pending) {
+                let overlay = std::mem::take(&mut self.overlay_redraw_pending);
+                let result = if consume_pending_redraw(&mut self.redraw_pending) {
+                    self.draw()
+                } else if overlay {
+                    // Only the context menu changed: repaint it over the
+                    // retained page composition.
+                    self.draw_overlay()
+                } else {
                     return;
-                }
-                if let Err(error) = self.draw() {
+                };
+                if let Err(error) = result {
                     eprintln!("trust-desktop: draw failed: {error}");
                 }
             }
@@ -9144,10 +9303,11 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
                 self.window_focused = focused;
                 if !focused {
                     self.close_select_popup();
+                    self.close_context_menu();
                     self.release_native_pointer_lock(true);
                     self.page_pointer_buttons = 0;
                     self.composing = false;
-                    self.selecting = false;
+                    self.text_selection.gesture = None;
                     if let Some(terminal) = &mut self.terminal {
                         terminal.line_input.selecting = false;
                     }
@@ -9258,6 +9418,7 @@ struct AccessibilityFrame<'a> {
     find_value: Option<&'a str>,
     terminal_text: Option<String>,
     terminal_input: Option<(String, bool)>,
+    context_menu: Option<&'a context_menu::PageContextMenu>,
 }
 
 fn build_accessibility_update(frame: AccessibilityFrame<'_>, initial: bool) -> TreeUpdate {
@@ -9273,6 +9434,7 @@ fn build_accessibility_update(frame: AccessibilityFrame<'_>, initial: bool) -> T
         find_value,
         terminal_text,
         terminal_input,
+        context_menu,
     } = frame;
     let mut nodes = Vec::new();
     let mut root = AccessNode::new(AccessRole::Window);
@@ -9449,9 +9611,49 @@ fn build_accessibility_update(frame: AccessibilityFrame<'_>, initial: bool) -> T
         children.push(ACCESS_TERMINAL_INPUT);
         nodes.push((ACCESS_TERMINAL_INPUT, input));
     }
+    // The context menu is a menu of menu items over the page (ARIA's menu
+    // pattern), focused on its highlighted item while it shows.
+    let access_rect = |rect: CssRect| {
+        AccessRect::new(
+            f64::from(rect.x),
+            f64::from(rect.y),
+            f64::from(rect.x + rect.width),
+            f64::from(rect.y + rect.height),
+        )
+    };
+    let menu_focus = context_menu.map(|menu| {
+        let mut node = AccessNode::new(AccessRole::Menu);
+        node.set_label("Page menu");
+        node.set_bounds(access_rect(menu.geometry.panel));
+        let items: Vec<AccessNodeId> = (0..menu.items.len() as u64)
+            .map(|index| AccessNodeId(ACCESS_CONTEXT_MENU_ITEMS + index))
+            .collect();
+        node.set_children(items.clone());
+        for ((item, row), id) in menu.items.iter().zip(&menu.geometry.rows).zip(&items) {
+            let mut child = AccessNode::new(AccessRole::MenuItem);
+            child.set_label(item.label.as_str());
+            if let Some(shortcut) = item.shortcut {
+                child.set_keyboard_shortcut(shortcut);
+            }
+            child.set_bounds(access_rect(*row));
+            if item.enabled {
+                child.add_action(AccessAction::Click);
+                child.add_action(AccessAction::Focus);
+            } else {
+                child.set_disabled();
+            }
+            nodes.push((*id, child));
+        }
+        children.push(ACCESS_CONTEXT_MENU);
+        nodes.push((ACCESS_CONTEXT_MENU, node));
+        menu.highlighted.map_or(ACCESS_CONTEXT_MENU, |index| {
+            AccessNodeId(ACCESS_CONTEXT_MENU_ITEMS + index as u64)
+        })
+    });
     root.set_children(children);
     nodes.push((ACCESS_ROOT, root));
     let focus = match focus {
+        _ if let Some(menu) = menu_focus => menu,
         FocusTarget::Find => ACCESS_FIND,
         FocusTarget::Command => ACCESS_COMMAND,
         FocusTarget::Download => ACCESS_ROOT,
@@ -10004,6 +10206,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 mod tests {
     use super::*;
     use trust::render::scene_damage;
+    use trust::render::{ContextMenuGeometry, ContextMenuIcon, ContextMenuItem};
 
     fn select_option(
         label: &str,
@@ -10204,6 +10407,384 @@ mod tests {
         // remains pending and is replayed at the canonical caret.
         reconcile_text_preview(&mut editor, &state, replacement[1..].iter(), (0, 0));
         assert_eq!(editor.text(), "[QbBZ]");
+    }
+
+    /// A desktop app showing `html` as a static page (no live Document),
+    /// composed as `draw` composes it.
+    fn static_page_app(event_loop: &EventLoop<DesktopEvent>, html: &str) -> DesktopApp {
+        let browser = BrowserController::new(Handle::current(), || {}, CssSize::new(640.0, 480.0));
+        let mut app = DesktopApp::new(
+            browser,
+            Handle::current(),
+            event_loop.create_proxy(),
+            RendererPreference::Cpu,
+            None,
+        );
+        app.clipboard = None;
+        app.metrics =
+            ViewportMetrics::from_physical(PhysicalSize::new(640, 480), ScaleFactor::new(1.0));
+        let response = trust::http::Response {
+            url: url::Url::parse("https://example.test/page").unwrap(),
+            status: 200,
+            status_text: String::new(),
+            content_type: "text/html".into(),
+            headers: Vec::new(),
+            body: html.as_bytes().to_vec(),
+            rendered: None,
+            js: None,
+            blobs: None,
+            live: None,
+            images: None,
+            declarative_refresh: None,
+            challenge: None,
+            from_post: false,
+            timing: None,
+            referrer: String::new(),
+            referrer_policy: None,
+        };
+        let rendered = trust::http::render_html_for_environment(
+            &response,
+            trust::layout2::Viewport::new(640.0, 400.0),
+            1.0,
+            None,
+            &Default::default(),
+        )
+        .unwrap();
+        let (document, layout) = DesktopPageAdapter::from_rendered(response.url, rendered);
+        app.page_layout = Some(PageLayoutCache {
+            generation: 1,
+            revision: 1,
+            rendered_revision: 1,
+            viewport: CssSize::new(640.0, 400.0),
+            device_pixel_ratio: 1.0,
+            frozen: false,
+            document,
+            layout,
+            scroll_offsets: HashMap::new(),
+        });
+        app.text_selection.document_generation = app.browser.document_generation();
+        recompose(&mut app);
+        app.set_focus(FocusTarget::Page);
+        app
+    }
+
+    fn recompose(app: &mut DesktopApp) {
+        let mut scene = desktop_chrome(
+            app.metrics,
+            &app.browser.snapshot(),
+            &ChromeModel::default(),
+        );
+        let page = app.page_layout.as_ref().unwrap();
+        scene.append_page_with_selection(
+            &page.layout.paint,
+            CssPoint::default(),
+            0.0,
+            &HashMap::new(),
+            app.text_selection.paint.as_ref(),
+        );
+        app.paint_page_context_menu(&mut scene);
+        app.scene = Some(scene);
+    }
+
+    /// The window point of byte `byte` of the run laying out `text`, at
+    /// its vertical middle.
+    fn text_at(app: &DesktopApp, text: &str, byte: usize) -> CssPoint {
+        let scene = app.scene.as_ref().unwrap();
+        let content = scene.content_viewport;
+        scene
+            .primitives
+            .iter()
+            .find_map(|command| match command {
+                DisplayCommand::GlyphRun { origin, shaped, .. } if shaped.text == text => {
+                    let x = shaped
+                        .clusters
+                        .iter()
+                        .find(|cluster| cluster.text_range.start == byte)
+                        .map_or(shaped.advance, |cluster| cluster.x + 0.5);
+                    Some(CssPoint::new(
+                        content.x + origin.x + x,
+                        content.y + origin.y + shaped.line_height / 2.0,
+                    ))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no run {text:?}"))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires Wayland for the native event-loop proxy; creates no window"]
+    async fn desktop_page_selection_and_context_menu() {
+        // winit allows one event loop per process: the scenarios share it.
+        use winit::platform::wayland::EventLoopBuilderExtWayland;
+        let mut builder = EventLoop::<DesktopEvent>::with_user_event();
+        builder.with_any_thread(true).with_wayland();
+        let event_loop = builder.build().unwrap();
+        static_page_text_selection_gestures_and_copy(&event_loop);
+        the_context_menu_offers_page_actions_and_takes_keys_and_pointer(&event_loop);
+        the_context_menu_repaints_only_itself(&event_loop);
+    }
+
+    fn static_page_text_selection_gestures_and_copy(event_loop: &EventLoop<DesktopEvent>) {
+        // Selection API §2 user interactions on a page without a live
+        // Document: drag, double/triple click, Shift+click, select-all; the
+        // copied text follows the rendered lines.
+        let mut app = static_page_app(
+            event_loop,
+            "<body style='margin:8px;font:16px/20px monospace'><p id=p>Hello brave world</p>\
+             <p>Second paragraph</p><p style='user-select:none'>Not this</p></body>",
+        );
+        let press = |app: &mut DesktopApp, at: CssPoint| {
+            app.pointer = at;
+            app.handle_pointer_button(ElementState::Pressed, MouseButton::Left);
+        };
+        let release = |app: &mut DesktopApp| {
+            app.handle_pointer_button(ElementState::Released, MouseButton::Left);
+            recompose(app);
+        };
+        // Drag from "brave" to the middle of the next paragraph.
+        let at = text_at(&app, "Hello brave world", 6);
+        press(&mut app, at);
+        assert!(!app.text_selection.selects(), "a press only collapses");
+        app.pointer = text_at(&app, "Second paragraph", 6);
+        assert!(app.extend_selection_gesture().is_some());
+        release(&mut app);
+        assert_eq!(
+            app.selected_page_text().as_deref(),
+            Some("brave world\n\nSecond")
+        );
+        // A double click selects the word, a triple click the paragraph.
+        let world = text_at(&app, "Hello brave world", 13);
+        press(&mut app, world);
+        release(&mut app);
+        press(&mut app, world);
+        assert_eq!(app.selected_page_text().as_deref(), Some("world"));
+        release(&mut app);
+        press(&mut app, world);
+        assert_eq!(
+            app.selected_page_text().as_deref(),
+            Some("Hello brave world")
+        );
+        release(&mut app);
+        // Shift+click moves the focus from the same anchor.
+        app.text_selection.clicks = None;
+        app.modifiers = ModifiersState::SHIFT;
+        let at = text_at(&app, "Second paragraph", 6);
+        press(&mut app, at);
+        app.modifiers = ModifiersState::empty();
+        release(&mut app);
+        assert_eq!(
+            app.selected_page_text().as_deref(),
+            Some("Hello brave world\n\nSecond")
+        );
+        // A press in user-select:none text leaves the selection alone.
+        app.text_selection.clicks = None;
+        let at = text_at(&app, "Not this", 2);
+        press(&mut app, at);
+        release(&mut app);
+        assert_eq!(
+            app.selected_page_text().as_deref(),
+            Some("Hello brave world\n\nSecond")
+        );
+        // Select-all takes every selectable run, and the menu offers Copy.
+        assert!(app.select_all_page_text());
+        recompose(&mut app);
+        assert_eq!(
+            app.selected_page_text().as_deref(),
+            Some("Hello brave world\n\nSecond paragraph")
+        );
+        app.open_context_menu(CssPoint::new(100.0, 100.0), false);
+        let menu = app.context_menu.as_ref().unwrap();
+        assert_eq!(menu.actions.first(), Some(&context_menu::MenuAction::Copy));
+    }
+
+    fn the_context_menu_offers_page_actions_and_takes_keys_and_pointer(
+        event_loop: &EventLoop<DesktopEvent>,
+    ) {
+        let mut app = static_page_app(event_loop, "<p>Just a page</p>");
+        // The browser's current page gives the bookmark item its address.
+        app.browser
+            .open_internal_gemtext("gemini://example.test/page", b"# Page".to_vec());
+        app.pointer = CssPoint::new(120.0, 150.0);
+        // Without a live page, the secondary click shows the menu at once.
+        app.handle_pointer_button(ElementState::Pressed, MouseButton::Right);
+        app.handle_pointer_button(ElementState::Released, MouseButton::Right);
+        let labels = |app: &DesktopApp| {
+            app.context_menu
+                .as_ref()
+                .unwrap()
+                .items
+                .iter()
+                .map(|item| (item.label.clone(), item.enabled))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            labels(&app),
+            vec![
+                ("Reload".into(), true),
+                ("Open COMMAND".into(), true),
+                ("Kill Page".into(), false),
+                ("Add Bookmark".into(), true),
+            ]
+        );
+        // COMMAND's own key, as everywhere else in the desktop.
+        assert_eq!(
+            app.context_menu.as_ref().unwrap().items[1].shortcut,
+            Some("Tab")
+        );
+        // The bookmark store's answer turns the item into a removal.
+        let address = app.page_bookmark_address().unwrap();
+        app.page_bookmark_answer(address, vec![4]);
+        assert_eq!(labels(&app)[3], ("Remove Bookmark".into(), true));
+        let key = |name: Key| KeyInput {
+            key: name,
+            code: String::new(),
+            location: 0,
+            state: KeyState::Pressed,
+            modifiers: Default::default(),
+            repeat: false,
+            composing: false,
+        };
+        assert!(app.context_menu_key(&key(Key::ArrowDown)));
+        assert_eq!(app.context_menu.as_ref().unwrap().highlighted, Some(0));
+        app.context_menu_key(&key(Key::ArrowDown));
+        app.context_menu_key(&key(Key::ArrowDown));
+        assert_eq!(
+            app.context_menu.as_ref().unwrap().highlighted,
+            Some(3),
+            "the disabled Kill Page is skipped"
+        );
+        app.context_menu_key(&key(Key::Home));
+        app.context_menu_key(&key(Key::ArrowUp));
+        assert_eq!(app.context_menu.as_ref().unwrap().highlighted, Some(3));
+        app.context_menu_key(&key(Key::Escape));
+        assert!(app.context_menu.is_none());
+        // Pointer: a press outside closes it and is consumed with its
+        // release; an item's press and release activate it.
+        app.open_context_menu(CssPoint::new(120.0, 150.0), false);
+        app.pointer = CssPoint::new(600.0, 450.0);
+        assert!(app.context_menu_pointer_button(ElementState::Pressed, MouseButton::Left));
+        assert!(app.context_menu.is_none());
+        assert!(app.context_menu_pointer_button(ElementState::Released, MouseButton::Left));
+        assert!(!app.context_menu_pointer_button(ElementState::Released, MouseButton::Left));
+        app.open_context_menu(CssPoint::new(120.0, 150.0), false);
+        let row = app.context_menu.as_ref().unwrap().geometry.rows[1];
+        app.pointer = CssPoint::new(row.x + 20.0, row.y + 10.0);
+        assert!(app.context_menu_pointer_moved());
+        assert_eq!(app.context_menu.as_ref().unwrap().highlighted, Some(1));
+        app.handle_pointer_button(ElementState::Pressed, MouseButton::Left);
+        app.handle_pointer_button(ElementState::Released, MouseButton::Left);
+        assert!(app.context_menu.is_none());
+        assert_eq!(app.focus, FocusTarget::Command, "Open COMMAND");
+        // Ctrl+L toggles COMMAND as Tab does: closing, then opening on the
+        // page's address.
+        app.toggle_command(true);
+        assert_eq!(app.focus, FocusTarget::Page);
+        app.command.set_text("draft");
+        app.toggle_command(true);
+        assert_eq!(app.focus, FocusTarget::Command);
+        assert_eq!(app.command.text(), app.browser.snapshot().address);
+    }
+
+    fn the_context_menu_repaints_only_itself(event_loop: &EventLoop<DesktopEvent>) {
+        // Showing and highlighting the menu change only the scene's last
+        // commands; the damage is the menu's rectangle, never the page.
+        let mut app = static_page_app(event_loop, "<p>Just a page</p>");
+        let before = app.scene.clone().unwrap();
+        app.open_context_menu(CssPoint::new(200.0, 160.0), false);
+        let start = app.overlay_start;
+        let mut scene = app.scene.take().unwrap();
+        scene.primitives.truncate(start);
+        app.paint_page_context_menu(&mut scene);
+        let menu = app.context_menu.as_ref().unwrap().geometry.damage();
+        match scene_damage(&before, &scene) {
+            SceneDamage::Partial(rect) => assert!(
+                rect.x >= menu.x - 2.0
+                    && rect.y >= menu.y - 2.0
+                    && rect.x + rect.width <= menu.x + menu.width + 2.0
+                    && rect.y + rect.height <= menu.y + menu.height + 2.0,
+                "{rect:?} beyond {menu:?}"
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(app.overlay_damage, Some(menu));
+        let shown = scene.clone();
+        app.context_menu.as_mut().unwrap().highlighted = Some(1);
+        scene.primitives.truncate(start);
+        app.paint_page_context_menu(&mut scene);
+        assert!(matches!(
+            scene_damage(&shown, &scene),
+            SceneDamage::Partial(_)
+        ));
+    }
+
+    #[test]
+    fn the_context_menu_is_an_accessible_menu() {
+        let items = vec![
+            ContextMenuItem {
+                label: "Reload".into(),
+                shortcut: Some("Ctrl+R"),
+                icon: ContextMenuIcon::Reload,
+                enabled: true,
+                separated: false,
+                caution: false,
+            },
+            ContextMenuItem {
+                label: "Kill Page".into(),
+                shortcut: None,
+                icon: ContextMenuIcon::Kill,
+                enabled: false,
+                separated: false,
+                caution: true,
+            },
+        ];
+        let geometry = ContextMenuGeometry::new(
+            CssPoint::new(50.0, 50.0),
+            CssRect::new(0.0, 40.0, 800.0, 560.0),
+            &items,
+        );
+        let menu = context_menu::PageContextMenu {
+            actions: vec![
+                context_menu::MenuAction::Reload,
+                context_menu::MenuAction::KillPage,
+            ],
+            items,
+            geometry,
+            highlighted: Some(0),
+            pressed: None,
+            title: "HTTPS  /  example.test".into(),
+        };
+        let update = build_accessibility_update(
+            AccessibilityFrame {
+                metrics: ViewportMetrics::from_physical(
+                    PhysicalSize::new(800, 600),
+                    ScaleFactor::new(1.0),
+                ),
+                page: None,
+                focus: FocusTarget::Page,
+                content_viewport: CssRect::new(0.0, 40.0, 800.0, 560.0),
+                scroll: CssPoint::default(),
+                keyboard_node: None,
+                command_value: None,
+                command_prompt: None,
+                find_value: None,
+                terminal_text: None,
+                terminal_input: None,
+                context_menu: Some(&menu),
+            },
+            true,
+        );
+        assert_eq!(update.focus, AccessNodeId(ACCESS_CONTEXT_MENU_ITEMS));
+        let node = |id: AccessNodeId| &update.nodes.iter().find(|(node, _)| *node == id).unwrap().1;
+        assert_eq!(node(ACCESS_CONTEXT_MENU).role(), AccessRole::Menu);
+        let reload = node(AccessNodeId(ACCESS_CONTEXT_MENU_ITEMS));
+        assert_eq!(reload.role(), AccessRole::MenuItem);
+        assert_eq!(reload.label(), Some("Reload"));
+        assert!(node(AccessNodeId(ACCESS_CONTEXT_MENU_ITEMS + 1)).is_disabled());
+        assert_eq!(
+            context_menu::endpoint_title("https://example.test:8443/x"),
+            "HTTPS  /  example.test:8443"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -10499,6 +11080,7 @@ mod tests {
                         clip: Some(clip),
                         node: 1,
                         link: None,
+                        selection: Default::default(),
                     },
                     DisplayCommand::PopTransform,
                     DisplayCommand::PopClip,
@@ -11095,6 +11677,7 @@ mod tests {
                     find_value: None,
                     terminal_text: Some("Welcome\nLogin:".into()),
                     terminal_input: Some(("private draft".into(), masked)),
+                    context_menu: None,
                 },
                 true,
             );
@@ -11207,6 +11790,7 @@ mod tests {
                 find_value: None,
                 terminal_text: None,
                 terminal_input: None,
+                context_menu: None,
             },
             true,
         );
@@ -11240,6 +11824,7 @@ mod tests {
                 find_value: None,
                 terminal_text: None,
                 terminal_input: None,
+                context_menu: None,
             },
             true,
         );

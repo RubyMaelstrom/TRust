@@ -45,6 +45,7 @@ mod parallel_match;
 mod parallel_style;
 mod properties;
 mod query_collections;
+mod selection;
 mod style_load;
 mod style_pool;
 mod style_records;
@@ -1056,6 +1057,7 @@ struct CascadedMaps {
     marker: FxHashMap<String, String>,
     placeholder: FxHashMap<String, String>,
     backdrop: FxHashMap<String, String>,
+    selection: FxHashMap<String, String>,
     custom_bases: FxHashMap<(Option<PseudoEl>, String), std::sync::Arc<url::Url>>,
 }
 
@@ -1069,6 +1071,7 @@ impl CascadedMaps {
             && self.marker == other.marker
             && self.placeholder == other.placeholder
             && self.backdrop == other.backdrop
+            && self.selection == other.selection
             && self.custom_bases.len() == other.custom_bases.len()
             && self
                 .custom_bases
@@ -1084,6 +1087,7 @@ impl CascadedMaps {
             PseudoEl::Marker => &self.marker,
             PseudoEl::Placeholder => &self.placeholder,
             PseudoEl::Backdrop => &self.backdrop,
+            PseudoEl::Selection => &self.selection,
         }
     }
 
@@ -1096,6 +1100,7 @@ impl CascadedMaps {
             Some(PseudoEl::Marker) => &mut self.marker,
             Some(PseudoEl::Placeholder) => &mut self.placeholder,
             Some(PseudoEl::Backdrop) => &mut self.backdrop,
+            Some(PseudoEl::Selection) => &mut self.selection,
         }
     }
 }
@@ -5078,6 +5083,124 @@ impl Dom {
             None => false,
         }
     }
+
+    /// CSS UI 4 #content-selection: the used value of `user-select` on
+    /// `id`, or on a Text node's parent element. An editable element (an
+    /// editing host or a mutable form control with textual content) is
+    /// `contain` whatever its computed value; `auto` is `all` or `none`
+    /// under a parent whose used value is that, otherwise `text`. The
+    /// parent is the flat-tree parent, so a shadow tree follows its host.
+    pub(crate) fn user_select(&self, id: NodeId) -> UserSelect {
+        self.user_select_memo(id, &mut FxHashMap::default())
+    }
+
+    /// `user_select`, sharing used values of elements already resolved in
+    /// `memo` (each element's follows its parent's).
+    pub(crate) fn user_select_memo(
+        &self,
+        id: NodeId,
+        memo: &mut FxHashMap<NodeId, UserSelect>,
+    ) -> UserSelect {
+        // The flat-tree parent; only a shadow tree's or a host's children
+        // need the slot resolution `parent_flat` performs.
+        let parent_of = |node: NodeId| {
+            let parent = self.nodes[node].parent?;
+            if self.shadow_roots.contains_key(&parent) || self.shadow_hosts.contains_key(&parent) {
+                self.parent_flat(node)
+            } else {
+                Some(parent)
+            }
+        };
+        let mut chain = Vec::new();
+        let mut current = if self.tag_name(id).is_some() {
+            Some(id)
+        } else {
+            parent_of(id)
+        };
+        let mut parent = UserSelect::Text;
+        while let Some(node) = current.filter(|&node| self.tag_name(node).is_some()) {
+            if let Some(&used) = memo.get(&node) {
+                parent = used;
+                break;
+            }
+            chain.push(node);
+            current = parent_of(node);
+        }
+        if chain.is_empty() {
+            return parent;
+        }
+        let authored = self.style_index().has_user_select;
+        for &node in chain.iter().rev() {
+            parent = self.user_select_under(node, parent, authored);
+            memo.insert(node, parent);
+        }
+        parent
+    }
+
+    /// The used `user-select` of element `id` whose parent's is `parent`.
+    /// Where no style rule declares the property (`authored` false) and the
+    /// element's own style does not, its computed value is the UA's.
+    fn user_select_under(&self, id: NodeId, parent: UserSelect, authored: bool) -> UserSelect {
+        if self.selection_editable(id) {
+            return UserSelect::Contain;
+        }
+        let computed = if authored
+            || self
+                .attr(id, "style")
+                .is_some_and(|style| style.contains("user-select"))
+        {
+            self.computed_value_resolved(id, "user-select")
+        } else {
+            self.tag_name(id)
+                .is_some_and(|tag| ua_user_select_none(tag, self.namespace_uri(id)))
+                .then(|| "none".to_owned())
+        };
+        match computed.as_deref().map(str::trim) {
+            Some("text") => UserSelect::Text,
+            Some("none") => UserSelect::None,
+            Some("contain") => UserSelect::Contain,
+            Some("all") => UserSelect::All,
+            _ => match parent {
+                UserSelect::All => UserSelect::All,
+                UserSelect::None => UserSelect::None,
+                _ => UserSelect::Text,
+            },
+        }
+    }
+
+    /// CSS UI 4's "editable element": an editing host, or a mutable form
+    /// control with textual content.
+    fn selection_editable(&self, id: NodeId) -> bool {
+        let Some(tag) = self.tag_name(id) else {
+            return false;
+        };
+        let textual = match tag {
+            "textarea" => true,
+            "input" => matches!(
+                self.input_type(id).as_str(),
+                "text" | "search" | "url" | "tel" | "email" | "password" | "number"
+            ),
+            _ => return self.is_contenteditable_host(id),
+        };
+        textual && self.attr(id, "readonly").is_none() && !self.actually_disabled(id, tag)
+    }
+}
+
+/// CSS UI 4 #content-selection: "button, meter, progress, select
+/// { user-select: none; }" in the UA stylesheet for HTML.
+fn ua_user_select_none(tag: &str, namespace: Option<&str>) -> bool {
+    matches!(tag, "button" | "meter" | "progress" | "select")
+        && namespace == Some("http://www.w3.org/1999/xhtml")
+}
+
+/// The used value of `user-select` (CSS UI 4 #content-selection); `auto`
+/// never remains.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UserSelect {
+    Text,
+    None,
+    Contain,
+    All,
 }
 
 impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
@@ -6988,6 +7111,26 @@ impl Dom {
         }) {
             return Some(value);
         }
+        // CSS Pseudo 4 #highlight-cascade: a highlight's colors inherit from
+        // the parent element's highlight; the root's `color` is
+        // `currentColor` and `background-color` takes its initial value.
+        if which == PseudoEl::Selection && matches!(name, "color" | "background-color") {
+            let declared = self.selection_declared(id, name);
+            return match declared.as_deref().map(str::trim) {
+                None if name == "background-color" => Some("rgba(0, 0, 0, 0)".into()),
+                Some(value)
+                    if !value.eq_ignore_ascii_case("currentcolor")
+                        && !value.eq_ignore_ascii_case("initial") =>
+                {
+                    Some(self.cssom_color(id, name, value))
+                }
+                Some(_) if name == "background-color" => Some("rgba(0, 0, 0, 0)".into()),
+                Some(value) if value.eq_ignore_ascii_case("initial") => {
+                    Some(self.cssom_color(id, name, "canvastext"))
+                }
+                _ => self.cssom_resolved_value(id, "color"),
+            };
+        }
         let direct = self
             .pseudo_style(id, which, name)
             .or_else(|| self.baked_pseudo_value(id, which, name));
@@ -7500,6 +7643,7 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
                 "bold"
             }
             "font-style" if matches!(tag, "i" | "em") => "italic",
+            "user-select" if ua_user_select_none(tag, self.namespace_uri(id)) => "none",
             "direction" if let Some(rtl) = self.ua_direction(id, tag) => {
                 if rtl {
                     "rtl"
@@ -7997,6 +8141,7 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
             mut marker,
             mut placeholder,
             mut backdrop,
+            mut selection,
             conditional: conditional_pseudos,
             ..
         } = winners;
@@ -8018,6 +8163,7 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
                     marker: Default::default(),
                     placeholder: Default::default(),
                     backdrop: Default::default(),
+                    selection: Default::default(),
                     custom_bases: Default::default(),
                 }),
             );
@@ -8035,6 +8181,7 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
                     Some(PseudoEl::Marker) => &mut marker,
                     Some(PseudoEl::Placeholder) => &mut placeholder,
                     Some(PseudoEl::Backdrop) => &mut backdrop,
+                    Some(PseudoEl::Selection) => &mut selection,
                     _ => &mut after,
                 };
                 for (pk, (imp, value)) in &r.decls {
@@ -8064,6 +8211,7 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
             marker: strip_winners(&marker),
             placeholder: strip_winners(&placeholder),
             backdrop: strip_winners(&backdrop),
+            selection: strip_winners(&selection),
             custom_bases: Default::default(),
         };
         for (pseudo, name, order) in custom_property_sources([
@@ -8074,6 +8222,7 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
             (Some(PseudoEl::Marker), &marker),
             (Some(PseudoEl::Placeholder), &placeholder),
             (Some(PseudoEl::Backdrop), &backdrop),
+            (Some(PseudoEl::Selection), &selection),
         ]) {
             if let Some(base) = index.rule_bases.get(&order) {
                 maps.custom_bases.insert((pseudo, name), base.clone());
@@ -8093,6 +8242,7 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
                 (Some(PseudoEl::Marker), &marker),
                 (Some(PseudoEl::Placeholder), &placeholder),
                 (Some(PseudoEl::Backdrop), &backdrop),
+                (Some(PseudoEl::Selection), &selection),
             ] {
                 let custom_count = winners.keys().filter(|k| k.starts_with("--")).count();
                 for pass in 0..=custom_count + 1 {
@@ -8187,6 +8337,7 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
             &marker,
             &placeholder,
             &backdrop,
+            &selection,
         ]
         .iter()
         .any(|map| map.keys().any(|key| logical_to_physical(key).is_some()))
@@ -8204,6 +8355,7 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
                 (Some(PseudoEl::Marker), &mut marker),
                 (Some(PseudoEl::Placeholder), &mut placeholder),
                 (Some(PseudoEl::Backdrop), &mut backdrop),
+                (Some(PseudoEl::Selection), &mut selection),
             ] {
                 let logical: Vec<_> = winners
                     .keys()
@@ -8786,6 +8938,42 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
 impl Dom {
     /// Whether `::first-letter` declarations apply to `id`, from the cascade
     /// or (in a stylesheet-free snapshot) from their baked attribute.
+    /// Whether any style rule targets `::selection` (CSS Pseudo 4
+    /// #highlight-styling): in the document's sheets, or, in a baked
+    /// presentation snapshot, by the root element's marker.
+    pub(crate) fn has_selection_rules(&self) -> bool {
+        self.style_index().has_selection
+            || self.document_element().is_some_and(|root| {
+                self.internal_marker(root, PseudoEl::Selection.baked_style_attr())
+                    .is_some()
+            })
+    }
+
+    /// CSS Pseudo 4 #highlight-cascade: the value of `prop` on `id`'s
+    /// `::selection` by highlight inheritance. A property the pseudo-element
+    /// does not set, or sets to `inherit`/`unset`, takes the value of the
+    /// parent element's `::selection`, whether or not it is inherited, up
+    /// to the root. `None` when no author declaration reaches `id`.
+    pub(crate) fn selection_declared(&self, id: NodeId, prop: &str) -> Option<String> {
+        let mut element = (self.tag_name(id).is_some())
+            .then_some(id)
+            .or_else(|| self.parent_flat(id));
+        while let Some(node) = element.filter(|&node| self.tag_name(node).is_some()) {
+            let value = self
+                .pseudo_style(node, PseudoEl::Selection, prop)
+                .or_else(|| self.baked_pseudo_value(node, PseudoEl::Selection, prop))
+                .map(|value| self.resolve_pseudo_vars(node, PseudoEl::Selection, &value));
+            match value
+                .as_deref()
+                .map(|value| value.trim().to_ascii_lowercase())
+            {
+                Some(keyword) if keyword != "inherit" && keyword != "unset" => return value,
+                _ => element = self.parent_flat(node),
+            }
+        }
+        None
+    }
+
     pub(crate) fn has_first_letter_style(&self, id: NodeId) -> bool {
         self.internal_marker(id, PseudoEl::FirstLetter.baked_style_attr())
             .is_some()
@@ -8809,6 +8997,8 @@ impl Dom {
                     && self.attr(id, "placeholder").is_some()
             }
             PseudoEl::Backdrop => self.in_top_layer(id),
+            // A highlight pseudo-element generates no box.
+            PseudoEl::Selection => false,
         }
     }
 
@@ -9614,6 +9804,12 @@ impl Dom {
         index.has_placeholder = unique.iter().any(|r| {
             r.selector.0.last().and_then(|(_, c)| c.pseudo) == Some(PseudoEl::Placeholder)
         });
+        index.has_selection = unique
+            .iter()
+            .any(|r| r.selector.0.last().and_then(|(_, c)| c.pseudo) == Some(PseudoEl::Selection));
+        index.has_user_select = unique
+            .iter()
+            .any(|r| r.decls.iter().any(|(k, _)| k == "user-select"));
         index.has_revert_layer = unique.iter().copied().any(|r| {
             r.decls
                 .iter()
@@ -13410,6 +13606,21 @@ impl Dom {
                 out.push('"');
             }
         }
+        // CSS Pseudo 4 #highlight-styling: an element's `::selection`
+        // declarations ride into the stylesheet-free presentation, whose
+        // painting resolves the highlight's inheritance from them.
+        if self.style_index().has_selection {
+            let selection = self.baked_pseudo_style(id, PseudoEl::Selection);
+            // The root element carries the marker even without declarations
+            // of its own: the snapshot has `::selection` styles.
+            if !selection.is_empty() || self.document_element() == Some(id) {
+                out.push(' ');
+                out.push_str(PseudoEl::Selection.baked_style_attr());
+                out.push_str("=\"");
+                out.push_str(&escape_attr(&selection));
+                out.push('"');
+            }
+        }
         // CSS Position 4 #backdrop: an element in the top layer carries its
         // `::backdrop` declarations into the stylesheet-free presentation.
         if self.top_layer.contains(&id) {
@@ -15473,6 +15684,10 @@ pub enum PseudoEl {
     /// CSS Position 4 #backdrop: the box below an element rendered in the
     /// top layer.
     Backdrop,
+    /// CSS Pseudo 4 #selectordef-selection: the part of the element's text
+    /// that a selection highlights. It generates no box; highlight
+    /// inheritance and painting live in `layout2::highlight`.
+    Selection,
 }
 
 /// A marquee's pause clock (HTML #dom-marquee-stop): when it was stopped, if
@@ -15494,6 +15709,7 @@ impl PseudoEl {
             PseudoEl::Marker => "data-trust-marker-style",
             PseudoEl::Placeholder => "data-trust-placeholder-style",
             PseudoEl::Backdrop => "data-trust-backdrop-style",
+            PseudoEl::Selection => "data-trust-selection-style",
         }
     }
 
@@ -15508,7 +15724,10 @@ impl PseudoEl {
             PseudoEl::Before => Some(("data-trust-before", "data-trust-before-items")),
             PseudoEl::After => Some(("data-trust-after", "data-trust-after-items")),
             PseudoEl::Marker => Some(("data-trust-marker", "data-trust-marker-items")),
-            PseudoEl::FirstLetter | PseudoEl::Placeholder | PseudoEl::Backdrop => None,
+            PseudoEl::FirstLetter
+            | PseudoEl::Placeholder
+            | PseudoEl::Backdrop
+            | PseudoEl::Selection => None,
         }
     }
 
@@ -15534,6 +15753,7 @@ impl PseudoEl {
             PseudoEl::Marker => "::marker",
             PseudoEl::Placeholder => "::placeholder",
             PseudoEl::Backdrop => "::backdrop",
+            PseudoEl::Selection => "::selection",
         }
     }
 
@@ -15547,6 +15767,7 @@ impl PseudoEl {
             PseudoEl::FirstLetter => 3,
             PseudoEl::Placeholder => 4,
             PseudoEl::Backdrop => 5,
+            PseudoEl::Selection => 6,
         }
     }
 }
@@ -16781,7 +17002,10 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
                     // and a top-layer element's ::backdrop (CSS Positioned
                     // Layout 4 #backdrop) are rendered; those of a ::slotted()
                     // element stay inert.
-                    && !((name == "marker" || name == "backdrop" || placeholder_pseudo_element(&name))
+                    && !((name == "marker"
+                        || name == "backdrop"
+                        || name == "selection"
+                        || placeholder_pseudo_element(&name))
                         && compound.slotted.is_none())
                 {
                     if unrendered_pseudo_element(&name, arg.is_some()) {
@@ -16902,6 +17126,7 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
                     || (double_colon
                         && (name == "marker"
                             || name == "backdrop"
+                            || name == "selection"
                             || placeholder_pseudo_element(&name)))
                 {
                     // Generated-content pseudo-element: the compound still
@@ -16921,6 +17146,8 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
                         "first-letter" => PseudoEl::FirstLetter,
                         // CSS Position 4 #backdrop.
                         "backdrop" => PseudoEl::Backdrop,
+                        // CSS Pseudo 4 #selectordef-selection.
+                        "selection" => PseudoEl::Selection,
                         _ => PseudoEl::Placeholder,
                     });
                 } else if name == "scope" {
@@ -17170,7 +17397,6 @@ fn unrendered_pseudo_element(name: &str, functional: bool) -> bool {
             name,
             "backdrop"
                 | "first-line"
-                | "selection"
                 | "placeholder"
                 | "-moz-placeholder"
                 | "marker"
@@ -17797,6 +18023,10 @@ const PROPS: &[PropDef] = &[
     // it into live presentation snapshots because graphical hit testing, not
     // box sizing, chooses the cursor for the topmost pointer target.
     prop("cursor", true, true),
+    // CSS UI 4 #content-selection: not inherited, but its `auto` used value
+    // follows the parent's (`Dom::user_select`). Baked so a stylesheet-free
+    // presentation snapshot selects as the page does.
+    prop("user-select", false, true),
     // CSS Backgrounds 3: the layout paints no color, but a declared background
     // is an OPAQUE FILL in the cell compositor (layout2 P4 — Appendix E paint
     // order: a modal's background erases the page cells under its rect).
@@ -20563,6 +20793,7 @@ struct CascadeWinners<'r> {
     marker: FxHashMap<String, CascadeWinner>,
     placeholder: FxHashMap<String, CascadeWinner>,
     backdrop: FxHashMap<String, CascadeWinner>,
+    selection: FxHashMap<String, CascadeWinner>,
     /// Pseudo-element rules whose container conditions need layout sizes.
     conditional: Vec<&'r StyleRule>,
     preserve_layers: bool,
@@ -20622,7 +20853,7 @@ fn strip_winners(map: &FxHashMap<String, CascadeWinner>) -> FxHashMap<String, St
 /// The source order (`StyleRule::order`) of each custom property's winning
 /// declaration, for resolving its `url()`s against its sheet.
 fn custom_property_sources<'m>(
-    maps: [(Option<PseudoEl>, &'m FxHashMap<String, CascadeWinner>); 7],
+    maps: [(Option<PseudoEl>, &'m FxHashMap<String, CascadeWinner>); 8],
 ) -> impl Iterator<Item = (Option<PseudoEl>, String, usize)> + 'm {
     maps.into_iter().flat_map(|(pseudo, winners)| {
         winners
@@ -20790,6 +21021,7 @@ impl StyleView<'_> {
         let mut marker = Winners::default();
         let mut placeholder = Winners::default();
         let mut backdrop = Winners::default();
+        let mut selection = Winners::default();
         let mut conditional_pseudos = Vec::new();
         // CSS Cascade 5 #cascade-context: the element's own tree context.
         let own = |important: bool| cascade_context(sources.depth, important);
@@ -20855,6 +21087,7 @@ impl StyleView<'_> {
                 Some(PseudoEl::Marker) => &mut marker,
                 Some(PseudoEl::Placeholder) => &mut placeholder,
                 Some(PseudoEl::Backdrop) => &mut backdrop,
+                Some(PseudoEl::Selection) => &mut selection,
             };
             for (pk, (imp, v)) in &r.decls {
                 consider_into(
@@ -20908,6 +21141,7 @@ impl StyleView<'_> {
                 Some(PseudoEl::Marker) => &mut marker,
                 Some(PseudoEl::Placeholder) => &mut placeholder,
                 Some(PseudoEl::Backdrop) => &mut backdrop,
+                Some(PseudoEl::Selection) => &mut selection,
             };
             let r = part.rule;
             for (pk, (imp, v)) in &r.decls {
@@ -21022,6 +21256,7 @@ impl StyleView<'_> {
             marker,
             placeholder,
             backdrop,
+            selection,
             conditional: conditional_pseudos,
             preserve_layers,
             declarations: declaration_order.get(),
@@ -21206,6 +21441,12 @@ struct StyleIndex {
     /// Whether any rule targets `::marker`, so list markers consult their
     /// pseudo-element only on pages that style it.
     has_marker: bool,
+    /// Whether any rule targets `::selection`, so painting resolves author
+    /// highlight colors only on pages that style them.
+    has_selection: bool,
+    /// Whether any rule declares `user-select`: elsewhere only the UA's and
+    /// inline declarations decide it (`Dom::user_select_under`).
+    has_user_select: bool,
     /// Whether any rule targets `::placeholder`, so text controls consult
     /// author placeholder declarations only on pages that style them.
     has_placeholder: bool,
@@ -21478,6 +21719,8 @@ impl StyleIndex {
             has_first_letter,
             has_marker,
             has_placeholder,
+            has_selection,
+            has_user_select,
             hover_probes,
             hover_buckets,
             hover_paint_buckets,
@@ -21489,6 +21732,8 @@ impl StyleIndex {
             has_first_letter,
             has_marker,
             has_placeholder,
+            has_selection,
+            has_user_select,
             has_container_queries,
             has_container_units,
             has_revert_layer,
@@ -23724,6 +23969,9 @@ fn legacy_name_alias(name: &str) -> Option<&'static str> {
         "-webkit-transition-property" => "transition-property",
         "-webkit-transition-timing-function" => "transition-timing-function",
         "-webkit-transition" => "transition",
+        // CSS UI 4 #content-selection: "UAs that support 'user-select' must
+        // also support -webkit-user-select as an alias."
+        "-webkit-user-select" => "user-select",
         // CSS Fonts 4 #font-stretch-prop.
         "font-stretch" => "font-width",
         _ => return None,

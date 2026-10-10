@@ -285,6 +285,19 @@ impl ShapedText {
         )
     }
 
+    /// The whole clusters painted in `[from, to)` from this text's origin,
+    /// moved so that `from` is the part's origin: a piece of a run that a
+    /// selection's highlight redraws in its own color (CSS Pseudo 4
+    /// #highlight-text), with decorations spanning only that piece.
+    pub(crate) fn visual_range(&self, from: f32, to: f32) -> ShapedText {
+        const EPSILON: f32 = 0.01;
+        self.visual_part(
+            |x| x >= from - EPSILON && x < to - EPSILON,
+            |center| center >= from - EPSILON && center < to - EPSILON,
+            from,
+        )
+    }
+
     fn visual_part(
         &self,
         keep_cluster: impl Fn(f32) -> bool,

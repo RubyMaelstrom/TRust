@@ -3015,6 +3015,7 @@ mod tests {
             clip: None,
             node: 1,
             link: None,
+            selection: Default::default(),
         });
 
         let mut renderer = VelloCpuRenderer::new();

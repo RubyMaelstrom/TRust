@@ -5881,11 +5881,44 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 && (composing || (t.localName === "input" && !formOwner(t)))) {
                 prevented = true;
             }
+            // The platform's select-all (Ctrl+A) and context menu keys (the
+            // menu key, Shift+F10), defaults of an uncanceled keydown. Text
+            // controls select their own text in the frontend's editor.
+            if (!prevented && !composing && !alt && !!ctrl !== !!meta && (init.key === "a" || init.key === "A")
+                && !isTextControl(t) && t.localName !== "textarea") {
+                trust.userSelectAll(t);
+            }
+            if (!prevented && !composing && (init.key === "ContextMenu"
+                || (init.key === "F10" && shift && !ctrl && !alt && !meta))) {
+                keyboardContextMenu(t);
+                prevented = true;
+            }
         } finally {
             trust.keyDispatch = false;
         }
         return prevented;
     };
+    // Pointer Events #maybe-show-context-menu from the keyboard: "call this
+    // algorithm with native = null and target = currently focused element",
+    // whose `contextmenu` comes from no pointing device (pointerId -1,
+    // pointerType ""), at the element's position.
+    function keyboardContextMenu(target) {
+        const element = target && target.nodeType === 1 ? target : (g.document.body || g.document.documentElement);
+        if (!element) return;
+        let x = 0, y = 0;
+        try {
+            const rect = Element.prototype.getBoundingClientRect.call(element);
+            x = rect.left + Math.min(rect.width / 2, 16);
+            y = rect.top + Math.min(rect.height / 2, 16);
+        } catch {}
+        const event = integralPointerEvent("contextmenu", {
+            bubbles: true, cancelable: true, composed: true, view: g, detail: 0,
+            clientX: x, clientY: y, screenX: x, screenY: y, pageX: x + (g.scrollX || 0), pageY: y + (g.scrollY || 0),
+            button: 0, buttons: 0, pointerId: -1, pointerType: "", isPrimary: false,
+        });
+        dispatch(element, event, false);
+        __context_menu_result(!event.defaultPrevented);
+    }
     // Parser and live DOM insertion share HTML's already-started flag.
     trust.prepareParserScript = function (id) {
         const node = wrap(id);
@@ -6206,7 +6239,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // UI Events native mouse down/up and Pointer Events compatibility mapping.
     // These entry points receive actual frontend transitions, never fabricated
     // press/release events for HTMLElement.click() or keyboard activation.
-    trust.pointerButton = function (id, pressed, x, y, screenX, screenY, button = 0, modifiers = 0, routed = false) {
+    // `textId`/`textOffset` name the Text boundary point the frontend paints
+    // nearest the pointer and `selects` says the frontend lets the user
+    // select page text with it (Selection API §2 "User Interactions");
+    // `bypassMenu` is the user's bypass of #maybe-show-context-menu.
+    trust.pointerButton = function (id, pressed, x, y, screenX, screenY, button = 0, modifiers = 0, routed = false,
+        textId = null, textOffset = 0, selects = false, bypassMenu = false) {
         if (currentPointerLock()) { pointerInput.modifiers = modifiers; return trust.lockedPointerButton(button, pressed); }
         x = +x || 0; y = +y || 0;
         screenX = screenX === undefined ? x : +screenX || 0;
@@ -6227,7 +6265,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (childFrame) {
             const rect = frameContentClientRect(childFrame);
             const canceled = trustOf(internalsOf(childFrame).contentRealmWindow).pointerButton(id, pressed,
-                x - rect.left, y - rect.top, screenX, screenY, button, modifiers, true);
+                x - rect.left, y - rect.top, screenX, screenY, button, modifiers, true,
+                textId, textOffset, selects, bypassMenu);
             if (pressed && !canceled) trust.focusPage(id);
             if (!pressed && !pointerInput.buttons) trust.hover(hit,x,y,screenX,screenY,modifiers,false,false);
             return canceled;
@@ -6273,6 +6312,13 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // A routed child press is focused by the top-level call, which moves
         // the focus chain into this navigable first (HTML focus update steps).
         if (pressed && !canceled && !routed) trust.focusPage(id);
+        // Selection API §2 and UI Events #event-type-mousedown: an uncanceled
+        // primary press starts the user's selection gesture as its default
+        // action; the release ends it at the pointer.
+        if (selects && button === 0) {
+            if (pressed && !canceled) userSelectionPress(target, textId, textOffset, down ? down.detail : 1, modifiers);
+            else if (!pressed) userSelectionRelease(textId, textOffset);
+        }
         if (!pressed) {
             const clickTarget = captured ? target : pointerClickTarget(down && down.target, target);
             pointerInput.downs.delete(button);
@@ -6285,9 +6331,16 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 pointerInput.pending = null; processPointerCapture(); pointerInput.suppress = false;
                 trust.hover(hit,x,y,screenX,screenY,modifiers,true,false);
             }
-            if (button === 2) dispatch(target, integralPointerEvent("contextmenu", {
-                ...init, detail:0, isPrimary:false, pressure:0
-            }), false);
+            // Pointer Events #maybe-show-context-menu: the user agent shows
+            // its context menu only when `contextmenu` is not canceled,
+            // unless the user bypassed the page.
+            if (button === 2 && !bypassMenu) {
+                const menu = integralPointerEvent("contextmenu", {
+                    ...init, detail:0, isPrimary:false, pressure:0
+                });
+                dispatch(target, menu, false);
+                if (selects) __context_menu_result(!menu.defaultPrevented);
+            }
             if (button !== 0 && clickTarget) dispatch(clickTarget,integralPointerEvent("auxclick", {
                 ...init, isPrimary:false, pressure:0
             }),false);
@@ -6329,8 +6382,13 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // CSSOM View's MouseEvent extensions distinguish screen coordinates from
     // viewport-relative client coordinates. Keep the frontend's screen space unchanged across
     // nested browsing contexts; only the client pair crosses content-box origins.
-    trust.hover = function (id, x, y, screenX, screenY, modifiers = 0, routed = false, motion = true) {
+    trust.hover = function (id, x, y, screenX, screenY, modifiers = 0, routed = false, motion = true,
+        textId = null, textOffset = 0) {
         if (currentPointerLock()) return true;
+        // Selection API §2: motion with the primary button held extends the
+        // user's selection gesture, in the Realm whose Document it selects.
+        const gesture = pointerInput.selectionGesture;
+        if (!routed && gesture && (pointerInput.buttons & 1)) gesture.owner.selectionGestureMove(textId, textOffset);
         // A stale id (the node was detached since the snapshot the app hit-test
         // ran against) wraps to null — degrade to hover-clear, never an error.
         x = +x || 0; y = +y || 0;
@@ -28411,6 +28469,35 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         }
         return nodes;
     }
+    // The forced breaks in the text `selectionTextNodes` flattens (CSS Text 3
+    // #white-space-processing and HTML's br): the indices of segment breaks
+    // a text's white-space preserves (pre, pre-wrap, pre-line,
+    // break-spaces), and the indices a <br> precedes. A segment break that
+    // white-space collapses is only a space.
+    function selectionForcedBreaks(document, texts, starts) {
+        const newlines = new Set(), breaks = new Set();
+        const preserving = /^(pre|pre-wrap|pre-line|break-spaces)$/;
+        for (let i = 0; i < texts.length; i++) {
+            const data = texts[i].data;
+            if (data.indexOf("\n") < 0) continue;
+            const parent = parentElementOf(texts[i]);
+            const whiteSpace = parent ? __dom_computed(elementIdentity(parent), "white-space") || "normal" : "normal";
+            if (!preserving.test(whiteSpace)) continue;
+            for (let k = data.indexOf("\n"); k >= 0; k = data.indexOf("\n", k + 1)) newlines.add(starts[i] + k);
+        }
+        const walker = document.createTreeWalker(document, 5 /* SHOW_ELEMENT | SHOW_TEXT */);
+        let pending = false, index = 0;
+        for (let node = walker.nextNode(); node && index < texts.length; node = walker.nextNode()) {
+            if (node.nodeType === 1) {
+                if (htmlElementName(node) === "br") pending = true;
+            } else if (rangeSame(node, texts[index])) {
+                if (pending) breaks.add(starts[index]);
+                pending = false;
+                index++;
+            }
+        }
+        return {newlines, breaks};
+    }
     const selectionBlockDisplays = /^(block|flow-root|list-item|table|flex|grid|table-row|table-cell|table-caption)/;
     function selectionBlockOf(node) {
         for (let element = parentElementOf(node); element; element = parentElementOf(element)) {
@@ -28457,20 +28544,27 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             // the run of text between forced breaks within one block.
             const blockAt = (index) => selectionBlockOf(toPoint(index)[0]);
             const block = blockAt(Math.min(position, Math.max(0, text.length - 1)));
+            const {newlines, breaks} = selectionForcedBreaks(document, texts, starts);
+            // A forced break between `index - 1` and `index`.
+            const breakBefore = (index) => breaks.has(index) || newlines.has(index - 1);
             let start = position, end = position;
-            while (start > 0 && text[start - 1] !== "\n" && blockAt(start - 1) === block) start--;
-            while (end < text.length && text[end] !== "\n" && blockAt(end) === block) end++;
+            while (start > 0 && !breakBefore(start) && blockAt(start - 1) === block) start--;
+            while (end < text.length && !newlines.has(end) && blockAt(end) === block) {
+                end++;
+                if (breaks.has(end)) break;
+            }
             if (granularity.endsWith("boundary")) return toPoint(forwards ? end : start);
             if (forwards) {
                 let next = end;
-                while (next < text.length && (text[next] === "\n" || blockAt(next) === block)) next++;
+                while (next < text.length && newlines.has(next)) next++;
                 return toPoint(next);
             }
             if (position > start) return toPoint(start);
             let previous = start - 1;
-            if (previous < 0) return toPoint(0);
+            while (previous > 0 && newlines.has(previous)) previous--;
+            if (previous <= 0) return toPoint(0);
             const previousBlock = blockAt(previous);
-            while (previous > 0 && text[previous - 1] !== "\n" && blockAt(previous - 1) === previousBlock) previous--;
+            while (previous > 0 && !breakBefore(previous) && blockAt(previous - 1) === previousBlock) previous--;
             return toPoint(previous);
         }
         const kind = granularity === "character" ? "grapheme"
@@ -28501,6 +28595,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     let selectionChangeQueued = false;
     function queueSelectionChange() {
+        // The frontend paints what the selection selects (`PageEvt::Selection`).
+        __selection_changed();
         if (selectionChangeQueued) return;
         selectionChangeQueued = true;
         controlSelectionTasks.push({frame:trust.__activeFrame || null, fn() {
@@ -28519,6 +28615,243 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         return selection;
     }
     g.getSelection = function getSelection() { return g.document ? selectionFor(g.document) : null; };
+    // ---- Selection API §2 "User Interactions" with CSS UI 4 ----------------
+    // The user changes a Document's selection with the primary pointer
+    // button: its press, the motion while it is held and its release run
+    // these as their default actions. The frontend resolves the pointer to
+    // the Text boundary point its layout paints nearest the pointer, so the
+    // selection is what the user sees. One gesture is one user change: it
+    // fires `selectstart` at most once, and each update associates the
+    // selection with a new range (§2 "create a new range ... (not modify
+    // the existing range)"). The gesture is shared by the page's Realms,
+    // like the pointer, and belongs to the Realm whose Document it selects.
+    function userTextPoint(textId, textOffset) {
+        if (textId === null || textId === undefined) return null;
+        const node = wrap(textId);
+        if (!node || node.nodeType !== 3 || !rangeSame(rangeRoot(node), g.document)) return null;
+        return [node, Math.max(0, Math.min(Math.floor(+textOffset || 0), node.data.length))];
+    }
+    // CSS UI 4 #content-selection: the used value of user-select on an
+    // element, or on a Text node's parent.
+    function usedUserSelect(node) {
+        const id = node ? nodeIds.get(node) : undefined;
+        return id === undefined ? "text" : (__dom_user_select(id) || "text");
+    }
+    function selectionElementOf(node) { return node.nodeType === 1 ? node : parentElementOf(node); }
+    // The outermost element of the chain of `user-select: all` elements
+    // holding `node`: its content is selected atomically.
+    function userSelectAllElement(node) {
+        let found = null;
+        for (let element = selectionElementOf(node); element; element = parentElementOf(element)) {
+            if (usedUserSelect(element) !== "all") break;
+            found = element;
+        }
+        return found;
+    }
+    // The outermost element holding `node`, but not `other`, whose used
+    // user-select is `none` or `contain`: a selection started outside it
+    // must not end in it.
+    function userSelectBoundary(node, other) {
+        let found = null;
+        for (let element = selectionElementOf(node); element && !rangeContains(element, other);
+            element = parentElementOf(element)) {
+            const used = usedUserSelect(element);
+            if (used === "none" || used === "contain") found = element;
+        }
+        return found;
+    }
+    function userSelectContain(node) {
+        for (let element = selectionElementOf(node); element; element = parentElementOf(element))
+            if (usedUserSelect(element) === "contain") return element;
+        return null;
+    }
+    function boundaryBefore(element) { return [rangeParent(element), rangeIndex(element)]; }
+    function boundaryAfter(element) { return [rangeParent(element), rangeIndex(element) + 1]; }
+    function selectionOrder(a, b) { return rangeOrder(a[0], a[1], b[0], b[1]); }
+    // CSS UI 4's constraints on the range from `anchor` to `focus`.
+    function userSelectConstrain(anchor, focus) {
+        let forwards = selectionOrder(anchor, focus) !== 1;
+        // all: the content of such an element is selected atomically.
+        const anchorAll = userSelectAllElement(anchor[0]), focusAll = userSelectAllElement(focus[0]);
+        if (anchorAll && anchorAll === focusAll) return [boundaryBefore(anchorAll), boundaryAfter(anchorAll)];
+        if (anchorAll) anchor = forwards ? boundaryBefore(anchorAll) : boundaryAfter(anchorAll);
+        if (focusAll) focus = forwards ? boundaryAfter(focusAll) : boundaryBefore(focusAll);
+        // contain: a selection started in the element stays in it.
+        const container = userSelectContain(anchor[0]);
+        if (container && !rangeContains(container, focus[0]))
+            focus = forwards ? [container, rangeLength(container)] : [container, 0];
+        // none, contain: a selection started outside does not end inside;
+        // it ends at the element's boundary.
+        const boundary = userSelectBoundary(focus[0], anchor[0]);
+        if (boundary) focus = forwards ? boundaryBefore(boundary) : boundaryAfter(boundary);
+        return [anchor, focus];
+    }
+    // The granule of `granularity` holding a boundary point, as two points:
+    // a word (UAX #29 word boundaries, via Intl.Segmenter; a run of spaces
+    // or punctuation is its own granule) or a paragraph (Selection API
+    // #dom-selection-modify's paragraph boundaries).
+    function userSelectionGranule(point, granularity) {
+        if (granularity === "paragraph")
+            return [selectionMovedPoint(g.document, point, false, "paragraphboundary"),
+                selectionMovedPoint(g.document, point, true, "paragraphboundary")];
+        const [node, offset] = point, data = node.data;
+        if (typeof Intl === "object" && typeof Intl.Segmenter === "function") {
+            let last = null;
+            for (const segment of new Intl.Segmenter(undefined, {granularity: "word"}).segment(data)) {
+                const end = segment.index + segment.segment.length;
+                last = [[node, segment.index], [node, end]];
+                if (offset < end) return last;
+            }
+            if (last) return last;
+        }
+        return [point, point];
+    }
+    function userSelect(selection, anchor, focus) {
+        const state = selectionState(selection);
+        const order = selectionOrder(anchor, focus);
+        const range = createLiveRange(state.document);
+        const [start, end] = order === 1 ? [focus, anchor] : [anchor, focus];
+        setRangeBoundary(range, start[0], start[1], true);
+        setRangeBoundary(range, end[0], end[1], false);
+        setSelectionRange(selection, range, order === 1 ? "backwards" : order === -1 ? "forwards" : "directionless");
+    }
+    // Fire `selectstart` before associating a new range when the selection
+    // was empty or collapsed, at the new range's start node; true when it
+    // may proceed.
+    function userSelectStart(state, anchor, focus) {
+        if (state.range && !rangeIsCollapsed(rangeState(state.range))) return true;
+        const start = selectionOrder(anchor, focus) === 1 ? focus : anchor;
+        const event = createTrustedEvent(Event, "selectstart", {bubbles: true, cancelable: true});
+        dispatch(start[0], event, false);
+        return !event.defaultPrevented;
+    }
+    function userSelectionUpdate(gesture, point) {
+        let anchor = gesture.anchor, focus = point;
+        if (gesture.granularity !== "character") {
+            // The selection grows by whole granules away from the one pressed.
+            const granule = userSelectionGranule(point, gesture.granularity);
+            if (selectionOrder(point, gesture.origin[0]) === -1) {
+                anchor = gesture.origin[1]; focus = granule[0];
+            } else {
+                anchor = gesture.origin[0]; focus = granule[1];
+            }
+        }
+        userSelectionApply(gesture, anchor, focus);
+    }
+    function userSelectionApply(gesture, anchor, focus) {
+        if (gesture.canceled) return;
+        const selection = selectionFor(gesture.document), state = selectionState(selection);
+        [anchor, focus] = userSelectConstrain(anchor, focus);
+        if (state.range) {
+            const a = selectionAnchor(state), f = selectionFocus(state);
+            if (rangeSame(a[0], anchor[0]) && a[1] === anchor[1] && rangeSame(f[0], focus[0]) && f[1] === focus[1]) return;
+        }
+        if (!gesture.started) {
+            gesture.started = true;
+            if (!userSelectStart(state, anchor, focus)) { gesture.canceled = true; return; }
+        }
+        userSelect(selection, anchor, focus);
+    }
+    function userSelectionPress(target, textId, textOffset, detail, modifiers) {
+        pointerInput.selectionGesture = null;
+        if (!target || target.nodeType !== 1) return;
+        // A text control or editing host selects its own text, which the
+        // frontend's editor presents. A control's press collapses the
+        // Document's selection at the control (§2: collapsed, never empty).
+        if (ecEditingHostOf(target)) return;
+        if (isTextControl(target) || target.localName === "textarea") {
+            const selection = selectionFor(g.document), state = selectionState(selection);
+            const parent = rangeParent(target);
+            if (parent && state.range && selectionVisible(state) && !rangeIsCollapsed(rangeState(state.range))) {
+                const at = [parent, rangeIndex(target)];
+                userSelect(selection, at, at);
+            }
+            return;
+        }
+        // CSS UI 4: pressing in a `user-select: none` element neither starts
+        // a selection nor affects the one there is.
+        if (usedUserSelect(target) === "none") return;
+        const document = g.document, selection = selectionFor(document), state = selectionState(selection);
+        const point = userTextPoint(textId, textOffset);
+        if (!point || usedUserSelect(point[0]) === "none") {
+            // §2: a user action never makes a selection empty; a press away
+            // from text only collapses it.
+            if (state.range && selectionVisible(state) && !rangeIsCollapsed(rangeState(state.range))) {
+                const focus = selectionFocus(state);
+                userSelect(selection, focus, focus);
+            }
+            return;
+        }
+        const granularity = detail >= 3 ? "paragraph" : detail === 2 ? "word" : "character";
+        let origin = [point, point];
+        // Shift extends the selection from its anchor.
+        if ((modifiers & 1) && state.range && selectionVisible(state)) {
+            const anchor = selectionAnchor(state);
+            origin = [anchor, anchor];
+        } else if (granularity !== "character") {
+            origin = userSelectionGranule(point, granularity);
+        }
+        // A hyperlink's press is its activation; Alt selects its text.
+        let link = false;
+        for (let element = target; element; element = parentElementOf(element)) {
+            if ((element.localName === "a" || element.localName === "area") && element.hasAttribute("href")) { link = true; break; }
+        }
+        const gesture = {owner: trust, document, granularity, origin, anchor: origin[0],
+            started: false, canceled: false, drag: !link || !!(modifiers & 4)};
+        pointerInput.selectionGesture = gesture;
+        if (modifiers & 1) userSelectionUpdate(gesture, point);
+        else userSelectionApply(gesture, origin[0], origin[1]);
+    }
+    trust.selectionGestureMove = function (textId, textOffset) {
+        const gesture = pointerInput.selectionGesture;
+        if (!gesture || gesture.owner !== trust || !gesture.drag) return;
+        const point = userTextPoint(textId, textOffset);
+        if (point) userSelectionUpdate(gesture, point);
+    };
+    function userSelectionRelease(textId, textOffset) {
+        const gesture = pointerInput.selectionGesture;
+        if (!gesture) return;
+        pointerInput.selectionGesture = null;
+        if (gesture.owner !== trust) return gesture.owner.selectionGestureEnd(textId, textOffset, gesture);
+        if (gesture.drag) {
+            const point = userTextPoint(textId, textOffset);
+            if (point) userSelectionUpdate(gesture, point);
+        }
+    }
+    trust.selectionGestureEnd = function (textId, textOffset, gesture) {
+        if (!gesture.drag) return;
+        const point = userTextPoint(textId, textOffset);
+        if (point) userSelectionUpdate(gesture, point);
+    };
+    // The user's "select all" (the platform's Ctrl+A): an editing host's
+    // content inside one, otherwise the body's (execCommand #the-selectall-command).
+    trust.userSelectAll = function (target) {
+        const document = g.document, selection = selectionFor(document), state = selectionState(selection);
+        const host = target && target.nodeType === 1 ? ecEditingHostOf(target) : null;
+        const root = host || document.body || document.documentElement;
+        if (!root) return;
+        const anchor = [root, 0], focus = [root, rangeLength(root)];
+        if (!userSelectStart(state, anchor, focus)) return;
+        userSelect(selection, anchor, focus);
+    };
+    // The boundary points of each Document's selected range in this Realm
+    // and its descendant navigables' Realms, for the frontend's report:
+    // start, end, anchor and focus as (node id, offset) pairs.
+    trust.selectionBoundaries = function () {
+        const out = [];
+        const state = selectionState(selectionFor(g.document));
+        if (state.range && selectionVisible(state)) {
+            const range = rangeState(state.range), anchor = selectionAnchor(state), focus = selectionFocus(state);
+            const ids = [range.startNode, range.endNode, anchor[0], focus[0]].map((node) => nodeIds.get(node));
+            if (!ids.includes(undefined))
+                out.push(ids[0], range.startOffset, ids[1], range.endOffset, ids[2], anchor[1], ids[3], focus[1]);
+        }
+        for (const child of childWindowTrusts) {
+            const more = child.selectionBoundaries();
+            for (let i = 0; i < more.length; i++) out.push(more[i]);
+        }
+        return out;
+    };
     // --- MutationObserver (real) ---------------------------------------
     // A pure-JS DOM-mutation observer, delivered as a microtask exactly like
     // the spec's "mutation observer microtask". Records are emitted ONLY by the
@@ -32976,7 +33309,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             const parent = flatTreeParentElement(node);
             if (!parent || !context.rendered(parent) || computedOf(parent, "visibility") !== "visible") return;
             const whiteSpace = computedOf(parent, "white-space") || "normal";
-            let text = node.data;
+            let text = context.cut ? context.cut(node) : node.data;
+            if (text === null) return;
             const collapsible = whiteSpace === "normal" || whiteSpace === "nowrap" || whiteSpace === "pre-line";
             if (whiteSpace === "pre-line") text = text.replace(/[\t ]*(\r\n|\r|\n)[\t ]*/g, "\n").replace(/[\t ]+/g, " ");
             else if (collapsible) text = text.replace(/[\t\n\f\r ]+/g, " ");
@@ -33033,8 +33367,15 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     function innerTextOf(element) {
         if (!isBeingRendered(element)) return messageApply(nodeTextContent.get, element, []);
+        return renderedTextOf(element, null);
+    }
+    // HTML's rendered text collection steps over `element`'s children;
+    // `cut(text)` gives the part of a Text node's data to collect, or null
+    // to collect none of it.
+    function renderedTextOf(element, cut) {
         const renderedCache = new Map(), lastCache = new Map();
         const context = {
+            cut,
             rendered(el) {
                 let value = renderedCache.get(el);
                 if (value === undefined) renderedCache.set(el, value = isBeingRendered(el));
@@ -33106,6 +33447,56 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         }
         return result;
     }
+    // The text a user's copy action places on the clipboard (Clipboard API
+    // #copy-action, "copy the selected contents"): the rendered text
+    // collection steps over the selection's range, each Text node cut to
+    // its selected data, leaving out `user-select: none` content as the
+    // highlight does (CSS UI 4 #content-selection: "keep the visual
+    // selection consistent with what would get copied").
+    function selectionRenderedText(document) {
+        const state = selectionState(selectionFor(document));
+        if (!state.range || !selectionVisible(state)) return "";
+        const range = rangeState(state.range);
+        if (rangeIsCollapsed(range)) return "";
+        let root = rangeCommonAncestor(range);
+        if (root.nodeType !== 1 && root.nodeType !== 9 && root.nodeType !== 11) root = rangeParent(root);
+        if (root && root.nodeType === 9) root = root.documentElement;
+        if (!root) return "";
+        const cut = (node) => {
+            const length = node.data.length;
+            if (rangeOrder(node, length, range.startNode, range.startOffset) !== 1 ||
+                rangeOrder(node, 0, range.endNode, range.endOffset) !== -1) return null;
+            if (usedUserSelect(node) === "none") return null;
+            const from = rangeSame(node, range.startNode) ? range.startOffset : 0;
+            const to = rangeSame(node, range.endNode) ? range.endOffset : length;
+            return node.data.slice(from, to);
+        };
+        return renderedTextOf(root, cut);
+    }
+    // The user's copy action (Clipboard API #copy-action), run in the
+    // Realm of the focused navigable: fire `copy` (#fire-a-clipboard-event)
+    // at the focused node or the body; uncanceled, the selected contents
+    // reach the clipboard, canceled, what its listeners set.
+    trust.userCopy = function () {
+        const active = g.document.activeElement;
+        const child = active && internalsOf(active).contentRealmWindow;
+        if (child) return trustOf(child).userCopy();
+        const target = ecClipboardTarget(g.document);
+        const data = ecClipboardDataTransfer();
+        const event = createTrustedEvent(ClipboardEvent, "copy", {bubbles: true, cancelable: true, composed: true,
+            clipboardData: data.transfer});
+        dispatch(target, event, false);
+        data.store.mode = "p";
+        if (typeof dissociateDataTransfer === "function") dissociateDataTransfer(data.transfer);
+        if (event.defaultPrevented) {
+            // #write-content-to-the-clipboard: TRust's clipboard holds text.
+            const item = data.store.items.find((entry) => entry.kind === "text" && entry.type === "text/plain");
+            if (item) ecWriteClipboard(String(item.data));
+            return;
+        }
+        const text = selectionRenderedText(g.document);
+        if (text !== "") ecWriteClipboard(text);
+    };
     // HTML #rendered-text-fragment.
     function renderedTextFragment(input, document) {
         const fragment = Document.prototype.createDocumentFragment.call(document);

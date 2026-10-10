@@ -62,12 +62,38 @@ pub(crate) enum AtomKind {
     Media { video: bool },
 }
 
+/// The DOM Text node whose data a text run is, and the UTF-16 offset of the
+/// run's first character there (nonzero once `::first-letter` splits it).
+/// Layout carries it to paint so a selection can name what the user
+/// selected (Selection API §2). Generated and replacement text (`content`,
+/// `alt`, UA fallbacks) has none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TextOrigin {
+    pub node: NodeId,
+    pub offset: u32,
+}
+
+impl TextOrigin {
+    pub(crate) const NONE: Self = Self {
+        node: crate::layout2::NO_NODE,
+        offset: 0,
+    };
+
+    pub(crate) fn of(node: NodeId) -> Self {
+        Self { node, offset: 0 }
+    }
+
+    pub(crate) fn is_none(self) -> bool {
+        self.node == crate::layout2::NO_NODE
+    }
+}
+
 /// Inline-level content inside an inline formatting context.
 #[derive(Clone, Debug)]
 pub(crate) enum Inline {
     /// A text run (raw — white-space collapsing happens at line building).
     /// The originating element is the enclosing `Box`/IFC root.
-    Text(String),
+    Text(String, TextOrigin),
     /// An inline box (`<a>`, `<b>`, `<span>`, …): style context plus its own
     /// horizontal margins/borders/padding, which occupy real inline space.
     /// The style snapshot is boxed — text runs vastly outnumber element
@@ -813,7 +839,7 @@ impl Builder<'_> {
                     let between = segments.len() >= 2
                         && matches!(segments.last(), Some(Segment::Inlines(run))
                         if run.iter().all(|inline| match inline {
-                            Inline::Text(text) => text.chars().all(is_collapsible_space),
+                            Inline::Text(text, _) => text.chars().all(is_collapsible_space),
                             Inline::OutOfFlow(_) => true,
                             _ => false,
                         }));
@@ -1123,6 +1149,7 @@ impl Builder<'_> {
             style,
             content: Content::Inlines(vec![Inline::Text(
                 crate::dom::display_text(alt).into_owned(),
+                TextOrigin::NONE,
             )]),
             marker: None,
             marker_image: None,
@@ -1292,7 +1319,7 @@ impl Builder<'_> {
                 // inside that text's anonymous item.
                 let only_breaks = run.iter().all(|inline| {
                     matches!(inline, Inline::Br)
-                        || matches!(inline, Inline::Text(text) if text.chars().all(is_collapsible_space))
+                        || matches!(inline, Inline::Text(text, _) if text.chars().all(is_collapsible_space))
                 });
                 if only_breaks {
                     run.clear();
@@ -1515,7 +1542,7 @@ impl Builder<'_> {
         // during serialization. Direct layout keeps the canonical DOM intact
         // and generates the equivalent anonymous UA content in the box tree.
         if let Some(text) = self.dom.render_clickable_fallback(id) {
-            out.insert(0, Built::Inline(Inline::Text(text)));
+            out.insert(0, Built::Inline(Inline::Text(text, TextOrigin::NONE)));
         }
         // CSS Pseudo 4 §4.1: generated `::before`/`::after` boxes are the
         // originating element's first/last children. `content:""` still
@@ -1549,8 +1576,12 @@ impl Builder<'_> {
         let kids: Vec<Inline> = content
             .into_iter()
             .filter_map(|item| match item {
-                crate::dom::GeneratedContent::Text(text) => (!text.is_empty())
-                    .then(|| Inline::Text(crate::dom::display_text(&text).into_owned())),
+                crate::dom::GeneratedContent::Text(text) => (!text.is_empty()).then(|| {
+                    Inline::Text(
+                        crate::dom::display_text(&text).into_owned(),
+                        TextOrigin::NONE,
+                    )
+                }),
                 crate::dom::GeneratedContent::Image(source) => {
                     let url = self
                         .dom
@@ -1676,6 +1707,7 @@ impl Builder<'_> {
                 NodeData::Text(t) if !t.is_empty() => {
                     out.push(Built::Inline(Inline::Text(
                         crate::dom::display_text(t).into_owned(),
+                        TextOrigin::of(c),
                     )));
                 }
                 NodeData::Element { .. } => match self.element(c) {
@@ -2017,11 +2049,11 @@ impl Builder<'_> {
         // bare text needs the row/group's inline context, not the table's.
         if let Some(parent) = parent {
             for child in &mut kids {
-                if let Built::Inline(Inline::Text(text)) = child {
+                if let Built::Inline(Inline::Text(text, origin)) = child {
                     *child = Built::Inline(Inline::Box {
                         node: parent,
                         style: Arc::new(BoxStyle::anonymous()),
-                        kids: vec![Inline::Text(std::mem::take(text))].into(),
+                        kids: vec![Inline::Text(std::mem::take(text), *origin)].into(),
                     });
                 }
             }
@@ -2261,7 +2293,7 @@ impl Builder<'_> {
 /// empty `<a name>`/`<span id>` is a fragment scroll target.
 fn inline_has_content(i: &Inline) -> bool {
     match i {
-        Inline::Text(t) => !t.chars().all(is_collapsible_space),
+        Inline::Text(t, _) => !t.chars().all(is_collapsible_space),
         Inline::Box { .. } => true,
         Inline::Atom(_) => true,
         // An atomic inline box is opaque content on the line (like an atom).

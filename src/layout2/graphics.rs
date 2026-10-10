@@ -18,8 +18,8 @@ use crate::render::{
     DisplayCommand, GradientInterpolation, GradientStop, HitRegion, ImageFit, ImageHandle,
     ImageRequest, ImageSampling, LineCap, LineJoin, MarqueeBehavior, MarqueeDirection,
     MarqueeScope, PagePaint, PaintBrush, PaintColor, PaintLine, PaintShape, PathElement,
-    ScrollContainer, StickyConstraint, StrokeStyle, TextDecorationPaint, TextShadowPaint,
-    TopLayerEntry,
+    RunSelection, ScrollContainer, StickyConstraint, StrokeStyle, TextDecorationPaint,
+    TextShadowPaint, TextSourceSpan, TopLayerEntry,
 };
 
 use super::ImageSizes;
@@ -128,6 +128,18 @@ struct Builder<'a> {
     /// trigger are then emitted so backdrop filters stop at the right
     /// element (Filter Effects 2 #BackdropRoot).
     backdrop_filters: bool,
+    /// Per element whose text a run lays out: its `::selection` paint, or
+    /// `None` where `user-select` is `none` (`Builder::run_selection`).
+    selection_paint: rustc_hash::FxHashMap<NodeId, Option<crate::render::HighlightPaint>>,
+    /// Used `user-select` values resolved so far (`Dom::user_select_memo`).
+    user_select: rustc_hash::FxHashMap<NodeId, crate::dom::UserSelect>,
+    /// The last element `run_selection` resolved: consecutive runs mostly
+    /// share one.
+    last_selection_paint: Option<(NodeId, Option<crate::render::HighlightPaint>)>,
+    /// The document styles `::selection` (`Dom::has_selection_rules`).
+    selection_rules: bool,
+    /// Elements whose images are replaced content (`PagePaint::replaced_images`).
+    replaced_images: HashSet<NodeId>,
 }
 
 /// Whether `fragment` or a descendant has a `backdrop-filter`.
@@ -136,6 +148,51 @@ fn has_backdrop_filter(fragment: &Frag) -> bool {
 }
 
 impl<'a> Builder<'a> {
+    /// What a selection makes of a text run (Selection API §2): the DOM text
+    /// it lays out, unless its element's used `user-select` is `none` (CSS
+    /// UI 4 #content-selection: such text neither starts nor shows a
+    /// selection), and how its originating element's `::selection` paints
+    /// (CSS Pseudo 4 #highlight-styling). The element is the parent of the
+    /// run's Text node, which a selection's highlight belongs to.
+    fn run_selection(&mut self, sources: &[TextSourceSpan]) -> RunSelection {
+        let Some(element) = sources
+            .first()
+            .and_then(|span| self.dom.node(span.node).parent)
+        else {
+            return RunSelection::default();
+        };
+        let paint = match self.last_selection_paint {
+            Some((last, paint)) if last == element => paint,
+            _ => {
+                let (dom, rules) = (self.dom, self.selection_rules);
+                let user_select = &mut self.user_select;
+                let paint = *self.selection_paint.entry(element).or_insert_with(|| {
+                    (dom.user_select_memo(element, user_select) != crate::dom::UserSelect::None)
+                        .then(|| {
+                            if rules {
+                                super::selection_highlight(dom, element)
+                            } else {
+                                crate::render::HighlightPaint::Ua
+                            }
+                        })
+                });
+                self.last_selection_paint = Some((element, paint));
+                paint
+            }
+        };
+        match paint {
+            Some(highlight) => RunSelection {
+                sources: Some(std::sync::Arc::from(sources)),
+                highlight,
+                ..RunSelection::default()
+            },
+            None => RunSelection {
+                unselectable: true,
+                ..RunSelection::default()
+            },
+        }
+    }
+
     fn viewport(&self) -> Vp {
         Vp {
             w: self.viewport_w,
@@ -205,6 +262,11 @@ impl<'a> Builder<'a> {
                 || top_layer
                     .iter()
                     .any(|top| has_backdrop_filter(&top.fragment)),
+            selection_paint: Default::default(),
+            user_select: Default::default(),
+            last_selection_paint: None,
+            selection_rules: dom.has_selection_rules(),
+            replaced_images: HashSet::new(),
         };
         this.collect_legacy_clips(root);
         this.collect_scroll_containers(root, false);
@@ -1041,6 +1103,7 @@ fn paint_in_spaces(
         scroll_containers: builder.scroll_containers,
         sticky_constraints: builder.sticky_constraints,
         timeline_origin_ms: dom.document_timeline_origin(),
+        replaced_images: std::mem::take(&mut builder.replaced_images),
     };
     let media_fallbacks = dom.retained_media_controls();
     if builder.has_media_controls || !media_fallbacks.is_empty() {
@@ -2067,6 +2130,16 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
                     None => text_shadows(builder.dom, style_node, current_color),
                 };
                 let label_hidden = placeholder_paint.as_ref().is_some_and(|p| p.hidden);
+                // A control's label and generated text are not the
+                // document's text; only a Text node's runs are selectable.
+                let mut selection = if form_piece || piece.control_text.is_some() {
+                    RunSelection::default()
+                } else {
+                    RunSelection {
+                        line_start: piece.line_start,
+                        ..builder.run_selection(&piece.sources)
+                    }
+                };
                 let label_layer = placeholder_paint
                     .as_ref()
                     .is_some_and(|p| !p.hidden && p.opacity < 1.0);
@@ -2131,6 +2204,8 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
                             clip,
                             node,
                             link: piece.item.link.clone(),
+                            // Only a text piece's single run is selectable.
+                            selection: std::mem::take(&mut selection),
                         },
                     );
                     // WHATWG Compatibility #the-webkit-text-stroke-width: stroke
@@ -2270,6 +2345,9 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
                     None => node != NO_NODE && builder.dom.canvas_size(node).is_some(),
                 };
                 if let Some(handle) = handle {
+                    if node != NO_NODE {
+                        builder.replaced_images.insert(node);
+                    }
                     builder.push_clipped_marquee_content(
                         node,
                         DisplayCommand::Image {
@@ -7291,6 +7369,11 @@ fn text_color_for_style(dom: &Dom, style: PaintStyle) -> PaintColor {
 
 fn resolve_color(dom: &Dom, node: NodeId, value: &str) -> Option<PaintColor> {
     resolve_color_for_style(dom, PaintStyle::Element(node), value)
+}
+
+/// A CSS color value as `node` paints it (for `layout2::highlight`).
+pub(super) fn resolve_element_color(dom: &Dom, node: NodeId, value: &str) -> Option<PaintColor> {
+    resolve_color(dom, node, value)
 }
 
 fn resolve_color_for_style(dom: &Dom, style: PaintStyle, value: &str) -> Option<PaintColor> {
