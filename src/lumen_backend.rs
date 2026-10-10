@@ -5046,6 +5046,16 @@ mod desktop {
     }
 
     fn extract_live(page: &mut LumenPage) -> (String, crate::http::RenderedPage, bool) {
+        let interaction = install_interaction_metadata(page);
+        paint_live(page, interaction)
+    }
+
+    /// The rendering update's presentation inputs that layout reads: canvas
+    /// and WebGL frames, SVG sprites, and the activation and hover hit-test
+    /// sets. Returns the activation set and whether anything is interactive.
+    fn install_interaction_metadata(
+        page: &mut LumenPage,
+    ) -> (std::collections::HashSet<usize>, bool) {
         webgl_host::publish(page.engine.ctx(), true, None);
         // HTML #offscreencanvas-placeholder: this Window agent's rendering
         // update pushes its OffscreenCanvases' bitmaps and presents frames.
@@ -5073,6 +5083,15 @@ mod desktop {
             dom.set_paint_patch_hosts(paint.into_iter().collect());
             dom.set_render_clickables(clickable.clone(), true);
         }
+        (clickable, has_interaction)
+    }
+
+    /// Lay out (reusing the retained geometry) and paint the live document
+    /// with the installed presentation metadata.
+    fn paint_live(
+        page: &mut LumenPage,
+        (clickable, has_interaction): (std::collections::HashSet<usize>, bool),
+    ) -> (String, crate::http::RenderedPage, bool) {
         let (viewport, ratio, images) = page
             .engine
             .ctx()
@@ -5153,22 +5172,32 @@ mod desktop {
 
     fn render_with_observers(page: &mut LumenPage) -> (String, crate::http::RenderedPage, bool) {
         let _animation_sample = CssAnimationSample::new(page.engine.ctx());
-        let mut rendered = extract_live(page);
+        // HTML #update-the-rendering: style and layout, then the resize
+        // observation rounds (each relayouts what its callbacks changed, as
+        // the observers read geometry), and only then paint. The geometry
+        // the observers read comes from the same lazily maintained layout
+        // transaction the paint below reuses.
+        let interaction = install_interaction_metadata(page);
         // CSSOM View §13.1 compares each nested Document's viewport after the
         // layout pass that established its iframe dimensions. The parent
         // resize task updates the top-level viewport first; run the nested
-        // resize steps here, then repaint if a child handler changed the DOM.
-        if trust_number(page, "updateFrameResizes").unwrap_or(0.0) > 0.0 {
-            rendered = extract_live(page);
-        }
+        // resize steps here, before the document's own observations.
+        let mut observed = trust_number(page, "updateFrameResizes").unwrap_or(0.0) > 0.0;
         for _ in 0..6 {
             let resized = trust_number(page, "updateResizes").unwrap_or(0.0);
             checkpoint(page, "rendering observers");
             if resized <= 0.0 || page.outcome.panicked {
                 break;
             }
-            rendered = extract_live(page);
+            observed = true;
         }
+        // Observer callbacks may have changed the activation and hover sets.
+        let interaction = if observed {
+            install_interaction_metadata(page)
+        } else {
+            interaction
+        };
+        let rendered = paint_live(page, interaction);
         let _ = trust_number(page, "updateIntersections");
         start_font_fetches(page);
         start_style_import_fetches(page);
