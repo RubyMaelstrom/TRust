@@ -93,6 +93,31 @@ trait Backend: Send + Sync {
 /// headless renderer) turns it off and plays in silent real time.
 static DEVICE_OUTPUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
+/// The default output device's preferred sample rate and channel count
+/// (Web Audio's default `sampleRate` and `maxChannelCount`), or 48 kHz
+/// stereo when no device answers.
+pub fn default_device() -> (u32, u16) {
+    let found: Option<(u32, u16)> = if !DEVICE_OUTPUT.load(std::sync::atomic::Ordering::Relaxed)
+        || std::env::var_os("TRUST_AUDIO").is_some_and(|value| value == "null")
+    {
+        None
+    } else {
+        #[cfg(target_os = "linux")]
+        {
+            pulse::default_device()
+        }
+        #[cfg(windows)]
+        {
+            wasapi::default_device()
+        }
+        #[cfg(not(any(target_os = "linux", windows)))]
+        {
+            None
+        }
+    };
+    found.unwrap_or((48_000, 2))
+}
+
 /// Play all media of this process silently (`trust-headless`).
 pub fn disable_device_output() {
     DEVICE_OUTPUT.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -105,9 +130,20 @@ pub struct Output {
 }
 
 impl Output {
-    /// Open a stream on the platform's default device, starting paused.
-    /// Falls back through the platform backends; fails when none works.
+    /// Open a stream on the platform's default device, starting paused,
+    /// with media playback's ~100 ms of buffering.
     pub fn open(format: Format, render: Arc<dyn Render>) -> Result<Self, Error> {
+        Self::open_with_latency(format, std::time::Duration::from_millis(100), render)
+    }
+
+    /// Open a stream asking the device for `latency` of buffering (Web
+    /// Audio's latency hint). Falls back through the platform backends;
+    /// fails when none works.
+    pub fn open_with_latency(
+        format: Format,
+        latency: std::time::Duration,
+        render: Arc<dyn Render>,
+    ) -> Result<Self, Error> {
         if format.rate == 0 || format.channels == 0 || format.channels > 32 {
             return Err(Error(format!("invalid format {format:?}")));
         }
@@ -119,7 +155,7 @@ impl Output {
         let mut errors = Vec::new();
         #[cfg(target_os = "linux")]
         {
-            match pulse::Pulse::open(format, render.clone()) {
+            match pulse::Pulse::open(format, latency, render.clone()) {
                 Ok(backend) => {
                     return Ok(Self {
                         backend: Box::new(backend),
@@ -128,7 +164,7 @@ impl Output {
                 }
                 Err(error) => errors.push(error.0),
             }
-            match alsa::Alsa::open(format, render.clone()) {
+            match alsa::Alsa::open(format, latency, render.clone()) {
                 Ok(backend) => {
                     return Ok(Self {
                         backend: Box::new(backend),
@@ -140,7 +176,7 @@ impl Output {
         }
         #[cfg(windows)]
         {
-            match wasapi::Wasapi::open(format, render.clone()) {
+            match wasapi::Wasapi::open(format, latency, render.clone()) {
                 Ok(backend) => {
                     return Ok(Self {
                         backend: Box::new(backend),
@@ -150,7 +186,7 @@ impl Output {
                 Err(error) => errors.push(error.0),
             }
         }
-        let _ = &render;
+        let _ = (&render, latency);
         if errors.is_empty() {
             errors.push(String::from("no audio backend on this platform"));
         }
@@ -266,6 +302,7 @@ mod tests {
                 rate: 48_000,
                 channels: 2,
             },
+            Duration::from_millis(100),
             render.clone(),
         ) else {
             eprintln!("skipping: no WASAPI endpoint");
@@ -298,6 +335,7 @@ mod tests {
                 rate: 44_100,
                 channels: 2,
             },
+            Duration::from_millis(100),
             render.clone(),
         ) else {
             return;

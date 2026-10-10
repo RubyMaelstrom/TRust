@@ -119,6 +119,6 @@ checkAudio(processor.onaudioprocess === handlerObject, 'non-callable object reta
 processor.onaudioprocess = () => processCalls++;
 processor.connect(destination);
 var silentResume = 'pending';
-silentContext.resume().catch(error => { silentResume = error.name; });
+silentContext.resume().then(() => { silentResume = 'resumed'; }, error => { silentResume = error.name; });
 secondContext.close();
 'audio-script-processor-ready'

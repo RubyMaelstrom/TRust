@@ -9,7 +9,7 @@
 use std::ffi::{CString, c_char, c_int, c_long, c_uint, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::{Backend, Error, Format, Position, Render};
 
@@ -87,7 +87,11 @@ pub(super) struct Alsa {
 }
 
 impl Alsa {
-    pub(super) fn open(format: Format, render: Arc<dyn Render>) -> Result<Self, Error> {
+    pub(super) fn open(
+        format: Format,
+        latency: Duration,
+        render: Arc<dyn Render>,
+    ) -> Result<Self, Error> {
         let api = api().ok_or_else(|| Error(String::from("libasound.so.2 unavailable")))?;
         let name = CString::new("default").expect("no NUL");
         let mut pcm = std::ptr::null_mut();
@@ -96,7 +100,7 @@ impl Alsa {
         if status < 0 || pcm.is_null() {
             return Err(Error(format!("snd_pcm_open failed ({status})")));
         }
-        // SAFETY: `pcm` is open; 100 ms latency with soft resampling.
+        // SAFETY: `pcm` is open; the requested latency with soft resampling.
         let status = unsafe {
             (api.set_params)(
                 pcm,
@@ -105,7 +109,7 @@ impl Alsa {
                 c_uint::from(format.channels),
                 format.rate,
                 1,
-                100_000,
+                latency.as_micros().clamp(5_000, 1_000_000) as c_uint,
             )
         };
         if status < 0 {

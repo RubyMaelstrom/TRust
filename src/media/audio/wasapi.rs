@@ -9,7 +9,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Media::Audio::{
@@ -27,8 +27,6 @@ use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use super::{Backend, Error, Format, Position, Render};
 
 const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
-/// Requested buffer: 100 ms, in 100-nanosecond units.
-const BUFFER_DURATION: i64 = 1_000_000;
 
 struct State {
     paused: bool,
@@ -74,7 +72,7 @@ struct Stream {
 impl Stream {
     /// # Safety
     /// COM must be initialised on the calling thread.
-    unsafe fn open(format: Format) -> windows::core::Result<Self> {
+    unsafe fn open(format: Format, latency: Duration) -> windows::core::Result<Self> {
         // SAFETY: plain COM calls with valid arguments on an initialised
         // apartment; the format structure outlives `Initialize`.
         unsafe {
@@ -104,7 +102,8 @@ impl Stream {
                 AUDCLNT_STREAMFLAGS_EVENTCALLBACK
                     | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
                     | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
-                BUFFER_DURATION,
+                // The requested buffer, in 100-nanosecond units.
+                (latency.as_nanos() / 100).clamp(30_000, 10_000_000) as i64,
                 0,
                 (&raw const wave).cast(),
                 None,
@@ -166,8 +165,40 @@ impl Drop for Stream {
     }
 }
 
+/// The default endpoint's mix format: sample rate and channel count.
+pub(super) fn default_device() -> Option<(u32, u16)> {
+    std::thread::spawn(|| {
+        // SAFETY: a short-lived thread's own apartment; COM objects are
+        // released before CoUninitialize.
+        unsafe {
+            CoInitializeEx(None, COINIT_MULTITHREADED).ok().ok()?;
+            let result = (|| -> windows::core::Result<(u32, u16)> {
+                let enumerator: IMMDeviceEnumerator =
+                    CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+                let device = enumerator.GetDefaultAudioEndpoint(eRender, eConsole)?;
+                let client: IAudioClient = device.Activate(CLSCTX_ALL, None)?;
+                let mix = client.GetMixFormat()?;
+                let format = ((*mix).nSamplesPerSec, (*mix).nChannels);
+                windows::Win32::System::Com::CoTaskMemFree(Some(mix.cast_const().cast()));
+                Ok(format)
+            })();
+            CoUninitialize();
+            result
+                .ok()
+                .filter(|&(rate, channels)| rate > 0 && channels > 0)
+        }
+    })
+    .join()
+    .ok()
+    .flatten()
+}
+
 impl Wasapi {
-    pub(super) fn open(format: Format, render: Arc<dyn Render>) -> Result<Self, Error> {
+    pub(super) fn open(
+        format: Format,
+        latency: Duration,
+        render: Arc<dyn Render>,
+    ) -> Result<Self, Error> {
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 paused: true,
@@ -189,7 +220,7 @@ impl Wasapi {
                     return;
                 }
                 // SAFETY: COM is initialised on this thread.
-                match unsafe { Stream::open(format) } {
+                match unsafe { Stream::open(format, latency) } {
                     Ok(stream) => {
                         let _ = opened.send(Ok(()));
                         run(&stream, format, render.as_ref(), &thread_shared);

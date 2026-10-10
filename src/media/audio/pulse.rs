@@ -30,6 +30,18 @@ fn client() -> Option<Arc<pulseaudio::Client>> {
         .clone()
 }
 
+/// The default sink's sample rate and channel count.
+pub(super) fn default_device() -> Option<(u32, u16)> {
+    let client = client()?;
+    let server = futures::executor::block_on(client.server_info()).ok()?;
+    let spec = server
+        .default_sink_name
+        .and_then(|name| futures::executor::block_on(client.sink_info_by_name(name)).ok())
+        .map_or(server.sample_spec, |sink| sink.sample_spec);
+    (spec.sample_rate > 0 && spec.channels > 0)
+        .then_some((spec.sample_rate, u16::from(spec.channels)))
+}
+
 fn channel_map(channels: u16) -> Option<protocol::ChannelMap> {
     use protocol::ChannelPosition::*;
     // WAVE-order defaults (the order TRust's decoders output) for the
@@ -85,10 +97,17 @@ pub(super) struct Pulse {
 }
 
 impl Pulse {
-    pub(super) fn open(format: Format, render: Arc<dyn Render>) -> Result<Self, Error> {
+    pub(super) fn open(
+        format: Format,
+        latency: Duration,
+        render: Arc<dyn Render>,
+    ) -> Result<Self, Error> {
         let client = client().ok_or_else(|| Error(String::from("no PulseAudio server")))?;
         let frame_bytes = format.frame_bytes();
-        let target = (format.rate as usize / 10 * frame_bytes) as u32;
+        let latency_frames = (latency.as_secs_f64() * f64::from(format.rate))
+            .ceil()
+            .max(1.0) as usize;
+        let target = (latency_frames * frame_bytes) as u32;
         let params = protocol::PlaybackStreamParams {
             sample_spec: protocol::SampleSpec {
                 format: protocol::SampleFormat::Float32Le,

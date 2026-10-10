@@ -114,6 +114,12 @@ The project favors:
   (`resource.rs`), Media Source Extensions (`mse/`) and the terminal's mpv
   handoff (`external.rs`). `src/media_host.rs` is the page actor's binding
   layer.
+- `src/webaudio/`: the Web Audio rendering engine: render-quantum buses and
+  channel mixing (`bus.rs`), AudioParam timelines (`param.rs`), the graph
+  and its ordering (`graph.rs`), node processors (`nodes/`), PeriodicWave
+  tables (`wave.rs`), each context's rendering thread (`engine.rs`) and
+  decodeAudioData's decoding threads (`decode.rs`, `resample.rs`).
+  `src/webaudio_host.rs` binds it to the prelude's Web Audio block.
 - `src/ui.rs`: Ratatui rendering for browser documents, inline images, fixed
   layers, scrollbars, dialogs, and terminal sessions.
 - `src/file_select.rs`: user-chosen files (accept filters, MIME types,
@@ -706,16 +712,32 @@ current behavior and limits; consult the governing standards before changing it.
   IDs as `encrypted` events. Widevine and PlayReady are not available, so
   DRM-only sites (Vimeo's protected videos, Netflix) do not play. The
   `encrypted-media` permissions policy is not checked.
-- Web Audio `AudioContext`s stay suspended with a stationary clock: there is no
-  output device, renderer acquisition errors asynchronously and `resume()`
-  rejects with `NotSupportedError`. `OfflineAudioContext` renders on the page's
-  DOM task queue (64 render quanta per task) with sample-accurate `AudioParam`
-  automation, speaker channel mixing, `OscillatorNode` (band-limited
-  `PeriodicWave` tables), `GainNode`, `DynamicsCompressorNode` (TRust's
-  documented knee/detector/envelope curves), `AudioBufferSourceNode` and
-  `AudioBuffer`. Keep its output deterministic; the compressor probe test pins
-  it. `ScriptProcessorNode` renders silence offline without `audioprocess`;
-  decoding, worklets, other node types, and playback are unimplemented.
+- Web Audio renders in Rust (`src/webaudio/`) on one rendering thread per
+  context, in both frontends. The prelude's block is the control thread: it
+  validates and queues control messages through `__audio_context_binding`;
+  the thread swaps the queue each render quantum (#rendering-loop) and its
+  reports return as `LumenHostTask::WebAudio` tasks. An `AudioContext`
+  renders ahead of the default output device (its preferred rate and
+  channel count are the defaults) through a lock-free ring sized by the
+  latency hint, paced by the device; suspended contexts sleep. Like Firefox,
+  a context is allowed to start only once its Window has sticky activation:
+  until then `resume()` waits, and `start()` on a source starts a context
+  that is allowed but blocked. `sinkId` {type: "none"}, a missing device and
+  trust-headless use a silent real-time sink. `OfflineAudioContext` renders
+  as fast as it can on its own thread, suspending at scheduled quanta. The
+  graph is ordered by strongly connected components (cycles are muted);
+  nodes not actively processing output one silent channel and are skipped.
+  Implemented: sample-accurate `AudioParam` automation, speaker channel
+  mixing, `OscillatorNode` (band-limited `PeriodicWave` tables), `GainNode`,
+  `DynamicsCompressorNode` (TRust's documented knee/detector/envelope
+  curves), `AudioBufferSourceNode`, `AudioBuffer` (content acquired into the
+  host, `getChannelData()` copies back lazily) and `decodeAudioData()`
+  (decoding threads, first audio track, windowed-sinc resampling). Keep the
+  rendering deterministic; the compressor probe test pins it.
+  `ScriptProcessorNode` renders silence without `audioprocess`; other node
+  types and worklets are unimplemented. A collected node is released to the
+  rendering thread and leaves the graph once silent; a started source and a
+  running context stay alive until they end or suspend.
 - WebAssembly exception handling runs both the legacy (`try`/`catch`/
   `rethrow`/`delegate`) and the standardized (`try_table`, `throw_ref`,
   `exnref`) instructions in the Wasmi fork; exceptions caught by reference

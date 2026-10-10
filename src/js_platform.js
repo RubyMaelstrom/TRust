@@ -12947,44 +12947,50 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         }
     }
 
-    // Web Audio 1.1, local WebAudio/web-audio-api@2047f16 (2026-09-06):
-    // #AudioContext-constructors, #AudioContext-methods, #sample-rates.
-    // Context construction is distinct from acquiring a renderer. Applications
-    // can create a suspended context while assembling their interface. TRust
-    // has no audio output device: acquisition fails asynchronously and resume
-    // rejects, without advancing the sample clock or reporting playback.
-    // Web Audio #AudioContext-methods (suspend) forbids processing callbacks while
-    // suspended: connecting nodes schedules no work and allocates no PCM.
+    // Web Audio 1.1, local WebAudio/web-audio-api@2047f16 (2026-09-06).
+    // This block is the control thread (#control-thread-and-rendering-thread):
+    // it owns the API objects, runs Web IDL conversion and every method's
+    // synchronous validation, and queues control messages to each context's
+    // rendering thread through the private `__audio_context_binding`
+    // (`webaudio_host`), which renders the graph in Rust (`crate::webaudio`):
+    // #rendering-loop, #computation-of-value, #waveform-generation,
+    // #DynamicsCompressorOptions-processing, #playback-AudioBufferSourceNode
+    // and #channel-up-mixing-and-down-mixing. The rendering threads' reports
+    // arrive as tasks through `trust.webAudioEvent`.
     //
-    // #OfflineAudioContext renders without a device. Its rendering thread is
-    // this realm's DOM task queue: each task renders a bounded number of render
-    // quanta of the graph (#rendering-loop) into the AudioBuffer that
-    // startRendering() resolves. The implemented processing nodes are
-    // OscillatorNode (band-limited PeriodicWave tables, #waveform-generation),
-    // GainNode, DynamicsCompressorNode (#DynamicsCompressorOptions-processing),
-    // AudioBufferSourceNode (#playback-AudioBufferSourceNode) and the
-    // destination, with sample-accurate AudioParam automation
-    // (#computation-of-value) and speaker channel mixing
-    // (#channel-up-mixing-and-down-mixing). A ScriptProcessorNode renders
-    // silence and dispatches no audioprocess events; decoding, worklets and
-    // other node types remain unimplemented.
+    // An AudioContext renders into the default audio output device (a silent
+    // real-time sink emulates one for sinkId {type: "none"}, without a device,
+    // and in trust-headless). Like Firefox, a context is allowed to start
+    // (#AudioContext-constructors) once its Window has sticky activation;
+    // until then resume() stays pending. An OfflineAudioContext renders on its
+    // own thread as fast as it can into the buffer startRendering() resolves.
+    //
+    // Objects are released to the rendering thread when collected; a started
+    // source node is kept until it ends, and a running context until it is
+    // suspended or closed. A ScriptProcessorNode renders silence and
+    // dispatches no audioprocess events.
     function installAudioContexts() {
         const binding = g.__audio_context_binding;
         delete g.__audio_context_binding;
         const slots = binding("slots", new WeakMap()), token = {};
         const get = WeakMap.prototype.get.bind(slots), set = WeakMap.prototype.set.bind(slots);
+        const host = (...args) => apply(binding, undefined, args);
         const PromiseCtor = Promise, Exception = DOMException;
         const finite = Number.isFinite, fround = Math.fround, NumberCtor = Number;
         const define = Object.defineProperty, freeze = Object.freeze, create = Object.create;
-        const apply = Reflect.apply, construct = Reflect.construct;
-        const F32 = Float32Array;
-        const floor = Math.floor, ceil = Math.ceil, abs = Math.abs, min = Math.min, max = Math.max;
-        const pow = Math.pow, exp = Math.exp, log10 = Math.log10, sin = Math.sin, cos = Math.cos;
-        const sqrt = Math.sqrt, PI = Math.PI, round = Math.round;
+        const apply = Reflect.apply;
+        const F32 = Float32Array, F64 = Float64Array;
+        const floor = Math.floor, ceil = Math.ceil, min = Math.min, max = Math.max, log2 = Math.log2;
         const iteratorSymbol = Symbol.iterator;
         const transferBuffer = ArrayBuffer.prototype.transfer;
+        const bufferByteLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength").get;
+        const bufferIsDetached = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "detached").get;
+        const MapCtor = Map, SetCtor = Set;
+        const mapGet = Map.prototype.get, mapSet = Map.prototype.set, mapDelete = Map.prototype.delete;
         const typedArrayLength = Object.getOwnPropertyDescriptor(
             Object.getPrototypeOf(F32.prototype), "length").get;
+        const typedArrayBuffer = Object.getOwnPropertyDescriptor(
+            Object.getPrototypeOf(F32.prototype), "buffer").get;
         const typedArrayTag = Object.getOwnPropertyDescriptor(
             Object.getPrototypeOf(F32.prototype), Symbol.toStringTag).get;
         const MAX_FLOAT = 3.4028234663852886e38;
@@ -12992,7 +12998,15 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // Total samples one AudioBuffer may hold (512 MiB of float data).
         // Larger buffers cannot be created ("internal data cannot be created").
         const MAX_BUFFER_SAMPLES = 134217728;
-        const SQRT_HALF = sqrt(0.5);
+        // Live contexts by host id (`webaudio_host`): running AudioContexts,
+        // contexts with a state transition in flight, and rendering
+        // OfflineAudioContexts are kept here; others may be collected.
+        const live = new MapCtor();
+        const liveGet = id => apply(mapGet, live, [id]);
+        const contextRelease = new FinalizationRegistry(id => host("drop", id));
+        const nodeRelease = new FinalizationRegistry(held => host("release", held.context, held.node));
+        const contentRelease = new FinalizationRegistry(id => host("bufferRelease", id));
+        const waveRelease = new FinalizationRegistry(id => host("waveRelease", id));
 
         // ---- brands, conversions and shared helpers ----
         function contextRecord(context) {
@@ -13088,19 +13102,33 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (!binding("active", contextId))
                 throw new Exception("Document is not fully active", "InvalidStateError");
         }
-        function requireOpen(context) {
-            const state = record(context);
-            requireActive(state.contextId);
-            if (state.closed) throw new Exception("AudioContext is closed", "InvalidStateError");
-            return state;
-        }
         function queue(fn) { __queue_dom_task(fn); }
         function rejected(error) { return apply(PromiseCtor.reject, PromiseCtor, [error]); }
         function fire(target, type, init) {
             dispatch(target, createTrustedEvent(Event, type, init || {}), false);
         }
-        function linearToDecibels(value) { return value === 0 ? -1000 : 20 * log10(value); }
-        function decibelsToLinear(value) { return pow(10, value / 20); }
+        // Keep a context reachable while it can still change observably.
+        function retain(state) {
+            if (state.object) apply(mapSet, live, [state.id, state.object]);
+        }
+        function updateRetention(state) {
+            const busy = state.tokens.size || state.sources.size || state.decodes.size ||
+                (state.kind === "context" ? state.state === "running" && !state.closed
+                    : state.jobs.length || state.state === "running");
+            if (busy) retain(state);
+            else apply(mapDelete, live, [state.id]);
+        }
+        // A control message whose completion the rendering thread reports.
+        function sendWithToken(state, op, done) {
+            const tokenId = ++state.nextToken;
+            apply(mapSet, state.tokens, [tokenId, done]);
+            retain(state);
+            host(op, state.id, tokenId);
+        }
+        // [[current frame]] / sampleRate.
+        function contextTime(state) {
+            return host("frame", state.id) / state.rate;
+        }
 
         // ---- AudioContext construction options ----
         function options(value) {
@@ -13108,53 +13136,74 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 throw new TypeError("AudioContext options must be a dictionary");
             // Web IDL #js-to-dictionary: get and convert each member once, in
             // lexicographic order, before executing constructor validation.
-            const latency = value == null ? undefined : value.latencyHint;
-            if (latency !== undefined) {
-                if (typeof latency === "number") {
-                    if (!finite(latency)) throw new TypeError("Latency must be finite");
-                } else enumValue(latency, ["balanced", "interactive", "playback"]);
+            let latency = value == null ? undefined : value.latencyHint;
+            // #dom-audiocontextoptions-latencyhint: the categories become
+            // target latencies; a number is clamped to what the device can do.
+            if (latency === undefined) latency = 0.015;
+            else if (typeof latency === "number") {
+                if (!finite(latency)) throw new TypeError("Latency must be finite");
+                latency = min(max(latency, 0.003), 1);
+            } else {
+                const category = enumValue(latency, ["balanced", "interactive", "playback"]);
+                latency = category === "interactive" ? 0.015 : category === "balanced" ? 0.05 : 0.15;
             }
             const sizing = renderSize(value == null ? undefined : value.renderSizeHint);
             let rate = value == null ? undefined : value.sampleRate;
-            if (rate === undefined) rate = 48000;
-            else {
+            if (rate !== undefined) {
                 rate = fround(+rate);
                 if (!finite(rate)) throw new TypeError("Sample rate must be a finite float");
             }
-            const sink = value == null ? undefined : value.sinkId;
-            if (sink !== undefined) {
-                if (sink === null || typeof sink === "object" || typeof sink === "function") {
-                    const type = sink === null ? undefined : sink.type;
+            const sinkValue = value == null ? undefined : value.sinkId;
+            let sink = "";
+            if (sinkValue !== undefined) {
+                if (sinkValue === null || typeof sinkValue === "object" || typeof sinkValue === "function") {
+                    const type = sinkValue === null ? undefined : sinkValue.type;
                     if (type === undefined) throw new TypeError("Audio sink type is required");
-                    enumValue(type, ["none"]);
-                } else `${sink}`;
+                    sink = {type: enumValue(type, ["none"])};
+                } else sink = `${sinkValue}`;
             }
-            return {rate, quantum: sizing.quantum, hardware: sizing.hardware};
+            return {rate, latency, quantum: sizing.quantum, hardware: sizing.hardware, sink};
         }
         // (AudioContextRenderSizeCategory or unsigned long) renderSizeHint.
         function renderSize(quantum) {
             if (quantum === undefined) return {quantum: 128, hardware: false};
             if (typeof quantum === "number") return {quantum: quantum >>> 0, hardware: false};
             const hardware = enumValue(quantum, ["default", "hardware"]) === "hardware";
-            return {quantum: hardware ? 0 : 128, hardware};
+            return {quantum: 128, hardware};
         }
         function validateRateAndQuantum(state) {
             if (state.rate < 3000 || state.rate > 768000)
                 throw new Exception("Unsupported sample rate", "NotSupportedError");
-            if ((!state.hardware && state.quantum < 1) || state.quantum > floor(6 * state.rate))
+            if (state.quantum < 1 || state.quantum > floor(6 * state.rate))
                 throw new Exception("Unsupported render quantum size", "NotSupportedError");
         }
 
-        // ---- AudioParam (#AudioParam, #computation-of-value) ----
+        // ---- AudioParam (#AudioParam) ----
+        // Automation events are kept here only for the methods' validation
+        // (value curves may not overlap other events); the rendering thread
+        // keeps the timeline and computes values (`webaudio::param`).
         const SET = 0, LINEAR = 1, EXPONENTIAL = 2, TARGET = 3, CURVE = 4;
         class AudioParam {
             constructor() { throw new TypeError("Illegal constructor"); }
-            get value() { return paramRecord(this).current; }
+            get value() {
+                const state = paramRecord(this);
+                // A value set by this task reads back until the rendering
+                // thread has seen it.
+                if (state.pinned) return state.current;
+                const value = host("value", get(state.context).id, state.id);
+                return typeof value === "number" && value === value ? value : state.current;
+            }
             set value(value) {
                 const state = paramRecord(this);
                 value = float(value, "AudioParam value");
+                const now = contextTime(get(state.context));
+                insertEvent(state, SET, now, 0);
                 state.current = value;
-                insertEvent(state, {type: SET, time: contextTime(state.context), value});
+                if (!state.pinned) {
+                    state.pinned = true;
+                    imageMicrotask(() => { state.pinned = false; });
+                }
+                automate(state, 0, value, 0, 0, now);
             }
             get automationRate() { return paramRecord(this).rate; }
             set automationRate(value) {
@@ -13165,6 +13214,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 if (state.fixedRate && value !== state.fixedRate)
                     throw new Exception("This AudioParam's automation rate is fixed", "InvalidStateError");
                 state.rate = value;
+                automate(state, 8, value === "k-rate" ? 1 : 0, 0, 0, 0);
             }
             get defaultValue() { return paramRecord(this).defaultValue; }
             get minValue() { return paramRecord(this).min; }
@@ -13173,14 +13223,18 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 const state = paramRecord(this);
                 value = float(value); startTime = double(startTime, "startTime");
                 if (startTime < 0) throw new RangeError("startTime must not be negative");
-                insertEvent(state, {type: SET, time: max(startTime, contextTime(state.context)), value});
+                const now = contextTime(get(state.context)), time = max(startTime, now);
+                insertEvent(state, SET, time, 0);
+                automate(state, 1, value, time, 0, now);
                 return this;
             }
             linearRampToValueAtTime(value, endTime) {
                 const state = paramRecord(this);
                 value = float(value); endTime = double(endTime, "endTime");
                 if (endTime < 0) throw new RangeError("endTime must not be negative");
-                insertRamp(state, LINEAR, value, max(endTime, contextTime(state.context)));
+                const now = contextTime(get(state.context)), time = max(endTime, now);
+                insertEvent(state, LINEAR, time, 0);
+                automate(state, 2, value, time, 0, now);
                 return this;
             }
             exponentialRampToValueAtTime(value, endTime) {
@@ -13188,7 +13242,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 value = float(value); endTime = double(endTime, "endTime");
                 if (value === 0) throw new RangeError("An exponential ramp cannot reach zero");
                 if (endTime < 0) throw new RangeError("endTime must not be negative");
-                insertRamp(state, EXPONENTIAL, value, max(endTime, contextTime(state.context)));
+                const now = contextTime(get(state.context)), time = max(endTime, now);
+                insertEvent(state, EXPONENTIAL, time, 0);
+                automate(state, 3, value, time, 0, now);
                 return this;
             }
             setTargetAtTime(target, startTime, timeConstant) {
@@ -13197,8 +13253,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 timeConstant = float(timeConstant, "timeConstant");
                 if (startTime < 0) throw new RangeError("startTime must not be negative");
                 if (timeConstant < 0) throw new RangeError("timeConstant must not be negative");
-                insertEvent(state, {type: TARGET, time: max(startTime, contextTime(state.context)),
-                    value: target, timeConstant});
+                const now = contextTime(get(state.context)), time = max(startTime, now);
+                insertEvent(state, TARGET, time, 0);
+                automate(state, 4, target, time, timeConstant, now);
                 return this;
             }
             setValueCurveAtTime(values, startTime, duration) {
@@ -13208,197 +13265,74 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 if (values.length < 2) throw new Exception("A value curve needs at least two values", "InvalidStateError");
                 if (startTime < 0) throw new RangeError("startTime must not be negative");
                 if (duration <= 0) throw new RangeError("duration must be positive");
-                const time = max(startTime, contextTime(state.context));
+                const now = contextTime(get(state.context)), time = max(startTime, now);
                 for (const event of state.events) {
                     if (event.time > time && event.time < time + duration)
                         throw new Exception("A value curve overlaps another automation event", "NotSupportedError");
                 }
-                insertEvent(state, {type: CURVE, time, duration, values: new F32(values), cut: Infinity});
+                insertEvent(state, CURVE, time, duration);
+                automate(state, 5, new F32(values), time, duration, now);
                 return this;
             }
             cancelScheduledValues(cancelTime) {
                 const state = paramRecord(this);
                 cancelTime = double(cancelTime, "cancelTime");
                 if (cancelTime < 0) throw new RangeError("cancelTime must not be negative");
-                cancelTime = max(cancelTime, contextTime(state.context));
-                state.base = state.current;
+                const now = contextTime(get(state.context));
+                cancelTime = max(cancelTime, now);
                 state.events = state.events.filter(event => event.time < cancelTime &&
                     !(event.type === CURVE && cancelTime <= event.time + event.duration));
-                changed(state);
+                automate(state, 6, cancelTime, 0, 0, now);
                 return this;
             }
             cancelAndHoldAtTime(cancelTime) {
                 const state = paramRecord(this);
                 cancelTime = double(cancelTime, "cancelTime");
                 if (cancelTime < 0) throw new RangeError("cancelTime must not be negative");
-                cancelAndHold(state, max(cancelTime, contextTime(state.context)));
+                const now = contextTime(get(state.context));
+                cancelTime = max(cancelTime, now);
+                // #dom-audioparam-cancelandholdattime: a value curve holding
+                // the time is cut there; later events go.
+                state.events = state.events.filter(event => event.time <= cancelTime);
+                for (const event of state.events) {
+                    if (event.type === CURVE && cancelTime < event.time + event.duration)
+                        event.duration = cancelTime - event.time;
+                }
+                automate(state, 7, cancelTime, 0, 0, now);
                 return this;
             }
         }
-        function contextTime(context) {
-            const state = get(context);
-            return state && state.kind === "offline" ? state.frame / state.rate : 0;
+        function automate(state, op, a, b, c, now) {
+            host("automate", get(state.context).id, state.id, op, a, b, c, now);
         }
-        function createParam(context, node, name, defaultValue, minValue, maxValue, rate, fixedRate, compound) {
-            const param = create(AudioParam.prototype);
-            const state = {kind: "param", context, node, name, defaultValue: fround(defaultValue),
-                min: fround(minValue), max: fround(maxValue), rate, fixedRate: fixedRate || null,
-                current: fround(defaultValue), base: fround(defaultValue), events: [], inputs: new Set(),
-                compound: !!compound};
-            set(param, state);
-            return param;
-        }
-        function changed(state) { for (const event of state.events) event.v0 = undefined; }
-        function curveOverlap(state, time) {
-            for (const event of state.events) {
+        // #AudioParam: an automation event may not lie inside a value curve.
+        // Events that ended more than a second ago can no longer conflict
+        // (new events are never earlier than currentTime).
+        function insertEvent(state, type, time, duration) {
+            const events = state.events;
+            for (const event of events) {
                 if (event.type === CURVE && time >= event.time && time < event.time + event.duration)
                     throw new Exception("An automation event lies inside a value curve", "NotSupportedError");
             }
-        }
-        // #AudioParam: an event at the same time as existing events follows them.
-        function insertEvent(state, event) {
-            curveOverlap(state, event.time);
-            const events = state.events;
-            let index = events.length;
-            while (index > 0 && events[index - 1].time > event.time) index--;
-            events.splice(index, 0, event);
-            changed(state);
-            return index;
-        }
-        function insertRamp(state, type, value, time) {
-            curveOverlap(state, time);
-            const events = state.events, now = contextTime(state.context);
-            let index = events.length;
-            while (index > 0 && events[index - 1].time > time) index--;
-            const event = {type, time, value};
-            if (index === 0) {
-                // No preceding event: as if setValueAtTime(value, currentTime).
-                insertEvent(state, {type: SET, time: now, value: state.current});
-                index = insertEvent(state, event);
-                return;
+            if (events.length > 32) {
+                const horizon = contextTime(get(state.context)) - 1;
+                state.events = events.filter(event => event.time + event.duration >= horizon);
             }
-            const previous = events[index - 1];
-            if (previous.type === TARGET) {
-                // A ramp after SetTarget starts where that automation is now,
-                // or, when it has not started, just before it starts.
-                event.start = previous.time > now
-                    ? {time: previous.time, value: valueBefore(state, index - 1, previous.time)}
-                    : {time: now, value: valueAt(state, now)};
-            }
-            insertEvent(state, event);
+            state.events.push({type, time, duration});
         }
-        // #dom-audioparam-cancelandholdattime
-        function cancelAndHold(state, time) {
-            const events = state.events;
-            let first = -1;
-            for (let i = 0; i < events.length; i++) if (events[i].time <= time) first = i;
-            const second = first + 1 < events.length ? events[first + 1] : null;
-            const held = valueAt(state, time);
-            if (second && (second.type === LINEAR || second.type === EXPONENTIAL)) {
-                second.time = time;
-                second.value = held;
-            } else if (first >= 0) {
-                const event = events[first];
-                if (event.type === TARGET) {
-                    events.splice(first + 1, 0, {type: SET, time, value: held});
-                } else if (event.type === CURVE && time <= event.time + event.duration) {
-                    event.cut = time;
-                    event.cutValue = held;
-                }
-            }
-            state.events = events.filter(event => event.time <= time);
-            changed(state);
-        }
-        function eventEnd(event) { return event.type === CURVE ? min(event.time + event.duration, event.cut) : event.time; }
-        function curveValue(event, time) {
-            if (time >= event.cut) return event.cutValue;
-            const values = event.values, count = values.length;
-            if (time >= event.time + event.duration) return values[count - 1];
-            const position = (count - 1) / event.duration * (time - event.time);
-            const k = floor(position);
-            if (k >= count - 1) return values[count - 1];
-            return values[k] + (values[k + 1] - values[k]) * (position - k);
-        }
-        // The value of the timeline formed by events[0..limit) at time.
-        function valueBefore(state, limit, time) {
-            return evaluate(state, state.events, limit, time);
-        }
-        function valueAt(state, time) { return evaluate(state, state.events, state.events.length, time); }
-        function endValue(state, events, index) {
-            const event = events[index];
-            switch (event.type) {
-                case CURVE: return curveValue(event, eventEnd(event));
-                case TARGET: {
-                    const next = index + 1 < events.length ? events[index + 1].time : event.time;
-                    return targetValue(state, events, index, next);
-                }
-                default: return event.value;
-            }
-        }
-        function targetValue(state, events, index, time) {
-            const event = events[index];
-            if (event.v0 === undefined) event.v0 = evaluate(state, events, index, event.time);
-            if (event.timeConstant === 0) return time >= event.time ? event.value : event.v0;
-            return event.value + (event.v0 - event.value) * exp(-(time - event.time) / event.timeConstant);
-        }
-        function evaluate(state, events, limit, time) {
-            if (!limit) return state.base;
-            let last = -1, low = 0, high = limit - 1;
-            while (low <= high) {
-                const mid = (low + high) >> 1;
-                if (events[mid].time <= time) { last = mid; low = mid + 1; } else high = mid - 1;
-            }
-            const next = last + 1 < limit ? events[last + 1] : null;
-            if (next && (next.type === LINEAR || next.type === EXPONENTIAL)) {
-                let t0, v0;
-                if (next.start) { t0 = next.start.time; v0 = next.start.value; }
-                else if (last >= 0) { t0 = eventEnd(events[last]); v0 = endValue(state, events, last); }
-                else { t0 = -Infinity; v0 = state.base; }
-                if (time >= t0) {
-                    const t1 = next.time, v1 = next.value;
-                    if (t1 <= t0) return v1;
-                    const fraction = (time - t0) / (t1 - t0);
-                    if (next.type === LINEAR) return v0 + (v1 - v0) * fraction;
-                    if (v0 === 0 || (v0 > 0) !== (v1 > 0)) return v0;
-                    return v0 * pow(v1 / v0, fraction);
-                }
-            }
-            if (last < 0) return state.base;
-            const event = events[last];
-            switch (event.type) {
-                case TARGET: return targetValue(state, events, last, time);
-                case CURVE: return curveValue(event, time);
-                default: return event.value;
-            }
-        }
-        // #computation-of-value for one render quantum: paramIntrinsicValue,
-        // [[current value]], the input AudioParam buffer, NaN replacement.
-        // Returns a Float32Array of frames values (one value for k-rate).
-        function paramBlock(state, quantum, render) {
-            const context = get(state.context), rate = context.rate, frame = context.frame;
-            const values = new F32(quantum);
-            const kRate = state.rate === "k-rate";
-            if (!state.events.length) values.fill(state.base);
-            else if (kRate) values.fill(valueAt(state, frame / rate));
-            else for (let i = 0; i < quantum; i++) values[i] = valueAt(state, (frame + i) / rate);
-            state.current = values[0];
-            if (state.inputs.size) {
-                const input = mixInputs(state.inputs, 1, "speakers", quantum, render)[0];
-                if (kRate) values.fill(values[0] + input[0]);
-                else for (let i = 0; i < quantum; i++) values[i] += input[i];
-            }
-            // NaN becomes the default value; a simple parameter is clamped to
-            // its nominal range, a compound one after it is combined.
-            const low = state.min, high = state.max, compound = state.compound;
-            for (let i = 0; i < quantum; i++) {
-                const value = values[i];
-                if (value !== value) values[i] = state.defaultValue;
-                else if (!compound && (value < low || value > high)) values[i] = value < low ? low : high;
-            }
-            return values;
+        function createParam(context, node, id, spec) {
+            const param = create(AudioParam.prototype);
+            set(param, {kind: "param", context, node, id, name: spec.name, defaultValue: fround(spec.value),
+                min: fround(spec.min), max: fround(spec.max), rate: spec.rate, fixedRate: spec.fixed ? spec.rate : null,
+                current: fround(spec.value), events: []});
+            return param;
         }
 
         // ---- AudioBuffer (#AudioBuffer) ----
+        // Channel data lives in script (Float32Arrays) until the buffer's
+        // content is acquired (#acquire-the-content) by a node, or comes
+        // from the host (rendered or decoded); then it lives in the host
+        // until script asks for the arrays again.
         class AudioBuffer {
             constructor(options) {
                 if (arguments.length < 1) throw new TypeError("AudioBuffer requires options");
@@ -13414,32 +13348,36 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             get sampleRate() { return bufferRecord(this).rate; }
             get length() { return bufferRecord(this).length; }
             get duration() { const state = bufferRecord(this); return state.length / state.rate; }
-            get numberOfChannels() { return bufferRecord(this).channels.length; }
+            get numberOfChannels() { return bufferRecord(this).count; }
             getChannelData(channel) {
                 const state = bufferRecord(this);
                 channel = unsignedLong(channel);
-                if (channel >= state.channels.length)
+                if (channel >= state.count)
                     throw new Exception("Channel index is out of range", "IndexSizeError");
-                return state.channels[channel];
+                return channelArrays(state)[channel];
             }
             copyFromChannel(destination, channelNumber, bufferOffset = 0) {
                 const state = bufferRecord(this);
                 destination = float32Array(destination, "destination");
                 channelNumber = unsignedLong(channelNumber); bufferOffset = unsignedLong(bufferOffset);
-                if (channelNumber >= state.channels.length)
+                if (channelNumber >= state.count)
                     throw new Exception("Channel index is out of range", "IndexSizeError");
+                const room = apply(typedArrayLength, destination, []);
+                if (!state.channels) {
+                    host("bufferCopy", state.content, channelNumber, bufferOffset, room, destination);
+                    return;
+                }
                 const source = state.channels[channelNumber];
-                const count = max(0, min(apply(typedArrayLength, source, []) - bufferOffset,
-                    apply(typedArrayLength, destination, [])));
+                const count = max(0, min(apply(typedArrayLength, source, []) - bufferOffset, room));
                 for (let i = 0; i < count; i++) destination[i] = source[bufferOffset + i];
             }
             copyToChannel(source, channelNumber, bufferOffset = 0) {
                 const state = bufferRecord(this);
                 source = float32Array(source, "source");
                 channelNumber = unsignedLong(channelNumber); bufferOffset = unsignedLong(bufferOffset);
-                if (channelNumber >= state.channels.length)
+                if (channelNumber >= state.count)
                     throw new Exception("Channel index is out of range", "IndexSizeError");
-                const target = state.channels[channelNumber];
+                const target = channelArrays(state)[channelNumber];
                 const count = max(0, min(apply(typedArrayLength, target, []) - bufferOffset,
                     apply(typedArrayLength, source, [])));
                 for (let i = 0; i < count; i++) target[bufferOffset + i] = source[i];
@@ -13456,36 +13394,57 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 throw new Exception("The AudioBuffer is too large", "NotSupportedError");
             const channels = [];
             for (let i = 0; i < channelCount; i++) channels.push(new F32(length));
-            set(buffer, {kind: "buffer", length, rate, channels});
+            set(buffer, {kind: "buffer", length, rate, count: channelCount, channels, content: 0});
             return buffer;
         }
         function createBuffer(channelCount, length, rate) {
             return initializeBuffer(create(AudioBuffer.prototype), channelCount, length, rate);
         }
+        // An AudioBuffer over host content `id` (rendered or decoded).
+        function contentBuffer(id, length, rate, count) {
+            const buffer = create(AudioBuffer.prototype);
+            set(buffer, {kind: "buffer", length, rate, count, channels: null, content: id});
+            contentRelease.register(buffer, id);
+            return buffer;
+        }
+        // The arrays getChannelData() hands out: copies of host content.
+        function channelArrays(state) {
+            if (!state.channels) {
+                const channels = [];
+                for (let c = 0; c < state.count; c++) {
+                    const bytes = host("bufferRead", state.content, c);
+                    channels.push(bytes ? new F32(bytes) : new F32(state.length));
+                }
+                state.channels = channels;
+                state.content = 0;
+            }
+            return state.channels;
+        }
         // #acquire-the-content: detach the arrays handed to script and keep
-        // their data privately; later getChannelData() calls return copies.
+        // their data in the host; later getChannelData() calls return copies.
+        // Returns the host content id (zero-length when an array was detached).
         function acquireContent(buffer) {
             const state = bufferRecord(buffer);
-            const acquired = [];
+            if (!state.channels) return state.content;
             for (const array of state.channels) {
-                if (array.buffer.byteLength === 0) return {rate: state.rate, length: 0, channels: []};
+                if (apply(typedArrayLength, array, []) === 0) {
+                    const id = host("buffer", state.rate, 0);
+                    contentRelease.register(buffer, id);
+                    return id;
+                }
             }
-            for (let i = 0; i < state.channels.length; i++) {
-                const array = state.channels[i];
-                const data = new F32(apply(transferBuffer, array.buffer, []));
-                acquired.push(data);
-                state.channels[i] = new F32(data);
-            }
-            return {rate: state.rate, length: state.length, channels: acquired};
+            const id = apply(binding, undefined, ["buffer", state.rate, state.length, ...state.channels]);
+            for (const array of state.channels) apply(transferBuffer, apply(typedArrayBuffer, array, []), []);
+            state.channels = null;
+            state.content = id;
+            contentRelease.register(buffer, id);
+            return id;
         }
 
-        // ---- PeriodicWave (#PeriodicWave, #waveform-generation) ----
-        // Waveforms are rendered from band-limited tables: for an oscillator
-        // frequency F only harmonics k with k|F| below the Nyquist frequency
-        // contribute. Each table holds TABLE_SIZE samples of one period,
-        // normalized by the wave's fixed factor (#waveform-normalization),
-        // and is read with linear interpolation.
-        const TABLE_SIZE = 4096, HARMONICS = TABLE_SIZE / 2;
+        // ---- PeriodicWave (#PeriodicWave) ----
+        // The band-limited tables (#waveform-generation) live in the host
+        // (`webaudio::wave`); built-in types are negative ids.
+        const BUILTIN_WAVES = {sine: -1, square: -2, sawtooth: -3, triangle: -4};
         class PeriodicWave {
             constructor(context, options = undefined) {
                 contextRecord(context);
@@ -13504,121 +13463,53 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (real && imag) {
                 if (real.length !== imag.length || real.length < 2)
                     throw new Exception("PeriodicWave coefficient arrays are invalid", "IndexSizeError");
-                a = real.slice(); b = imag.slice();
+                a = real; b = imag;
             } else if (real) {
                 if (real.length < 2) throw new Exception("PeriodicWave coefficient arrays are invalid", "IndexSizeError");
-                a = real.slice(); b = new Array(real.length).fill(0);
+                a = real; b = new Array(real.length).fill(0);
             } else if (imag) {
                 if (imag.length < 2) throw new Exception("PeriodicWave coefficient arrays are invalid", "IndexSizeError");
-                b = imag.slice(); a = new Array(imag.length).fill(0);
+                b = imag; a = new Array(imag.length).fill(0);
             } else { a = [0, 0]; b = [0, 1]; }
-            a[0] = 0; b[0] = 0;
-            set(wave, {kind: "wave", source: waveSource(a, b, !disableNormalization)});
+            const id = host("wave", new F32(a), new F32(b), !disableNormalization);
+            set(wave, {kind: "wave", id});
+            waveRelease.register(wave, id);
             return wave;
-        }
-        function waveSource(a, b, normalize) {
-            const count = min(a.length, HARMONICS);
-            const source = {a: new F32(count), b: new F32(count), normalize, factor: 1, tables: new Map()};
-            for (let k = 1; k < count; k++) { source.a[k] = a[k]; source.b[k] = b[k]; }
-            if (normalize) {
-                // f = max |x~(n)| over one period of the full series.
-                const full = synthesize(source, count - 1);
-                let peak = 0;
-                for (let n = 0; n < TABLE_SIZE; n++) peak = max(peak, abs(full[n]));
-                source.factor = peak > 0 ? peak : 1;
-            }
-            return source;
-        }
-        // #oscillator-coefficients for the built-in types.
-        const builtinWaves = create(null);
-        function builtinWave(type) {
-            if (builtinWaves[type]) return builtinWaves[type];
-            const a = new Array(HARMONICS).fill(0), b = new Array(HARMONICS).fill(0);
-            for (let n = 1; n < HARMONICS; n++) {
-                if (type === "sine") b[n] = n === 1 ? 1 : 0;
-                else if (type === "square") b[n] = 2 / (n * PI) * (1 - pow(-1, n));
-                else if (type === "sawtooth") b[n] = pow(-1, n + 1) * 2 / (n * PI);
-                else b[n] = 8 * sin(n * PI / 2) / (PI * n * PI * n);
-            }
-            return builtinWaves[type] = waveSource(a, b, true);
-        }
-        // x(n) = sum_k a[k] cos(2 pi k n / N) + b[k] sin(2 pi k n / N), k <= K,
-        // by an inverse FFT of size N.
-        function synthesize(source, harmonics) {
-            const re = new Float64Array(TABLE_SIZE), im = new Float64Array(TABLE_SIZE);
-            for (let k = 1; k <= harmonics && k < source.a.length; k++) { re[k] = source.a[k]; im[k] = -source.b[k]; }
-            fft(re, im);
-            return re;
-        }
-        function fft(re, im) {
-            const n = re.length;
-            for (let i = 1, j = 0; i < n; i++) {
-                let bit = n >> 1;
-                for (; j & bit; bit >>= 1) j ^= bit;
-                j ^= bit;
-                if (i < j) {
-                    let t = re[i]; re[i] = re[j]; re[j] = t;
-                    t = im[i]; im[i] = im[j]; im[j] = t;
-                }
-            }
-            for (let size = 2; size <= n; size <<= 1) {
-                const step = 2 * PI / size, half = size >> 1;
-                for (let start = 0; start < n; start += size) {
-                    for (let k = 0; k < half; k++) {
-                        const wr = cos(step * k), wi = sin(step * k);
-                        const i = start + k, j = i + half;
-                        const tr = re[j] * wr - im[j] * wi, ti = re[j] * wi + im[j] * wr;
-                        re[j] = re[i] - tr; im[j] = im[i] - ti;
-                        re[i] += tr; im[i] += ti;
-                    }
-                }
-            }
-        }
-        // Harmonic limits shared by tables: exact up to 32, then quarter-octave
-        // steps (rounded down, so no table contains aliased partials).
-        function harmonicLevel(limit, count) {
-            limit = min(limit, count - 1);
-            if (limit <= 32) return limit;
-            const level = floor(32 * pow(2, floor(4 * Math.log2(limit / 32)) / 4));
-            return min(level, count - 1);
-        }
-        function waveTable(source, frequency, nyquist) {
-            const magnitude = abs(frequency);
-            const limit = magnitude > 0 ? ceil(nyquist / magnitude) - 1 : source.a.length - 1;
-            const level = harmonicLevel(max(limit, 0), source.a.length);
-            let table = source.tables.get(level);
-            if (!table) {
-                const samples = synthesize(source, level);
-                table = new F32(TABLE_SIZE + 1);
-                for (let n = 0; n < TABLE_SIZE; n++) table[n] = samples[n] / source.factor;
-                table[TABLE_SIZE] = table[0];
-                source.tables.set(level, table);
-            }
-            return table;
         }
 
         // ---- AudioNode and its channel/connection model ----
         // Web Audio #AudioNode-methods: preserve actual connection identity,
         // including duplicate suppression and selective disconnect errors.
-        // Both endpoints retain an edge, so a reachable destination retains
-        // its connected nodes. Unreachable graphs remain WeakMap keys.
+        // A node retains its outgoing connections (so what it feeds stays
+        // alive with it); the rendering thread keeps the graph itself.
+        const MODES = ["max", "clamped-max", "explicit"];
         const NODE_DEFAULTS = {
             processor: {mode: "explicit"}, destination: {mode: "explicit"},
             oscillator: {mode: "max", inputs: 0}, gain: {mode: "max"},
             compressor: {mode: "clamped-max"}, "buffer-source": {mode: "max", inputs: 0},
         };
         class AudioNode extends EventTarget {
-            constructor(key, context, kind, channelCount) {
+            constructor(key, context, kind, channelCount, params, init) {
                 if (key !== token) throw new TypeError("Illegal constructor");
                 super();
-                const defaults = NODE_DEFAULTS[kind];
+                const defaults = NODE_DEFAULTS[kind], owner = get(context);
+                const inputs = defaults.inputs === undefined ? 1 : defaults.inputs;
                 const state = {node: true, kind, context, channelCount, mode: defaults.mode,
-                    interpretation: "speakers", inputs: defaults.inputs === undefined ? 1 : defaults.inputs,
-                    outputs: 1, edges: new Set(), params: []};
+                    interpretation: "speakers", inputs, outputs: 1,
+                    edges: new SetCtor(), params: create(null), id: 0};
                 eventTargetState(this, state);
                 set(this, state);
-                const owner = get(context);
-                if (owner.kind === "offline" && kind !== "destination") owner.nodes.push(this);
+                const descriptors = new F64(params.length * 5);
+                params.forEach((spec, index) => {
+                    descriptors.set([spec.value, spec.min, spec.max, spec.rate === "k-rate" ? 1 : 0,
+                        spec.compound ? 1 : 0], index * 5);
+                });
+                state.id = host("node", owner.id, kind, inputs, 1, channelCount, MODES.indexOf(state.mode),
+                    0, descriptors, ...(init || []));
+                params.forEach((spec, index) => {
+                    state.params[spec.name] = createParam(context, this, state.id + 1 + index, spec);
+                });
+                if (kind !== "destination") nodeRelease.register(this, {context: owner.id, node: state.id});
             }
             get context() { return nodeRecord(this).context; }
             get numberOfInputs() { return nodeRecord(this).inputs; }
@@ -13642,6 +13533,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                     throw new Exception("Unsupported channel count", "NotSupportedError");
                 }
                 state.channelCount = value;
+                channelMessage(state);
             }
             get channelCountMode() { return nodeRecord(this).mode; }
             set channelCountMode(value) {
@@ -13656,6 +13548,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 if (state.kind === "destination" && get(state.context).kind === "offline" && value !== state.mode)
                     throw new Exception("OfflineAudioContext destination mode is fixed", "InvalidStateError");
                 state.mode = value;
+                channelMessage(state);
             }
             get channelInterpretation() { return nodeRecord(this).interpretation; }
             set channelInterpretation(value) {
@@ -13663,10 +13556,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 value = `${value}`;
                 if (value !== "speakers" && value !== "discrete") return;
                 state.interpretation = value;
+                channelMessage(state);
             }
             connect(destination, output = 0, input = 0) {
                 const state = nodeRecord(this);
                 const target = get(destination);
+                const owner = get(state.context);
                 if (target && target.kind === "param") {
                     // connect(AudioParam destinationParam, optional unsigned long output = 0)
                     output = output >>> 0;
@@ -13675,9 +13570,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                     checkPort(output, state.outputs);
                     for (const edge of state.edges)
                         if (edge.param === destination && edge.output === output) return undefined;
-                    const edge = {source: this, param: destination, output};
-                    state.edges.add(edge);
-                    target.inputs.add(edge);
+                    state.edges.add({param: destination, output});
+                    host("connectParam", owner.id, state.id, output, target.id);
                     return undefined;
                 }
                 const other = nodeRecord(destination);
@@ -13689,27 +13583,26 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 checkPort(output, state.outputs);
                 checkPort(input, other.inputs);
                 for (const edge of state.edges) {
-                    if (edge.source === this && edge.destination === destination &&
-                        edge.output === output && edge.input === input) return destination;
+                    if (edge.destination === destination && edge.output === output && edge.input === input)
+                        return destination;
                 }
-                const edge = {source: this, destination, output, input};
-                state.edges.add(edge);
-                other.edges.add(edge);
+                state.edges.add({destination, output, input});
+                host("connect", owner.id, state.id, output, other.id, input);
                 return destination;
             }
             disconnect(destination = undefined, output = undefined, input = undefined) {
                 const state = nodeRecord(this), count = Math.min(arguments.length, 3);
-                let other = null, param = null;
+                const owner = get(state.context);
+                let other = null;
                 if (count) {
                     const candidate = get(destination);
                     if (candidate && candidate.kind === "param") {
-                        param = candidate;
                         if (count > 1) { output = output >>> 0; checkPort(output, state.outputs); }
                         let removed = false;
                         for (const edge of state.edges) {
                             if (edge.param !== destination || (count > 1 && edge.output !== output)) continue;
                             state.edges.delete(edge);
-                            param.inputs.delete(edge);
+                            host("disconnectParam", owner.id, state.id, edge.output, candidate.id);
                             removed = true;
                         }
                         if (!removed) throw new Exception("Audio node is not connected to the AudioParam", "InvalidAccessError");
@@ -13729,18 +13622,21 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 }
                 let removed = false;
                 for (const edge of state.edges) {
-                    if (edge.source !== this ||
-                        (other && edge.destination !== destination) ||
+                    if ((other && edge.destination !== destination) ||
                         (count && (!other || count > 1) && edge.output !== output) ||
                         (other && count > 2 && edge.input !== input)) continue;
                     state.edges.delete(edge);
-                    if (edge.param) get(edge.param).inputs.delete(edge);
-                    else nodeRecord(edge.destination).edges.delete(edge);
+                    if (edge.param) host("disconnectParam", owner.id, state.id, edge.output, get(edge.param).id);
+                    else host("disconnect", owner.id, state.id, edge.output, nodeRecord(edge.destination).id, edge.input);
                     removed = true;
                 }
                 if (other && !removed)
                     throw new Exception("Audio nodes are not connected", "InvalidAccessError");
             }
+        }
+        function channelMessage(state) {
+            host("channel", get(state.context).id, state.id, state.channelCount, MODES.indexOf(state.mode),
+                state.interpretation === "discrete" ? 1 : 0);
         }
         // #audionode-constructor-init: AudioNodeOptions, applied through the
         // attribute setters (and their constraints) after the defaults.
@@ -13750,8 +13646,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             const interpretation = member(dict, "channelInterpretation");
             return {
                 channelCount: count === undefined ? undefined : unsignedLong(count),
-                channelCountMode: mode === undefined ? undefined
-                    : enumValue(mode, ["max", "clamped-max", "explicit"]),
+                channelCountMode: mode === undefined ? undefined : enumValue(mode, MODES),
                 channelInterpretation: interpretation === undefined ? undefined
                     : enumValue(interpretation, ["speakers", "discrete"]),
             };
@@ -13761,16 +13656,20 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (converted.channelCountMode !== undefined) node.channelCountMode = converted.channelCountMode;
             if (converted.channelInterpretation !== undefined) node.channelInterpretation = converted.channelInterpretation;
         }
+        function control(node, op, a, b, c) {
+            const state = nodeRecord(node);
+            host("control", get(state.context).id, state.id, op, a, b, c);
+        }
         class AudioDestinationNode extends AudioNode {
             constructor(key, context, channels, maxChannels) {
-                super(key, context, "destination", channels);
+                super(key, context, "destination", channels, []);
                 nodeRecord(this).maxChannels = maxChannels;
             }
             get maxChannelCount() { return nodeRecord(this, "destination").maxChannels; }
         }
         class ScriptProcessorNode extends AudioNode {
             constructor(key, context, bufferSize, inputs, outputs) {
-                super(key, context, "processor", inputs);
+                super(key, context, "processor", inputs, [], [outputs]);
                 const state = nodeRecord(this);
                 state.bufferSize = bufferSize;
                 state.outputChannels = outputs;
@@ -13784,24 +13683,20 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 const converted = nodeOptions(dict);
                 const gain = member(dict, "gain");
                 const gainValue = gain === undefined ? undefined : float(gain, "gain");
-                super(token, context, "gain", 2);
-                const state = nodeRecord(this);
-                state.gain = createParam(context, this, "gain", 1, -MAX_FLOAT, MAX_FLOAT, "a-rate");
-                state.params.push(state.gain);
+                super(token, context, "gain", 2, [{name: "gain", value: 1, min: -MAX_FLOAT, max: MAX_FLOAT, rate: "a-rate"}]);
                 applyNodeOptions(this, converted);
-                if (gainValue !== undefined) state.gain.value = gainValue;
+                if (gainValue !== undefined) nodeRecord(this).params.gain.value = gainValue;
             }
-            get gain() { return nodeRecord(this, "gain").gain; }
+            get gain() { return nodeRecord(this, "gain").params.gain; }
         }
         // #AudioScheduledSourceNode
         class AudioScheduledSourceNode extends AudioNode {
-            constructor(key, context, kind) {
+            constructor(key, context, kind, params, init) {
                 if (key !== token) throw new TypeError("Illegal constructor");
-                super(key, context, kind, 2);
+                super(key, context, kind, 2, params, init);
                 const state = nodeRecord(this);
+                state.source = true;
                 state.started = false;
-                state.startTime = Infinity;
-                state.stopTime = Infinity;
                 state.ended = false;
             }
             start(when = 0) {
@@ -13810,8 +13705,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 when = double(when, "when");
                 if (state.started) throw new Exception("The source has already been started", "InvalidStateError");
                 if (when < 0) throw new RangeError("when must not be negative");
-                state.started = true;
-                state.startTime = when;
+                startSource(this, state, when, NaN, NaN);
             }
             stop(when = 0) {
                 const state = nodeRecord(this);
@@ -13819,8 +13713,22 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 when = double(when, "when");
                 if (!state.started) throw new Exception("The source has not been started", "InvalidStateError");
                 if (when < 0) throw new RangeError("when must not be negative");
-                if (!state.ended) state.stopTime = when;
+                control(this, "stop", when);
             }
+        }
+        // #dom-audioscheduledsourcenode-start steps 3-5: the source is kept
+        // until it ends; an AudioContext that is allowed to start but was
+        // prevented from starting starts now.
+        function startSource(node, state, when, offset, duration) {
+            state.started = true;
+            const owner = get(state.context);
+            if (owner.closed || (owner.kind === "offline" && owner.state === "closed")) return;
+            apply(mapSet, owner.sources, [state.id, node]);
+            retain(owner);
+            control(node, "start", when, offset, duration);
+            if (owner.kind === "context" && owner.state === "suspended" && !owner.suspendedByUser &&
+                allowedToStart())
+                startRendering(owner);
         }
         const OSCILLATOR_TYPES = ["sine", "square", "sawtooth", "triangle", "custom"];
         class OscillatorNode extends AudioScheduledSourceNode {
@@ -13838,21 +13746,17 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 const typeValue = type === undefined ? "sine" : enumValue(type, OSCILLATOR_TYPES);
                 if (typeValue === "custom" && !waveState)
                     throw new Exception("A custom oscillator requires a PeriodicWave", "InvalidStateError");
-                super(token, context, "oscillator");
+                const nyquist = owner.rate / 2, detuneLimit = 1200 * log2(MAX_FLOAT);
+                super(token, context, "oscillator", [
+                    {name: "frequency", value: 440, min: -nyquist, max: nyquist, rate: "a-rate", compound: true},
+                    {name: "detune", value: 0, min: -detuneLimit, max: detuneLimit, rate: "a-rate", compound: true},
+                ], [waveState ? waveState.id : BUILTIN_WAVES[typeValue]]);
                 const state = nodeRecord(this);
-                state.source = true;
-                const nyquist = owner.rate / 2;
-                state.frequency = createParam(context, this, "frequency", 440, -nyquist, nyquist, "a-rate", null, true);
-                state.detune = createParam(context, this, "detune", 0, -1200 * Math.log2(MAX_FLOAT),
-                    1200 * Math.log2(MAX_FLOAT), "a-rate", null, true);
-                state.params.push(state.frequency, state.detune);
                 state.type = waveState ? "custom" : typeValue;
-                state.wave = waveState ? waveState.source : builtinWave(typeValue);
-                state.phase = 0;
-                state.playing = false;
+                state.wave = waveState ? wave : null;
                 applyNodeOptions(this, converted);
-                if (frequencyValue !== undefined) state.frequency.value = frequencyValue;
-                if (detuneValue !== undefined) state.detune.value = detuneValue;
+                if (frequencyValue !== undefined) state.params.frequency.value = frequencyValue;
+                if (detuneValue !== undefined) state.params.detune.value = detuneValue;
             }
             get type() { return nodeRecord(this, "oscillator").type; }
             set type(value) {
@@ -13862,17 +13766,28 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 if (value === "custom")
                     throw new Exception("Use setPeriodicWave() for a custom oscillator", "InvalidStateError");
                 state.type = value;
-                state.wave = builtinWave(value);
+                state.wave = null;
+                control(this, "wave", BUILTIN_WAVES[value]);
             }
-            get frequency() { return nodeRecord(this, "oscillator").frequency; }
-            get detune() { return nodeRecord(this, "oscillator").detune; }
+            get frequency() { return nodeRecord(this, "oscillator").params.frequency; }
+            get detune() { return nodeRecord(this, "oscillator").params.detune; }
             setPeriodicWave(periodicWave) {
                 const state = nodeRecord(this, "oscillator");
                 if (arguments.length < 1) throw new TypeError("setPeriodicWave requires a PeriodicWave");
-                state.wave = waveRecord(periodicWave).source;
+                const wave = waveRecord(periodicWave);
+                // The node keeps the wave (and so its host tables) alive.
+                state.wave = periodicWave;
                 state.type = "custom";
+                control(this, "wave", wave.id);
             }
         }
+        const COMPRESSOR_PARAMS = [
+            {name: "threshold", value: -24, min: -100, max: 0},
+            {name: "knee", value: 30, min: 0, max: 40},
+            {name: "ratio", value: 12, min: 1, max: 20},
+            {name: "attack", value: 0.003, min: 0, max: 1},
+            {name: "release", value: 0.25, min: 0, max: 1},
+        ];
         class DynamicsCompressorNode extends AudioNode {
             constructor(context, options = undefined) {
                 contextRecord(context);
@@ -13883,27 +13798,22 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                     const value = member(dict, name);
                     if (value !== undefined) values[name] = float(value, name);
                 }
-                super(token, context, "compressor", 2);
+                super(token, context, "compressor", 2, COMPRESSOR_PARAMS.map(spec =>
+                    ({...spec, rate: "k-rate", fixed: true})));
                 const state = nodeRecord(this);
-                state.threshold = createParam(context, this, "threshold", -24, -100, 0, "k-rate", "k-rate");
-                state.knee = createParam(context, this, "knee", 30, 0, 40, "k-rate", "k-rate");
-                state.ratio = createParam(context, this, "ratio", 12, 1, 20, "k-rate", "k-rate");
-                state.attack = createParam(context, this, "attack", 0.003, 0, 1, "k-rate", "k-rate");
-                state.release = createParam(context, this, "release", 0.25, 0, 1, "k-rate", "k-rate");
-                state.params.push(state.threshold, state.knee, state.ratio, state.attack, state.release);
-                state.reduction = 0;
-                state.detectorAverage = 0;
-                state.compressorGain = 1;
-                state.delay = null;
                 applyNodeOptions(this, converted);
                 for (const name of ["attack", "knee", "ratio", "release", "threshold"])
-                    if (values[name] !== undefined) state[name].value = values[name];
+                    if (values[name] !== undefined) state.params[name].value = values[name];
             }
-            get reduction() { return fround(nodeRecord(this, "compressor").reduction); }
+            get reduction() {
+                const state = nodeRecord(this, "compressor");
+                const value = host("value", get(state.context).id, state.id);
+                return fround(typeof value === "number" && value === value ? value : 0);
+            }
         }
-        for (const name of ["threshold", "knee", "ratio", "attack", "release"]) {
+        for (const {name} of COMPRESSOR_PARAMS) {
             define(DynamicsCompressorNode.prototype, name, {configurable: true, enumerable: true,
-                get: {[name]() { return nodeRecord(this, "compressor")[name]; }}[name]});
+                get: {[name]() { return nodeRecord(this, "compressor").params[name]; }}[name]});
             define(Object.getOwnPropertyDescriptor(DynamicsCompressorNode.prototype, name).get,
                 "name", {value: "get " + name, configurable: true});
         }
@@ -13923,28 +13833,20 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 const loopStartValue = loopStart === undefined ? 0 : double(loopStart, "loopStart");
                 const rate = member(dict, "playbackRate");
                 const rateValue = rate === undefined ? undefined : float(rate, "playbackRate");
-                super(token, context, "buffer-source");
+                super(token, context, "buffer-source", [
+                    {name: "playbackRate", value: 1, min: -MAX_FLOAT, max: MAX_FLOAT, rate: "k-rate", fixed: true, compound: true},
+                    {name: "detune", value: 0, min: -MAX_FLOAT, max: MAX_FLOAT, rate: "k-rate", fixed: true, compound: true},
+                ], [loop ? 1 : 0, loopStartValue, loopEndValue]);
                 const state = nodeRecord(this);
-                state.source = true;
                 state.buffer = null;
                 state.bufferSet = false;
-                state.content = null;
-                state.playbackRate = createParam(context, this, "playbackRate", 1, -MAX_FLOAT, MAX_FLOAT, "k-rate", "k-rate", true);
-                state.detune = createParam(context, this, "detune", 0, -MAX_FLOAT, MAX_FLOAT, "k-rate", "k-rate", true);
-                state.params.push(state.playbackRate, state.detune);
                 state.loop = loop;
                 state.loopStart = loopStartValue;
                 state.loopEnd = loopEndValue;
-                state.offset = 0;
-                state.duration = Infinity;
-                state.position = 0;
-                state.elapsed = 0;
-                state.begun = false;
-                state.enteredLoop = false;
                 applyNodeOptions(this, converted);
                 if (buffer) this.buffer = buffer;
-                if (detuneValue !== undefined) state.detune.value = detuneValue;
-                if (rateValue !== undefined) state.playbackRate.value = rateValue;
+                if (detuneValue !== undefined) state.params.detune.value = detuneValue;
+                if (rateValue !== undefined) state.params.playbackRate.value = rateValue;
             }
             get buffer() { return nodeRecord(this, "buffer-source").buffer; }
             set buffer(value) {
@@ -13956,16 +13858,28 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                     throw new Exception("The buffer can only be set once", "InvalidStateError");
                 if (value !== null) state.bufferSet = true;
                 state.buffer = value;
-                if (state.started) state.content = value === null ? null : acquireContent(value);
+                if (state.started) control(this, "buffer", value === null ? 0 : acquireContent(value));
             }
-            get playbackRate() { return nodeRecord(this, "buffer-source").playbackRate; }
-            get detune() { return nodeRecord(this, "buffer-source").detune; }
+            get playbackRate() { return nodeRecord(this, "buffer-source").params.playbackRate; }
+            get detune() { return nodeRecord(this, "buffer-source").params.detune; }
             get loop() { return nodeRecord(this, "buffer-source").loop; }
-            set loop(value) { nodeRecord(this, "buffer-source").loop = !!value; }
+            set loop(value) {
+                const state = nodeRecord(this, "buffer-source");
+                state.loop = !!value;
+                control(this, "loop", state.loop ? 1 : 0);
+            }
             get loopStart() { return nodeRecord(this, "buffer-source").loopStart; }
-            set loopStart(value) { nodeRecord(this, "buffer-source").loopStart = double(value, "loopStart"); }
+            set loopStart(value) {
+                const state = nodeRecord(this, "buffer-source");
+                state.loopStart = double(value, "loopStart");
+                control(this, "loopStart", state.loopStart);
+            }
             get loopEnd() { return nodeRecord(this, "buffer-source").loopEnd; }
-            set loopEnd(value) { nodeRecord(this, "buffer-source").loopEnd = double(value, "loopEnd"); }
+            set loopEnd(value) {
+                const state = nodeRecord(this, "buffer-source");
+                state.loopEnd = double(value, "loopEnd");
+                control(this, "loopEnd", state.loopEnd);
+            }
             start(when = 0, offset = undefined, duration = undefined) {
                 const state = nodeRecord(this, "buffer-source");
                 when = double(when, "when");
@@ -13975,300 +13889,37 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 if (when < 0) throw new RangeError("when must not be negative");
                 if (offsetValue < 0) throw new RangeError("offset must not be negative");
                 if (durationValue !== undefined && durationValue < 0) throw new RangeError("duration must not be negative");
-                state.started = true;
-                state.startTime = when;
-                state.offset = offsetValue;
-                if (durationValue !== undefined) state.duration = durationValue;
-                if (state.buffer) state.content = acquireContent(state.buffer);
+                if (state.buffer) control(this, "buffer", acquireContent(state.buffer));
+                startSource(this, state, when, offsetValue, durationValue === undefined ? NaN : durationValue);
             }
-        }
-
-        // ---- graph rendering (#rendering-loop) ----
-        function silence(channels, quantum) {
-            const result = [];
-            for (let c = 0; c < channels; c++) result.push(new F32(quantum));
-            return result;
-        }
-        // #channel-up-mixing-and-down-mixing for one connection.
-        function mixInto(target, source, interpretation) {
-            const from = source.length, to = target.length, frames = target[0].length;
-            const add = (t, s, scale) => { for (let i = 0; i < frames; i++) t[i] += s[i] * scale; };
-            if (from === to) { for (let c = 0; c < to; c++) add(target[c], source[c], 1); return; }
-            if (interpretation === "speakers") {
-                if (from === 1 && to === 2) { add(target[0], source[0], 1); add(target[1], source[0], 1); return; }
-                if (from === 1 && to === 4) { add(target[0], source[0], 1); add(target[1], source[0], 1); return; }
-                if (from === 1 && to === 6) { add(target[2], source[0], 1); return; }
-                if ((from === 2 && (to === 4 || to === 6))) { add(target[0], source[0], 1); add(target[1], source[1], 1); return; }
-                if (from === 4 && to === 6) {
-                    add(target[0], source[0], 1); add(target[1], source[1], 1);
-                    add(target[4], source[2], 1); add(target[5], source[3], 1); return;
-                }
-                if (from === 2 && to === 1) { add(target[0], source[0], 0.5); add(target[0], source[1], 0.5); return; }
-                if (from === 4 && to === 1) { for (let c = 0; c < 4; c++) add(target[0], source[c], 0.25); return; }
-                if (from === 6 && to === 1) {
-                    add(target[0], source[0], SQRT_HALF); add(target[0], source[1], SQRT_HALF);
-                    add(target[0], source[2], 1); add(target[0], source[4], 0.5); add(target[0], source[5], 0.5); return;
-                }
-                if (from === 4 && to === 2) {
-                    add(target[0], source[0], 0.5); add(target[0], source[2], 0.5);
-                    add(target[1], source[1], 0.5); add(target[1], source[3], 0.5); return;
-                }
-                if (from === 6 && to === 2) {
-                    add(target[0], source[0], 1); add(target[0], source[2], SQRT_HALF); add(target[0], source[4], SQRT_HALF);
-                    add(target[1], source[1], 1); add(target[1], source[2], SQRT_HALF); add(target[1], source[5], SQRT_HALF); return;
-                }
-                if (from === 6 && to === 4) {
-                    add(target[0], source[0], 1); add(target[0], source[2], SQRT_HALF);
-                    add(target[1], source[1], 1); add(target[1], source[2], SQRT_HALF);
-                    add(target[2], source[4], 1); add(target[3], source[5], 1); return;
-                }
-            }
-            // "discrete": fill channels until they run out, drop the rest.
-            for (let c = 0; c < min(from, to); c++) add(target[c], source[c], 1);
-        }
-        function computedChannels(sources, mode, channelCount) {
-            let count = 1;
-            for (const source of sources) count = max(count, source.length);
-            if (mode === "explicit") return channelCount;
-            if (mode === "clamped-max") return min(count, channelCount);
-            return count;
-        }
-        function mixInputs(edges, channels, interpretation, quantum, render) {
-            const sources = [];
-            for (const edge of edges) {
-                const output = render(edge.source);
-                if (output) sources.push(output);
-            }
-            const target = silence(channels, quantum);
-            for (const source of sources) mixInto(target, source, interpretation);
-            return target;
-        }
-        function nodeInput(state, quantum, render) {
-            const edges = [];
-            for (const edge of state.edges) if (edge.destination && get(edge.destination) === state) edges.push(edge);
-            const sources = [];
-            for (const edge of edges) sources.push(render(edge.source));
-            const channels = computedChannels(sources, state.mode, state.channelCount);
-            const target = silence(max(channels, 1), quantum);
-            for (const source of sources) mixInto(target, source, state.interpretation);
-            return target;
-        }
-        // Render one quantum for every node of the context in dependency
-        // order; nodes in a cycle (there is no DelayNode) are muted.
-        function renderQuantum(context, quantum) {
-            const outputs = new Map(), visiting = new Set();
-            const render = node => {
-                if (outputs.has(node)) return outputs.get(node);
-                if (visiting.has(node)) return silence(1, quantum);
-                visiting.add(node);
-                const output = processNode(context, node, quantum, render);
-                visiting.delete(node);
-                outputs.set(node, output);
-                return output;
-            };
-            for (const node of context.nodes) render(node);
-            return render(context.destination);
-        }
-        function processNode(context, node, quantum, render) {
-            const state = get(node);
-            switch (state.kind) {
-                case "destination": return nodeInput(state, quantum, render);
-                case "gain": {
-                    const input = nodeInput(state, quantum, render);
-                    const gain = paramBlock(get(state.gain), quantum, render);
-                    for (const channel of input) for (let i = 0; i < quantum; i++) channel[i] *= gain[i];
-                    return input;
-                }
-                case "oscillator": return renderOscillator(context, node, state, quantum, render);
-                case "compressor": return renderCompressor(context, state, quantum, render);
-                case "buffer-source": return renderBufferSource(context, node, state, quantum, render);
-                default: {
-                    // ScriptProcessorNode: no audioprocess dispatch while
-                    // rendering offline; its output is silent.
-                    nodeInput(state, quantum, render);
-                    return silence(max(1, state.outputChannels || 1), quantum);
-                }
-            }
-        }
-        function scheduleEnded(context, node, state) {
-            if (state.ended) return;
-            state.ended = true;
-            queue(() => fire(node, "ended"));
-        }
-        function renderOscillator(context, node, state, quantum, render) {
-            const output = new F32(quantum);
-            const frequency = paramBlock(get(state.frequency), quantum, render);
-            const detune = paramBlock(get(state.detune), quantum, render);
-            const rate = context.rate, nyquist = rate / 2, frame = context.frame;
-            for (let i = 0; i < quantum; i++) {
-                const time = (frame + i) / rate;
-                if (!state.started || time < state.startTime || time >= state.stopTime) continue;
-                // computedOscFrequency, clamped to its nominal range.
-                const computed = min(nyquist, max(-nyquist, frequency[i] * pow(2, detune[i] / 1200)));
-                if (!state.playing) {
-                    // Phase zero at the node's exact start time.
-                    state.playing = true;
-                    state.phase = (time - state.startTime) * computed;
-                    state.phase -= floor(state.phase);
-                }
-                if (computed !== state.lastFrequency || state.wave !== state.lastWave) {
-                    state.lastTable = waveTable(state.wave, computed, nyquist);
-                    state.lastFrequency = computed;
-                    state.lastWave = state.wave;
-                }
-                const table = state.lastTable;
-                const position = state.phase * TABLE_SIZE, index = floor(position);
-                output[i] = table[index] + (table[index + 1] - table[index]) * (position - index);
-                state.phase += computed / rate;
-                state.phase -= floor(state.phase);
-            }
-            if (state.started && (frame + quantum) / rate >= state.stopTime) scheduleEnded(context, node, state);
-            return [output];
-        }
-        // #DynamicsCompressorOptions-processing. The user-agent-defined parts
-        // are: a soft knee that is quadratic in decibels between threshold and
-        // threshold + knee (continuous, with slope 1/ratio where it meets the
-        // ratio segment); a detector curve r(a) = d (1 + a) / 2 with a 1 ms
-        // smoothing coefficient d; an attack curve c_a (1 + x) / 2 on
-        // x = detector average / compressor gain in [0, 1]; and a release curve
-        // 1 + c_r * 2 / (1 + x) with c_r reaching +10 dB over the release time.
-        // The pre-delay is the 6 ms DelayNode of the internal graph.
-        function compressorCurve(xDb, threshold, knee, ratio) {
-            if (xDb <= threshold) return xDb;
-            if (knee > 0 && xDb < threshold + knee)
-                return xDb + (1 / ratio - 1) * (xDb - threshold) * (xDb - threshold) / (2 * knee);
-            return threshold + knee / 2 + knee / (2 * ratio) + (xDb - threshold - knee) / ratio;
-        }
-        function renderCompressor(context, state, quantum, render) {
-            const input = nodeInput(state, quantum, render);
-            const rate = context.rate;
-            const sample = name => paramBlock(get(state[name]), quantum, render)[0];
-            const threshold = sample("threshold"), knee = sample("knee"), ratio = sample("ratio");
-            const attack = sample("attack"), release = sample("release");
-            const channels = input.length;
-            const delayFrames = 0.006 * rate;
-            if (!state.delay || state.delay.length !== channels) {
-                const size = ceil(delayFrames) + quantum + 2;
-                const previous = state.delay;
-                state.delay = [];
-                for (let c = 0; c < channels; c++)
-                    state.delay.push(previous && previous[c] ? previous[c] : new F32(size));
-                state.delayWrite = state.delayWrite || 0;
-            }
-            const makeup = pow(1 / decibelsToLinear(compressorCurve(0, threshold, knee, ratio)), 0.6);
-            const detector = 1 - exp(-1 / max(1, 0.001 * rate));
-            const attackRate = 1 - exp(-1 / max(1, attack * rate));
-            const releaseStep = pow(10, 0.5 / max(1, release * rate)) - 1;
-            let detectorAverage = state.detectorAverage, compressorGain = state.compressorGain;
-            let reductionGain = compressorGain * makeup;
-            const output = silence(channels, quantum);
-            const size = state.delay[0].length;
-            for (let i = 0; i < quantum; i++) {
-                let level = 0;
-                for (let c = 0; c < channels; c++) level = max(level, abs(input[c][i]));
-                let attenuation = 1;
-                if (level >= 0.0001) {
-                    const shaped = decibelsToLinear(compressorCurve(linearToDecibels(level), threshold, knee, ratio));
-                    attenuation = shaped / level;
-                }
-                const releasing = attenuation > compressorGain;
-                detectorAverage += (attenuation - detectorAverage) * detector * (1 + attenuation) / 2;
-                detectorAverage = min(1, detectorAverage);
-                const x = compressorGain > 0 ? detectorAverage / compressorGain : 1;
-                if (releasing) compressorGain = min(1, compressorGain * (1 + releaseStep * 2 / (1 + max(0, x))));
-                else compressorGain += (detectorAverage - compressorGain) * attackRate * (1 + min(1, max(0, x))) / 2;
-                reductionGain = compressorGain * makeup;
-                // The pre-delayed signal, read with linear interpolation.
-                const write = state.delayWrite;
-                for (let c = 0; c < channels; c++) state.delay[c][write] = input[c][i];
-                let read = write - delayFrames;
-                while (read < 0) read += size;
-                const base = floor(read), fraction = read - base, next = base + 1 === size ? 0 : base + 1;
-                for (let c = 0; c < channels; c++) {
-                    const line = state.delay[c];
-                    output[c][i] = (line[base] + (line[next] - line[base]) * fraction) * reductionGain;
-                }
-                state.delayWrite = write + 1 === size ? 0 : write + 1;
-            }
-            state.detectorAverage = detectorAverage;
-            state.compressorGain = compressorGain;
-            state.reduction = linearToDecibels(reductionGain);
-            return output;
-        }
-        // #playback-AudioBufferSourceNode. The playhead is kept in buffer
-        // sample frames (position = playhead time x buffer sample rate) so
-        // that unit-rate playback addresses exact frames; between frames the
-        // playback signal is linearly interpolated.
-        function renderBufferSource(context, node, state, quantum, render) {
-            const playbackRate = paramBlock(get(state.playbackRate), quantum, render)[0];
-            const detune = paramBlock(get(state.detune), quantum, render)[0];
-            const content = state.content;
-            const channels = content && content.channels.length ? content.channels.length : 1;
-            const output = silence(channels, quantum);
-            const rate = context.rate, frame = context.frame;
-            const computedRate = playbackRate * pow(2, detune / 1200);
-            if (!state.started || !content || !content.length) {
-                if (state.started && frame / rate >= state.startTime) scheduleEnded(context, node, state);
-                return output;
-            }
-            const bufferRate = content.rate, frames = content.length, bufferDuration = frames / bufferRate;
-            let loopStart = 0, loopEnd = bufferDuration;
-            if (state.loop) {
-                if (state.loopStart >= 0 && state.loopEnd > 0 && state.loopStart < state.loopEnd) {
-                    loopStart = state.loopStart;
-                    loopEnd = min(state.loopEnd, bufferDuration);
-                }
-            } else state.enteredLoop = false;
-            const loopStartFrame = loopStart * bufferRate, loopEndFrame = loopEnd * bufferRate;
-            const step = computedRate * bufferRate / rate;
-            let finished = false;
-            for (let i = 0; i < quantum; i++) {
-                const time = (frame + i) / rate;
-                if (time < state.startTime) continue;
-                if (time >= state.stopTime || state.elapsed >= state.duration) { finished = true; continue; }
-                if (!state.begun) {
-                    let offset = min(state.offset, bufferDuration);
-                    if (state.loop && computedRate >= 0 && offset >= loopEnd) offset = loopEnd;
-                    if (computedRate < 0 && state.loop && offset < loopStart) offset = loopStart;
-                    state.offset = offset;
-                    state.position = offset * bufferRate;
-                    state.begun = true;
-                }
-                if (state.loop) {
-                    const offsetFrame = state.offset * bufferRate;
-                    if (!state.enteredLoop) {
-                        if (offsetFrame < loopEndFrame && state.position >= loopStartFrame) state.enteredLoop = true;
-                        if (offsetFrame >= loopEndFrame && state.position < loopEndFrame) state.enteredLoop = true;
-                    }
-                    if (state.enteredLoop && loopEndFrame > loopStartFrame &&
-                        (state.position >= loopEndFrame || state.position < loopStartFrame)) {
-                        // Wrap whole loop iterations (any number of them).
-                        const span = loopEndFrame - loopStartFrame;
-                        const wrapped = (state.position - loopStartFrame) % span;
-                        state.position = loopStartFrame + (wrapped < 0 ? wrapped + span : wrapped);
-                    }
-                }
-                const position = state.position;
-                if (position >= 0 && position < frames) {
-                    // Past the last frame of a loop, interpolation continues
-                    // with the frames that follow loopStart.
-                    const index = floor(position), fraction = position - index;
-                    let nextIndex = index + 1;
-                    if (nextIndex >= frames) nextIndex = state.loop && state.enteredLoop ? floor(loopStartFrame) : -1;
-                    for (let c = 0; c < channels; c++) {
-                        const data = content.channels[c];
-                        const next = nextIndex < 0 ? 0 : data[nextIndex];
-                        output[c][i] = fraction === 0 ? data[index] : data[index] + (next - data[index]) * fraction;
-                    }
-                } else if (!state.loop) finished = true;
-                state.position += step;
-                state.elapsed += computedRate / rate;
-            }
-            if (finished || (frame + quantum) / rate >= state.stopTime) scheduleEnded(context, node, state);
-            return output;
         }
 
         // ---- contexts ----
+        // [[control thread state]] is `state.state`; `state.reported` is the
+        // state the last statechange announced, so each transition the
+        // rendering thread completes fires one event.
+        function reportState(context, state, value) {
+            if (state.reported === value) return;
+            state.reported = value;
+            queue(() => fire(context, "statechange"));
+        }
+        // #allowed-to-start: like Firefox, the Window needs sticky activation.
+        function allowedToStart() {
+            return currentTime() >= topWindowState.lastActivation;
+        }
+        // Sending a control message to start processing (#AudioContext
+        // constructor, #context-resume): the rendering thread acquires the
+        // device and runs; its report resolves the pending resume promises.
+        function startRendering(state, resolve) {
+            sendWithToken(state, "start", () => {
+                const pending = state.pendingResume.splice(0);
+                for (const promise of pending) promise.resolve(undefined);
+                if (resolve) resolve(undefined);
+                if (state.closed) return;
+                if (state.state === "suspended" && !state.suspendedByUser) state.state = "running";
+                if (state.state === "running") reportState(state.object, state, "running");
+            });
+        }
         class BaseAudioContext extends EventTarget {
             constructor(key, state) {
                 if (key !== token) throw new TypeError("Illegal constructor");
@@ -14276,15 +13927,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 set(this, state);
             }
             get sampleRate() { return contextRecord(this).rate; }
-            get currentTime() {
-                const state = contextRecord(this);
-                return state.kind === "offline" ? state.frame / state.rate : 0;
-            }
-            get state() {
-                const state = contextRecord(this);
-                if (state.kind === "offline") return state.state;
-                return state.closed ? "closed" : "suspended";
-            }
+            get currentTime() { return contextTime(contextRecord(this)); }
+            get state() { return contextRecord(this).state; }
             get renderQuantumSize() { return contextRecord(this).quantum; }
             get destination() { return contextRecord(this).destination; }
             createScriptProcessor(bufferSize = 0, numberOfInputChannels = 2, numberOfOutputChannels = 2) {
@@ -14324,54 +13968,118 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 // an IndexSizeError, as for the constructor.
                 return initializeWave(create(PeriodicWave.prototype), a, b, disable);
             }
+            // #dom-baseaudiocontext-decodeaudiodata: the bytes are detached
+            // and decoded on a decoding thread (`webaudio::decode`).
+            decodeAudioData(audioData, successCallback = undefined, errorCallback = undefined) {
+                let state;
+                try {
+                    state = contextRecord(this);
+                    if (arguments.length < 1) throw new TypeError("decodeAudioData requires audio data");
+                    apply(bufferByteLength, audioData, []);
+                    for (const callback of [successCallback, errorCallback]) {
+                        if (callback !== undefined && callback !== null && typeof callback !== "function")
+                            throw new TypeError("decodeAudioData callbacks must be functions");
+                    }
+                    requireActive(state.contextId);
+                } catch (error) { return rejected(error); }
+                const invoke = (callback, value) => {
+                    if (typeof callback !== "function") return;
+                    try { apply(callback, undefined, [value]); }
+                    catch (error) { reportException(error, "decodeAudioData callback"); }
+                };
+                return new PromiseCtor((resolve, reject) => {
+                    let bytes = null;
+                    if (!apply(bufferIsDetached, audioData, [])) {
+                        try { bytes = apply(transferBuffer, audioData, []); } catch (_) { bytes = null; }
+                    }
+                    if (bytes === null) {
+                        const error = new Exception("The audio data is detached", "DataCloneError");
+                        reject(error);
+                        queue(() => invoke(errorCallback, error));
+                        return;
+                    }
+                    const job = host("decode", state.id, bytes);
+                    apply(mapSet, state.decodes, [job, {resolve, reject, success: successCallback, failure: errorCallback, invoke}]);
+                    retain(state);
+                });
+            }
+        }
+        function contextState(kind, fields) {
+            const state = {kind, id: 0, object: null, destination: null, state: "suspended",
+                reported: "suspended", closed: false, tokens: new MapCtor(), nextToken: 0,
+                sources: new MapCtor(), decodes: new MapCtor()};
+            for (const key in fields) state[key] = fields[key];
+            return state;
         }
         class AudioContext extends BaseAudioContext {
             constructor(contextOptions = undefined) {
-                const state = options(contextOptions);
+                const converted = options(contextOptions);
                 requireActive(storageContextId);
+                const device = host("device");
+                const rate = converted.rate === undefined ? device[0] : converted.rate;
+                const state = contextState("context", {rate, quantum: converted.quantum,
+                    contextId: storageContextId, suspendedByUser: false, pendingResume: [],
+                    sink: converted.sink, latency: converted.latency, maxChannels: device[1]});
                 validateRateAndQuantum(state);
-                state.closed = false;
-                state.kind = "context";
-                state.contextId = storageContextId;
                 super(token, state);
                 eventTargetState(this, state);
-                state.destination = new AudioDestinationNode(token, this, 2, 2);
-                state.enqueue = fn => __queue_dom_task(fn);
-                state.fire = type => dispatch(this, createTrustedEvent(Event, type), false);
-                // Sending a control message to start processing: acquisition
-                // failure queues an error event; it does not throw out of the
-                // constructor or start a timer to imitate an audio clock.
-                state.enqueue(() => {
-                    if (!state.closed) state.fire("error");
-                });
+                state.object = this;
+                state.id = host("realtime", rate, state.quantum, device[1], converted.latency,
+                    typeof converted.sink === "object");
+                if (!state.id) throw new Exception("Web Audio is unavailable", "NotSupportedError");
+                contextRelease.register(this, state.id);
+                state.destination = new AudioDestinationNode(token, this, min(2, device[1]), device[1]);
+                if (allowedToStart()) startRendering(state);
             }
-            get baseLatency() { record(this); return 0; }
-            get outputLatency() { record(this); return 0; }
+            get baseLatency() { return host("latency", record(this).id)[0]; }
+            get outputLatency() { return host("latency", record(this).id)[1]; }
+            get sinkId() {
+                const sink = record(this).sink;
+                return typeof sink === "object" ? sink.info || (sink.info = freeze({type: sink.type})) : sink;
+            }
             getOutputTimestamp() {
-                record(this);
-                return {contextTime: 0, performanceTime: 0};
+                const state = record(this);
+                if (state.state !== "running") return {contextTime: 0, performanceTime: 0};
+                return {contextTime: host("outputTime", state.id), performanceTime: currentTime()};
             }
             resume() {
                 return new PromiseCtor((resolve, reject) => {
-                    const state = requireOpen(this);
-                    state.enqueue(() => reject(new Exception(
-                        "No Web Audio renderer is available", "NotSupportedError")));
+                    const state = record(this);
+                    requireActive(state.contextId);
+                    if (state.closed) throw new Exception("AudioContext is closed", "InvalidStateError");
+                    state.suspendedByUser = false;
+                    if (!allowedToStart()) {
+                        state.pendingResume.push({resolve, reject});
+                        return;
+                    }
+                    state.state = "running";
+                    startRendering(state, resolve);
                 });
             }
             suspend() {
                 return new PromiseCtor(resolve => {
-                    requireOpen(this);
-                    // Already suspended: resolve without a spurious statechange.
-                    resolve();
+                    const state = record(this);
+                    requireActive(state.contextId);
+                    if (state.closed) throw new Exception("AudioContext is closed", "InvalidStateError");
+                    state.suspendedByUser = true;
+                    state.state = "suspended";
+                    sendWithToken(state, "suspend", () => {
+                        resolve(undefined);
+                        if (!state.closed) reportState(this, state, "suspended");
+                    });
                 });
             }
             close() {
                 return new PromiseCtor(resolve => {
-                    const state = requireOpen(this);
+                    const state = record(this);
+                    requireActive(state.contextId);
+                    if (state.closed) throw new Exception("AudioContext is closed", "InvalidStateError");
                     state.closed = true;
-                    state.enqueue(() => {
-                        resolve();
-                        state.enqueue(() => state.fire("statechange"));
+                    state.state = "closed";
+                    state.sources.clear();
+                    sendWithToken(state, "close", () => {
+                        resolve(undefined);
+                        reportState(this, state, "closed");
                     });
                 });
             }
@@ -14382,7 +14090,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 // constructor(unsigned long numberOfChannels, unsigned long length, float sampleRate)
                 const channels = unsignedLong(args[0]), length = unsignedLong(args[1]);
                 const rate = float(args[2], "sampleRate");
-                return {channels, length, rate, quantum: 128, hardware: false};
+                return {channels, length, rate, quantum: 128};
             }
             if (args.length !== 1) throw new TypeError("OfflineAudioContext requires options or three arguments");
             const dict = dictionary(args[0], "OfflineAudioContextOptions");
@@ -14393,8 +14101,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             const sizing = renderSize(member(dict, "renderSizeHint"));
             const rateValue = member(dict, "sampleRate");
             if (rateValue === undefined) throw new TypeError("OfflineAudioContextOptions.sampleRate is required");
-            return {channels, length, rate: float(rateValue, "sampleRate"),
-                quantum: sizing.hardware ? 128 : sizing.quantum, hardware: false};
+            return {channels, length, rate: float(rateValue, "sampleRate"), quantum: sizing.quantum};
         }
         class OfflineAudioContext extends BaseAudioContext {
             constructor(...args) {
@@ -14406,12 +14113,15 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 if (converted.length !== null && (converted.length < 1 ||
                     converted.length * converted.channels > MAX_BUFFER_SAMPLES))
                     throw new Exception("Unsupported OfflineAudioContext length", "NotSupportedError");
-                const state = {kind: "offline", rate: converted.rate, quantum: converted.quantum,
+                const state = contextState("offline", {rate: converted.rate, quantum: converted.quantum,
                     channels: converted.channels, length: converted.length, contextId: storageContextId,
-                    state: "suspended", frame: 0, renderingStarted: false, committed: 0, rendered: 0,
-                    nodes: [], suspends: new Map(), jobs: [], closed: false};
+                    renderingStarted: false, committed: 0, rendered: 0, suspends: new MapCtor(), jobs: []});
                 super(token, state);
                 eventTargetState(this, state);
+                state.object = this;
+                state.id = host("offline", converted.rate, converted.quantum, converted.channels);
+                if (!state.id) throw new Exception("Web Audio is unavailable", "NotSupportedError");
+                contextRelease.register(this, state.id);
                 state.destination = new AudioDestinationNode(token, this, converted.channels, converted.channels);
             }
             get length() { return offlineRecord(this).length; }
@@ -14437,17 +14147,18 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                     // every engine report as the final buffer's length.
                     if (length % state.quantum) length += state.quantum - length % state.quantum;
                     if (state.length !== null) length = min(length, state.length - state.committed);
-                    let buffer;
-                    try { buffer = createBuffer(state.channels, max(1, length), state.rate); }
-                    catch (error) { return reject(error); }
+                    length = max(1, length);
+                    if (length * state.channels > MAX_BUFFER_SAMPLES)
+                        return reject(new Exception("The AudioBuffer is too large", "NotSupportedError"));
                     state.renderingStarted = true;
                     state.committed += length;
-                    state.jobs.push({buffer, written: 0, length, resolve, reject});
+                    state.jobs.push({length, resolve, reject});
                     if (state.state !== "running") {
                         state.state = "running";
-                        queue(() => fire(this, "statechange"));
+                        reportState(this, state, "running");
                     }
-                    if (state.jobs.length === 1) queue(() => renderJob(this, state));
+                    retain(state);
+                    host("render", state.id, length);
                 });
             }
             resume() {
@@ -14459,13 +14170,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 return new PromiseCtor((resolve, reject) => {
                     if (state.state === "closed" || state.closed || !state.renderingStarted)
                         return reject(new Exception("The OfflineAudioContext cannot be resumed", "InvalidStateError"));
-                    queue(() => {
+                    sendWithToken(state, "start", () => {
                         resolve(undefined);
-                        if (state.state !== "running") {
-                            state.state = "running";
-                            queue(() => fire(this, "statechange"));
-                        }
-                        if (state.jobs.length) queue(() => renderJob(this, state));
+                        if (state.closed) return;
+                        state.state = "running";
+                        reportState(this, state, "running");
+                        updateRetention(state);
                     });
                 });
             }
@@ -14479,10 +14189,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 return new PromiseCtor((resolve, reject) => {
                     // The suspend frame is rounded up to a render quantum boundary.
                     const frame = ceil(suspendTime * state.rate / state.quantum) * state.quantum;
-                    if (frame < 0 || frame <= state.frame || (state.length !== null && frame >= state.length) ||
+                    if (frame < 0 || frame <= host("frame", state.id) || (state.length !== null && frame >= state.length) ||
                         state.suspends.has(frame) || state.state === "closed")
                         return reject(new Exception("Invalid suspend time", "InvalidStateError"));
-                    state.suspends.set(frame, resolve);
+                    state.suspends.set(frame, {resolve, reject});
+                    host("suspendAt", state.id, frame);
                 });
             }
             close() {
@@ -14498,61 +14209,101 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                     // never completed.
                     for (const job of state.jobs.splice(0))
                         queue(() => job.reject(new Exception("The OfflineAudioContext was closed", "InvalidStateError")));
-                    closeOffline(this, state, resolve);
+                    state.sources.clear();
+                    sendWithToken(state, "close", () => {
+                        resolve(undefined);
+                        state.state = "closed";
+                        reportState(this, state, "closed");
+                    });
                 });
             }
         }
-        function closeOffline(context, state, resolve) {
-            queue(() => {
-                if (resolve) resolve(undefined);
-                if (state.state !== "closed") {
-                    state.state = "closed";
-                    queue(() => fire(context, "statechange"));
-                }
-            });
-        }
-        // #begin-offline-rendering on this realm's task queue: at most 64
-        // render quanta per task, suspending at scheduled quantum boundaries.
-        function renderJob(context, state) {
-            const job = state.jobs[0];
-            if (!job || state.state !== "running" || state.closed) return;
-            if (!binding("active", state.contextId)) return;
-            for (let budget = 0; budget < 64 && job.written < job.length; budget++) {
-                const suspend = state.suspends.get(state.frame);
-                if (suspend) {
-                    state.suspends.delete(state.frame);
-                    state.state = "suspended";
-                    queue(() => {
-                        suspend(undefined);
-                        fire(context, "statechange");
-                    });
-                    return;
-                }
-                const block = renderQuantum(state, state.quantum);
-                const count = min(state.quantum, job.length - job.written);
-                const channels = bufferRecord(job.buffer).channels;
-                for (let c = 0; c < channels.length && c < block.length; c++)
-                    channels[c].set(count === state.quantum ? block[c] : block[c].subarray(0, count), job.written);
-                job.written += count;
-                state.frame += state.quantum;
-            }
-            if (job.written < job.length) { queue(() => renderJob(context, state)); return; }
-            state.jobs.shift();
+        // A startRendering() buffer is complete (#rendering-loop for an
+        // OfflineAudioContext): resolve its promise, then fire complete.
+        function offlineRendered(context, state, buffer) {
+            const job = state.jobs.shift();
+            if (!job) return;
             state.rendered += job.length;
             const complete = () => dispatch(context, createTrustedEvent(OfflineAudioCompletionEvent, "complete",
-                {renderedBuffer: job.buffer}), false);
-            queue(() => {
-                job.resolve(job.buffer);
-                if (state.length !== null) {
-                    if (state.rendered >= state.length && !state.closed) {
-                        state.closed = true;
-                        queue(complete);
-                        closeOffline(context, state, null);
-                    } else queue(complete);
-                }
-            });
-            if (state.jobs.length) queue(() => renderJob(context, state));
+                {renderedBuffer: buffer}), false);
+            job.resolve(buffer);
+            if (state.length !== null) {
+                if (state.rendered >= state.length && !state.closed) {
+                    state.closed = true;
+                    queue(complete);
+                    queue(() => {
+                        state.state = "closed";
+                        reportState(context, state, "closed");
+                        host("close", state.id, 0);
+                    });
+                } else queue(complete);
+            }
         }
+        // The rendering threads' reports (`webaudio_host::dispatch`), each a
+        // task of the context's media element event task source.
+        trust.webAudioEvent = function (id, kind, a, b, c, d) {
+            const context = liveGet(id);
+            const state = context && get(context);
+            if (!state) return;
+            switch (kind) {
+                case "ended": {
+                    const node = apply(mapGet, state.sources, [a]);
+                    if (node) {
+                        apply(mapDelete, state.sources, [a]);
+                        const nodeState = get(node);
+                        if (!nodeState.ended) {
+                            nodeState.ended = true;
+                            fire(node, "ended");
+                        }
+                    }
+                    break;
+                }
+                case "running": case "suspended": case "closed": {
+                    const done = apply(mapGet, state.tokens, [a]);
+                    apply(mapDelete, state.tokens, [a]);
+                    if (done) done();
+                    break;
+                }
+                case "offlineSuspended": {
+                    const pending = state.suspends.get(a);
+                    state.suspends.delete(a);
+                    state.state = "suspended";
+                    if (pending) pending.resolve(undefined);
+                    reportState(context, state, "suspended");
+                    break;
+                }
+                case "suspendMissed": {
+                    const pending = state.suspends.get(a);
+                    state.suspends.delete(a);
+                    if (pending) pending.reject(new Exception("Invalid suspend time", "InvalidStateError"));
+                    break;
+                }
+                case "rendered":
+                    offlineRendered(context, state, contentBuffer(a, b, state.rate, c));
+                    break;
+                case "decoded": {
+                    const pending = apply(mapGet, state.decodes, [a]);
+                    apply(mapDelete, state.decodes, [a]);
+                    if (!pending) break;
+                    if (b) {
+                        const buffer = contentBuffer(b, c, state.rate, d);
+                        pending.resolve(buffer);
+                        pending.invoke(pending.success, buffer);
+                    } else {
+                        const error = new Exception("The audio data cannot be decoded", "EncodingError");
+                        pending.reject(error);
+                        pending.invoke(pending.failure, error);
+                    }
+                    break;
+                }
+                case "renderFailed": {
+                    const job = state.jobs.shift();
+                    if (job) job.reject(new Exception("The rendered buffer cannot be allocated", "NotSupportedError"));
+                    break;
+                }
+            }
+            updateRetention(state);
+        };
         class OfflineAudioCompletionEvent extends Event {
             constructor(type, init) {
                 if (arguments.length < 2) throw new TypeError("OfflineAudioCompletionEvent requires type and init");

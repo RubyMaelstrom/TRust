@@ -88,6 +88,7 @@ pub mod text;
 pub mod theme;
 pub mod tls;
 pub mod ui;
+pub mod webaudio;
 pub mod ws;
 
 /// Stable frontend grouping. The root re-exports above remain while the

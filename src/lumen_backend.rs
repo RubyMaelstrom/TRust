@@ -45,6 +45,8 @@ mod page_spare;
 mod svg_geometry_host;
 #[path = "text_decoder_host.rs"]
 mod text_decoder_host;
+#[path = "webaudio_host.rs"]
+mod webaudio_host;
 #[path = "webgl_host.rs"]
 mod webgl_host;
 
@@ -185,6 +187,8 @@ enum LumenHostTask {
         id: u64,
         task: media_host::MediaTask,
     },
+    /// A Web Audio rendering thread reported (`webaudio_host`).
+    WebAudio(webaudio_host::WebAudioTask),
     /// HTML #offscreencanvas-placeholder: an OffscreenCanvas committed a
     /// frame for the placeholder canvas element `node`.
     CanvasFrame {
@@ -792,6 +796,8 @@ struct HostState {
     task_events: Option<LumenTaskSender>,
     /// The players of this document's media elements (`media_host`).
     media: media_host::MediaHost,
+    /// Web Audio contexts' engines and shared data (`webaudio_host`).
+    webaudio: webaudio_host::WebAudioHost,
     pending_resources: usize,
     /// HTML #link-type-preload fetches in flight. They never delay the load
     /// event, but the document is not quiescent until they settle.
@@ -974,6 +980,7 @@ impl HostState {
             pending_document_images: 0,
             task_events: None,
             media: media_host::MediaHost::default(),
+            webaudio: webaudio_host::WebAudioHost::default(),
             pending_resources: 0,
             pending_preloads: 0,
             pending_module_evaluations: 0,
@@ -1287,6 +1294,7 @@ impl RetainedMemory for HostState {
             pending_document_images: _,
             task_events,
             media,
+            webaudio,
             pending_resources,
             pending_preloads: _,
             pending_module_evaluations: _,
@@ -1543,7 +1551,7 @@ impl RetainedMemory for HostState {
         // page's image store; report the native maps and the payload bytes.
         // Media players own their buffers on their own threads; the agent
         // retains only their table here.
-        let media_bytes = media.retained_bytes();
+        let media_bytes = media.retained_bytes() + webaudio.retained_bytes();
         if media_bytes != 0 {
             visitor.opaque_storage();
             visitor.allocation(RetainedManagedAllocation::new(
@@ -12374,10 +12382,13 @@ fn host_audio_context_binding(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Re
     if op == "slots" {
         return Ok(state.audio_context_slots.get_or_insert(value).clone());
     }
-    let context = value.as_num_opt().unwrap_or(0.) as u64;
-    Ok(Value::Bool(
-        context == 0 || state.window_realms.contains_key(&context),
-    ))
+    if op == "active" {
+        let context = value.as_num_opt().unwrap_or(0.) as u64;
+        return Ok(Value::Bool(
+            context == 0 || state.window_realms.contains_key(&context),
+        ));
+    }
+    webaudio_host::binding(ctx, &op, args)
 }
 
 /// A native Window operation observes its script caller BEFORE entering the
@@ -15577,6 +15588,7 @@ fn host_release_job_context(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
         state.window_realms.remove(&context);
         state.message_ports.release(Some(context));
         state.indexed_db.release(Some(context));
+        state.webaudio.release_realm(context);
         // File API #lifeTime: the Window's entries go away with its Document.
         state
             .blobs
@@ -19014,6 +19026,7 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
     match task {
         LumenHostTask::PortReady => {}
         LumenHostTask::Media { id, task } => media_host::dispatch(engine, id, task)?,
+        LumenHostTask::WebAudio(task) => webaudio_host::dispatch(engine, task)?,
         LumenHostTask::CanvasFrame { node } => {
             let dom = engine
                 .ctx()
@@ -35129,10 +35142,59 @@ mod tests {
         }
     }
 
+    /// A Window realm whose host tasks (Web Audio rendering threads'
+    /// reports) arrive on `tasks`.
+    fn audio_engine() -> (
+        lumen::Engine,
+        tokio::sync::mpsc::UnboundedReceiver<LumenHostTask>,
+    ) {
+        let (sender, tasks) = tokio::sync::mpsc::unbounded_channel();
+        let mut state = HostState::new(
+            Rc::new(RefCell::new(Dom::new())),
+            Rc::new(RealmClock::new()),
+        );
+        state.task_events = Some(LumenTaskSender::Page(sender));
+        (configured_engine(state, DEFAULT_URL), tasks)
+    }
+
+    /// Run host and platform tasks until `condition` is true (or panic
+    /// after `seconds`).
+    fn pump_audio_until(
+        engine: &mut lumen::Engine,
+        tasks: &mut tokio::sync::mpsc::UnboundedReceiver<LumenHostTask>,
+        condition: &str,
+        seconds: u64,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(seconds);
+        loop {
+            run_microtask_checkpoint(engine);
+            if string_value(engine, &format!("String({condition})")) == "true" {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "audio never reached {condition}: {}",
+                string_value(engine, "__trust.takeErrors()")
+            );
+            if let Ok(task) = tasks.try_recv() {
+                dispatch_host_task(engine, task).unwrap();
+            } else if string_value(engine, "__trust.hasPlatformTask()") == "true" {
+                eval(engine, "__trust.runPlatformTask()", "audio task").unwrap();
+            } else if string_value(engine, "String(__trust.tick())") != "true" {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
     #[test]
-    fn audio_context_lifecycle_without_a_renderer() {
+    fn audio_context_waits_for_activation_then_renders() {
+        // Web Audio 1.1 (local WebAudio/web-audio-api@2047f16)
+        // #AudioContext-constructors "allowed to start", #AudioContext-methods
+        // resume()/suspend()/close() and #rendering-loop: without sticky
+        // activation resume() waits; after activation the context runs (here
+        // on the silent real-time sink) and its clock advances.
         for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
-            let mut engine = platform_engine();
+            let (mut engine, mut tasks) = audio_engine();
             engine.set_tier(tier);
             engine.set_tier_threshold(0);
             assert_eq!(
@@ -35140,57 +35202,76 @@ mod tests {
                 "audio-context-pending",
                 "{tier:?}"
             );
+            pump_audio_until(
+                &mut engine,
+                &mut tasks,
+                "audioSuspendResult !== 'pending' && audioBrandResult !== 'pending'",
+                10,
+            );
+            std::thread::sleep(Duration::from_millis(50));
             run_microtask_checkpoint(&mut engine);
             assert_eq!(
                 string_value(
                     &mut engine,
-                    "audioResumeResult + '|' + audioSuspendResult + '|' + audioBrandResult"
+                    "[audioResumeResult, audioSuspendResult, audioBrandResult, audioEvents.join(), audioContext.state, audioContext.currentTime].join('|')"
                 ),
-                "pending|suspended|TypeError"
+                "pending|suspended|TypeError||suspended|0",
+                "{tier:?}"
             );
-            for _ in 0..100 {
-                if string_value(&mut engine, "__trust.hasPlatformTask()") == "false" {
-                    break;
-                }
-                eval(&mut engine, "__trust.runPlatformTask()", "audio task").unwrap();
-                run_microtask_checkpoint(&mut engine);
-            }
+            eval(
+                &mut engine,
+                "const root = document.createElement('html'), body = document.createElement('body');\n\
+                 document.append(root); root.append(body);\n\
+                 __trust.key(body.__id,'a','KeyA',false,false,false,false,false,false);\n\
+                 if (!navigator.userActivation.hasBeenActive) throw Error('no activation');\n\
+                 audioContext.resume().then(() => globalThis.secondResume = 'resumed');",
+                "activate and resume",
+            )
+            .unwrap();
+            pump_audio_until(
+                &mut engine,
+                &mut tasks,
+                "audioResumeResult === 'resumed' && globalThis.secondResume === 'resumed' && audioContext.currentTime > 0.05",
+                10,
+            );
+            pump_audio_until(&mut engine, &mut tasks, "audioEvents.length > 0", 5);
             assert_eq!(
                 string_value(
                     &mut engine,
-                    "[audioResumeResult, audioEvents.join(','), audioContext.state, audioContext.currentTime, __trust.hasPlatformTask()].join('|')"
+                    "[audioEvents.join(), audioContext.state, __trust.takeErrors()].join('|')"
                 ),
-                "NotSupportedError|error,new-handler,after-handler|suspended|0|false",
+                "state:running|running|",
                 "{tier:?}"
             );
-            eval(&mut engine, r#"
-                audioEvents.length = 0;
-                audioContext.onstatechange = event => {
-                    assertAudio(event.isTrusted && event.target === audioContext, 'trusted state event');
-                    audioEvents.push('closed-event');
-                };
+            eval(
+                &mut engine,
+                r#"
                 audioContext.close().then(() => audioEvents.push('closed-promise'));
-                assertAudio(audioContext.state === 'closed', 'close changes control state synchronously');
+                if (audioContext.state !== 'closed') throw Error('close changes control state synchronously');
                 Promise.all(['resume', 'suspend', 'close'].map(method =>
                     audioContext[method]().catch(error => error.name))).then(results => {
                         globalThis.audioClosedResults = results.join(',');
                     });
-            "#, "close audio context").unwrap();
-            run_microtask_checkpoint(&mut engine);
-            assert_eq!(string_value(&mut engine, "audioEvents.length"), "0");
-            for _ in 0..10 {
-                if string_value(&mut engine, "__trust.hasPlatformTask()") == "false" {
-                    break;
-                }
-                eval(&mut engine, "__trust.runPlatformTask()", "audio close task").unwrap();
-                run_microtask_checkpoint(&mut engine);
-            }
+            "#,
+                "close audio context",
+            )
+            .unwrap();
+            pump_audio_until(
+                &mut engine,
+                &mut tasks,
+                "audioEvents.includes('state:closed') && globalThis.audioClosedResults !== undefined",
+                10,
+            );
+            let stopped = string_value(&mut engine, "audioContext.currentTime");
+            std::thread::sleep(Duration::from_millis(60));
             assert_eq!(
                 string_value(
                     &mut engine,
-                    "[audioEvents.join(','), audioClosedResults, audioContext.currentTime, __trust.hasPlatformTask(), __trust.takeErrors()].join('|')"
+                    "[audioEvents.join(), audioClosedResults, audioContext.currentTime, __trust.takeErrors()].join('|')"
                 ),
-                "closed-promise,closed-event|InvalidStateError,InvalidStateError,InvalidStateError|0|false|",
+                format!(
+                    "state:running,closed-promise,state:closed|InvalidStateError,InvalidStateError,InvalidStateError|{stopped}|"
+                ),
                 "{tier:?}"
             );
         }
@@ -35199,7 +35280,7 @@ mod tests {
     #[test]
     fn audio_context_script_processor_suspended_graph() {
         for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
-            let mut engine = platform_engine();
+            let (mut engine, mut tasks) = audio_engine();
             engine.set_tier(tier);
             engine.set_tier_threshold(0);
             assert_eq!(
@@ -35211,20 +35292,15 @@ mod tests {
                 "{tier:?}"
             );
             run_microtask_checkpoint(&mut engine);
-            for _ in 0..20 {
-                if string_value(&mut engine, "__trust.hasPlatformTask()") == "false" {
-                    break;
-                }
-                eval(&mut engine, "__trust.runPlatformTask()", "audio graph task").unwrap();
-                run_microtask_checkpoint(&mut engine);
-            }
+            std::thread::sleep(Duration::from_millis(50));
+            pump_audio_until(&mut engine, &mut tasks, "true", 1);
             engine.ctx().collect_garbage_for_host();
             assert_eq!(
                 string_value(
                     &mut engine,
-                    "[silentResume, silentContext.state, silentContext.currentTime, processCalls, __trust.hasPlatformTask()].join('|')"
+                    "[silentResume, silentContext.state, silentContext.currentTime, processCalls].join('|')"
                 ),
-                "NotSupportedError|suspended|0|0|false",
+                "pending|suspended|0|0",
                 "{tier:?}"
             );
             // Connections remain valid across collection and context closure;
@@ -35239,19 +35315,18 @@ mod tests {
                 "close suspended graph",
             )
             .unwrap();
-            for _ in 0..20 {
-                if string_value(&mut engine, "__trust.hasPlatformTask()") == "false" {
-                    break;
-                }
-                eval(&mut engine, "__trust.runPlatformTask()", "audio close task").unwrap();
-                run_microtask_checkpoint(&mut engine);
-            }
+            pump_audio_until(
+                &mut engine,
+                &mut tasks,
+                "silentContext.state === 'closed'",
+                10,
+            );
             assert_eq!(
                 string_value(
                     &mut engine,
-                    "[silentContext.state, silentContext.currentTime, processCalls, __trust.hasPlatformTask()].join('|')"
+                    "[silentContext.state, silentContext.currentTime, processCalls].join('|')"
                 ),
-                "closed|0|0|false",
+                "closed|0|0",
                 "{tier:?}"
             );
             eval(
@@ -35276,10 +35351,8 @@ mod tests {
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
         assert!(!outcome.panicked);
         assert!(rendered.contains(">Start audio</button>"), "{rendered}");
-        assert!(
-            rendered.contains(">NotSupportedError</output>"),
-            "{rendered}"
-        );
+        // Without user activation the context may not start: resume() waits.
+        assert!(rendered.contains(">Ready</output>"), "{rendered}");
     }
 
     #[test]
@@ -35381,7 +35454,7 @@ mod tests {
         // #rendering-loop, #computation-of-value, #waveform-generation,
         // #DynamicsCompressorOptions-processing and #playback-AudioBufferSourceNode.
         for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
-            let mut engine = platform_engine();
+            let (mut engine, mut tasks) = audio_engine();
             engine.set_tier(tier);
             engine.set_tier_threshold(0);
             eval(
@@ -35390,8 +35463,14 @@ mod tests {
                 "offline audio",
             )
             .unwrap();
+            pump_audio_until(
+                &mut engine,
+                &mut tasks,
+                "globalThis.offlineAudioResult !== undefined",
+                20,
+            );
             assert_eq!(
-                settle_platform_result(&mut engine, "__trust", "offlineAudioResult"),
+                string_value(&mut engine, "offlineAudioResult"),
                 "offline-audio-ok",
                 "{tier:?}"
             );
@@ -35430,11 +35509,17 @@ mod tests {
         "#;
         let mut results = Vec::new();
         for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
-            let mut engine = platform_engine();
+            let (mut engine, mut tasks) = audio_engine();
             engine.set_tier(tier);
             engine.set_tier_threshold(0);
             eval(&mut engine, probe, "audio probe").unwrap();
-            results.push(settle_platform_result(&mut engine, "__trust", "audioProbe"));
+            pump_audio_until(
+                &mut engine,
+                &mut tasks,
+                "globalThis.audioProbe !== undefined",
+                20,
+            );
+            results.push(string_value(&mut engine, "audioProbe"));
         }
         assert!(
             results.windows(2).all(|pair| pair[0] == pair[1]),
@@ -35450,6 +35535,69 @@ mod tests {
         // libm last-place differences between platforms.
         let sum: f64 = fields[3].parse().unwrap();
         assert!((sum - 189.434_536_896_733_33).abs() < 1e-9, "{results:?}");
+    }
+
+    #[test]
+    fn decode_audio_data_decodes_resamples_and_plays() {
+        // Web Audio 1.1 (local WebAudio/web-audio-api@2047f16)
+        // #dom-baseaudiocontext-decodeaudiodata: the ArrayBuffer is detached,
+        // its sniffed audio decoded on a decoding thread and resampled to the
+        // context's rate; undecodable bytes are an EncodingError and detached
+        // ones a DataCloneError, each also reported to the error callback.
+        let probe = r#"
+            (async () => {
+                // 8 frames of 16-bit stereo PCM at 4 kHz.
+                const frames = [[16384, -8192], [8192, -8192], [0, -8192], [-8192, -8192],
+                    [-16384, -8192], [-8192, -8192], [0, -8192], [8192, -8192]];
+                const bytes = new Uint8Array(44 + frames.length * 4), view = new DataView(bytes.buffer);
+                const text = (offset, value) => [...value].forEach((c, i) => bytes[offset + i] = c.charCodeAt(0));
+                text(0, 'RIFF'); view.setUint32(4, 36 + frames.length * 4, true); text(8, 'WAVEfmt ');
+                view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 2, true);
+                view.setUint32(24, 4000, true); view.setUint32(28, 16000, true); view.setUint16(32, 4, true);
+                view.setUint16(34, 16, true); text(36, 'data'); view.setUint32(40, frames.length * 4, true);
+                frames.forEach(([l, r], i) => { view.setInt16(44 + i * 4, l, true); view.setInt16(46 + i * 4, r, true); });
+                const results = [];
+                const context = new OfflineAudioContext(2, 128, 4000);
+                const data = bytes.buffer.slice(0);
+                let callback = null;
+                const buffer = await context.decodeAudioData(data, decoded => callback = decoded);
+                results.push(data.byteLength, buffer instanceof AudioBuffer, callback === buffer,
+                    buffer.length, buffer.numberOfChannels, buffer.sampleRate,
+                    buffer.getChannelData(0)[0], buffer.getChannelData(1)[3]);
+                const resampled = await new OfflineAudioContext(1, 128, 8000).decodeAudioData(bytes.buffer.slice(0));
+                results.push(resampled.length, resampled.sampleRate);
+                const failures = [];
+                await context.decodeAudioData(new Uint8Array([1, 2, 3]).buffer, null, error => failures.push('cb:' + error.name))
+                    .catch(error => failures.push(error.name));
+                const detached = new ArrayBuffer(4);
+                structuredClone(detached, {transfer: [detached]});
+                await context.decodeAudioData(detached, null, error => failures.push('cb:' + error.name))
+                    .catch(error => failures.push(error.name));
+                await context.decodeAudioData('nope').catch(error => failures.push(error.name));
+                await new Promise(resolve => setTimeout(resolve, 0));
+                results.push(failures.join());
+                const source = context.createBufferSource();
+                source.buffer = buffer;
+                source.connect(context.destination);
+                source.start();
+                const rendered = await context.startRendering();
+                results.push(rendered.getChannelData(0)[1], rendered.getChannelData(1)[7], rendered.getChannelData(0)[9]);
+                return results.join('|');
+            })().then(value => globalThis.decodeProbe = value,
+                error => globalThis.decodeProbe = 'ERROR:' + error.name + ':' + error.message);
+        "#;
+        let (mut engine, mut tasks) = audio_engine();
+        eval(&mut engine, probe, "decode probe").unwrap();
+        pump_audio_until(
+            &mut engine,
+            &mut tasks,
+            "globalThis.decodeProbe !== undefined",
+            20,
+        );
+        assert_eq!(
+            string_value(&mut engine, "decodeProbe"),
+            "0|true|true|8|2|4000|0.5|-0.25|16|8000|cb:EncodingError,EncodingError,DataCloneError,TypeError,cb:DataCloneError|0.25|-0.25|0"
+        );
     }
 
     #[test]

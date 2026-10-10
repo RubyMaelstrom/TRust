@@ -1,6 +1,7 @@
-// Web Audio 1.1 #AudioContext / #sample-rates and Web IDL #js-to-dictionary.
-// A missing renderer must not abort a module that constructs its context
-// before creating UI. It must also never pretend to play or advance time.
+// Web Audio 1.1 (local WebAudio/web-audio-api@2047f16) #AudioContext,
+// #AudioContext-constructors, #AudioContext-methods, #sample-rates and Web IDL
+// #js-to-dictionary. A context that is not allowed to start (no sticky
+// activation) stays suspended without failing; resume() waits for it.
 function assertAudio(condition, message) {
     if (!condition) throw new Error(message);
 }
@@ -18,8 +19,12 @@ assertAudio(audioContext instanceof AudioContext && audioContext instanceof Base
 assertAudio(Object.prototype.toString.call(audioContext) === '[object AudioContext]', 'interface tag');
 assertAudio(audioContext.state === 'suspended' && audioContext.currentTime === 0, 'initial state and clock');
 assertAudio(audioContext.sampleRate === 48000 && audioContext.renderQuantumSize === 128, 'default settings');
+assertAudio(audioContext.destination.maxChannelCount === 2 && audioContext.destination.channelCount === 2,
+    'destination follows the device');
 assertAudio(audioContext.onerror === null && audioContext.onstatechange === null, 'initial event handlers');
-assertAudio(audioContext.baseLatency === 0 && audioContext.outputLatency === 0, 'no acquired renderer latency');
+assertAudio(audioContext.baseLatency > 0 && audioContext.baseLatency < 0.1 && audioContext.outputLatency === 0,
+    'processing latency without an acquired device');
+assertAudio(audioContext.sinkId === '', 'default sink');
 const stamp = audioContext.getOutputTimestamp();
 assertAudio(stamp.contextTime === 0 && stamp.performanceTime === 0 &&
     stamp !== audioContext.getOutputTimestamp(), 'fresh zero timestamp before processing');
@@ -51,6 +56,9 @@ for (const rate of [3000, 44100.1, 768000]) {
 for (const options of [undefined, null, {}, {latencyHint: 'interactive'},
     {latencyHint: 'balanced'}, {latencyHint: 'playback'}, {renderSizeHint: 'hardware'},
     {renderSizeHint: 256}, {sinkId: {type: 'none'}}]) new AudioContext(options).close();
+const silentSink = new AudioContext({sinkId: {type: 'none'}});
+assertAudio(silentSink.sinkId.type === 'none' && silentSink.sinkId === silentSink.sinkId, 'AudioSinkInfo');
+silentSink.close();
 const reads = [];
 new AudioContext({
     get sinkId() { reads.push('sink'); return ''; },
@@ -60,19 +68,21 @@ new AudioContext({
 }).close();
 assertAudio(reads.join(',') === 'latency,quantum,rate,number,sink', 'dictionary conversion ordering');
 
-audioContext.addEventListener('error', event => {
-    assertAudio(event.isTrusted && !event.bubbles && !event.cancelable &&
-        event.target === audioContext, 'trusted acquisition failure event');
-    audioEvents.push('error');
-});
+// Event handler attributes keep their listener position when replaced.
+audioContext.addEventListener('error', () => audioEvents.push('first'));
 audioContext.onerror = () => audioEvents.push('old-handler');
 audioContext.addEventListener('error', () => audioEvents.push('after-handler'));
 audioContext.onerror = () => audioEvents.push('new-handler');
-audioContext.onstatechange = () => audioEvents.push('unexpected-statechange');
-assertAudio(audioEvents.length === 0, 'construction does not dispatch synchronously');
+audioContext.dispatchEvent(new Event('error'));
+assertAudio(audioEvents.join() === 'first,new-handler,after-handler', 'handler order: ' + audioEvents);
+audioEvents.length = 0;
+audioContext.onstatechange = event => {
+    assertAudio(event.isTrusted && event.target === audioContext, 'trusted state event');
+    audioEvents.push('state:' + audioContext.state);
+};
 var audioResumeResult = 'pending', audioSuspendResult = 'pending', audioBrandResult = 'pending';
-audioContext.resume().then(() => audioResumeResult = 'incorrectly running', error => audioResumeResult = error.name);
+audioContext.resume().then(() => audioResumeResult = 'resumed', error => audioResumeResult = error.name);
 audioContext.suspend().then(() => audioSuspendResult = 'suspended');
 AudioContext.prototype.resume.call({}).catch(error => audioBrandResult = error.name);
-assertAudio(audioResumeResult === 'pending', 'resume failure is asynchronous');
+assertAudio(audioResumeResult === 'pending', 'resume waits until the context may start');
 'audio-context-pending'
