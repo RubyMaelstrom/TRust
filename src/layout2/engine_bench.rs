@@ -381,3 +381,75 @@ fn layout_engine_resource_workloads() {
         }
     }
 }
+
+/// A collection page's tile grid, then a script appending a measuring probe
+/// to the body (the pattern behind a layout read after each mutation batch).
+/// Only the probe is new; every tile keeps its inputs, so the next layout
+/// reuses them. Run it with `--nocapture` in release for the timings (100
+/// tiles: about 120 ms cold, about 4 ms after each probe).
+#[test]
+fn a_body_probe_after_a_tile_grid_keeps_the_tile_box_trees() {
+    const TILES: usize = 40;
+    let base = Url::parse("https://layout.invalid/").unwrap();
+    let vp = Viewport::new(1280., 900.);
+    let controls = ControlMap::new();
+    let images = ImageSizes::new();
+    let tile = "<article class=tile><div class=thumb><img src=/t.png></div>\
+        <div class=meta><h4>title of the book here</h4><div>added Oct 10, 2026</div></div>\
+        <div class=stats><span>0</span><span>1</span><span>2</span></div></article>";
+    let html = format!(
+        "<style>body{{margin:0}}main{{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:10px}}\
+         .tile{{display:flex;flex-direction:column;border:1px solid #ccc}}.thumb{{height:160px;display:flex;justify-content:center}}\
+         .meta{{padding:4px}}.stats{{display:flex;justify-content:space-between}}</style>\
+         <header>top</header><main>{}</main><footer>end</footer>",
+        tile.repeat(TILES)
+    );
+    let mut dom = Dom::parse_document(&html);
+    let measure = |dom: &Dom| {
+        let start = Instant::now();
+        let layout = measure_retained_layout(dom, &base, vp, &[], &controls, &images);
+        eprintln!(
+            "BODY_PROBE {:.1}ms flow={:?} tree={:?} hits={} builds={}",
+            start.elapsed().as_secs_f64() * 1e3,
+            layout.work.flow,
+            layout.work.tree,
+            layout.work.item_hits,
+            layout.work.tree_builds
+        );
+        layout.work
+    };
+    let cold = measure(&dom);
+    assert!(cold.tree_builds > 0);
+    let body = dom
+        .descendants(crate::dom::DOCUMENT)
+        .find(|&n| dom.tag_name(n) == Some("body"))
+        .unwrap();
+    // Font and SVG metadata revisions are process-wide, and tests running
+    // beside this one advance them, which expires every retained result once.
+    // Four layouts cannot all be hit by that: the best one shows the reuse.
+    let mut best = usize::MAX;
+    let mut reused = false;
+    for width in [10, 11] {
+        let probe = dom.create_element("div");
+        dom.set_attr(
+            probe,
+            "style",
+            &format!("position:absolute;visibility:hidden;width:{width}px"),
+        );
+        dom.append(body, probe);
+        let work = measure(&dom);
+        best = best.min(work.tree_builds);
+        reused |= work.tree_hits + work.item_hits > 0;
+        dom.detach(probe);
+        let work = measure(&dom);
+        best = best.min(work.tree_builds);
+        reused |= work.tree_hits + work.item_hits > 0;
+    }
+    // Only the path from the body to the probe is built again; the box tree
+    // of every tile is the retained one.
+    assert!(
+        best <= 4,
+        "the box trees were rebuilt: {best} (cold {cold:?})"
+    );
+    assert!(reused, "nothing was reused");
+}
