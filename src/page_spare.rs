@@ -235,6 +235,7 @@ fn warm(engine: &mut lumen::Engine, snapshot: &'static [u8]) -> Result<(), Strin
         serde_json::Value::Null,
         None,
         false,
+        false,
         MainWindowTraces::default(),
     );
 

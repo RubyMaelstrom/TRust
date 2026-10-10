@@ -582,10 +582,6 @@ enum CoreEvent {
         generation: u64,
         result: Result<FetchedDocument, String>,
     },
-    ExternalMedia {
-        generation: u64,
-        url: url::Url,
-    },
     Download {
         generation: u64,
         response: Box<http::Response>,
@@ -606,7 +602,6 @@ enum CoreEvent {
 
 enum InteractiveFetch {
     Document(FetchedDocument),
-    ExternalMedia(url::Url),
     Download(Box<http::Response>),
     GopherDownload(Box<crate::download::DownloadOffer>),
 }
@@ -1948,9 +1943,6 @@ impl BrowserController {
                 CoreEvent::FetchFinished { generation, result } => {
                     changed |= self.finish_fetch(generation, result);
                 }
-                CoreEvent::ExternalMedia { generation, url } => {
-                    changed |= self.finish_external_media(generation, url);
-                }
                 CoreEvent::Download {
                     generation,
                     response,
@@ -2000,13 +1992,6 @@ impl BrowserController {
     }
 
     fn begin_address(&mut self, address: &str, intent: NavigationIntent) -> bool {
-        // Classify the address-bar form before generic bare-host handling adds
-        // a trailing slash. For `youtube.com/watch?v=id`, appending that slash
-        // would alter the query value and hide an otherwise valid video URL.
-        if let Some(url) = crate::media::youtube_video_url(address) {
-            self.delegate_external_media(url);
-            return true;
-        }
         match parse_navigation_target(address) {
             Ok((target, fallback_http)) => {
                 self.begin_fetch(target, fallback_http, intent);
@@ -2255,12 +2240,6 @@ impl BrowserController {
         } else {
             target
         };
-        if let Link::Http(url) = &target
-            && crate::media::is_youtube_video_url(url)
-        {
-            self.delegate_external_media(url.clone());
-            return;
-        }
         if let Some(task) = self.task.take() {
             task.abort();
         }
@@ -2465,33 +2444,6 @@ impl BrowserController {
         self.status = format!("Opening in mpv: {url}");
         self.external_media.push_back((url, referrer));
         self.invalidation.request_redraw();
-    }
-
-    fn delegate_external_media(&mut self, url: url::Url) {
-        self.abort_declarative_refresh();
-        if self.pending.take().is_some() {
-            if let Some(task) = self.task.take() {
-                task.abort();
-            }
-            self.prompt = None;
-            self.retire_query("Incomplete reply: request replaced");
-            self.render_is_final = self.live_page.is_none();
-            // Ignore a completion already queued by the superseded fetch.
-            self.generation = self.generation.wrapping_add(1);
-        }
-        self.queue_external_media(url);
-    }
-
-    fn finish_external_media(&mut self, generation: u64, url: url::Url) -> bool {
-        let Some(_pending) = self
-            .pending
-            .take_if(|pending| pending.generation == generation)
-        else {
-            return false;
-        };
-        self.task = None;
-        self.queue_external_media(url);
-        true
     }
 
     fn finish_download(&mut self, generation: u64, response: http::Response) -> bool {
@@ -3771,7 +3723,7 @@ impl BrowserController {
     /// Apply HTML's URL and history update steps without starting a fetch or
     /// replacing the resident Document. The JS realm owns classic-history
     /// state; this controller owns browser chrome and product-level navigation
-    /// policy, including the existing YouTube → mpv delegation.
+    /// policy.
     fn same_document_history_entry(&self) -> Option<HistoryEntry> {
         let page = self.current.as_ref()?;
         Some(HistoryEntry {
@@ -3815,12 +3767,7 @@ impl BrowserController {
             // active Document URL—not the original request URL—is the base.
             response.url = url.clone();
         }
-        if crate::media::is_youtube_video_url(&url) {
-            self.queue_external_media_with_referrer(url, old_url);
-            true
-        } else {
-            address_changed
-        }
+        address_changed
     }
 
     /// HTML #form-submission-algorithm for a static form: the submitter's
@@ -3905,10 +3852,6 @@ impl BrowserController {
         body: Vec<u8>,
         source: Option<http::NavigationInitiator>,
     ) {
-        if crate::media::is_youtube_video_url(&url) {
-            self.delegate_external_media(url);
-            return;
-        }
         if let Some(task) = self.task.take() {
             task.abort();
         }
@@ -4095,11 +4038,13 @@ async fn fetch_protocol_interactive(
         if let Some(timing) = response.timing.as_mut() {
             timing.navigation_type = intent.timing_type();
         }
-        if crate::media::is_youtube_video_url(&response.url) {
-            return Ok(InteractiveFetch::ExternalMedia(response.url));
-        }
         let computed_type = crate::download::computed_mime_type(&response);
-        if crate::download::response_needs_download(&response, true) {
+        // Media plays inline in graphical frontends: a media document
+        // rather than the Save/Open offer.
+        let media_document = crate::http::plays_as_media_document(&response, &computed_type);
+        if media_document {
+            response = crate::http::media_navigation_response(response, &computed_type);
+        } else if crate::download::response_needs_download(&response, true) {
             return Ok(InteractiveFetch::Download(Box::new(response)));
         }
         if crate::rdap::is_response(&response) {
@@ -4107,7 +4052,9 @@ async fn fetch_protocol_interactive(
                 crate::rdap::Page::from_response(response),
             )));
         }
-        if computed_type
+        if media_document {
+            // Already an HTML document.
+        } else if computed_type
             .split(';')
             .next()
             .is_some_and(|mime| mime.trim().starts_with("image/"))
@@ -4158,7 +4105,6 @@ fn interactive_fetch_event(generation: u64, result: Result<InteractiveFetch, Str
             generation,
             result: Ok(document),
         },
-        Ok(InteractiveFetch::ExternalMedia(url)) => CoreEvent::ExternalMedia { generation, url },
         Ok(InteractiveFetch::Download(response)) => CoreEvent::Download {
             generation,
             response,
@@ -4317,6 +4263,11 @@ pub fn parse_navigation_target(address: &str) -> Result<(Link, bool), String> {
         Some(port) => Err(format!(
             "Port {port} is a terminal session; open it with the terminal frontend."
         )),
+        // A bare host gets the root path; an address with its own path,
+        // query or fragment keeps them as typed.
+        None if host.contains(['/', '?', '#']) => http::parse_url(&format!("https://{host}"))
+            .map(|url| (Link::Http(url), true))
+            .ok_or_else(|| format!("Invalid address: {address}")),
         None => http::parse_url(&format!("https://{host}/"))
             .map(|url| (Link::Http(url), true))
             .ok_or_else(|| format!("Invalid address: {address}")),
@@ -4566,6 +4517,71 @@ mod tests {
             response.js
         );
         server.await.unwrap();
+    }
+
+    /// HTML #read-media: a playable video navigation becomes a media
+    /// document instead of a Save/Open offer; an attachment stays a download.
+    #[tokio::test]
+    async fn playable_media_navigations_become_media_documents() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (disposition, document) in [("", true), ("Content-Disposition: attachment\r\n", false)]
+        {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = url::Url::parse(&format!(
+                "http://{}/clip.webm?a=1&b=2",
+                listener.local_addr().unwrap()
+            ))
+            .unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(stream.read_u8().await.unwrap());
+                }
+                let body = [0x1Au8, 0x45, 0xDF, 0xA3];
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: video/webm\r\n{disposition}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(&body).await;
+            });
+            let (_environment, receiver) = tokio::sync::watch::channel(WindowEnvironment {
+                viewport: CssSize::new(800., 600.),
+                device_pixel_ratio: 1.,
+                screen_position: (0, 0),
+                fullscreen_supported: false,
+            });
+            let result = fetch_protocol_interactive(
+                &Link::Http(url.clone()),
+                false,
+                None,
+                receiver,
+                Default::default(),
+                None,
+                NavigationIntent::New,
+            )
+            .await
+            .unwrap();
+            match result {
+                InteractiveFetch::Document(FetchedDocument::Http(response)) => {
+                    assert!(document, "an attachment must stay a download");
+                    assert_eq!(response.url, url);
+                    let html = String::from_utf8_lossy(&response.body);
+                    assert!(
+                        html.contains("<video controls=\"\" autoplay=\"\" src=\"http://")
+                            || html.contains("<video controls autoplay src=\"http://"),
+                        "{html}"
+                    );
+                    assert!(html.contains("/clip.webm?a=1&amp;b=2\""), "{html}");
+                }
+                InteractiveFetch::Download(_) => {
+                    assert!(!document, "a playable video must not be a download")
+                }
+                _ => panic!("unexpected navigation result"),
+            }
+            server.await.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -6057,53 +6073,33 @@ mod tests {
     }
 
     #[test]
-    fn typed_clicked_and_scripted_youtube_players_delegate_without_fetching() {
+    fn video_players_load_in_the_browser() {
+        // Media plays inline: YouTube watch pages are ordinary pages, and a
+        // typed address keeps its query as typed.
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         let mut browser =
             BrowserController::new(runtime.handle().clone(), || {}, CssSize::new(640.0, 480.0));
-
         browser.handle_action(UserAction::Navigate(String::from(
-            "https://127.0.0.1:9/superseded",
-        )));
-        assert!(browser.snapshot().loading);
-
-        let outcome = browser.handle_action(UserAction::Navigate(String::from(
             "youtube.com/watch?v=typed123",
         )));
-        assert!(outcome.invalidated);
-        assert!(outcome.loading_retired);
-        assert!(!browser.snapshot().loading);
-        let (url, referrer) = browser.take_external_media().unwrap();
-        assert_eq!(url.as_str(), "https://youtube.com/watch?v=typed123");
-        assert!(referrer.is_none());
-
+        assert!(browser.snapshot().loading);
+        assert!(browser.take_external_media().is_none());
+        let (target, fallback) = parse_navigation_target("youtube.com/watch?v=typed123").unwrap();
+        assert!(fallback);
+        assert_eq!(
+            target,
+            Link::Http(url::Url::parse("https://youtube.com/watch?v=typed123").unwrap())
+        );
+        let (target, _) = parse_navigation_target("example.com").unwrap();
+        assert_eq!(
+            target,
+            Link::Http(url::Url::parse("https://example.com/").unwrap())
+        );
         browser.handle_action(UserAction::Activate(Link::Http(
             url::Url::parse("https://youtu.be/clicked123?si=share").unwrap(),
-        )));
-        let (url, _) = browser.take_external_media().unwrap();
-        assert_eq!(url.host_str(), Some("youtu.be"));
-
-        assert!(browser.handle_page_event(crate::js::PageEvt::Replace(
-            String::from("https://www.youtube.com/shorts/scripted123"),
-            None,
-        )));
-        let (url, _) = browser.take_external_media().unwrap();
-        assert_eq!(url.path(), "/shorts/scripted123");
-        assert!(browser.current_page().is_none());
-
-        browser.begin_post(
-            url::Url::parse("https://www.youtube.com/watch?v=posted123").unwrap(),
-            String::from("ignored=body"),
-            None,
-        );
-        let (url, _) = browser.take_external_media().unwrap();
-        assert_eq!(url.query(), Some("v=posted123"));
-
-        browser.handle_action(UserAction::Navigate(String::from(
-            "https://www.youtube.com/results?search_query=rust",
         )));
         assert!(browser.snapshot().loading);
         assert!(browser.take_external_media().is_none());
@@ -6282,7 +6278,7 @@ mod tests {
     }
 
     #[test]
-    fn spa_history_watch_update_preserves_page_and_delegates_to_mpv() {
+    fn spa_history_watch_update_preserves_the_page() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -6322,9 +6318,14 @@ mod tests {
             browser.snapshot().address,
             "https://www.youtube.com/watch?v=spa123"
         );
-        let (video, referrer) = browser.take_external_media().unwrap();
-        assert_eq!(video.as_str(), "https://www.youtube.com/watch?v=spa123");
-        assert_eq!(referrer.as_ref(), Some(&source));
+        assert!(browser.take_external_media().is_none());
+        assert_eq!(
+            browser.current_page().map(|page| page.target.clone()),
+            Some(Link::Http(
+                url::Url::parse("https://www.youtube.com/watch?v=spa123").unwrap()
+            ))
+        );
+        let _ = source;
     }
 
     #[test]
@@ -6489,32 +6490,6 @@ mod tests {
             matches!(rx.try_recv(), Ok(crate::js::PageCmd::NavigateFragment { url, replace:false }) if url.ends_with("#other"))
         );
         assert!(browser.page_is_live() && browser.pending.is_none());
-    }
-
-    #[test]
-    fn redirected_youtube_result_is_delegated_before_document_commit() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let mut browser =
-            BrowserController::new(runtime.handle().clone(), || {}, CssSize::new(640.0, 480.0));
-        browser.handle_action(UserAction::Navigate(String::from(
-            "https://127.0.0.1:9/redirect-source",
-        )));
-        let generation = browser.generation;
-        browser.task.take().unwrap().abort();
-
-        let url = url::Url::parse("https://www.youtube.com/watch?v=redirect123").unwrap();
-        let event =
-            interactive_fetch_event(generation, Ok(InteractiveFetch::ExternalMedia(url.clone())));
-        runtime.block_on(browser.tx.send(event)).unwrap();
-        let outcome = browser.process_async_events();
-
-        assert!(outcome.invalidated);
-        assert!(!browser.snapshot().loading);
-        assert!(browser.current_page().is_none());
-        assert_eq!(browser.take_external_media().unwrap().0, url);
     }
 
     #[test]

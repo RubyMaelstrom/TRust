@@ -88,6 +88,7 @@ struct Inputs<'a> {
     doc_url: Option<&'a url::Url>,
     render_clickables: &'a std::collections::HashSet<NodeId>,
     render_live: bool,
+    inline_media: bool,
     /// The top-level document's base for presentational hints; nested
     /// documents' hints poison a worker.
     document_base: html_hints::DocumentBase,
@@ -266,6 +267,9 @@ impl<'a> StyleBackend for Worker<'_, 'a> {
     #[inline]
     fn render_live(&self) -> bool {
         self.inputs.render_live
+    }
+    fn inline_media(&self) -> bool {
+        self.inputs.inline_media
     }
     fn document_base(&self, id: NodeId) -> html_hints::DocumentBase {
         if self.style_view().frame_owner(id).is_some() {
@@ -835,6 +839,7 @@ impl Dom {
             doc_url: self.doc_url.as_ref(),
             render_clickables: &self.render_clickables,
             render_live: self.render_live,
+            inline_media: self.inline_media,
             document_base,
             animated: &animated,
             vp: Vp {

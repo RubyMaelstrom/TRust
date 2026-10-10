@@ -650,19 +650,14 @@ async fn receive(
 }
 
 /// Whether a response to `request` with this head has a body that is not
-/// read: none at all, or a download navigation or a media subresource.
+/// read: none at all, or a download navigation (Save/Open reads it).
 fn body_unread(request: &Request, status: u16, headers: &Headers) -> (bool, bool) {
     let no_content = request.method == "HEAD" || matches!(status, 204 | 205 | 304);
     let navigation_get = request.method == "GET"
         && request
             .fetch_metadata
             .is_some_and(|m| m.destination == "document");
-    let skip = !no_content
-        && ((navigation_get && super::navigation_headers_need_download(headers))
-            || headers.get("content-type").is_some_and(|c| {
-                let c = c.trim_start().to_ascii_lowercase();
-                c.starts_with("video/") || c.starts_with("audio/")
-            }));
+    let skip = !no_content && navigation_get && super::navigation_headers_need_download(headers);
     (no_content, skip)
 }
 

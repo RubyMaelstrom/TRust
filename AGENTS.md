@@ -107,6 +107,13 @@ The project favors:
     metrics, and the public layout/rendering contract.
 - `src/img.rs`: guarded raster/SVG decoding, sizing, tinting, alpha detection,
   compositing, and terminal graphics encoding.
+- `src/media/`: inline audio/video: codec strings and MIME support
+  (`codec.rs`, `container.rs`), container parsers (`isobmff.rs`, `webm.rs`,
+  `demux/`), decoders (`decode/`: bundled rav1d/Symphonia, system FFmpeg),
+  audio output (`audio/`), the per-element `player/`, HTTP range resources
+  (`resource.rs`), Media Source Extensions (`mse/`) and the terminal's mpv
+  handoff (`external.rs`). `src/media_host.rs` is the page actor's binding
+  layer.
 - `src/ui.rs`: Ratatui rendering for browser documents, inline images, fixed
   layers, scrollbars, dialogs, and terminal sessions.
 - `src/file_select.rs`: user-chosen files (accept filters, MIME types,
@@ -649,6 +656,56 @@ current behavior and limits; consult the governing standards before changing it.
   (OSC 52), and trust-headless refuses them. `navigator.serviceWorker` has no
   registrations and `register()` rejects with `SecurityError`. `SharedWorker`
   shares one agent per origin, URL and name within the page.
+- Audio and video (HTML #media-elements) play inline in the graphical
+  frontends; the terminal plays nothing inline (`canPlayType()` answers "",
+  there is no `MediaSource`) and keeps opening media and YouTube players in
+  mpv. The prelude runs the media element algorithms; `media_host` owns
+  each element's `media::player::Player` (a control thread that demuxes and
+  decodes audio, a video decode thread and a presenter publishing frames to
+  a `VideoSurface` that paint reads by surface id), whose reports come back
+  as `LumenHostTask::Media`. Audio goes to PulseAudio/PipeWire (the
+  pure-Rust `pulseaudio` crate) or dlopen'd ALSA, silently in
+  trust-headless (`media::audio::disable_device_output`); the clock follows
+  the heard audio. Bundled decoders: rav1d (AV1) and Symphonia (MP3, FLAC,
+  Vorbis, PCM). H.264, HEVC, AAC, VP8, VP9 and Opus come from the system's
+  FFmpeg, libavcodec 59–63 dlopen'd at run time (`media::decode::ffmpeg`);
+  Windows has no system decoder module yet. One registry
+  (`media::decode::Registry`, bundled first) answers `canPlayType()`,
+  `MediaSource.isTypeSupported()` and Media Capabilities, so they never
+  claim what cannot decode. Containers are TRust's own ISO BMFF, Matroska/
+  WebM and ADTS parsers plus Symphonia's Ogg/MP3/FLAC/WAV readers; HTTP
+  media streams through Range requests (CORS-safelisted single ranges) into
+  a bounded sparse cache. A top-level navigation to playable audio/video is
+  a media document (HTML #read-media) on the desktop, not a download.
+- Media Source Extensions (w3c/media-source): `media::mse` runs the segment
+  parser loop for ISO BMFF and WebM byte streams, coded frame processing
+  (segments and sequence modes, timestampOffset, append windows, overlap
+  removal with decode dependencies, audio splices by trimming), removal,
+  eviction and the buffered ranges; the prelude's MediaSource/SourceBuffer/
+  SourceBufferList run the IDL, events and the media element's side
+  (`__media_source`, `__media_attach`). An attached element's player reads
+  the track buffers through `MseDemuxer`: reads return `demux::Error::
+  Pending` until data is appended and wake the player when it is; a new
+  initialization segment reaches the decoders as `Packet::config`. Capacity
+  is 100 MiB per SourceBuffer with video, 12 MiB without; eviction frees
+  whole groups of pictures before the playback position, else
+  `QuotaExceededError`. MediaSource in workers and ManagedMediaSource are not
+  implemented (`canConstructInDedicatedWorker` is false).
+- Media Capabilities: `decodingInfo()` answers from the registry (smooth up
+  to a software pixel rate of 1080p60, 1080p30 for AV1/HEVC; power
+  efficient only with hardware decoding); `encodingInfo()` and the WebRTC
+  types are unsupported; encrypted configurations are unsupported.
+- Encrypted Media Extensions (w3c/encrypted-media) with the Clear Key key
+  system only (`media::eme`): the CDM extracts key IDs from "cenc" (the
+  Common SystemID pssh), "keyids" and "webm" initialization data and takes
+  JWK Set licenses; sessions are "temporary". A MediaKeys object's
+  `KeyRing` decrypts ISO Common Encryption `cenc`/`cbcs` and WebM samples
+  in the player before decoding; a packet without a usable key waits
+  (`waitingforkey`) and the ring wakes the player when keys arrive. MSE
+  initialization and media segments report their pssh boxes and WebM key
+  IDs as `encrypted` events. Widevine and PlayReady are not available, so
+  DRM-only sites (Vimeo's protected videos, Netflix) do not play. The
+  `encrypted-media` permissions policy is not checked.
 - Web Audio `AudioContext`s stay suspended with a stationary clock: there is no
   output device, renderer acquisition errors asynchronously and `resume()`
   rejects with `NotSupportedError`. `OfflineAudioContext` renders on the page's

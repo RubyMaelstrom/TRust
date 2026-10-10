@@ -147,6 +147,8 @@ enum DesktopEvent {
         image_epoch: u64,
     },
     AnimationWake,
+    /// A media element's player showed a new frame (`media::player`).
+    MediaFrame,
     Access(AccessEvent),
     Telnet {
         session: u64,
@@ -570,6 +572,24 @@ impl WorkerAnimation {
         self.plays_completed = self.plays_completed.saturating_add(1);
         self.start_play(frame_started)
     }
+}
+
+/// Repaint when any video element shows a new frame: one pending wake at a
+/// time, however many players publish frames before the window redraws.
+/// The redraw finds each visible video's new frame by its image revision
+/// and rasterizes only that damage.
+static MEDIA_FRAME_PENDING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn install_media_frame_waker(proxy: EventLoopProxy<DesktopEvent>) {
+    let proxy = Mutex::new(proxy);
+    trust::media::player::set_frame_waker(move |_surface| {
+        if !MEDIA_FRAME_PENDING.swap(true, std::sync::atomic::Ordering::AcqRel)
+            && let Ok(proxy) = proxy.lock()
+        {
+            let _ = proxy.send_event(DesktopEvent::MediaFrame);
+        }
+    });
 }
 
 fn animation_frame_delay(delay: Duration) -> Duration {
@@ -9173,6 +9193,10 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
                     self.request_redraw();
                 }
             }
+            DesktopEvent::MediaFrame => {
+                MEDIA_FRAME_PENDING.store(false, std::sync::atomic::Ordering::Release);
+                self.request_redraw();
+            }
             DesktopEvent::Access(event) => match event.window_event {
                 accesskit_winit::WindowEvent::InitialTreeRequested => {
                     self.update_accessibility(true)
@@ -10146,16 +10170,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         );
         return Ok(());
     }
-    // External URL handlers should not create a browser window for a concrete
-    // YouTube player. Navigation/search/channel pages still open normally.
-    if let Some(url) = options
-        .address
-        .as_deref()
-        .and_then(trust::media::youtube_video_url)
-    {
-        trust::media::launch_mpv(url.as_str(), None).map_err(std::io::Error::other)?;
-        return Ok(());
-    }
     if let Err(error) = trust::site_storage::initialize() {
         eprintln!("trust: {error}; using temporary site storage");
     }
@@ -10170,6 +10184,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     let event_loop = EventLoop::<DesktopEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
+    install_media_frame_waker(proxy.clone());
     let storage_proxy = proxy.clone();
     trust::site_storage::set_wake(move || {
         let _ = storage_proxy.send_event(DesktopEvent::BrowserWake);

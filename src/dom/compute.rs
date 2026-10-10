@@ -54,6 +54,8 @@ pub(super) trait StyleBackend {
     fn properties(&self) -> &properties::State;
     fn render_clickables(&self) -> &std::collections::HashSet<NodeId>;
     fn render_live(&self) -> bool;
+    /// Media elements are inline players (`Dom::inline_media`).
+    fn inline_media(&self) -> bool;
     /// The node document's base URL for presentational hints.
     fn document_base(&self, id: NodeId) -> html_hints::DocumentBase;
     /// The `::slotted()` rules matching a light-DOM element.
@@ -212,6 +214,10 @@ impl StyleBackend for Dom {
     #[inline]
     fn render_live(&self) -> bool {
         self.render_live
+    }
+    #[inline]
+    fn inline_media(&self) -> bool {
+        self.inline_media
     }
     #[inline]
     fn document_base(&self, id: NodeId) -> html_hints::DocumentBase {

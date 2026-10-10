@@ -154,6 +154,10 @@ pub struct Frame {
     pub y: Plane,
     /// U and V; `None` for monochrome pictures.
     pub chroma: Option<[Plane; 2]>,
+    /// The timestamp passed with the temporal unit that produced this
+    /// picture ([`Decoder::decode_at`]), carried through frame reordering
+    /// and frame threading.
+    pub timestamp: Option<i64>,
 }
 
 /// A rav1d decoding context. Feed it AV1 temporal units (low-overhead OBU
@@ -184,8 +188,20 @@ impl Decoder {
     ///
     /// After an error the decoder is closed and every later call fails.
     pub fn decode(&mut self, temporal_unit: &[u8]) -> Result<Vec<Frame>, Error> {
+        self.decode_at(temporal_unit, None)
+    }
+
+    /// [`Self::decode`] for a timed stream: `timestamp` comes back as the
+    /// [`Frame::timestamp`] of the picture this unit produces.
+    pub fn decode_at(
+        &mut self,
+        temporal_unit: &[u8],
+        timestamp: Option<i64>,
+    ) -> Result<Vec<Frame>, Error> {
         let inner = self.inner.as_mut().ok_or(Error::Closed)?;
-        match catch_unwind(AssertUnwindSafe(|| decode_unit(inner, temporal_unit))) {
+        match catch_unwind(AssertUnwindSafe(|| {
+            decode_unit(inner, temporal_unit, timestamp)
+        })) {
             Ok(Ok(frames)) => Ok(frames),
             Ok(Err(error)) => {
                 // rav1d may still hold part of the unit; a fresh context is
@@ -203,6 +219,36 @@ impl Decoder {
     /// Decode a still picture: the last frame output for `temporal_unit`.
     pub fn decode_still(&mut self, temporal_unit: &[u8]) -> Result<Frame, Error> {
         self.decode(temporal_unit)?.pop().ok_or(Error::NoFrame)
+    }
+
+    /// Return the pictures still held for frame threading at the end of a
+    /// stream.
+    pub fn drain(&mut self) -> Result<Vec<Frame>, Error> {
+        let inner = self.inner.as_mut().ok_or(Error::Closed)?;
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let mut frames = Vec::new();
+            // dav1d drains delayed pictures when asked for output with no
+            // input pending; each call returns one picture.
+            for _ in 0..1024 {
+                match inner.get_picture() {
+                    Ok(picture) => frames.push(frame_from(&picture)?),
+                    Err(Rav1dError::TryAgain) => return Ok(frames),
+                    Err(error) => return Err(Error::Decode(error)),
+                }
+            }
+            Ok(frames)
+        }));
+        match result {
+            Ok(Ok(frames)) => Ok(frames),
+            Ok(Err(error)) => {
+                self.close();
+                Err(error)
+            }
+            Err(_) => {
+                self.close();
+                Err(Error::Panicked)
+            }
+        }
     }
 
     /// Discard queued input and pictures, e.g. before seeking.
@@ -229,7 +275,11 @@ impl Drop for Decoder {
     }
 }
 
-fn decode_unit(decoder: &mut rav1d::Decoder, temporal_unit: &[u8]) -> Result<Vec<Frame>, Error> {
+fn decode_unit(
+    decoder: &mut rav1d::Decoder,
+    temporal_unit: &[u8],
+    timestamp: Option<i64>,
+) -> Result<Vec<Frame>, Error> {
     if temporal_unit.is_empty() {
         return Err(Error::NoFrame);
     }
@@ -242,7 +292,8 @@ fn decode_unit(decoder: &mut rav1d::Decoder, temporal_unit: &[u8]) -> Result<Vec
     // `TryAgain` from sending means "take output first"; from getting, "send
     // more input". Every pass consumes input or outputs a frame, and a frame
     // needs at least one OBU, so a working decoder never reaches this bound.
-    let mut input_pending = pending(decoder.send_data(Box::from(temporal_unit), None, None, None))?;
+    let mut input_pending =
+        pending(decoder.send_data(Box::from(temporal_unit), None, timestamp, None))?;
     for _ in 0..temporal_unit.len().saturating_add(16) {
         match decoder.get_picture() {
             Ok(picture) => frames.push(frame_from(&picture)?),
@@ -313,6 +364,7 @@ fn frame_from(picture: &rav1d::Picture) -> Result<Frame, Error> {
         color,
         y,
         chroma,
+        timestamp: picture.timestamp(),
     })
 }
 

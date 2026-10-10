@@ -494,7 +494,7 @@ fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
         .map(|(_, value)| value.as_str())
 }
 
-fn content_disposition(response: &http::Response) -> Option<String> {
+pub(crate) fn content_disposition(response: &http::Response) -> Option<String> {
     let value = header(&response.headers, "content-disposition")?;
     let first = disposition_parts(value).into_iter().next()?;
     let disposition = first.trim().to_ascii_lowercase();

@@ -19,7 +19,16 @@ mkdir -p ~/.local/bin
 install -m 0755 target/release/trust target/release/trust-desktop ~/.local/bin/
 ```
 
-Make sure `~/.local/bin` is on your PATH. Install mpv for audio and video playback.
+Make sure `~/.local/bin` is on your PATH.
+
+trust-desktop plays audio and video in the page. AV1, MP3, FLAC, Vorbis and
+PCM decode on their own; H.264, HEVC, AAC, VP8, VP9 and Opus use the system's
+FFmpeg (libavcodec from FFmpeg 5.0 through 9.0, found at run time; install
+your distribution's `ffmpeg` or `libavcodec` package) on Linux and Media
+Foundation on Windows (HEVC and VP9 need the HEVC and VP9 Video Extensions).
+Sound goes to PulseAudio or PipeWire (through `pipewire-pulse`), else ALSA, on
+Linux and to the default WASAPI device on Windows. The terminal browser opens
+media in mpv: install mpv for audio and video playback there.
 trust-desktop's file chooser (for `<input type=file>`) uses the XDG Desktop
 Portal on Linux: run `xdg-desktop-portal` with a backend such as
 `xdg-desktop-portal-gtk`, `-kde` or `-gnome`. Without a portal it falls back to

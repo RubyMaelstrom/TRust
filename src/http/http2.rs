@@ -639,7 +639,7 @@ struct Head {
     recv: RecvStream,
     /// The response has no body (HEAD, 204, 205, 304).
     no_content: bool,
-    /// The body is not read: a download navigation or a media subresource.
+    /// The body is not read: a download navigation (Save/Open reads it).
     skip: bool,
 }
 
@@ -656,12 +656,7 @@ async fn receive_head(
         && request
             .fetch_metadata
             .is_some_and(|m| m.destination == "document");
-    let skip = !no_content
-        && ((navigation_get && super::navigation_headers_need_download(&headers))
-            || headers.get("content-type").is_some_and(|c| {
-                let c = c.trim_start().to_ascii_lowercase();
-                c.starts_with("video/") || c.starts_with("audio/")
-            }));
+    let skip = !no_content && navigation_get && super::navigation_headers_need_download(&headers);
     Ok(Head {
         status,
         headers,

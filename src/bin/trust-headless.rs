@@ -240,6 +240,8 @@ fn main() {
         }
     };
 
+    // Media plays in silent real time: a headless render has no listener.
+    trust::media::audio::disable_device_output();
     // Site storage is opt-in: without it a dump never reads or writes the profile.
     let site_data = options.site_data;
     if site_data && let Err(error) = trust::site_storage::initialize() {

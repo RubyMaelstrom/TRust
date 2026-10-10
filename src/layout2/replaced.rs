@@ -31,6 +31,11 @@ pub(crate) struct Replaced {
     pub crop: bool,
 }
 
+/// The size of an audio element's controls (HTML Rendering: "about one line
+/// high, as wide as is necessary to expose the user agent's user interface
+/// features"); the size Chrome's audio controls have.
+pub(crate) const AUDIO_CONTROLS: (f32, f32) = (300.0, 54.0);
+
 /// Resource-dependent inputs to replaced-image sizing. Keeping the selected
 /// dimension source, density-corrected natural size, and selected URL together
 /// prevents callers from accidentally mixing metadata from the `src` fallback
@@ -61,11 +66,21 @@ pub(crate) fn size(
         url,
     } = image;
     let replacement = dom.content_replacement_image(node).is_some();
+    // HTML #the-video-element: a video's natural dimensions are the video's
+    // when available, else the poster frame's (`natural`, the poster
+    // image); an audio element's controls are one line high.
+    let media = dom
+        .inline_media()
+        .then(|| dom.tag_name(node))
+        .flatten()
+        .filter(|tag| matches!(*tag, "video" | "audio"));
     let natural = (!replacement)
         .then(|| dom.canvas_size(node))
         .flatten()
+        .or_else(|| media.and_then(|_| dom.media_natural_size(node)))
         .map(|(w, h)| (w as f32, h as f32))
         .or(natural)
+        .or_else(|| (media == Some("audio")).then_some(AUDIO_CONTROLS))
         // CSS Content 3 #replaced: an unavailable replacement has zero
         // natural dimensions, never the HTML source's fallback/alt contents.
         .or_else(|| replacement.then_some((0.0, 0.0)));
@@ -233,6 +248,9 @@ pub(crate) fn size(
                 }
                 (None, Some(n), _) => n,
                 (None, None, Some(r)) if r > 0.0 => (300.0, 300.0 / r),
+                // CSS Images 3 #default-object-size: a video with neither a
+                // video nor a poster to size it is 300×150.
+                (None, None, _) if media == Some("video") => (300.0, 150.0),
                 (None, None, _) => return None, // fallback-content representation
             },
         })

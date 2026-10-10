@@ -1216,6 +1216,14 @@ pub(crate) fn needs_live_dom(dom: &Dom) -> bool {
         || element_referrer_policies(dom)
 }
 
+/// Whether the document has `audio` or `video` elements, whose players
+/// only a page actor runs.
+pub(crate) fn has_media_elements(dom: &Dom) -> bool {
+    dom.composed_descendants(DOCUMENT)
+        .into_iter()
+        .any(|node| matches!(dom.tag_name(node), Some("video" | "audio")))
+}
+
 /// Whether an element chooses its own requests' referrer policy: a
 /// `referrerpolicy` attribute (HTML #referrer-policy-attributes) or a
 /// `noreferrer` hyperlink or form (#link-type-noreferrer). The page actor

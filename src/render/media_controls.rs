@@ -8,13 +8,24 @@
 //! Local HTML snapshot e5071a20c8569d8a3ec02ed27dd01b948773f850.
 
 use super::*;
+use crate::dom::media::MediaControlsState;
+
+/// What browser UI a media element's anchor gets.
+pub(crate) enum MediaAnchor {
+    /// The external-player button (the terminal's representation of media
+    /// that cannot play inline, and players that were removed).
+    External(CssRect, Link),
+    /// The user agent's playback controls of an inline media element (HTML
+    /// #expose-a-user-interface-to-the-user), in its border box.
+    Controls(CssRect, MediaControlsState, bool),
+}
 
 impl PagePaint {
     /// Compile once per paint transaction, not per frame or pointer event.
     /// `anchor` filters eligible media and supplies its actual replaced box.
     pub(crate) fn collect_browser_media(
         &mut self,
-        mut anchor: impl FnMut(&HitRegion) -> Option<(CssRect, Link)>,
+        mut anchor: impl FnMut(&HitRegion) -> Option<MediaAnchor>,
     ) {
         let mut result = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -55,16 +66,27 @@ impl PagePaint {
                 if seen.contains(&hit.node) {
                     continue;
                 }
-                let Some((rect, link)) = anchor(hit) else {
+                let Some(media) = anchor(hit) else {
                     continue;
                 };
-                if rect.width <= 0. || rect.height <= 0. {
-                    continue;
+                match media {
+                    MediaAnchor::External(rect, link) => {
+                        if rect.width <= 0. || rect.height <= 0. {
+                            continue;
+                        }
+                        seen.insert(hit.node);
+                        let mut hit = hit.clone();
+                        hit.link = Some(link);
+                        append_button(&mut result, &hit, rect);
+                    }
+                    MediaAnchor::Controls(rect, state, video) => {
+                        if rect.width <= 0. || rect.height <= 0. {
+                            continue;
+                        }
+                        seen.insert(hit.node);
+                        append_media_controls(&mut result, hit, rect, &state, video);
+                    }
                 }
-                seen.insert(hit.node);
-                let mut hit = hit.clone();
-                hit.link = Some(link);
-                append_button(&mut result, &hit, rect);
             }
             if fixed {
                 result.push(Primitive::EndFixed);
@@ -146,6 +168,257 @@ fn append_button(commands: &mut Vec<Primitive>, hit: &HitRegion, anchor: CssRect
         actor: None,
         link: hit.link.clone(),
         cursor: Some("pointer".into()),
+    }));
+    commands.push(Primitive::PopClip);
+}
+
+/// The parts of a media element's control bar, in CSS px. The page actor's
+/// hit test of the same controls (`mediaControlsLayout` in the platform
+/// prelude) uses this geometry; keep them identical.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct MediaControlsLayout {
+    pub bar: CssRect,
+    pub play: CssRect,
+    pub mute: Option<CssRect>,
+    pub time: Option<CssRect>,
+    pub scrubber: Option<CssRect>,
+    pub fullscreen: Option<CssRect>,
+}
+
+const CONTROL_BAR_HEIGHT: f32 = 36.;
+const CONTROL_TIME_WIDTH: f32 = 92.;
+
+pub(crate) fn media_controls_layout(rect: CssRect, video: bool) -> MediaControlsLayout {
+    let height = if video {
+        CONTROL_BAR_HEIGHT.min(rect.height)
+    } else {
+        rect.height
+    };
+    let bar = CssRect::new(rect.x, rect.y + rect.height - height, rect.width, height);
+    let square = |x: f32| CssRect::new(x, bar.y, height, height);
+    let play = square(bar.x);
+    let mut end = bar.x + bar.width;
+    let fullscreen = (video && bar.width >= 4. * height).then(|| {
+        end -= height;
+        square(end)
+    });
+    let mute = (bar.width >= 3. * height).then(|| square(play.x + height));
+    let time = mute
+        .filter(|_| bar.width >= 3. * height + CONTROL_TIME_WIDTH + 40.)
+        .map(|mute| CssRect::new(mute.x + height, bar.y, CONTROL_TIME_WIDTH, height));
+    let start = time
+        .or(mute)
+        .map_or(play.x + height, |part| part.x + part.width)
+        + 8.;
+    let scrubber =
+        (end - 10. - start >= 30.).then(|| CssRect::new(start, bar.y, end - 10. - start, height));
+    MediaControlsLayout {
+        bar,
+        play,
+        mute,
+        time,
+        scrubber,
+        fullscreen,
+    }
+}
+
+/// `m:ss` (or `h:mm:ss`) for the control bar's time display.
+fn clock_text(seconds: f32) -> String {
+    if !seconds.is_finite() || seconds < 0. {
+        return String::from("--:--");
+    }
+    let total = seconds.floor() as u64;
+    let (hours, minutes, seconds) = (total / 3600, total / 60 % 60, total % 60);
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
+    }
+}
+
+/// Draw a media element's controls (when shown) and claim their area for
+/// the element: presses there reach the page actor as presses on the media
+/// element, which operates the controls instead of dispatching page events
+/// (HTML #expose-a-user-interface-to-the-user).
+fn append_media_controls(
+    commands: &mut Vec<Primitive>,
+    hit: &HitRegion,
+    anchor: CssRect,
+    state: &MediaControlsState,
+    video: bool,
+) {
+    if video && !state.visible {
+        return;
+    }
+    let layout = media_controls_layout(anchor, video);
+    let white = PaintColor::Rgba(255, 255, 255, 255);
+    let dim = PaintColor::Rgba(255, 255, 255, 110);
+    commands.push(Primitive::PushClip(PaintShape::Rect(layout.bar)));
+    commands.push(Primitive::FillRect {
+        rect: layout.bar,
+        color: if video {
+            PaintColor::Rgba(0, 0, 0, 150)
+        } else {
+            PaintColor::Rgba(32, 33, 36, 255)
+        },
+    });
+    // Play (a triangle) or pause (two bars).
+    let icon = |part: CssRect, size: f32| {
+        CssRect::new(
+            part.x + (part.width - size) / 2.,
+            part.y + (part.height - size) / 2.,
+            size,
+            size,
+        )
+    };
+    let glyph = icon(layout.play, (layout.play.height * 0.42).min(16.));
+    if state.paused {
+        commands.push(Primitive::FillPolygon {
+            points: vec![
+                CssPoint::new(glyph.x + glyph.width * 0.15, glyph.y),
+                CssPoint::new(glyph.x + glyph.width, glyph.y + glyph.height / 2.),
+                CssPoint::new(glyph.x + glyph.width * 0.15, glyph.y + glyph.height),
+            ],
+            color: white,
+        });
+    } else {
+        for x in [glyph.x + glyph.width * 0.1, glyph.x + glyph.width * 0.6] {
+            commands.push(Primitive::FillRect {
+                rect: CssRect::new(x, glyph.y, glyph.width * 0.3, glyph.height),
+                color: white,
+            });
+        }
+    }
+    // A speaker, crossed out when muted.
+    if let Some(mute) = layout.mute {
+        let glyph = icon(mute, (mute.height * 0.42).min(16.));
+        commands.push(Primitive::FillRect {
+            rect: CssRect::new(
+                glyph.x,
+                glyph.y + glyph.height * 0.33,
+                glyph.width * 0.25,
+                glyph.height * 0.34,
+            ),
+            color: white,
+        });
+        commands.push(Primitive::FillPolygon {
+            points: vec![
+                CssPoint::new(glyph.x + glyph.width * 0.2, glyph.y + glyph.height * 0.33),
+                CssPoint::new(glyph.x + glyph.width * 0.55, glyph.y),
+                CssPoint::new(glyph.x + glyph.width * 0.55, glyph.y + glyph.height),
+                CssPoint::new(glyph.x + glyph.width * 0.2, glyph.y + glyph.height * 0.67),
+            ],
+            color: white,
+        });
+        if state.muted {
+            commands.push(Primitive::FillRect {
+                rect: CssRect::new(
+                    glyph.x + glyph.width * 0.7,
+                    glyph.y + glyph.height * 0.3,
+                    glyph.width * 0.3,
+                    glyph.height * 0.4,
+                ),
+                color: PaintColor::Rgba(234, 67, 53, 255),
+            });
+        } else {
+            for (offset, height) in [(0.7, 0.4), (0.88, 0.7)] {
+                commands.push(Primitive::FillRect {
+                    rect: CssRect::new(
+                        glyph.x + glyph.width * offset,
+                        glyph.y + glyph.height * (1. - height) / 2.,
+                        glyph.width * 0.1,
+                        glyph.height * height,
+                    ),
+                    color: white,
+                });
+            }
+        }
+    }
+    if let Some(time) = layout.time {
+        let style = crate::text::TextStyle {
+            size: 12.,
+            ..Default::default()
+        };
+        let text = format!(
+            "{} / {}",
+            clock_text(state.time),
+            clock_text(state.duration)
+        );
+        let shaped = crate::text::shape(&text, &style);
+        commands.push(Primitive::GlyphRun {
+            origin: CssPoint::new(
+                time.x,
+                time.y + ((time.height - shaped.line_height) * 0.5).max(0.),
+            ),
+            shaped,
+            color: white,
+            decoration: TextDecorationPaint {
+                color: white,
+                style: DecorationStyle::Solid,
+                thickness: None,
+                underline_offset: None,
+            },
+            shadows: Vec::new(),
+            clip: None,
+            node: hit.node,
+            link: None,
+            selection: Default::default(),
+        });
+    }
+    if let Some(scrubber) = layout.scrubber {
+        let track = CssRect::new(
+            scrubber.x,
+            scrubber.y + scrubber.height / 2. - 2.,
+            scrubber.width,
+            4.,
+        );
+        commands.push(Primitive::FillRect {
+            rect: track,
+            color: dim,
+        });
+        let fraction = if state.duration.is_finite() && state.duration > 0. {
+            (state.time / state.duration).clamp(0., 1.)
+        } else {
+            0.
+        };
+        let filled = CssRect::new(track.x, track.y, track.width * fraction, track.height);
+        commands.push(Primitive::FillRect {
+            rect: filled,
+            color: white,
+        });
+        commands.push(Primitive::FillRect {
+            rect: CssRect::new(filled.x + filled.width - 5., track.y - 3., 10., 10.),
+            color: white,
+        });
+    }
+    if let Some(fullscreen) = layout.fullscreen {
+        // Four corners.
+        let glyph = icon(fullscreen, (fullscreen.height * 0.4).min(14.));
+        let (thin, long) = (2., glyph.width * 0.35);
+        for (x, y, right, bottom) in [
+            (glyph.x, glyph.y, false, false),
+            (glyph.x + glyph.width, glyph.y, true, false),
+            (glyph.x, glyph.y + glyph.height, false, true),
+            (glyph.x + glyph.width, glyph.y + glyph.height, true, true),
+        ] {
+            let horizontal_x = if right { x - long } else { x };
+            let vertical_y = if bottom { y - long } else { y };
+            commands.push(Primitive::FillRect {
+                rect: CssRect::new(horizontal_x, if bottom { y - thin } else { y }, long, thin),
+                color: white,
+            });
+            commands.push(Primitive::FillRect {
+                rect: CssRect::new(if right { x - thin } else { x }, vertical_y, thin, long),
+                color: white,
+            });
+        }
+    }
+    commands.push(Primitive::HitRegion(HitRegion {
+        rect: layout.bar,
+        node: hit.node,
+        actor: hit.actor,
+        link: None,
+        cursor: Some("default".into()),
     }));
     commands.push(Primitive::PopClip);
 }
@@ -571,7 +844,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        page.collect_browser_media(|hit| Some((hit.rect, hit.link.clone()?)));
+        page.collect_browser_media(|hit| Some(MediaAnchor::External(hit.rect, hit.link.clone()?)));
         let scene = scene(&page, CssPoint::default());
         assert!(matches!(
             scene.page_hit_at(CssPoint::new(110., 10.)).unwrap().link,

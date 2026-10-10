@@ -1316,6 +1316,7 @@ mod tests {
                 },
                 y: plane(yuv[0]),
                 chroma: Some([plane(yuv[1]), plane(yuv[2])]),
+                timestamp: None,
             };
             let mut rgba = [0u8; 4];
             let mut canvas = Canvas {

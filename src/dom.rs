@@ -39,7 +39,7 @@ mod generated;
 mod html_hints;
 mod input;
 mod invalidation;
-mod media;
+pub(crate) mod media;
 mod media_tracks;
 mod parallel_match;
 mod parallel_style;
@@ -871,6 +871,12 @@ pub struct Dom {
     /// Whether this DOM currently backs a resident page actor. Static layouts
     /// retain ordinary links/forms but do not manufacture actor commands.
     render_live: bool,
+    /// Media elements are players this document presents inline (a
+    /// graphical page actor): `<video>` is a replaced element showing its
+    /// frames and `<audio>` without controls renders nothing (HTML Rendering
+    /// #embedded-content-rendering-rules). Otherwise media elements keep the
+    /// external-player representation.
+    inline_media: bool,
     /// Activation metadata can add anonymous fallback content and changes
     /// retained inline actions. It is not a DOM/style mutation, but is an
     /// independent input to a reusable box/fragment tree.
@@ -1248,6 +1254,7 @@ impl Dom {
             paint_patch_hosts,
             render_clickables,
             render_live,
+            inline_media,
             layout_presentation_epoch,
             layout_paint_epoch,
             scroll_epoch,
@@ -1276,6 +1283,7 @@ impl Dom {
             dirty_attributed,
             hover_hits_complete,
             render_live,
+            inline_media,
             layout_presentation_epoch,
             layout_paint_epoch,
             scroll_epoch,
@@ -1820,6 +1828,7 @@ impl Dom {
             paint_patch_hosts: std::collections::HashSet::new(),
             render_clickables: std::collections::HashSet::new(),
             render_live: false,
+            inline_media: false,
             layout_presentation_epoch: 0,
             layout_paint_epoch: 0,
             scroll_epoch: 0,
@@ -1919,6 +1928,20 @@ impl Dom {
 
     pub fn render_live(&self) -> bool {
         self.render_live
+    }
+
+    /// Whether media elements are inline players here (see the field).
+    pub fn inline_media(&self) -> bool {
+        self.inline_media
+    }
+
+    /// Make media elements inline players. Set once by a graphical page
+    /// actor before its document lays out.
+    pub(crate) fn set_inline_media(&mut self, inline: bool) {
+        if self.inline_media != inline {
+            self.inline_media = inline;
+            self.touch_style();
+        }
     }
 
     /// TRust's own presentation marker `name` (a `data-trust-*` attribute) on
@@ -5622,6 +5645,17 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
         if self.attr(id, "hidden").is_some() {
             return Some("none".to_string());
         }
+        // HTML Rendering #embedded-content-rendering-rules: an audio element
+        // that is not exposing a user interface has its display forced to
+        // `none`, irrespective of CSS rules. (Scripting disabled counts as
+        // exposing one, like the `controls` attribute.)
+        if self.0.inline_media()
+            && self.tag_name(id) == Some("audio")
+            && self.namespace_uri(id) == Some("http://www.w3.org/1999/xhtml")
+            && self.attr(id, "controls").is_none()
+        {
+            return Some("none".to_string());
+        }
         let v = self.cascaded(id, "display")?;
         // CSS Variables L1 §3: custom properties are substituted at computed
         // value time. Keep this resolution in the canonical display path so
@@ -7770,6 +7804,11 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     fn top_layer_ua_default(&self, id: NodeId, tag: &str, name: &str) -> Option<&'static str> {
         if self.namespace_uri(id) != Some("http://www.w3.org/1999/xhtml") {
             return (name == "object-fit" && self.fullscreen_ua_applies(id)).then_some("contain");
+        }
+        // HTML Rendering #embedded-content-rendering-rules: `video {
+        // object-fit: contain; }`.
+        if tag == "video" && name == "object-fit" {
+            return Some("contain");
         }
         let dialog = tag == "dialog";
         let popover = self.attr(id, "popover").is_some();

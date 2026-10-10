@@ -4081,7 +4081,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // HTML #event-handler-content-attributes: the attribute change steps.
     function eventHandlerAttributeChanged(element, localName, oldValue, value) {
         const name = localName.slice(2);
-        if (!EVENT_HANDLER_CONTENT_TYPES.has(name) && !WINDOW_REFLECTING_BODY_HANDLERS.has(name)) return;
+        // EME's onencrypted and onwaitingforkey are media element content
+        // attributes.
+        const mediaHandler = (name === "encrypted" || name === "waitingforkey")
+            && (element.localName === "video" || element.localName === "audio");
+        if (!mediaHandler && !EVENT_HANDLER_CONTENT_TYPES.has(name) && !WINDOW_REFLECTING_BODY_HANDLERS.has(name)) return;
         const namespace = internalsFor(element).trustNS === undefined ? element.namespaceURI : internalsFor(element).trustNS;
         if (namespace !== HTML_NS && namespace !== SVG_NS && namespace !== MATHML_NS) return;
         if (WINDOW_REFLECTING_BODY_HANDLERS.has(name) && !EVENT_HANDLER_CONTENT_TYPES.has(name) &&
@@ -6276,6 +6280,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         pointerInput.document = target.ownerDocument;
         pointerInput.lastTarget = target;
         if (pressed) notifyPointerActivation();
+        if (button === 0 && mediaControlsPress(target, x, y, pressed)) return true;
         const buttons = pointerInput.buttons;
         const previous = pointerInput.series;
         let down = pointerInput.downs.get(button);
@@ -6447,6 +6452,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // target (Phase B syscall; guarded so the JS half stands alone).
         if (typeof __dom_set_hover === "function") __dom_set_hover(t ? nodeIds.get(t) : -1);
         if (childFrame) childHover(childFrame, id);
+        if (t && motion) mediaControlsHover(t);
         return true;
     };
     // The nodes holding any hover-type listener — the serializer marks them
@@ -7701,7 +7707,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // local name never changes). Each answer reflects the tree when its step
     // runs: only internal bookkeeping precedes the last of them.
     const INSERT_RANGES = 1, INSERT_LISTENERS = 2, INSERT_SLOTS = 4,
-        INSERT_SCRIPT = 8, INSERT_LINK = 16, INSERT_BASE = 32, INSERT_FORM_STATE = 64, INSERT_TRACK = 128;
+        INSERT_SCRIPT = 8, INSERT_LINK = 16, INSERT_BASE = 32, INSERT_FORM_STATE = 64, INSERT_TRACK = 128,
+        INSERT_MEDIA = 256;
     function insertedNodeSteps(parent, node, oldParent, oldIndex, silent = false) {
         const id = nodeIds.get(node);
         const effects = __dom_insertion_effects(id, nodeIds.get(parent));
@@ -7716,6 +7723,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // HTML #sourcing-out-of-band-text-tracks: a track element's parent
         // changed (its old parent's removal included).
         if (effects & INSERT_TRACK) processTrackChanges();
+        if (effects & INSERT_MEDIA) mediaSubtreeInserted(parent, node);
         if (ceDefined) {
             if (deferredCeReactions !== null) deferredCeReactions.push(() => ceScan(node));
             else ceScan(node);
@@ -7781,7 +7789,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // arena removal one query tells which remaining steps have work; with a
     // navigable container in the subtree, whose destruction can run author
     // code, each later step asks again as before.
-    const REMOVE_FRAMES = 1, REMOVE_LISTENERS = 2, REMOVE_SLOTS = 4, REMOVE_FORM_STATE = 8, REMOVE_TRACK = 16;
+    const REMOVE_FRAMES = 1, REMOVE_LISTENERS = 2, REMOVE_SLOTS = 4, REMOVE_FORM_STATE = 8, REMOVE_TRACK = 16,
+        REMOVE_MEDIA = 32;
     function removeChildSteps(parent, c, silent = false) {
         rangesRemove(c, parent, c);
         if (internalsOf(c).trustLN === "base") baseHrefCache = null;
@@ -7803,6 +7812,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         }
         if (effects & REMOVE_FORM_STATE) formStateSubtreeChanged(c, false);
         if (effects & REMOVE_TRACK) processTrackChanges();
+        if (effects & REMOVE_MEDIA) mediaSubtreeRemoved(c);
         // HTML #cereactions: disconnectedCallback runs once the removal is
         // complete (after an enclosing operation's, when one is deferring).
         if (ceDefined) {
@@ -10043,28 +10053,47 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     Object.defineProperty(HTMLElement.prototype, "attachInternals", {enumerable: true});
 
-    // HTML #media-elements (local whatwg/html@e5071a2). TRust has no inline
-    // media decoder: canPlayType() reports no supported type, the resource
-    // selection algorithm ends in the dedicated media source failure steps,
-    // readyState stays HAVE_NOTHING, the element stays paused (play() reports
-    // that the element is not allowed to play) and the current and official
-    // playback positions stay 0. The playback attributes, the text track
+    // HTML #media-elements (local whatwg/html@e5071a2).
+    //
+    // In a graphical frontend (`cfg.inlineMedia`) media elements play
+    // inline: these algorithms run here and each element's player runs in
+    // the host (`media_host`), which reports through `trust.mediaEvent`.
+    // canPlayType() and the resource selection algorithm consult the
+    // decoders the host actually has.
+    //
+    // The terminal plays nothing inline: canPlayType() reports no supported
+    // type, the resource selection algorithm ends in the dedicated media
+    // source failure steps, readyState stays HAVE_NOTHING, the element stays
+    // paused (play() reports that the element is not allowed to play) and
+    // the playback positions stay 0. The playback attributes, the text track
     // model of #timed-text-tracks and WebVTT's VTTCue/VTTRegion (local
-    // w3c/webvtt@0648025) behave as specified around that state.
+    // w3c/webvtt@0648025) behave as specified around that state either way.
+    const inlineMedia = cfg.inlineMedia === true;
     const mediaStates = new WeakMap(), mediaErrors = new WeakMap();
     const mediaErrorToken = {}, mediaToken = {};
+    // Player id -> element, for host reports.
+    const mediaPlayers = new Map();
+    const NETWORK_EMPTY = 0, NETWORK_IDLE = 1, NETWORK_LOADING = 2, NETWORK_NO_SOURCE = 3;
+    const HAVE_NOTHING = 0, HAVE_METADATA = 1, HAVE_CURRENT_DATA = 2, HAVE_FUTURE_DATA = 3, HAVE_ENOUGH_DATA = 4;
+    const mediaErrorMessages = {
+        2: "A network error stopped fetching the media resource",
+        3: "The media resource could not be decoded",
+        4: "The media resource is not supported",
+    };
     class MediaError {
-        constructor(token) {
+        constructor(token, code, message) {
             if (token !== mediaErrorToken) throw new TypeError("Illegal constructor");
-            mediaErrors.set(this, true);
+            mediaErrors.set(this, {code, message});
         }
         get code() {
-            if (!mediaErrors.has(this)) throw new TypeError("Illegal MediaError invocation");
-            return 4;
+            const record = mediaErrors.get(this);
+            if (!record) throw new TypeError("Illegal MediaError invocation");
+            return record.code;
         }
         get message() {
-            if (!mediaErrors.has(this)) throw new TypeError("Illegal MediaError invocation");
-            return "No inline media decoder is available";
+            const record = mediaErrors.get(this);
+            if (!record) throw new TypeError("Illegal MediaError invocation");
+            return record.message;
         }
         get [Symbol.toStringTag]() { return "MediaError"; }
     }
@@ -10074,15 +10103,28 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             Object.defineProperty(target, name, {value, enumerable:true});
     }
     g.MediaError = MediaError;
+    function mediaError(code, message) {
+        return new MediaError(mediaErrorToken, code, inlineMedia ? (message || mediaErrorMessages[code]) : "No inline media decoder is available");
+    }
     function mediaState(element) {
         let state = mediaStates.get(element);
         if (!state) {
-            state = {generation: 0, network: 0, error: null, currentSrc: "", provider: null,
+            state = {generation: 0, network: NETWORK_EMPTY, error: null, currentSrc: "", provider: null,
                 volume: 1, mutedState: "default", playbackRate: 1, defaultPlaybackRate: 1,
                 preservesPitch: true, defaultStart: 0, showPoster: true, canAutoplay: true,
                 textTrackChangePending: false, textTracks: null, audioTracks: null, videoTracks: null,
                 tracks: [], element, blockedOnParser: false, didPerformTrackSelection: false,
-                pendingTextTracks: []};
+                pendingTextTracks: [],
+                // Inline playback state.
+                player: -1, readyState: HAVE_NOTHING, paused: true, seeking: false, ended: false,
+                duration: NaN, position: 0, seekable: false, playPromises: [], loadedData: false,
+                videoWidth: 0, videoHeight: 0, mediaTracks: [], played: [], playedFrom: null,
+                candidate: null, pointer: null, waitingForSource: false, delaying: false,
+                timeCache: null, controlsUntil: 0, controlsKey: "",
+                // The attached MediaSource (Media Source Extensions).
+                mediaSource: null,
+                // Encrypted Media Extensions: the MediaKeys and its CDM id.
+                mediaKeys: null, cdm: -1, attachingMediaKeys: false};
             mediaStates.set(element, state);
         }
         return state;
@@ -10109,64 +10151,390 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         });
     }
     function fireMediaEvent(target, type) { dispatch(target, createTrustedEvent(Event, type), false); }
+    function queueFire(element, state, type) {
+        queueMediaTask(element, state, () => fireMediaEvent(element, type));
+    }
     // Web IDL #js-double: a finite number, or a TypeError.
     function mediaDouble(value, what) {
         const number = Number(value);
         if (!Number.isFinite(number)) throw new TypeError(what + " must be a finite number");
         return number;
     }
+    function mediaControl(element, state, op, a, b) {
+        if (state.player < 0) return undefined;
+        return __media_control(nodeIds.get(element), state.player, op, a, b);
+    }
+    // The effective media volume (#effective-media-volume) goes to the
+    // player with the muted state; the player applies it to the audio.
+    function mediaMuted(element, state) {
+        return state.mutedState === true || (state.mutedState === "default" && element.hasAttribute("muted"));
+    }
+    function sendVolume(element, state) {
+        mediaControl(element, state, "volume", state.volume, mediaMuted(element, state));
+    }
+    function setShowPoster(element, state, value) {
+        if (state.showPoster === value) return;
+        state.showPoster = value;
+        mediaControl(element, state, "poster", value);
+    }
+    // Stop the current player, if any (the media element load algorithm's
+    // "stop the fetching process", and replacement of the resource).
+    function closePlayer(element, state) {
+        detachMediaSource(element, state);
+        if (state.player < 0) return;
+        mediaControl(element, state, "close");
+        mediaPlayers.delete(state.player);
+        state.player = -1;
+    }
+    // #take-pending-play-promises
+    function takePlayPromises(state) {
+        const promises = state.playPromises;
+        state.playPromises = [];
+        return promises;
+    }
+    function resolvePlayPromises(promises) {
+        for (const promise of promises) promise.resolve(undefined);
+    }
+    function rejectPlayPromises(promises, name, message) {
+        for (const promise of promises) promise.reject(new DOMException(message || "The play() request was interrupted", name));
+    }
+    // #notify-about-playing
+    function notifyAboutPlaying(element, state) {
+        const promises = takePlayPromises(state);
+        queueMediaTask(element, state, function () {
+            fireMediaEvent(element, "playing");
+            resolvePlayPromises(promises);
+        });
+    }
+    // #potentially-playing
+    function potentiallyPlaying(element, state) {
+        return !state.paused && !state.ended && state.error === null && state.readyState >= HAVE_FUTURE_DATA;
+    }
+    // #eligible-for-autoplay
+    function eligibleForAutoplay(element, state) {
+        return state.canAutoplay && state.paused && element.hasAttribute("autoplay");
+    }
+    // #allowed-to-play: like Firefox, audible playback needs the document's
+    // sticky activation; muted (or silent) media may always play.
+    function allowedToPlay(element, state) {
+        if (!inlineMedia) return false;
+        if (mediaMuted(element, state) || state.volume === 0) return true;
+        if (state.readyState >= HAVE_METADATA && !state.mediaTracks.some(track => track.kind === "audio")) return true;
+        // Sticky activation of the element's relevant global object.
+        return currentTime() >= windowStateForNode(element.ownerDocument || element).lastActivation;
+    }
+    // #playing-the-media-resource: whether the player should run.
+    function syncPlaying(element, state) {
+        if (state.player < 0) return;
+        mediaControl(element, state, state.paused || state.ended ? "pause" : "play");
+        updateControls(element, state);
+    }
+    // The current playback position for script: the player's clock while
+    // it runs, stable within one task (#official-playback-position).
+    function currentPosition(element, state) {
+        if (state.player < 0 || state.paused || state.seeking || state.readyState === HAVE_NOTHING) return state.position;
+        if (state.timeCache === null) {
+            const time = mediaControl(element, state, "time");
+            if (typeof time === "number" && Number.isFinite(time)) state.position = time;
+            state.timeCache = state.position;
+            imageMicrotask(function () { state.timeCache = null; });
+        }
+        return state.position;
+    }
+    // The played ranges (#dom-media-played): positions reached through
+    // normal playback.
+    function notePlayed(state, from, to) {
+        if (!(to > from)) return;
+        const ranges = state.played;
+        ranges.push([from, to]);
+        ranges.sort((a, b) => a[0] - b[0]);
+        const merged = [];
+        for (const range of ranges) {
+            const last = merged[merged.length - 1];
+            if (last && range[0] <= last[1]) last[1] = Math.max(last[1], range[1]);
+            else merged.push([range[0], range[1]]);
+        }
+        state.played = merged;
+    }
+    function timeRanges(list) {
+        const ranges = Object.create(TimeRanges.prototype);
+        internalsFor(ranges).timeRanges = list.map(range => [range[0], range[1]]);
+        return ranges;
+    }
+
+    // The user agent's controls (#expose-a-user-interface-to-the-user): the
+    // host draws them over the element from the state sent here, and
+    // presses on them arrive as pointer input (`mediaControlsPress`).
+    // Video controls show while paused and for 3 seconds after the pointer
+    // moved over the element; audio controls are the element itself.
+    function exposesControls(element) {
+        return inlineMedia && element.hasAttribute("controls");
+    }
+    function controlsVisible(element, state) {
+        return element.localName === "audio" || state.paused || state.ended
+            || state.readyState < HAVE_CURRENT_DATA || currentTime() < state.controlsUntil;
+    }
+    function updateControls(element, state) {
+        if (state.player < 0) return;
+        const exposed = exposesControls(element);
+        const visible = exposed && controlsVisible(element, state);
+        const flags = (exposed ? 1 : 0) | (state.paused || state.ended ? 2 : 0)
+            | (mediaMuted(element, state) ? 4 : 0) | (visible ? 8 : 0);
+        // The time display shows whole seconds: send it once a second.
+        const key = flags + "," + (visible ? Math.floor(state.position) : 0) + "," + state.duration;
+        if (key === state.controlsKey) return;
+        state.controlsKey = key;
+        mediaControl(element, state, "ui", flags, state.position + "," + state.duration);
+    }
+    // The control bar's geometry in client coordinates; the host draws the
+    // same layout (`render::media_controls::media_controls_layout`).
+    function mediaControlsLayout(element) {
+        const rect = element.getBoundingClientRect();
+        const video = element.localName === "video";
+        const height = video ? Math.min(36, rect.height) : rect.height;
+        const bar = {x: rect.left, y: rect.top + rect.height - height, w: rect.width, h: height};
+        const square = x => ({x, y: bar.y, w: height, h: height});
+        const play = square(bar.x);
+        let end = bar.x + bar.w;
+        let fullscreen = null;
+        if (video && bar.w >= 4 * height) { end -= height; fullscreen = square(end); }
+        const mute = bar.w >= 3 * height ? square(play.x + height) : null;
+        const time = mute && bar.w >= 3 * height + 92 + 40 ? {x: mute.x + height, y: bar.y, w: 92, h: height} : null;
+        const last = time || mute || play;
+        const start = last.x + last.w + 8;
+        const scrubber = end - 10 - start >= 30 ? {x: start, y: bar.y, w: end - 10 - start, h: height} : null;
+        return {bar, play, mute, time, scrubber, fullscreen};
+    }
+    const inPart = (part, x, y) => part !== null && x >= part.x && x < part.x + part.w && y >= part.y && y < part.y + part.h;
+    // A primary press at client (x, y) on `target`: operate the controls it
+    // lands on and report true, so no page events are dispatched for it
+    // (#expose-a-user-interface-to-the-user: user interaction events are
+    // suppressed while the user agent's interface is being used).
+    function mediaControlsPress(target, x, y, pressed) {
+        if (!inlineMedia || !target) return false;
+        const element = target instanceof HTMLMediaElement ? target : null;
+        if (element === null || !exposesControls(element)) return false;
+        const state = mediaState(element);
+        if (!controlsVisible(element, state) || state.player < 0) return false;
+        const layout = mediaControlsLayout(element);
+        if (!inPart(layout.bar, x, y)) return false;
+        if (!pressed) return true;
+        // Implemented in terms of the DOM API, as HTML requires.
+        if (inPart(layout.play, x, y)) {
+            if (state.paused || state.ended) Reflect.apply(mediaPlay, element, []).catch(function () {});
+            else Reflect.apply(mediaPause, element, []);
+        } else if (inPart(layout.mute, x, y)) {
+            mediaMutedSetter.call(element, !mediaMuted(element, state));
+        } else if (inPart(layout.scrubber, x, y) && Number.isFinite(state.duration) && state.readyState >= HAVE_METADATA) {
+            seekMedia(element, state, (x - layout.scrubber.x) / layout.scrubber.w * state.duration, false);
+        } else if (inPart(layout.fullscreen, x, y)) {
+            const document = element.ownerDocument;
+            if (fullscreenElementOf(document) === element) exitFullscreenDocument(document).catch(function () {});
+            else Reflect.apply(requestFullscreen, element, []).catch(function () {});
+        }
+        state.controlsUntil = currentTime() + 3000;
+        updateControls(element, state);
+        return true;
+    }
+    // Pointer motion over a video shows its controls for a while.
+    function mediaControlsHover(target) {
+        if (!inlineMedia || !(target instanceof HTMLMediaElement) || !exposesControls(target)) return;
+        const state = mediaState(target);
+        state.controlsUntil = currentTime() + 3000;
+        updateControls(target, state);
+    }
+
     // #concept-media-load-algorithm (the resource selection algorithm).
     function selectMediaResource(element, state) {
         const generation = state.generation;
-        state.network = 3;
-        state.showPoster = true;
+        state.network = NETWORK_NO_SOURCE;
+        setShowPoster(element, state, true);
+        state.delaying = true;
         // Await a stable state. Reuse the private, captured microtask primitive,
         // which is initialized before any author script can invoke this path.
         imageMicrotask(function () {
             if (state.generation !== generation) return;
             const src = element.getAttribute("src");
-            const sources = state.provider === null && src === null
-                ? Array.from(element.children).filter(e => e.localName === "source") : [];
-            if (state.provider === null && src === null && !sources.length) { state.network = 0; return; }
-            state.network = 2;
+            const firstSource = state.provider === null && src === null
+                ? Array.from(element.children).find(e => e.localName === "source") || null : null;
+            if (state.provider === null && src === null && firstSource === null) {
+                state.network = NETWORK_EMPTY;
+                state.delaying = false;
+                return;
+            }
+            state.network = NETWORK_LOADING;
             queueMediaEvent(element, state, generation, "loadstart");
-            if (state.provider !== null || src !== null) {
-                if (state.provider !== null) state.currentSrc = "";
-                else {
-                    const url = src === "" ? null : encodingParseForNode(src, element);
-                    if (url) state.currentSrc = url[0];
+            if (state.provider !== null) {
+                state.currentSrc = "";
+                fetchMediaResource(element, state, null, state.provider, null);
+            } else if (src !== null) {
+                // #concept-media-load-algorithm mode attribute: "" fails.
+                const url = src === "" ? null : encodingParseForNode(src, element);
+                if (url) state.currentSrc = url[0];
+                if (!url) {
+                    queueMediaTask(element, state, () => mediaSourceFailure(element, state, takePlayPromises(state)));
+                    return;
                 }
-                // Dedicated media source failure steps. No decoder means no
-                // usable media resource; this is not a fabricated network error.
-                queueMediaEvent(element, state, generation, "error", function () {
-                    state.error = new MediaError(mediaErrorToken);
-                    state.network = 3;
-                    rememberMediaFailure(nodeIds.get(element), true);
-                });
+                fetchMediaResource(element, state, url[0], null, null);
             } else {
-                // Child-source failures target each source, not the media
-                // element. Exhausting candidates leaves error null.
-                for (let i = 0; i < sources.length; i++)
-                    queueMediaEvent(sources[i], state, generation, "error", i === 0 ? function () {
-                        rememberMediaFailure(nodeIds.get(element), true);
-                    } : null);
-                __queue_dom_task(function () {
-                    if (state.generation === generation) state.network = 3;
-                });
+                state.candidate = firstSource;
+                processCandidate(element, state);
             }
         });
     }
+    // Mode children: process candidate (#concept-media-load-algorithm).
+    function processCandidate(element, state) {
+        const candidate = state.candidate;
+        const failed = () => failedWithElements(element, state, candidate);
+        const src = candidate.getAttribute("src");
+        if (src === null || src === "") return failed();
+        // The media attribute against the environment (Media Queries 4),
+        // through the internal evaluator rather than author-replaceable
+        // `matchMedia`.
+        const media = candidate.getAttribute("media");
+        if (media !== null && !__match_media(media, windowViewportDimension("width"),
+            windowViewportDimension("height"), screenDimension("width"), screenDimension("height"))) return failed();
+        const url = encodingParseForNode(src, candidate);
+        if (!url) return failed();
+        const type = candidate.getAttribute("type");
+        if (type !== null && canPlay(type) === "") return failed();
+        state.currentSrc = url[0];
+        fetchMediaResource(element, state, url[0], null, candidate, type);
+    }
+    // "Failed with elements": the candidate's error event, then the next
+    // source child after it, or wait for one to be inserted.
+    function failedWithElements(element, state, candidate) {
+        const generation = state.generation;
+        queueMediaEvent(candidate, state, generation, "error");
+        if (!inlineMedia) rememberMediaFailure(nodeIds.get(element), true);
+        imageMicrotask(function () {
+            if (state.generation !== generation) return;
+            forgetMediaTracks(element, state);
+            let next = candidate.parentNode === element ? candidate.nextElementSibling : null;
+            while (next !== null && next.localName !== "source") next = next.nextElementSibling;
+            if (next !== null) {
+                state.candidate = next;
+                processCandidate(element, state);
+                return;
+            }
+            // Waiting: a later source child resumes the search.
+            state.network = NETWORK_NO_SOURCE;
+            setShowPoster(element, state, true);
+            state.waitingForSource = candidate;
+            queueMediaTask(element, state, () => { state.delaying = false; });
+        });
+    }
+    // A source element was inserted into a media element waiting for one.
+    function mediaSourceInserted(element, source) {
+        const state = mediaState(element);
+        if (state.network === NETWORK_EMPTY) {
+            selectMediaResource(element, state);
+            return;
+        }
+        if (!state.waitingForSource) return;
+        const previous = state.waitingForSource;
+        // The pointer sits after the last candidate tried: only a source
+        // after it in the child list resumes the search.
+        if (previous.parentNode === element && !(previous.compareDocumentPosition(source) & 4)) return;
+        state.waitingForSource = false;
+        const generation = state.generation;
+        imageMicrotask(function () {
+            if (state.generation !== generation) return;
+            state.delaying = true;
+            state.network = NETWORK_LOADING;
+            state.candidate = source;
+            processCandidate(element, state);
+        });
+    }
+    function canPlay(type) {
+        return inlineMedia ? __media_can_play(`${type}`) : "";
+    }
+    // #concept-media-load-resource for a URL or a media provider object.
+    function fetchMediaResource(element, state, url, provider, candidate, type) {
+        const failure = function () {
+            if (candidate) failedWithElements(element, state, candidate);
+            else queueMediaTask(element, state, () => mediaSourceFailure(element, state, takePlayPromises(state)));
+        };
+        if (!inlineMedia) {
+            // No inline decoder: no usable media resource.
+            if (candidate) return failedWithElements(element, state, candidate);
+            queueMediaEvent(element, state, state.generation, "error", function () {
+                state.error = mediaError(4);
+                state.network = NETWORK_NO_SOURCE;
+                rememberMediaFailure(nodeIds.get(element), true);
+            });
+            return;
+        }
+        // A MediaSource media provider object or object URL
+        // (#mediasource-attach).
+        const mediaSource = provider !== null ? mseRecords.get(provider) : mediaSourceURLs.get(url);
+        if (mediaSource !== undefined && mediaSource.type === "MediaSource")
+            return attachMediaSource(element, state, mediaSource, candidate, failure);
+        let bytes = undefined;
+        if (provider !== null) {
+            if (!fileAPI.isBlob(provider)) return failure();
+            try { bytes = fileAPI.bytes(provider); } catch (_) { return failure(); }
+            type = fileAPI.type(provider);
+        }
+        closePlayer(element, state);
+        const id = __media_load(nodeIds.get(element), url || "", element.localName, type || "", bytes);
+        if (typeof id !== "number" || id < 0) return failure();
+        adoptPlayer(element, state, id, candidate);
+    }
+    // The element's new player: send it the element's state.
+    function adoptPlayer(element, state, id, candidate) {
+        state.player = id;
+        state.candidate = candidate;
+        mediaPlayers.set(id, element);
+        if (state.cdm >= 0) __eme("attach", state.cdm, id);
+        sendVolume(element, state);
+        mediaControl(element, state, "rate", state.playbackRate, state.preservesPitch);
+        if (!state.showPoster) mediaControl(element, state, "poster", false);
+        state.controlsKey = "";
+        updateControls(element, state);
+        syncPlaying(element, state);
+    }
+    // #dedicated-media-source-failure-steps
+    function mediaSourceFailure(element, state, promises) {
+        state.error = mediaError(4);
+        forgetMediaTracks(element, state);
+        state.network = NETWORK_NO_SOURCE;
+        setShowPoster(element, state, true);
+        closePlayer(element, state);
+        fireMediaEvent(element, "error");
+        rejectPlayPromises(promises, "NotSupportedError", "The element has no supported sources");
+        state.delaying = false;
+    }
     // #media-element-load-algorithm
     function loadMediaElement(element) {
-        const state = mediaState(element), generation = ++state.generation;
-        rememberMediaFailure(nodeIds.get(element), false);
-        // Abort/empty the old resource. Superseded tasks were discarded above.
-        if (state.network === 1 || state.network === 2)
+        const state = mediaState(element);
+        const generation = ++state.generation;
+        if (!inlineMedia) rememberMediaFailure(nodeIds.get(element), false);
+        state.waitingForSource = false;
+        // Pending play promises are settled at once (step 4).
+        if (state.network === NETWORK_LOADING || state.network === NETWORK_IDLE)
             queueMediaEvent(element, state, generation, "abort");
-        if (state.network !== 0) {
+        if (state.network !== NETWORK_EMPTY) {
+            // MSE #mediasource-detach runs right before emptied.
+            detachMediaSource(element, state);
             queueMediaEvent(element, state, generation, "emptied");
-            // The official playback position, readyState, paused and seeking
-            // already have their initial values; the timeline offset stays NaN.
+            closePlayer(element, state);
+            forgetMediaTracks(element, state);
+            state.readyState = HAVE_NOTHING;
+            if (!state.paused) {
+                state.paused = true;
+                rejectPlayPromises(takePlayPromises(state), "AbortError", "The play() request was interrupted by a new load request");
+            }
+            state.seeking = false;
+            state.ended = false;
+            const changed = state.position !== 0;
+            state.position = 0;
+            state.played = [];
+            state.playedFrom = null;
+            if (changed) queueMediaEvent(element, state, generation, "timeupdate");
+            state.duration = NaN;
+            state.videoWidth = state.videoHeight = 0;
+            state.loadedData = false;
         }
         if (state.playbackRate !== state.defaultPlaybackRate) {
             state.playbackRate = state.defaultPlaybackRate;
@@ -10180,43 +10548,334 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         return state.textTracks || (state.textTracks = createTrackList(TextTrackList,
             () => mediaTextTracks(state.element, state)));
     }
-    // #internal-pause-steps: paused is always true here, so only the can
-    // autoplay flag changes.
-    function internalPauseSteps(state) { state.canAutoplay = false; }
+    // #internal-pause-steps
+    function internalPauseSteps(element, state) {
+        state.canAutoplay = false;
+        if (!state.paused) {
+            state.paused = true;
+            notePlayed(state, state.playedFrom === null ? state.position : state.playedFrom, currentPosition(element, state));
+            state.playedFrom = null;
+            const promises = takePlayPromises(state);
+            queueMediaTask(element, state, function () {
+                fireMediaEvent(element, "timeupdate");
+                fireMediaEvent(element, "pause");
+                rejectPlayPromises(promises, "AbortError", "The play() request was interrupted by a call to pause()");
+            });
+            syncPlaying(element, state);
+        }
+        // Official playback position := current playback position.
+        state.position = currentPosition(element, state);
+    }
+    // #internal-play-steps
+    function internalPlaySteps(element, state) {
+        if (state.network === NETWORK_EMPTY) selectMediaResource(element, state);
+        if (state.ended && state.playbackRate >= 0) seekMedia(element, state, 0, false);
+        if (state.paused) {
+            state.paused = false;
+            if (state.showPoster) {
+                setShowPoster(element, state, false);
+                timeMarchesOn(element, state);
+            }
+            state.playedFrom = state.position;
+            queueFire(element, state, "play");
+            if (state.readyState <= HAVE_CURRENT_DATA) queueFire(element, state, "waiting");
+            else notifyAboutPlaying(element, state);
+        } else if (state.readyState >= HAVE_FUTURE_DATA) {
+            const promises = takePlayPromises(state);
+            queueMediaTask(element, state, () => resolvePlayPromises(promises));
+        }
+        state.canAutoplay = false;
+        syncPlaying(element, state);
+    }
+    // #dom-media-seek
+    function seekMedia(element, state, time, approximate) {
+        setShowPoster(element, state, false);
+        if (state.readyState === HAVE_NOTHING) return;
+        state.seeking = true;
+        if (!state.paused) {
+            notePlayed(state, state.playedFrom === null ? state.position : state.playedFrom, currentPosition(element, state));
+            state.playedFrom = null;
+        }
+        if (Number.isFinite(state.duration) && time > state.duration) time = state.duration;
+        if (time < 0) time = 0;
+        if (!state.seekable) time = Math.min(time, 0);
+        state.ended = false;
+        queueFire(element, state, "seeking");
+        state.position = time;
+        mediaControl(element, state, "seek", time, !!approximate);
+    }
+    // #reaches-the-end
+    function mediaReachedEnd(element, state) {
+        if (element.hasAttribute("loop")) {
+            seekMedia(element, state, 0, false);
+            return;
+        }
+        state.ended = true;
+        if (Number.isFinite(state.duration)) state.position = state.duration;
+        if (!state.paused) notePlayed(state, state.playedFrom === null ? state.position : state.playedFrom, state.position);
+        state.playedFrom = null;
+        queueMediaTask(element, state, function () {
+            fireMediaEvent(element, "timeupdate");
+            if (state.ended && !state.paused) {
+                state.paused = true;
+                fireMediaEvent(element, "pause");
+                rejectPlayPromises(takePlayPromises(state), "AbortError", "The media ended");
+            }
+            fireMediaEvent(element, "ended");
+        });
+    }
+    // #ready-states: the steps for a ready state change.
+    function setReadyState(element, state, next) {
+        const previous = state.readyState;
+        if (previous === next) return;
+        state.readyState = next;
+        if (state.network === NETWORK_EMPTY) return;
+        if (previous === HAVE_NOTHING && next === HAVE_METADATA) {
+            queueFire(element, state, "loadedmetadata");
+            return;
+        }
+        if (previous <= HAVE_METADATA && next >= HAVE_CURRENT_DATA && !state.loadedData) {
+            if (previous === HAVE_NOTHING) queueFire(element, state, "loadedmetadata");
+            state.loadedData = true;
+            queueFire(element, state, "loadeddata");
+        }
+        if (previous >= HAVE_FUTURE_DATA && next <= HAVE_CURRENT_DATA) {
+            if (!state.paused && !state.ended && state.error === null) {
+                queueFire(element, state, "timeupdate");
+                queueFire(element, state, "waiting");
+            }
+            return;
+        }
+        if (previous <= HAVE_CURRENT_DATA && next === HAVE_FUTURE_DATA) {
+            queueFire(element, state, "canplay");
+            if (!state.paused) notifyAboutPlaying(element, state);
+            return;
+        }
+        if (next === HAVE_ENOUGH_DATA) {
+            if (previous <= HAVE_CURRENT_DATA) {
+                queueFire(element, state, "canplay");
+                if (!state.paused) notifyAboutPlaying(element, state);
+            }
+            queueFire(element, state, "canplaythrough");
+            if (!eligibleForAutoplay(element, state) || !allowedToPlay(element, state)) return;
+            state.paused = false;
+            if (state.showPoster) {
+                setShowPoster(element, state, false);
+                timeMarchesOn(element, state);
+            }
+            state.playedFrom = state.position;
+            queueFire(element, state, "play");
+            notifyAboutPlaying(element, state);
+            syncPlaying(element, state);
+        }
+    }
+    // Media-resource-specific tracks (#media-resource-specific-text-track and
+    // the AudioTrack/VideoTrack lists).
+    function forgetMediaTracks(element, state) {
+        const removed = state.mediaTracks;
+        if (!removed.length) return;
+        state.mediaTracks = [];
+        for (const record of removed) {
+            const list = record.kind === "audio" ? state.audioTracks : state.videoTracks;
+            if (list) dispatch(list, createTrustedEvent(TrackEvent, "removetrack", {track: record.track}), false);
+        }
+    }
+    function addMediaTracks(element, state, tracks) {
+        for (const info of tracks) {
+            if (info.kind !== "audio" && info.kind !== "video") continue;
+            const audio = info.kind === "audio";
+            const track = Object.create((audio ? AudioTrack : VideoTrack).prototype);
+            const record = {kind: audio ? "AudioTrack" : "VideoTrack", id: info.id, trackKind: "main",
+                label: info.label, language: info.language, enabled: audio && info.active,
+                selected: !audio && info.active, media: element};
+            trackSlots.set(track, record);
+            state.mediaTracks.push({kind: info.kind, track, record});
+            const list = audio ? element.audioTracks : element.videoTracks;
+            queueMediaTask(element, state, () => dispatch(list, createTrustedEvent(TrackEvent, "addtrack", {track}), false));
+        }
+    }
+    // Host reports (`media_host::dispatch`), run as media element tasks.
+    trust.mediaEvent = function (id, kind, a, b, c) {
+        const element = mediaPlayers.get(id);
+        if (!element) return;
+        const state = mediaState(element);
+        if (state.player !== id) return;
+        switch (kind) {
+        case "metadata": {
+            const info = JSON.parse(c);
+            if (state.mediaSource !== null) {
+                // MSE: tracks, the duration and HAVE_METADATA came from the
+                // initialization segments; the player adds the video size.
+                if (element.localName === "video" && info.width > 0
+                    && (state.videoWidth !== info.width || state.videoHeight !== info.height)) {
+                    state.videoWidth = info.width;
+                    state.videoHeight = info.height;
+                    if (state.readyState !== HAVE_NOTHING) queueFire(element, state, "resize");
+                }
+                return;
+            }
+            // #concept-media-load-resource: once the duration and
+            // dimensions are known.
+            addMediaTracks(element, state, info.tracks);
+            state.position = 0;
+            state.seekable = !!b;
+            const duration = Number.isNaN(a) ? Infinity : a;
+            if (!Object.is(state.duration, duration)) {
+                state.duration = duration;
+                queueFire(element, state, "durationchange");
+            }
+            if (element.localName === "video" && info.width > 0) {
+                state.videoWidth = info.width;
+                state.videoHeight = info.height;
+                queueFire(element, state, "resize");
+            }
+            setReadyState(element, state, HAVE_METADATA);
+            updateControls(element, state);
+            if (state.defaultStart > 0) {
+                const start = state.defaultStart;
+                state.defaultStart = 0;
+                seekMedia(element, state, start, false);
+            }
+            return;
+        }
+        case "ready":
+            if (state.readyState === HAVE_NOTHING && a > HAVE_NOTHING) return;
+            setReadyState(element, state, a);
+            return;
+        case "duration":
+            // An attached MediaSource owns the duration.
+            if (state.mediaSource !== null) return;
+            if (!Object.is(state.duration, a)) {
+                state.duration = a;
+                queueFire(element, state, "durationchange");
+            }
+            updateControls(element, state);
+            return;
+        case "resize":
+            if (element.localName !== "video" || (state.videoWidth === a && state.videoHeight === b)) return;
+            state.videoWidth = a;
+            state.videoHeight = b;
+            if (state.readyState !== HAVE_NOTHING) queueFire(element, state, "resize");
+            return;
+        case "time":
+            if (state.seeking || state.paused) return;
+            state.position = a;
+            timeMarchesOn(element, state);
+            queueFire(element, state, "timeupdate");
+            updateControls(element, state);
+            return;
+        case "seeked":
+            if (!state.seeking) return;
+            state.seeking = false;
+            state.position = a;
+            if (!state.paused) state.playedFrom = a;
+            timeMarchesOn(element, state);
+            queueFire(element, state, "timeupdate");
+            queueFire(element, state, "seeked");
+            updateControls(element, state);
+            return;
+        case "ended":
+            mediaReachedEnd(element, state);
+            updateControls(element, state);
+            return;
+        case "waitingforkey":
+            // EME #wait-for-key (the player's ready states follow its data).
+            queueFire(element, state, "waitingforkey");
+            return;
+        case "error":
+            if (state.readyState === HAVE_NOTHING) {
+                // The resource is not usable: the next candidate, or the
+                // dedicated media source failure steps.
+                closePlayer(element, state);
+                if (state.candidate) failedWithElements(element, state, state.candidate);
+                else mediaSourceFailure(element, state, takePlayPromises(state));
+                return;
+            }
+            // #fatal-network-error / #media-data-is-corrupted.
+            state.error = mediaError(a, b);
+            state.network = NETWORK_IDLE;
+            state.delaying = false;
+            fireMediaEvent(element, "error");
+            return;
+        case "network":
+            if (a === "progress") {
+                if (state.network === NETWORK_IDLE) state.network = NETWORK_LOADING;
+                fireMediaEvent(element, "progress");
+            } else if (a === "suspend" || a === "complete") {
+                if (state.network === NETWORK_LOADING) state.network = NETWORK_IDLE;
+                state.delaying = false;
+                fireMediaEvent(element, "suspend");
+            } else if (a === "stalled") {
+                fireMediaEvent(element, "stalled");
+            }
+            return;
+        }
+    };
+    // DOM insertion and removal steps for media elements (the platform
+    // reports which insertions and removals involve them).
+    function mediaSubtreeInserted(parent, node) {
+        if (node.localName === "source" && parent instanceof HTMLMediaElement) {
+            mediaSourceInserted(parent, node);
+            return;
+        }
+        const elements = node instanceof HTMLMediaElement ? [node]
+            : typeof node.querySelectorAll === "function" ? Array.from(node.querySelectorAll("video, audio")) : [];
+        for (const element of elements) {
+            const state = mediaState(element);
+            // #media-element-insertion: an element whose networkState is
+            // NETWORK_EMPTY invokes its resource selection algorithm.
+            if (state.network === NETWORK_EMPTY && element.isConnected) selectMediaResource(element, state);
+        }
+    }
+    function mediaSubtreeRemoved(node) {
+        const elements = node instanceof HTMLMediaElement ? [node]
+            : typeof node.querySelectorAll === "function" ? Array.from(node.querySelectorAll("video, audio")) : [];
+        for (const element of elements) {
+            const state = mediaState(element);
+            // #playing-the-media-resource: removal from a document runs the
+            // internal pause steps once in a stable state.
+            imageMicrotask(function () {
+                if (!element.isConnected) internalPauseSteps(element, state);
+            });
+        }
+    }
 
     class HTMLMediaElement extends HTMLElement {
         canPlayType(type) {
             if (!arguments.length) throw new TypeError("canPlayType requires a type");
             const converted = `${type}`; // Web IDL DOMString conversion, including Symbol rejection.
-            return "";
+            return canPlay(converted);
         }
         load() { mediaRecord(this); loadMediaElement(this); }
-        // HTMLMediaElement §"playing the media resource": an element that is
-        // "not allowed to play" returns a promise rejected with
-        // NotAllowedError — the exact signal a real browser gives for blocked
-        // autoplay. We NEVER play inline (media routes to mpv via the follow
-        // affordance), so report that honestly instead of a lying resolve:
-        // hover-preview sites (Steam's sale-capsule microtrailers, every
-        // autoplay-guarded player since Chrome's policy) handle precisely
-        // this rejection and fall back to their poster/image UI — which keeps
-        // the capsule IMAGE instead of swapping to a video we can't paint.
-        // (The lying resolve left Steam's `with_microtrailer` class on
-        // forever: image hidden, unpaintable video shown, capsule destroyed.)
-        // The rejection is pre-observed so a page that never .catch()es
-        // doesn't count as a page error — browsers only console-warn there.
+        // #dom-media-play. Without inline playback the element is never
+        // allowed to play, which is the signal hover-preview sites (Steam's
+        // sale-capsule microtrailers, every autoplay-guarded player) handle
+        // by keeping their poster; the rejection is pre-observed so a page
+        // that never .catch()es doesn't count as a page error.
         play() {
-            const p = Promise.reject(new DOMException(
-                "play() failed: no inline media playback in this rendering",
-                "NotAllowedError"
-            ));
-            p.catch(function () {});
-            return p;
+            const state = mediaRecord(this);
+            if (!allowedToPlay(this, state)) {
+                const p = Promise.reject(new DOMException(
+                    inlineMedia ? "play() failed because the user didn't interact with the document first"
+                        : "play() failed: no inline media playback in this rendering",
+                    "NotAllowedError"
+                ));
+                p.catch(function () {});
+                return p;
+            }
+            if (state.error !== null && state.error.code === 4)
+                return Promise.reject(new DOMException("The element has no supported sources", "NotSupportedError"));
+            let resolve, reject;
+            const promise = new Promise(function (res, rej) { resolve = res; reject = rej; });
+            state.playPromises.push({resolve, reject});
+            internalPlaySteps(this, state);
+            return promise;
         }
         // #dom-media-pause
         pause() {
             const state = mediaRecord(this);
-            if (state.network === 0) selectMediaResource(this, state);
-            internalPauseSteps(state);
+            if (state.network === NETWORK_EMPTY) selectMediaResource(this, state);
+            internalPauseSteps(this, state);
         }
         // #dom-media-addtexttrack
         addTextTrack(kind, label = "", language = "") {
@@ -10229,24 +10888,26 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             addTextTrackToMedia(this, state, track);
             return track;
         }
-        // #dom-media-fastseek: the seek algorithm returns at HAVE_NOTHING.
+        // #dom-media-fastseek
         fastSeek(time) {
             const state = mediaRecord(this);
             if (arguments.length < 1) throw new TypeError("fastSeek requires a time");
-            mediaDouble(time, "time");
-            state.showPoster = false;
+            time = mediaDouble(time, "time");
+            seekMedia(this, state, time, true);
         }
         // #dom-media-getstartdate: the timeline offset is NaN.
         getStartDate() { mediaRecord(this); return new Date(NaN); }
         get src() { return reflectedURL(this, this.getAttribute("src")); }
         set src(v) { this.setAttribute("src", String(v)); }
         // #dom-media-srcobject: MediaProvider is (MediaStream or MediaSource
-        // or Blob); this user agent has Blob.
+        // or Blob); this user agent has Blob, and MediaSource where media
+        // plays inline.
         get srcObject() { return mediaRecord(this).provider; }
         set srcObject(value) {
             const state = mediaRecord(this);
             if (value === undefined || value === null) value = null;
-            else if (!fileAPI.isBlob(value)) throw new TypeError("srcObject must be a MediaProvider");
+            else if (!fileAPI.isBlob(value) && !(inlineMedia && mseRecords.get(value)?.type === "MediaSource"))
+                throw new TypeError("srcObject must be a MediaProvider");
             state.provider = value;
             loadMediaElement(this);
         }
@@ -10283,31 +10944,80 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             return value !== null && value.toLowerCase() === "lazy" ? "lazy" : "eager";
         }
         set loading(value) { mediaRecord(this); this.setAttribute("loading", `${value}`); }
-        get readyState() { mediaRecord(this); return 0; }
+        get readyState() { return mediaRecord(this).readyState; }
         get networkState() { return mediaRecord(this).network; }
         get error() { return mediaRecord(this).error; }
-        get ended() { mediaRecord(this); return false; }
-        get seeking() { mediaRecord(this); return false; }
-        get duration() { mediaRecord(this); return NaN; }
-        get buffered() { mediaRecord(this); return emptyTimeRanges(); }
-        get played() { mediaRecord(this); return emptyTimeRanges(); }
-        get seekable() { mediaRecord(this); return emptyTimeRanges(); }
+        // #dom-media-ended: ended playback, forwards.
+        get ended() {
+            const state = mediaRecord(this);
+            return state.ended && state.readyState >= HAVE_METADATA && !this.hasAttribute("loop");
+        }
+        get seeking() { return mediaRecord(this).seeking; }
+        get duration() { return mediaRecord(this).duration; }
+        // #dom-media-buffered: TRust reports what the player can play
+        // without fetching more, which for a progressive resource is
+        // estimated as the whole timeline once metadata is in.
+        get buffered() {
+            const state = mediaRecord(this);
+            // MSE #htmlmediaelement-extensions-buffered
+            if (state.mediaSource !== null)
+                return cachedRanges(state.mediaSource, __media_source("buffered", state.mediaSource.id, -1));
+            if (state.readyState < HAVE_METADATA || !Number.isFinite(state.duration)) return emptyTimeRanges();
+            return timeRanges([[0, state.network === NETWORK_IDLE ? state.duration : Math.max(currentPosition(this, state), 0)]]);
+        }
+        get played() {
+            const state = mediaRecord(this);
+            const ranges = state.played.slice();
+            if (!state.paused && state.playedFrom !== null) ranges.push([state.playedFrom, currentPosition(this, state)]);
+            const scratch = {played: ranges};
+            notePlayed(scratch, 0, 0);
+            return timeRanges(scratch.played.filter(range => range[1] > range[0]));
+        }
+        // #dom-media-seekable: the whole timeline of a seekable resource.
+        get seekable() {
+            const state = mediaRecord(this);
+            // MSE #htmlmediaelement-extensions-seekable
+            if (state.mediaSource !== null) {
+                const source = state.mediaSource;
+                const duration = __media_source("duration", source.id);
+                if (Number.isNaN(duration)) return emptyTimeRanges();
+                if (duration !== Infinity) return timeRanges([[0, duration]]);
+                const buffered = mseRanges(__media_source("buffered", source.id, -1));
+                const live = mseRanges(__media_source("liveRange", source.id));
+                if (live.length) {
+                    const union = live.concat(buffered);
+                    return timeRanges([[Math.min(...union.map(r => r[0])), Math.max(...union.map(r => r[1]))]]);
+                }
+                if (!buffered.length) return emptyTimeRanges();
+                return timeRanges([[0, buffered[buffered.length - 1][1]]]);
+            }
+            if (state.readyState < HAVE_METADATA || !state.seekable) return emptyTimeRanges();
+            return timeRanges([[0, state.duration]]);
+        }
         get textTracks() { return textTrackListOf(mediaRecord(this)); }
         get audioTracks() {
             const state = mediaRecord(this);
-            return state.audioTracks || (state.audioTracks = createTrackList(AudioTrackList, () => []));
+            return state.audioTracks || (state.audioTracks = createTrackList(AudioTrackList,
+                () => state.mediaTracks.filter(entry => entry.kind === "audio").map(entry => entry.track)));
         }
         get videoTracks() {
             const state = mediaRecord(this);
-            return state.videoTracks || (state.videoTracks = createTrackList(VideoTrackList, () => []));
+            return state.videoTracks || (state.videoTracks = createTrackList(VideoTrackList,
+                () => state.mediaTracks.filter(entry => entry.kind === "video").map(entry => entry.track)));
         }
-        get paused() { mediaRecord(this); return true; }
+        get paused() { return mediaRecord(this).paused; }
         // #dom-media-currenttime: at HAVE_NOTHING the setter sets the default
         // playback start position, which the getter returns unless it is 0.
-        get currentTime() { return mediaRecord(this).defaultStart; }
+        get currentTime() {
+            const state = mediaRecord(this);
+            if (state.defaultStart !== 0) return state.defaultStart;
+            return currentPosition(this, state);
+        }
         set currentTime(value) {
             const state = mediaRecord(this);
-            state.defaultStart = mediaDouble(value, "currentTime");
+            value = mediaDouble(value, "currentTime");
+            if (state.readyState === HAVE_NOTHING) state.defaultStart = value;
+            else seekMedia(this, state, value, false);
         }
         // #dom-media-volume and #set-the-playback-volume
         get volume() { return mediaRecord(this).volume; }
@@ -10318,14 +11028,17 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 throw new DOMException("The volume must be in the range 0 to 1", "IndexSizeError");
             if (state.volume === value) return;
             state.volume = value;
+            sendVolume(this, state);
             const element = this;
             queueMediaTask(element, state, () => fireMediaEvent(element, "volumechange"));
+            // An element that is no longer allowed to play pauses.
+            if (!state.paused && !allowedToPlay(this, state)) internalPauseSteps(this, state);
         }
         // #dom-media-muted and #set-the-muted-state: the muted state is
         // initially "default", which follows the muted content attribute.
         get muted() {
             const state = mediaRecord(this);
-            return state.mutedState === true || (state.mutedState === "default" && this.hasAttribute("muted"));
+            return mediaMuted(this, state);
         }
         set muted(value) {
             const state = mediaRecord(this);
@@ -10334,18 +11047,24 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             state.mutedState = value;
             // HTML #selector-muted reads the DOM's copy of the muted state.
             __dom_input(elementIdentity(this), "media-muted", value);
+            sendVolume(this, state);
+            updateControls(this, state);
             const element = this;
             queueMediaTask(element, state, () => fireMediaEvent(element, "volumechange"));
+            if (!state.paused && !allowedToPlay(this, state)) internalPauseSteps(this, state);
         }
         // #dom-media-defaultplaybackrate, #dom-media-playbackrate and
-        // #rateUpdate: every finite rate is supported (no media resource is
-        // ever potentially playing), and a changed value fires ratechange.
+        // #rateUpdate. Negative rates (backwards playback) are not supported
+        // (as in Chrome and Firefox).
         get playbackRate() { return mediaRecord(this).playbackRate; }
         set playbackRate(value) {
             const state = mediaRecord(this);
             value = mediaDouble(value, "playbackRate");
+            if (inlineMedia && value < 0)
+                throw new DOMException("Backwards playback is not supported", "NotSupportedError");
             if (state.playbackRate === value) return;
             state.playbackRate = value;
+            mediaControl(this, state, "rate", value, state.preservesPitch);
             const element = this;
             queueMediaTask(element, state, () => fireMediaEvent(element, "ratechange"));
         }
@@ -10353,6 +11072,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         set defaultPlaybackRate(value) {
             const state = mediaRecord(this);
             value = mediaDouble(value, "defaultPlaybackRate");
+            if (inlineMedia && value < 0)
+                throw new DOMException("Backwards playback is not supported", "NotSupportedError");
             if (state.defaultPlaybackRate === value) return;
             state.defaultPlaybackRate = value;
             const element = this;
@@ -10360,8 +11081,16 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         }
         // #dom-media-preservespitch
         get preservesPitch() { return mediaRecord(this).preservesPitch; }
-        set preservesPitch(value) { mediaRecord(this).preservesPitch = !!value; }
+        set preservesPitch(value) {
+            const state = mediaRecord(this);
+            state.preservesPitch = !!value;
+            mediaControl(this, state, "rate", state.playbackRate, state.preservesPitch);
+        }
     }
+    // The controls operate the element through these, captured before any
+    // author script could replace them.
+    const mediaPlay = HTMLMediaElement.prototype.play, mediaPause = HTMLMediaElement.prototype.pause;
+    const mediaMutedSetter = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, "muted").set;
     // [Reflect] boolean attributes of HTMLMediaElement.
     for (const [property, attribute] of [["autoplay", "autoplay"], ["loop", "loop"], ["controls", "controls"],
         ["defaultMuted", "muted"]]) {
@@ -10374,9 +11103,31 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     // videoWidth/videoHeight are HTMLVideoElement-only (not on <audio>).
     class HTMLVideoElement extends HTMLMediaElement {
-        get videoWidth() { mediaRecord(this); return 0; }
-        get videoHeight() { mediaRecord(this); return 0; }
+        get videoWidth() { return mediaRecord(this).videoWidth; }
+        get videoHeight() { return mediaRecord(this).videoHeight; }
+        // Media Playback Quality #dom-htmlvideoelement-getvideoplaybackquality.
+        getVideoPlaybackQuality() {
+            const state = mediaRecord(this);
+            const presented = Number(mediaControl(this, state, "presented")) || 0;
+            const dropped = Number(mediaControl(this, state, "dropped")) || 0;
+            const quality = Object.create(VideoPlaybackQuality.prototype);
+            internalsFor(quality).quality = {creationTime: g.performance.now(), dropped, total: presented + dropped};
+            return quality;
+        }
     }
+    class VideoPlaybackQuality {
+        constructor() { throw new TypeError("Illegal constructor"); }
+        get creationTime() { return qualityRecord(this).creationTime; }
+        get droppedVideoFrames() { return qualityRecord(this).dropped; }
+        get totalVideoFrames() { return qualityRecord(this).total; }
+        get corruptedVideoFrames() { qualityRecord(this); return 0; }
+    }
+    function qualityRecord(quality) {
+        const record = internalsOf(quality).quality;
+        if (!record) throw new TypeError("Illegal invocation");
+        return record;
+    }
+    if (inlineMedia) g.VideoPlaybackQuality = VideoPlaybackQuality;
     class HTMLAudioElement extends HTMLMediaElement {}
 
     // --- #timed-text-tracks -----------------------------------------------------
@@ -10461,14 +11212,20 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             return null;
         }
     }
+    // #audiotracklist-and-videotracklist-objects over a media element's
+    // media-resource-specific tracks.
+    function trackById(list, kind, id) {
+        const tracks = trackRecord(list, kind).items();
+        for (let i = 0; i < tracks.length; i++) if (trackSlots.get(tracks[i]).id === id) return tracks[i];
+        return null;
+    }
     class AudioTrackList extends EventTarget {
         constructor() { throw new TypeError("Illegal constructor"); }
         get length() { return trackRecord(this, "AudioTrackList").items().length; }
         getTrackById(id) {
             trackRecord(this, "AudioTrackList");
             if (arguments.length < 1) throw new TypeError("getTrackById requires an id");
-            id = `${id}`;
-            return null;
+            return trackById(this, "AudioTrackList", `${id}`);
         }
     }
     class VideoTrackList extends EventTarget {
@@ -10477,13 +11234,22 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         getTrackById(id) {
             trackRecord(this, "VideoTrackList");
             if (arguments.length < 1) throw new TypeError("getTrackById requires an id");
-            id = `${id}`;
-            return null;
+            return trackById(this, "VideoTrackList", `${id}`);
         }
-        get selectedIndex() { trackRecord(this, "VideoTrackList"); return -1; }
+        get selectedIndex() {
+            const tracks = trackRecord(this, "VideoTrackList").items();
+            for (let i = 0; i < tracks.length; i++) if (trackSlots.get(tracks[i]).selected) return i;
+            return -1;
+        }
     }
-    // A media resource's audio and video tracks: none exist without a
-    // decoder, but the interfaces are exposed.
+    // A change of enabled/selected queues a `change` event at the list
+    // (#dom-audiotrack-enabled, #dom-videotrack-selected).
+    function trackChanged(record, list) {
+        const media = record.media;
+        if (!media || !list) return;
+        const state = mediaState(media);
+        queueMediaTask(media, state, () => fireMediaEvent(list, "change"));
+    }
     class AudioTrack {
         constructor() { throw new TypeError("Illegal constructor"); }
         get id() { return trackRecord(this, "AudioTrack").id; }
@@ -10491,7 +11257,14 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         get label() { return trackRecord(this, "AudioTrack").label; }
         get language() { return trackRecord(this, "AudioTrack").language; }
         get enabled() { return trackRecord(this, "AudioTrack").enabled; }
-        set enabled(value) { trackRecord(this, "AudioTrack").enabled = !!value; }
+        set enabled(value) {
+            const record = trackRecord(this, "AudioTrack");
+            value = !!value;
+            if (record.enabled === value) return;
+            record.enabled = value;
+            if (record.media) trackChanged(record, record.media.audioTracks);
+            if (record.sourceBuffer) mseTrackSelection(record.sourceBuffer);
+        }
     }
     class VideoTrack {
         constructor() { throw new TypeError("Illegal constructor"); }
@@ -10500,7 +11273,14 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         get label() { return trackRecord(this, "VideoTrack").label; }
         get language() { return trackRecord(this, "VideoTrack").language; }
         get selected() { return trackRecord(this, "VideoTrack").selected; }
-        set selected(value) { trackRecord(this, "VideoTrack").selected = !!value; }
+        set selected(value) {
+            const record = trackRecord(this, "VideoTrack");
+            value = !!value;
+            if (record.selected === value) return;
+            record.selected = value;
+            if (record.media) trackChanged(record, record.media.videoTracks);
+            if (record.sourceBuffer) mseTrackSelection(record.sourceBuffer);
+        }
     }
 
     // A text track (#text-track): kind, label, language, identifier, in-band
@@ -10567,11 +11347,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (activeSnapshot !== null && activeSnapshot.has(cue)) return activeSnapshot.get(cue);
         return trackSlots.get(cue).active;
     }
-    // #time-marches-on. The current playback position is always 0 and never
-    // advances through normal playback, so no cue is missed, no timeupdate is
-    // due and no cue pauses on exit.
+    // #time-marches-on at the official playback position (cues missed by
+    // a jump are not replayed: timeupdate fires from the player's reports).
     function timeMarchesOn(element, state) {
-        const position = 0;
+        const position = state.position;
         const current = [], other = [];
         const cueOrder = new Map();
         const tracks = mediaTextTracks(element, state);
@@ -11606,6 +12385,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             honorUserPreferences(media, state);
             populatePendingTextTracks(media, state);
             state.blockedOnParser = false;
+            // HTML #media-elements: inserted into a document with networkState
+            // NETWORK_EMPTY, the element runs its resource selection
+            // algorithm; its source children are in place by now.
+            if (inlineMedia && state.network === NETWORK_EMPTY && media.isConnected)
+                selectMediaResource(media, state);
         }
     };
     class HTMLTrackElement extends HTMLElement {
@@ -11643,6 +12427,525 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     for (const C of [TextTrackList, AudioTrackList, VideoTrackList, TextTrackCueList])
         Object.defineProperty(C.prototype, Symbol.iterator, {value: Array.prototype.values, writable: true, configurable: true});
+
+    // Media Source Extensions (local w3c/media-source@8e0611a): MediaSource,
+    // SourceBuffer and SourceBufferList over the host's MediaSource state
+    // (`__media_source`, `crate::media::mse`). The host runs the segment
+    // parser loop, coded frame processing, removal and eviction, and the
+    // buffered ranges, and reports what script observes; the IDL, the events
+    // and the media element's side of each algorithm run here. Window only,
+    // and only where media plays inline (the terminal has no MediaSource):
+    // MediaSource in dedicated workers (`handle`) is not implemented, so
+    // `canConstructInDedicatedWorker` is false.
+    const mseRecords = new WeakMap();
+    // EME #initdata-encountered, installed by the Encrypted Media Extensions
+    // block: (element, initDataType, bytes).
+    let mediaInitDataEncountered = null;
+    // MediaSource object URLs (#mediasource-attach), until revoked.
+    const mediaSourceURLs = new Map();
+    function mseRecord(object, type) {
+        const record = (typeof object === "object" || typeof object === "function") && object !== null
+            ? mseRecords.get(object) : undefined;
+        if (!record || record.type !== type) throw new TypeError("Illegal " + type + " invocation");
+        return record;
+    }
+    function mseThrow(name, message) {
+        if (name === "TypeError") throw new TypeError(message);
+        if (name === "QuotaExceededError") throw new QuotaExceededError(message);
+        throw new DOMException(message, name);
+    }
+    // MSE queues its events as tasks (no media element task source).
+    function mseQueue(target, type) {
+        __queue_dom_task(function () { fireMediaEvent(target, type); });
+    }
+    function mseQueueTrackEvent(list, type, track) {
+        __queue_dom_task(function () { dispatch(list, createTrustedEvent(TrackEvent, type, {track}), false); });
+    }
+    function mseRanges(text) {
+        return JSON.parse(text).map(range => [range[0], range[1] === null ? Infinity : range[1]]);
+    }
+    function sourceState(source) { return __media_source("state", source.id); }
+    // The current value of a `buffered` attribute: a new TimeRanges only
+    // when the ranges changed (#dom-sourcebuffer-buffered,
+    // #htmlmediaelement-extensions-buffered).
+    function cachedRanges(record, text) {
+        if (record.bufferedText !== text) {
+            record.bufferedText = text;
+            record.bufferedRanges = timeRanges(mseRanges(text));
+        }
+        return record.bufferedRanges;
+    }
+    // A MediaSource object URL for `object`, or null (URL.createObjectURL).
+    function mediaSourceObjectURL(object, url) {
+        const record = (typeof object === "object" || typeof object === "function") && object !== null
+            ? mseRecords.get(object) : undefined;
+        if (!inlineMedia || !record || record.type !== "MediaSource") return null;
+        mediaSourceURLs.set(url, record);
+        return url;
+    }
+    // The media element's side of #duration-change-algorithm (HTML
+    // #durationChange).
+    function mirrorDuration(source) {
+        const element = source.element;
+        if (element === null) return;
+        const state = mediaState(element);
+        const duration = __media_source("duration", source.id);
+        if (Object.is(state.duration, duration)) return;
+        state.duration = duration;
+        queueFire(element, state, "durationchange");
+        if (state.readyState >= HAVE_METADATA && currentPosition(element, state) > duration)
+            seekMedia(element, state, duration, false);
+        updateControls(element, state);
+    }
+    // #mediasource-attach (the resource fetch algorithm with a MediaSource
+    // media provider object or object URL).
+    function attachMediaSource(element, state, source, candidate, failure) {
+        closePlayer(element, state);
+        if (sourceState(source) !== "closed") return failure();
+        const id = __media_attach(nodeIds.get(element), source.id, element.localName);
+        if (typeof id !== "number" || id < 0) return failure();
+        source.element = element;
+        state.mediaSource = source;
+        state.delaying = false;
+        adoptPlayer(element, state, id, candidate);
+        mseQueue(source.object, "sourceopen");
+    }
+    // #mediasource-detach, before the media element's emptied event or when
+    // its player goes.
+    function detachMediaSource(element, state) {
+        const source = state.mediaSource;
+        if (source === null) return;
+        state.mediaSource = null;
+        source.element = null;
+        __media_source("detach", source.id);
+        for (const buffer of source.buffers) {
+            buffer.removed = true;
+            buffer.updating = false;
+            buffer.token++;
+        }
+        source.active = [];
+        mseQueue(source.activeSourceBuffers, "removesourcebuffer");
+        source.buffers = [];
+        mseQueue(source.sourceBuffers, "removesourcebuffer");
+        mseQueue(source.object, "sourceclose");
+    }
+    // #end-of-stream-algorithm; the host has made the MediaSource "ended".
+    function mseEndOfStream(source, error, outcome) {
+        mseQueue(source.object, "sourceended");
+        if (error === undefined) {
+            if (outcome !== null && outcome.durationChanged) mirrorDuration(source);
+            return;
+        }
+        const element = source.element;
+        if (element === null) return;
+        const state = mediaState(element);
+        if (state.readyState === HAVE_NOTHING) {
+            // "Cannot be fetched at all" / "unsupported format": the
+            // resource selection algorithm fails.
+            const candidate = state.candidate;
+            const promises = candidate ? null : takePlayPromises(state);
+            queueMediaTask(element, state, function () {
+                closePlayer(element, state);
+                if (candidate) failedWithElements(element, state, candidate);
+                else mediaSourceFailure(element, state, promises);
+            });
+            return;
+        }
+        // "Interrupted" (network) or "corrupted" (decode).
+        state.error = mediaError(error === "network" ? 2 : 3);
+        state.network = NETWORK_IDLE;
+        state.delaying = false;
+        queueFire(element, state, "error");
+    }
+    // What the host reports a SourceBuffer's algorithms did: tracks of the
+    // first initialization segment, activeSourceBuffers, the duration and
+    // the media element reaching HAVE_METADATA (#sourcebuffer-init-segment-received).
+    function mseApply(buffer, outcome) {
+        const source = buffer.source, element = source.element;
+        if (outcome.durationChanged) mirrorDuration(source);
+        if (element !== null && mediaInitDataEncountered !== null) {
+            for (const [initDataType, initData] of outcome.initData || [])
+                mediaInitDataEncountered(element, initDataType, initData);
+        }
+        for (const info of outcome.tracks) {
+            const audio = info.kind === "audio";
+            const track = Object.create((audio ? AudioTrack : VideoTrack).prototype);
+            const record = {kind: audio ? "AudioTrack" : "VideoTrack", id: info.id, trackKind: info.kindName,
+                label: info.label, language: info.language === "und" ? "" : info.language,
+                enabled: audio && info.enabled, selected: !audio && info.enabled, media: element, sourceBuffer: buffer};
+            trackSlots.set(track, record);
+            buffer.tracks.push(track);
+            mseQueueTrackEvent(audio ? buffer.object.audioTracks : buffer.object.videoTracks, "addtrack", track);
+            if (element !== null) {
+                const state = mediaState(element);
+                state.mediaTracks.push({kind: info.kind, track, record});
+                const list = audio ? element.audioTracks : element.videoTracks;
+                queueMediaTask(element, state, () => dispatch(list, createTrustedEvent(TrackEvent, "addtrack", {track}), false));
+            }
+        }
+        if (outcome.activated && !source.active.includes(buffer)) {
+            source.active = source.buffers.filter(b => b === buffer || source.active.includes(b));
+            mseQueue(source.activeSourceBuffers, "addsourcebuffer");
+        }
+        if (outcome.metadata && element !== null) {
+            const state = mediaState(element);
+            if (state.readyState === HAVE_NOTHING) {
+                state.seekable = true;
+                setReadyState(element, state, HAVE_METADATA);
+                updateControls(element, state);
+                if (state.defaultStart > 0) {
+                    const start = state.defaultStart;
+                    state.defaultStart = 0;
+                    seekMedia(element, state, start, false);
+                }
+            }
+        }
+    }
+    // #active-source-buffer-changes after a track's enabled or selected
+    // state changed.
+    function mseTrackSelection(buffer) {
+        if (buffer.removed) return;
+        const source = buffer.source;
+        const active = buffer.tracks.some(track => {
+            const record = trackSlots.get(track);
+            return record.enabled || record.selected;
+        });
+        if (active === source.active.includes(buffer)) return;
+        source.active = source.buffers.filter(b => b === buffer ? active : source.active.includes(b));
+        __media_source("active", source.id, buffer.id, active);
+        mseQueue(source.activeSourceBuffers, active ? "addsourcebuffer" : "removesourcebuffer");
+    }
+    function createSourceBufferList(items) {
+        const target = Reflect.construct(EventTarget, [], SourceBufferList);
+        const list = indexedObject(target, items);
+        const record = {type: "SourceBufferList", items};
+        mseRecords.set(target, record);
+        mseRecords.set(list, record);
+        return list;
+    }
+    class SourceBufferList extends EventTarget {
+        constructor() { throw new TypeError("Illegal constructor"); }
+        get length() { return mseRecord(this, "SourceBufferList").items().length; }
+    }
+    class MediaSource extends EventTarget {
+        constructor() {
+            super();
+            const id = __media_source("create", 0);
+            const record = {type: "MediaSource", id, object: this, element: null, buffers: [], active: [],
+                bufferedText: null, bufferedRanges: null};
+            record.sourceBuffers = createSourceBufferList(() => record.buffers.map(buffer => buffer.object));
+            record.activeSourceBuffers = createSourceBufferList(() => record.active.map(buffer => buffer.object));
+            mseRecords.set(this, record);
+        }
+        get sourceBuffers() { return mseRecord(this, "MediaSource").sourceBuffers; }
+        get activeSourceBuffers() { return mseRecord(this, "MediaSource").activeSourceBuffers; }
+        get readyState() { return sourceState(mseRecord(this, "MediaSource")); }
+        get duration() { return __media_source("duration", mseRecord(this, "MediaSource").id); }
+        set duration(value) {
+            const source = mseRecord(this, "MediaSource");
+            value = +value;
+            if (value < 0 || Number.isNaN(value)) throw new TypeError("The duration must not be negative or NaN");
+            if (sourceState(source) !== "open") mseThrow("InvalidStateError", "The MediaSource is not open");
+            if (source.buffers.some(buffer => buffer.updating)) mseThrow("InvalidStateError", "A SourceBuffer is updating");
+            const result = __media_source("setDuration", source.id, value);
+            if (result[0] !== "{") mseThrow(result, "The duration cannot truncate buffered media");
+            if (JSON.parse(result).durationChanged) mirrorDuration(source);
+        }
+        addSourceBuffer(type) {
+            const source = mseRecord(this, "MediaSource");
+            if (arguments.length < 1) throw new TypeError("addSourceBuffer requires a type");
+            type = `${type}`;
+            if (type === "") throw new TypeError("The type is empty");
+            const element = source.element;
+            const playing = element !== null && mediaState(element).readyState >= HAVE_METADATA;
+            const id = __media_source("add", source.id, type, playing);
+            if (typeof id !== "number") {
+                mseThrow(id, id === "NotSupportedError" ? "Unsupported MIME type or codec: " + type
+                    : id === "QuotaExceededError" ? "No more SourceBuffers can be added" : "The MediaSource is not open");
+            }
+            const object = Reflect.construct(EventTarget, [], SourceBuffer);
+            const buffer = {type: "SourceBuffer", id, source, object, updating: false, removing: false, removed: false,
+                token: 0, tracks: [], audioTracks: null, videoTracks: null, textTracks: null,
+                bufferedText: null, bufferedRanges: null};
+            mseRecords.set(object, buffer);
+            source.buffers.push(buffer);
+            mseQueue(source.sourceBuffers, "addsourcebuffer");
+            return object;
+        }
+        removeSourceBuffer(sourceBuffer) {
+            const source = mseRecord(this, "MediaSource");
+            if (arguments.length < 1) throw new TypeError("removeSourceBuffer requires a SourceBuffer");
+            const buffer = mseRecord(sourceBuffer, "SourceBuffer");
+            const index = source.buffers.indexOf(buffer);
+            if (index < 0) mseThrow("NotFoundError", "The SourceBuffer is not in this MediaSource");
+            if (buffer.updating) {
+                buffer.token++;
+                buffer.updating = buffer.removing = false;
+                mseQueue(buffer.object, "abort");
+                mseQueue(buffer.object, "updateend");
+            }
+            // Its tracks leave the SourceBuffer and the media element.
+            const element = source.element;
+            const state = element !== null ? mediaState(element) : null;
+            for (const track of buffer.tracks) {
+                const record = trackSlots.get(track);
+                const audio = record.kind === "AudioTrack";
+                const on = audio ? record.enabled : record.selected;
+                record.sourceBuffer = null;
+                const own = audio ? buffer.object.audioTracks : buffer.object.videoTracks;
+                mseQueueTrackEvent(own, "removetrack", track);
+                if (on) mseQueue(own, "change");
+                if (state !== null) {
+                    state.mediaTracks = state.mediaTracks.filter(entry => entry.track !== track);
+                    const list = audio ? element.audioTracks : element.videoTracks;
+                    mseQueueTrackEvent(list, "removetrack", track);
+                    if (on) mseQueue(list, "change");
+                }
+            }
+            buffer.tracks = [];
+            const active = source.active.indexOf(buffer);
+            if (active >= 0) {
+                source.active.splice(active, 1);
+                mseQueue(source.activeSourceBuffers, "removesourcebuffer");
+            }
+            source.buffers.splice(index, 1);
+            mseQueue(source.sourceBuffers, "removesourcebuffer");
+            buffer.removed = true;
+            __media_source("removeBuffer", source.id, buffer.id);
+        }
+        endOfStream(error = undefined) {
+            const source = mseRecord(this, "MediaSource");
+            if (error !== undefined) {
+                error = `${error}`;
+                if (error !== "network" && error !== "decode")
+                    throw new TypeError("The error must be \"network\" or \"decode\"");
+            }
+            if (sourceState(source) !== "open") mseThrow("InvalidStateError", "The MediaSource is not open");
+            if (source.buffers.some(buffer => buffer.updating)) mseThrow("InvalidStateError", "A SourceBuffer is updating");
+            const result = __media_source("endOfStream", source.id, error !== undefined);
+            mseEndOfStream(source, error, result[0] === "{" ? JSON.parse(result) : null);
+        }
+        setLiveSeekableRange(start, end) {
+            const source = mseRecord(this, "MediaSource");
+            if (arguments.length < 2) throw new TypeError("setLiveSeekableRange requires a start and an end");
+            start = mediaDouble(start, "start");
+            end = mediaDouble(end, "end");
+            if (sourceState(source) !== "open") mseThrow("InvalidStateError", "The MediaSource is not open");
+            if (start < 0 || start > end) throw new TypeError("The start must be between 0 and the end");
+            __media_source("live", source.id, start, end);
+        }
+        clearLiveSeekableRange() {
+            const source = mseRecord(this, "MediaSource");
+            if (sourceState(source) !== "open") mseThrow("InvalidStateError", "The MediaSource is not open");
+            __media_source("live", source.id, NaN, NaN);
+        }
+        static isTypeSupported(type) {
+            if (arguments.length < 1) throw new TypeError("isTypeSupported requires a type");
+            return __media_mse_supported(`${type}`);
+        }
+        static get canConstructInDedicatedWorker() { return false; }
+    }
+    function liveBuffer(buffer) {
+        if (buffer.removed) mseThrow("InvalidStateError", "The SourceBuffer was removed from its MediaSource");
+    }
+    function idleBuffer(buffer) {
+        liveBuffer(buffer);
+        if (buffer.updating) mseThrow("InvalidStateError", "The SourceBuffer is updating");
+    }
+    function mseReopened(buffer, reopened) {
+        if (reopened) mseQueue(buffer.source.object, "sourceopen");
+    }
+    // A mode or timestampOffset setter's host result.
+    function mseSetter(buffer, text) {
+        const result = JSON.parse(text);
+        mseReopened(buffer, result.reopened);
+        if (result.error !== null) {
+            mseThrow(result.error, result.error === "TypeError" ? "The SourceBuffer generates timestamps"
+                : "The SourceBuffer is parsing a media segment");
+        }
+    }
+    function appendWindow(buffer) {
+        const window = JSON.parse(__media_source("window", buffer.source.id, buffer.id));
+        return [window[0], window[1] === null ? Infinity : window[1]];
+    }
+    // #sourcebuffer-prepare-append
+    function prepareAppend(buffer, length) {
+        idleBuffer(buffer);
+        const element = buffer.source.element;
+        if (element !== null && mediaState(element).error !== null)
+            mseThrow("InvalidStateError", "The media element has an error");
+        if (sourceState(buffer.source) === "ended") mseReopened(buffer, __media_source("reopen", buffer.source.id));
+        const result = __media_source("prepare", buffer.source.id, buffer.id, length);
+        if (result !== "") mseThrow(result, result === "QuotaExceededError" ? "The SourceBuffer is full" : "The SourceBuffer was removed");
+    }
+    // #sourcebuffer-buffer-append
+    function bufferAppend(buffer, token) {
+        if (buffer.token !== token || buffer.removed) return;
+        const outcome = JSON.parse(__media_source("process", buffer.source.id, buffer.id));
+        mseApply(buffer, outcome);
+        if (outcome.error !== null) {
+            // #sourcebuffer-append-error (the host reset the parser and
+            // ran the end of stream algorithm's MediaSource side).
+            buffer.updating = false;
+            mseQueue(buffer.object, "error");
+            mseQueue(buffer.object, "updateend");
+            mseEndOfStream(buffer.source, "decode", null);
+            return;
+        }
+        buffer.updating = false;
+        mseQueue(buffer.object, "update");
+        mseQueue(buffer.object, "updateend");
+    }
+    class SourceBuffer extends EventTarget {
+        constructor() { throw new TypeError("Illegal constructor"); }
+        get mode() {
+            const buffer = mseRecord(this, "SourceBuffer");
+            return __media_source("mode", buffer.source.id, buffer.id);
+        }
+        set mode(value) {
+            const buffer = mseRecord(this, "SourceBuffer");
+            value = `${value}`;
+            // An enumeration attribute ignores other values.
+            if (value !== "segments" && value !== "sequence") return;
+            idleBuffer(buffer);
+            mseSetter(buffer, __media_source("setMode", buffer.source.id, buffer.id, value));
+        }
+        get updating() { return mseRecord(this, "SourceBuffer").updating; }
+        get buffered() {
+            const buffer = mseRecord(this, "SourceBuffer");
+            liveBuffer(buffer);
+            return cachedRanges(buffer, __media_source("buffered", buffer.source.id, buffer.id));
+        }
+        get timestampOffset() {
+            const buffer = mseRecord(this, "SourceBuffer");
+            return __media_source("offset", buffer.source.id, buffer.id);
+        }
+        set timestampOffset(value) {
+            const buffer = mseRecord(this, "SourceBuffer");
+            value = mediaDouble(value, "timestampOffset");
+            idleBuffer(buffer);
+            mseSetter(buffer, __media_source("setOffset", buffer.source.id, buffer.id, value));
+        }
+        get audioTracks() {
+            const buffer = mseRecord(this, "SourceBuffer");
+            return buffer.audioTracks || (buffer.audioTracks = createTrackList(AudioTrackList,
+                () => buffer.tracks.filter(track => trackSlots.get(track).kind === "AudioTrack")));
+        }
+        get videoTracks() {
+            const buffer = mseRecord(this, "SourceBuffer");
+            return buffer.videoTracks || (buffer.videoTracks = createTrackList(VideoTrackList,
+                () => buffer.tracks.filter(track => trackSlots.get(track).kind === "VideoTrack")));
+        }
+        get textTracks() {
+            const buffer = mseRecord(this, "SourceBuffer");
+            return buffer.textTracks || (buffer.textTracks = createTrackList(TextTrackList, () => []));
+        }
+        get appendWindowStart() { return appendWindow(mseRecord(this, "SourceBuffer"))[0]; }
+        set appendWindowStart(value) {
+            const buffer = mseRecord(this, "SourceBuffer");
+            value = mediaDouble(value, "appendWindowStart");
+            idleBuffer(buffer);
+            const end = appendWindow(buffer)[1];
+            if (value < 0 || value >= end) throw new TypeError("appendWindowStart must be between 0 and appendWindowEnd");
+            __media_source("setWindow", buffer.source.id, buffer.id, value, end);
+        }
+        get appendWindowEnd() { return appendWindow(mseRecord(this, "SourceBuffer"))[1]; }
+        set appendWindowEnd(value) {
+            const buffer = mseRecord(this, "SourceBuffer");
+            value = +value;
+            idleBuffer(buffer);
+            if (Number.isNaN(value)) throw new TypeError("appendWindowEnd must not be NaN");
+            const start = appendWindow(buffer)[0];
+            if (value <= start) throw new TypeError("appendWindowEnd must be greater than appendWindowStart");
+            __media_source("setWindow", buffer.source.id, buffer.id, start, value);
+        }
+        appendBuffer(data) {
+            const buffer = mseRecord(this, "SourceBuffer");
+            if (arguments.length < 1) throw new TypeError("appendBuffer requires data");
+            // Web IDL BufferSource conversion; the host keeps the bytes.
+            const length = __media_source("stage", 0, data);
+            if (length < 0) throw new TypeError("appendBuffer requires an ArrayBuffer or ArrayBufferView");
+            prepareAppend(buffer, length);
+            __media_source("append", buffer.source.id, buffer.id);
+            buffer.updating = true;
+            mseQueue(buffer.object, "updatestart");
+            const token = ++buffer.token;
+            __queue_dom_task(function () { bufferAppend(buffer, token); });
+        }
+        abort() {
+            const buffer = mseRecord(this, "SourceBuffer");
+            liveBuffer(buffer);
+            if (sourceState(buffer.source) !== "open") mseThrow("InvalidStateError", "The MediaSource is not open");
+            if (buffer.removing) mseThrow("InvalidStateError", "A removal is running");
+            if (buffer.updating) {
+                buffer.token++;
+                buffer.updating = false;
+                mseQueue(buffer.object, "abort");
+                mseQueue(buffer.object, "updateend");
+            }
+            mseApply(buffer, JSON.parse(__media_source("abort", buffer.source.id, buffer.id)));
+        }
+        changeType(type) {
+            const buffer = mseRecord(this, "SourceBuffer");
+            if (arguments.length < 1) throw new TypeError("changeType requires a type");
+            type = `${type}`;
+            if (type === "") throw new TypeError("The type is empty");
+            idleBuffer(buffer);
+            const result = __media_source("changeType", buffer.source.id, buffer.id, type);
+            if (result[0] !== "{") mseThrow(result, "Unsupported MIME type or codec: " + type);
+            const parsed = JSON.parse(result);
+            mseReopened(buffer, parsed.reopened);
+            mseApply(buffer, parsed.outcome);
+        }
+        remove(start, end) {
+            const buffer = mseRecord(this, "SourceBuffer");
+            if (arguments.length < 2) throw new TypeError("remove requires a start and an end");
+            start = mediaDouble(start, "start");
+            end = +end;
+            idleBuffer(buffer);
+            const duration = __media_source("duration", buffer.source.id);
+            if (Number.isNaN(duration)) throw new TypeError("The duration is unknown");
+            if (start < 0 || start > duration) throw new TypeError("The start must be between 0 and the duration");
+            if (!(end > start)) throw new TypeError("The end must be greater than the start");
+            if (sourceState(buffer.source) === "ended") mseReopened(buffer, __media_source("reopen", buffer.source.id));
+            // #sourcebuffer-range-removal
+            buffer.updating = buffer.removing = true;
+            mseQueue(buffer.object, "updatestart");
+            const token = ++buffer.token;
+            __queue_dom_task(function () {
+                if (buffer.token !== token || buffer.removed) return;
+                __media_source("remove", buffer.source.id, buffer.id, start, end);
+                buffer.updating = buffer.removing = false;
+                mseQueue(buffer.object, "update");
+                mseQueue(buffer.object, "updateend");
+            });
+        }
+    }
+    if (inlineMedia) {
+        installHandlerProps(MediaSource.prototype, ["sourceopen", "sourceended", "sourceclose"]);
+        installHandlerProps(SourceBuffer.prototype, ["updatestart", "update", "updateend", "error", "abort"]);
+        installHandlerProps(SourceBufferList.prototype, ["addsourcebuffer", "removesourcebuffer"]);
+        for (const [C, length] of [[MediaSource, 0], [SourceBuffer, 0], [SourceBufferList, 0]]) {
+            for (const name of Object.getOwnPropertyNames(C.prototype)) {
+                if (name !== "constructor") Object.defineProperty(C.prototype, name, {enumerable: true});
+            }
+            for (const name of Object.getOwnPropertyNames(C)) {
+                if (name === "isTypeSupported" || name === "canConstructInDedicatedWorker")
+                    Object.defineProperty(C, name, {enumerable: true});
+            }
+            Object.defineProperty(C, "length", {value: length, configurable: true});
+            Object.defineProperty(C.prototype, Symbol.toStringTag, {value: C.name, configurable: true});
+            Object.defineProperty(g, C.name, {value: C, writable: true, configurable: true});
+        }
+        Object.defineProperty(SourceBufferList.prototype, Symbol.iterator, {value: Array.prototype.values, writable: true, configurable: true});
+        // #audio-track-extensions, #video-track-extensions
+        for (const [C, kind] of [[AudioTrack, "AudioTrack"], [VideoTrack, "VideoTrack"]]) {
+            Object.defineProperty(C.prototype, "sourceBuffer", {enumerable: true, configurable: true, get() {
+                const buffer = trackRecord(this, kind).sourceBuffer;
+                return buffer && !buffer.removed ? buffer.object : null;
+            }});
+        }
+    }
 
     // Web Audio 1.1, local WebAudio/web-audio-api@2047f16 (2026-09-06):
     // #AudioContext-constructors, #AudioContext-methods, #sample-rates.
@@ -20802,6 +22105,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (localName === "source") pictureSourceAttributeChanged(element, lower);
         if (lower === "loading" && localName === "img" && v.toLowerCase() !== "lazy") resumeLazyImage(element);
         if (lower === "src" && (localName === "video" || localName === "audio")) loadMediaElement(element);
+        if ((lower === "controls" || lower === "muted") && element instanceof HTMLMediaElement) {
+            const state = mediaState(element);
+            if (lower === "muted") sendVolume(element, state);
+            updateControls(element, state);
+        }
         if (lower === "src" && localName === "track" && isTrackElement(element)) trackSourceChanged(element);
         if (linkOld !== undefined) linkAttributeChanged(element, lower, linkOld);
     }
@@ -20838,6 +22146,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // HTML #lazy-loading-attributes: the Eager state resumes a lazy load.
         if (lower === "loading" && localName === "img") resumeLazyImage(element);
         if (lower === "src" && localName === "track" && isTrackElement(element)) trackSourceChanged(element);
+        if ((lower === "controls" || lower === "muted") && element instanceof HTMLMediaElement) {
+            const state = mediaState(element);
+            if (lower === "muted") sendVolume(element, state);
+            updateControls(element, state);
+        }
     }
     // Attributes changed: drop the getAttribute read cache, and refresh the
     // [SameObject] NamedNodeMap (DOM §4.9.1, a live collection) so a caller
@@ -26792,6 +28105,692 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         g.__permission_api = {state:permissionState, request:requestPermission};
     })();
     /*__PERMISSIONS_END__*/
+    (() => {
+        "use strict";
+        // Media Capabilities (local w3c/media-capabilities@dbc6ff7):
+        // navigator.mediaCapabilities. decodingInfo() answers from the
+        // decoders the host has (`__media_capabilities`, the registry behind
+        // canPlayType() and MediaSource.isTypeSupported()); no key system is
+        // available, so an encrypted configuration is unsupported. TRust
+        // neither records nor sends media: encodingInfo() reports no support.
+        const define = Object.defineProperty, apply = Reflect.apply, includes = Array.prototype.includes;
+        const PromiseCtor = Promise, promiseReject = Promise.reject, TypeErrorCtor = TypeError;
+        const NumberCtor = Number, isFinite = Number.isFinite, trunc = Math.trunc;
+        const navigator = g.navigator, NavigatorPrototype = Object.getPrototypeOf(navigator);
+        const token = {};
+        // Web IDL conversions.
+        function dictionary(value, name) {
+            if (value === undefined || value === null) return {};
+            if (typeof value !== "object" && typeof value !== "function") throw new TypeErrorCtor(name + " must be a dictionary");
+            return value;
+        }
+        function required(value, name) {
+            if (value === undefined) throw new TypeErrorCtor(name + " is required");
+            return value;
+        }
+        function unsigned(value, bits) {
+            let number = NumberCtor(value);
+            if (!isFinite(number) || number === 0) return 0;
+            number = trunc(number);
+            const modulus = bits === 64 ? 18446744073709551616 : 4294967296;
+            number %= modulus;
+            return number < 0 ? number + modulus : number;
+        }
+        function restrictedDouble(value, name) {
+            const number = +value;
+            if (!isFinite(number)) throw new TypeErrorCtor(name + " must be a finite number");
+            return number;
+        }
+        function enumeration(value, values, name) {
+            const string = `${value}`;
+            if (!apply(includes, values, [string])) throw new TypeErrorCtor(`"${string}" is not a valid ${name}`);
+            return string;
+        }
+        // Members in lexicographic order (Web IDL #js-dictionary).
+        function audioConfiguration(value) {
+            const source = dictionary(value, "AudioConfiguration"), out = {};
+            let member;
+            if ((member = source.bitrate) !== undefined) out.bitrate = unsigned(member, 64);
+            if ((member = source.channels) !== undefined) out.channels = `${member}`;
+            out.contentType = `${required(source.contentType, "AudioConfiguration.contentType")}`;
+            if ((member = source.samplerate) !== undefined) out.samplerate = unsigned(member, 32);
+            if ((member = source.spatialRendering) !== undefined) out.spatialRendering = !!member;
+            return out;
+        }
+        function videoConfiguration(value) {
+            const source = dictionary(value, "VideoConfiguration"), out = {};
+            let member;
+            out.bitrate = unsigned(required(source.bitrate, "VideoConfiguration.bitrate"), 64);
+            if ((member = source.colorGamut) !== undefined) out.colorGamut = enumeration(member, ["srgb", "p3", "rec2020"], "ColorGamut");
+            out.contentType = `${required(source.contentType, "VideoConfiguration.contentType")}`;
+            out.framerate = restrictedDouble(required(source.framerate, "VideoConfiguration.framerate"), "framerate");
+            if ((member = source.hasAlphaChannel) !== undefined) out.hasAlphaChannel = !!member;
+            if ((member = source.hdrMetadataType) !== undefined)
+                out.hdrMetadataType = enumeration(member, ["smpteSt2086", "smpteSt2094-10", "smpteSt2094-40"], "HdrMetadataType");
+            out.height = unsigned(required(source.height, "VideoConfiguration.height"), 32);
+            if ((member = source.scalabilityMode) !== undefined) out.scalabilityMode = `${member}`;
+            if ((member = source.spatialScalability) !== undefined) out.spatialScalability = !!member;
+            if ((member = source.transferFunction) !== undefined)
+                out.transferFunction = enumeration(member, ["srgb", "pq", "hlg"], "TransferFunction");
+            out.width = unsigned(required(source.width, "VideoConfiguration.width"), 32);
+            return out;
+        }
+        function keySystemTrack(value) {
+            const source = dictionary(value, "KeySystemTrackConfiguration"), out = {};
+            let member;
+            if ((member = source.encryptionScheme) !== undefined) out.encryptionScheme = member === null ? null : `${member}`;
+            out.robustness = source.robustness === undefined ? "" : `${source.robustness}`;
+            return out;
+        }
+        function keySystemConfiguration(value) {
+            const source = dictionary(value, "MediaCapabilitiesKeySystemConfiguration"), out = {};
+            let member;
+            if ((member = source.audio) !== undefined) out.audio = keySystemTrack(member);
+            out.distinctiveIdentifier = source.distinctiveIdentifier === undefined ? "optional"
+                : enumeration(source.distinctiveIdentifier, ["required", "optional", "not-allowed"], "MediaKeysRequirement");
+            out.initDataType = source.initDataType === undefined ? "" : `${source.initDataType}`;
+            out.keySystem = `${required(source.keySystem, "keySystem")}`;
+            out.persistentState = source.persistentState === undefined ? "optional"
+                : enumeration(source.persistentState, ["required", "optional", "not-allowed"], "MediaKeysRequirement");
+            if ((member = source.sessionTypes) !== undefined) {
+                if (typeof member !== "object" || member === null) throw new TypeErrorCtor("sessionTypes must be a sequence");
+                out.sessionTypes = Array.from(member, type => `${type}`);
+            }
+            if ((member = source.video) !== undefined) out.video = keySystemTrack(member);
+            return out;
+        }
+        function configuration(value, decoding) {
+            const name = decoding ? "MediaDecodingConfiguration" : "MediaEncodingConfiguration";
+            const source = dictionary(value, name), out = {};
+            let member;
+            if ((member = source.audio) !== undefined) out.audio = audioConfiguration(member);
+            if ((member = source.video) !== undefined) out.video = videoConfiguration(member);
+            if (decoding && (member = source.keySystemConfiguration) !== undefined)
+                out.keySystemConfiguration = keySystemConfiguration(member);
+            out.type = enumeration(required(source.type, name + ".type"),
+                decoding ? ["file", "media-source", "webrtc"] : ["record", "webrtc"], decoding ? "MediaDecodingType" : "MediaEncodingType");
+            return out;
+        }
+        // #valid-media-configuration and the member applicability rules.
+        function flags(track, media, type) {
+            return __media_capabilities(track.contentType, media, type, track.width || 0, track.height || 0, track.framerate || 0);
+        }
+        function valid(config, decoding) {
+            const playback = decoding && (config.type === "media-source" || config.type === "file");
+            const { audio, video } = config;
+            if (audio === undefined && video === undefined) return false;
+            if (video !== undefined) {
+                if (!(video.framerate > 0)) return false;
+                if (!playback && (video.hdrMetadataType !== undefined || video.colorGamut !== undefined
+                    || video.transferFunction !== undefined)) return false;
+                if (video.scalabilityMode !== undefined && (decoding || config.type !== "webrtc")) return false;
+                if (video.spatialScalability !== undefined && !decoding) return false;
+                if (!(flags(video, "video", config.type) & 8)) return false;
+            }
+            if (audio !== undefined) {
+                if ((audio.channels !== undefined || audio.samplerate !== undefined) && !decoding && config.type !== "webrtc")
+                    return false;
+                if (audio.spatialRendering !== undefined && !playback) return false;
+                if (!(flags(audio, "audio", config.type) & 8)) return false;
+            }
+            const keys = config.keySystemConfiguration;
+            if (keys !== undefined) {
+                if (!playback) return false;
+                if (keys.audio !== undefined && audio === undefined) return false;
+                if (keys.video !== undefined && video === undefined) return false;
+            }
+            return true;
+        }
+        // #create-media-capabilities-decoding-info (MediaCapabilitiesInfo's
+        // members, then MediaCapabilitiesDecodingInfo's).
+        function info(config, decoding) {
+            let supported = !decoding || config.keySystemConfiguration === undefined, smooth = true, efficient = true;
+            for (const [track, media] of [[config.video, "video"], [config.audio, "audio"]]) {
+                if (track === undefined || !supported) continue;
+                const answer = decoding ? flags(track, media, config.type) : 0;
+                supported = (answer & 1) !== 0;
+                smooth = smooth && (answer & 2) !== 0;
+                efficient = efficient && (answer & 4) !== 0;
+            }
+            const result = supported ? {powerEfficient: efficient, smooth, supported}
+                : {powerEfficient: false, smooth: false, supported: false};
+            if (decoding) {
+                result.configuration = config;
+                result.keySystemAccess = null;
+            }
+            return result;
+        }
+        function query(capabilities, value, decoding, count) {
+            try {
+                if (capabilities !== instance) throw new TypeErrorCtor("Illegal MediaCapabilities invocation");
+                if (count < 1) throw new TypeErrorCtor((decoding ? "decodingInfo" : "encodingInfo") + " requires a configuration");
+                const config = configuration(value, decoding);
+                if (!valid(config, decoding))
+                    throw new TypeErrorCtor("The configuration is not a valid " + (decoding ? "MediaDecodingConfiguration" : "MediaConfiguration"));
+                if (config.keySystemConfiguration !== undefined && !g.isSecureContext)
+                    throw new g.DOMException("Encrypted media needs a secure context", "SecurityError");
+                return new PromiseCtor(resolve => __queue_dom_task(() => resolve(info(config, decoding))));
+            } catch (error) {
+                return apply(promiseReject, PromiseCtor, [error]);
+            }
+        }
+        class MediaCapabilities {
+            constructor(key) { if (key !== token) throw new TypeErrorCtor("Illegal constructor"); }
+            decodingInfo(configuration) { return query(this, configuration, true, arguments.length); }
+            encodingInfo(configuration) { return query(this, configuration, false, arguments.length); }
+        }
+        for (const name of ["decodingInfo", "encodingInfo"]) define(MediaCapabilities.prototype, name, {enumerable: true});
+        define(MediaCapabilities.prototype, Symbol.toStringTag, {value: "MediaCapabilities", configurable: true});
+        const instance = new MediaCapabilities(token);
+        // [SameObject] readonly attribute MediaCapabilities mediaCapabilities.
+        const getter = Object.getOwnPropertyDescriptor({get mediaCapabilities() {
+            if (this !== navigator) throw new TypeErrorCtor("Illegal Navigator invocation");
+            return instance;
+        }}, "mediaCapabilities").get;
+        define(NavigatorPrototype, "mediaCapabilities", {configurable: true, enumerable: true, get: getter});
+        define(g, "MediaCapabilities", {value: MediaCapabilities, writable: true, configurable: true});
+    })();
+    (() => {
+        "use strict";
+        // Encrypted Media Extensions (local w3c/encrypted-media@fb9130a) with
+        // the Clear Key key system (#clear-key), whose CDM runs in the host
+        // (`__eme`, `media::eme`): generateRequest() extracts the key IDs of
+        // "cenc", "keyids" or "webm" initialization data, update() takes a JWK
+        // Set, and a MediaKeys object's keys decrypt the media of the elements
+        // it is attached to (cenc and cbcs). No other key system exists, and
+        // sessions are "temporary" only. Window only, where media plays inline.
+        // The "encrypted-media" permissions policy is not checked: Clear Key
+        // uses no identifiers and persists nothing.
+        if (!inlineMedia) return;
+        const secure = !!g.isSecureContext;
+        const define = Object.defineProperty, apply = Reflect.apply;
+        const PromiseCtor = Promise, TypeErrorCtor = TypeError, Uint8ArrayCtor = Uint8Array;
+        const isView = ArrayBuffer.isView, ArrayBufferCtor = ArrayBuffer;
+        const KEY_SYSTEM = "org.w3.clearkey";
+        const emeRecords = new WeakMap();
+        function emeRecord(object, type) {
+            const record = (typeof object === "object" || typeof object === "function") && object !== null
+                ? emeRecords.get(object) : undefined;
+            if (!record || record.type !== type) throw new TypeErrorCtor("Illegal " + type + " invocation");
+            return record;
+        }
+        // A host failure "Name:message" as the exception it names.
+        function hostError(text) {
+            const colon = text.indexOf(":");
+            const name = text.slice(0, colon), message = text.slice(colon + 1);
+            return name === "TypeError" ? new TypeErrorCtor(message) : new DOMException(message, name);
+        }
+        function arrayBuffer(bytes) { return new Uint8ArrayCtor(bytes).buffer; }
+        // Web IDL BufferSource: its bytes, for comparing key IDs.
+        function bufferBytes(value, what) {
+            if (isView(value)) return new Uint8ArrayCtor(value.buffer, value.byteOffset, value.byteLength);
+            if (value instanceof ArrayBufferCtor) return new Uint8ArrayCtor(value);
+            throw new TypeErrorCtor(what + " is not a BufferSource");
+        }
+        function hex(bytes) {
+            let out = "";
+            for (let i = 0; i < bytes.length; i++) out += (bytes[i] < 16 ? "0" : "") + bytes[i].toString(16);
+            return out;
+        }
+        const rejected = error => PromiseCtor.reject(error);
+        // Promise-returning operations report every error by rejection
+        // (Web IDL #dfn-create-operation-function).
+        function promised(body) {
+            try { return body(); } catch (error) { return rejected(error); }
+        }
+        function sequence(value, name) {
+            if (value === undefined) return undefined;
+            if (value === null || (typeof value !== "object" && typeof value !== "function") || typeof value[Symbol.iterator] !== "function")
+                throw new TypeErrorCtor(name + " must be a sequence");
+            return Array.from(value);
+        }
+        function requirement(value, name) {
+            if (value === undefined) return "optional";
+            const string = `${value}`;
+            if (string !== "required" && string !== "optional" && string !== "not-allowed")
+                throw new TypeErrorCtor(`"${string}" is not a valid MediaKeysRequirement for ${name}`);
+            return string;
+        }
+        // MediaKeySystemMediaCapability, members in lexicographic order.
+        function mediaCapability(value) {
+            if (value !== undefined && value !== null && typeof value !== "object" && typeof value !== "function")
+                throw new TypeErrorCtor("MediaKeySystemMediaCapability must be a dictionary");
+            const source = value || {};
+            const contentType = source.contentType === undefined ? "" : `${source.contentType}`;
+            const scheme = source.encryptionScheme;
+            const encryptionScheme = scheme === undefined || scheme === null ? null : `${scheme}`;
+            const robustness = source.robustness === undefined ? "" : `${source.robustness}`;
+            return {contentType, encryptionScheme, robustness};
+        }
+        // MediaKeySystemConfiguration (#mediakeysystemconfiguration-dictionary).
+        function systemConfiguration(value) {
+            if (value !== undefined && value !== null && typeof value !== "object" && typeof value !== "function")
+                throw new TypeErrorCtor("MediaKeySystemConfiguration must be a dictionary");
+            const source = value || {};
+            const audio = sequence(source.audioCapabilities, "audioCapabilities");
+            const distinctiveIdentifier = requirement(source.distinctiveIdentifier, "distinctiveIdentifier");
+            const initDataTypes = sequence(source.initDataTypes, "initDataTypes");
+            const label = source.label === undefined ? "" : `${source.label}`;
+            const persistentState = requirement(source.persistentState, "persistentState");
+            const sessionTypes = sequence(source.sessionTypes, "sessionTypes");
+            const video = sequence(source.videoCapabilities, "videoCapabilities");
+            return {
+                audioCapabilities: (audio || []).map(mediaCapability), distinctiveIdentifier,
+                initDataTypes: (initDataTypes || []).map(type => `${type}`), label, persistentState,
+                sessionTypes: sessionTypes === undefined ? undefined : sessionTypes.map(type => `${type}`),
+                videoCapabilities: (video || []).map(mediaCapability),
+            };
+        }
+        // #get-supported-capabilities-for-audio-video-type for Clear Key: a
+        // type the media pipeline plays, with codecs (unless its container
+        // implies them), the cenc or cbcs scheme and no robustness.
+        function supportedCapabilities(kind, requested) {
+            const supported = [];
+            for (const capability of requested) {
+                const type = capability.contentType;
+                if (type === "") return null;
+                const essence = type.split(";")[0].trim().toLowerCase();
+                if (!essence.startsWith(kind + "/")) continue;
+                const implied = essence === "audio/mpeg" || essence === "audio/aac" || essence === "audio/flac";
+                if (!implied && !/;\s*codecs\s*=/i.test(type)) continue;
+                if (__media_can_play(type) === "") continue;
+                const scheme = capability.encryptionScheme;
+                if (scheme !== null && scheme !== "cenc" && scheme !== "cbcs" && scheme !== "cbcs-1-9") continue;
+                if (capability.robustness !== "") continue;
+                supported.push({contentType: capability.contentType, encryptionScheme: capability.encryptionScheme,
+                    robustness: capability.robustness});
+            }
+            return supported.length ? supported : null;
+        }
+        // #get-supported-configuration: Clear Key uses no distinctive
+        // identifier, persists nothing and needs no consent.
+        function supportedConfiguration(candidate) {
+            const accumulated = {label: candidate.label, initDataTypes: []};
+            if (candidate.initDataTypes.length) {
+                const types = candidate.initDataTypes.filter(type => type === "cenc" || type === "keyids" || type === "webm");
+                if (!types.length) return null;
+                accumulated.initDataTypes = types;
+            }
+            if (candidate.distinctiveIdentifier === "required" || candidate.persistentState === "required") return null;
+            const sessionTypes = candidate.sessionTypes === undefined ? ["temporary"] : candidate.sessionTypes;
+            if (sessionTypes.some(type => type !== "temporary")) return null;
+            if (!candidate.videoCapabilities.length && !candidate.audioCapabilities.length) return null;
+            accumulated.videoCapabilities = [];
+            if (candidate.videoCapabilities.length) {
+                const video = supportedCapabilities("video", candidate.videoCapabilities);
+                if (video === null) return null;
+                accumulated.videoCapabilities = video;
+            }
+            accumulated.audioCapabilities = [];
+            if (candidate.audioCapabilities.length) {
+                const audio = supportedCapabilities("audio", candidate.audioCapabilities);
+                if (audio === null) return null;
+                accumulated.audioCapabilities = audio;
+            }
+            accumulated.distinctiveIdentifier = "not-allowed";
+            accumulated.persistentState = "not-allowed";
+            accumulated.sessionTypes = sessionTypes;
+            return accumulated;
+        }
+        function copyConfiguration(config) {
+            const capability = c => ({contentType: c.contentType, encryptionScheme: c.encryptionScheme, robustness: c.robustness});
+            return {audioCapabilities: config.audioCapabilities.map(capability),
+                distinctiveIdentifier: config.distinctiveIdentifier, initDataTypes: config.initDataTypes.slice(),
+                label: config.label, persistentState: config.persistentState, sessionTypes: config.sessionTypes.slice(),
+                videoCapabilities: config.videoCapabilities.map(capability)};
+        }
+
+        class MediaKeySystemAccess {
+            constructor() { throw new TypeErrorCtor("Illegal constructor"); }
+            get keySystem() { return emeRecord(this, "MediaKeySystemAccess").keySystem; }
+            getConfiguration() { return copyConfiguration(emeRecord(this, "MediaKeySystemAccess").configuration); }
+            // #dom-mediakeysystemaccess-createmediakeys
+            createMediaKeys() {
+                return promised(() => {
+                    const access = emeRecord(this, "MediaKeySystemAccess");
+                    return new PromiseCtor(function (resolve, reject) {
+                        __queue_dom_task(function () {
+                            const cdm = __eme("create", 0);
+                            if (typeof cdm !== "number" || cdm < 0) {
+                                reject(new DOMException("The Clear Key CDM is unavailable", "InvalidStateError"));
+                                return;
+                            }
+                            const keys = Object.create(MediaKeys.prototype);
+                            emeRecords.set(keys, {type: "MediaKeys", cdm, sessionTypes: access.configuration.sessionTypes.slice(),
+                                elements: new Set()});
+                            resolve(keys);
+                        });
+                    });
+                });
+            }
+        }
+        class MediaKeys {
+            constructor() { throw new TypeErrorCtor("Illegal constructor"); }
+            // #dom-mediakeys-createsession
+            createSession(sessionType = "temporary") {
+                const keys = emeRecord(this, "MediaKeys");
+                sessionType = `${sessionType}`;
+                if (sessionType !== "temporary" && sessionType !== "persistent-license")
+                    throw new TypeErrorCtor(`"${sessionType}" is not a valid MediaKeySessionType`);
+                if (!keys.sessionTypes.includes(sessionType))
+                    throw new DOMException(`"${sessionType}" sessions are not supported`, "NotSupportedError");
+                const session = Reflect.construct(EventTarget, [], MediaKeySession);
+                let resolveClosed;
+                const closed = new PromiseCtor(resolve => { resolveClosed = resolve; });
+                const statuses = Object.create(MediaKeyStatusMap.prototype);
+                emeRecords.set(statuses, {type: "MediaKeyStatusMap", entries: []});
+                emeRecords.set(session, {type: "MediaKeySession", keys, sessionType, sessionId: "", expiration: NaN,
+                    closed, resolveClosed, statuses, id: -1, uninitialized: true, callable: false, closing: false});
+                return session;
+            }
+            // #dom-mediakeys-getstatusforpolicy: Clear Key always answers "usable".
+            getStatusForPolicy(policy = {}) {
+                return promised(() => {
+                    emeRecord(this, "MediaKeys");
+                    if (policy !== null && typeof policy !== "object" && typeof policy !== "function")
+                        throw new TypeErrorCtor("MediaKeysPolicy must be a dictionary");
+                    const version = policy === null ? undefined : policy.minHdcpVersion;
+                    if (version === undefined) throw new TypeErrorCtor("The policy names no requirement");
+                    `${version}`;
+                    return new PromiseCtor(resolve => __queue_dom_task(() => resolve("usable")));
+                });
+            }
+            // Clear Key does not use server certificates.
+            setServerCertificate(serverCertificate) {
+                return promised(() => {
+                    emeRecord(this, "MediaKeys");
+                    if (arguments.length < 1) throw new TypeErrorCtor("setServerCertificate requires a certificate");
+                    bufferBytes(serverCertificate, "serverCertificate");
+                    return PromiseCtor.resolve(false);
+                });
+            }
+        }
+        // #update-key-statuses, then #resume-playback for the elements that
+        // use the MediaKeys (their players retry as keys arrive).
+        function updateKeyStatuses(session, record, kids) {
+            const entries = kids.map(kid => [new Uint8ArrayCtor(kid), "usable"]);
+            entries.sort((a, b) => {
+                const n = Math.min(a[0].length, b[0].length);
+                for (let i = 0; i < n; i++) if (a[0][i] !== b[0][i]) return a[0][i] - b[0][i];
+                return a[0].length - b[0].length;
+            });
+            emeRecords.get(record.statuses).entries = entries;
+            __queue_dom_task(() => fireMediaEvent(session, "keystatuseschange"));
+        }
+        // #session-closed
+        function sessionClosed(session, record, reason) {
+            if (record.closedDone) return;
+            record.closing = true;
+            record.closedDone = true;
+            updateKeyStatuses(session, record, []);
+            record.expiration = NaN;
+            record.resolveClosed(reason);
+        }
+        class MediaKeySession extends EventTarget {
+            constructor() { throw new TypeErrorCtor("Illegal constructor"); }
+            get sessionId() { return emeRecord(this, "MediaKeySession").sessionId; }
+            get expiration() { return emeRecord(this, "MediaKeySession").expiration; }
+            get closed() { return emeRecord(this, "MediaKeySession").closed; }
+            get keyStatuses() { return emeRecord(this, "MediaKeySession").statuses; }
+            // #dom-mediakeysession-generaterequest
+            generateRequest(initDataType, initData) {
+                return promised(() => {
+                    const record = emeRecord(this, "MediaKeySession");
+                    if (arguments.length < 2) throw new TypeErrorCtor("generateRequest requires initDataType and initData");
+                    initDataType = `${initDataType}`;
+                    const bytes = bufferBytes(initData, "initData");
+                    if (record.closing) throw new DOMException("The session is closed", "InvalidStateError");
+                    if (!record.uninitialized) throw new DOMException("The session already has a request", "InvalidStateError");
+                    record.uninitialized = false;
+                    if (initDataType === "") throw new TypeErrorCtor("initDataType is empty");
+                    if (bytes.length === 0) throw new TypeErrorCtor("initData is empty");
+                    if (initDataType !== "cenc" && initDataType !== "keyids" && initDataType !== "webm")
+                        throw new DOMException(`Clear Key does not support "${initDataType}" initialization data`, "NotSupportedError");
+                    const result = __eme("generate", record.keys.cdm, initDataType, new Uint8ArrayCtor(bytes));
+                    const session = this;
+                    return new PromiseCtor(function (resolve, reject) {
+                        __queue_dom_task(function () {
+                            if (result[0] !== "{") { reject(hostError(result)); return; }
+                            const parsed = JSON.parse(result);
+                            record.id = parsed.session;
+                            record.sessionId = String(parsed.session);
+                            record.callable = true;
+                            resolve(undefined);
+                            // #queue-message
+                            const message = arrayBuffer(parsed.message);
+                            __queue_dom_task(() => dispatch(session, createTrustedEvent(MediaKeyMessageEvent, "message",
+                                {messageType: "license-request", message}), false));
+                        });
+                    });
+                });
+            }
+            // Only "persistent-license" sessions load, which Clear Key here
+            // does not create.
+            load(sessionId) {
+                return promised(() => {
+                    const record = emeRecord(this, "MediaKeySession");
+                    if (arguments.length < 1) throw new TypeErrorCtor("load requires a sessionId");
+                    sessionId = `${sessionId}`;
+                    if (record.closing || !record.uninitialized) throw new DOMException("The session cannot load", "InvalidStateError");
+                    record.uninitialized = false;
+                    if (sessionId === "") throw new TypeErrorCtor("sessionId is empty");
+                    throw new TypeErrorCtor("Only persistent-license sessions can be loaded");
+                });
+            }
+            // #dom-mediakeysession-update
+            update(response) {
+                return promised(() => {
+                    const record = emeRecord(this, "MediaKeySession");
+                    if (arguments.length < 1) throw new TypeErrorCtor("update requires a response");
+                    const bytes = bufferBytes(response, "response");
+                    if (record.closing) throw new DOMException("The session is closed", "InvalidStateError");
+                    if (!record.callable) throw new DOMException("The session has no request", "InvalidStateError");
+                    if (bytes.length === 0) throw new TypeErrorCtor("response is empty");
+                    const result = __eme("update", record.keys.cdm, record.id, new Uint8ArrayCtor(bytes));
+                    const session = this;
+                    return new PromiseCtor(function (resolve, reject) {
+                        __queue_dom_task(function () {
+                            if (result[0] !== "{") { reject(hostError(result)); return; }
+                            updateKeyStatuses(session, record, JSON.parse(result).known);
+                            resolve(undefined);
+                        });
+                    });
+                });
+            }
+            // #dom-mediakeysession-close
+            close() {
+                return promised(() => {
+                    const record = emeRecord(this, "MediaKeySession");
+                    if (record.closing) return PromiseCtor.resolve(undefined);
+                    if (!record.callable) throw new DOMException("The session has no request", "InvalidStateError");
+                    record.closing = true;
+                    __eme("close", record.keys.cdm, record.id);
+                    const session = this;
+                    return new PromiseCtor(function (resolve) {
+                        __queue_dom_task(function () {
+                            resolve(undefined);
+                            sessionClosed(session, record, "closed-by-application");
+                        });
+                    });
+                });
+            }
+            // #dom-mediakeysession-remove (temporary sessions: the keys go).
+            remove() {
+                return promised(() => {
+                    const record = emeRecord(this, "MediaKeySession");
+                    if (record.closing) throw new DOMException("The session is closed", "InvalidStateError");
+                    if (!record.callable) throw new DOMException("The session has no request", "InvalidStateError");
+                    __eme("remove", record.keys.cdm, record.id);
+                    const session = this;
+                    return new PromiseCtor(function (resolve) {
+                        __queue_dom_task(function () {
+                            updateKeyStatuses(session, record, []);
+                            record.expiration = NaN;
+                            resolve(undefined);
+                        });
+                    });
+                });
+            }
+        }
+        class MediaKeyStatusMap {
+            constructor() { throw new TypeErrorCtor("Illegal constructor"); }
+            get size() { return emeRecord(this, "MediaKeyStatusMap").entries.length; }
+            has(keyId) {
+                const record = emeRecord(this, "MediaKeyStatusMap");
+                if (arguments.length < 1) throw new TypeErrorCtor("has requires a keyId");
+                const id = hex(bufferBytes(keyId, "keyId"));
+                return record.entries.some(entry => hex(entry[0]) === id);
+            }
+            get(keyId) {
+                const record = emeRecord(this, "MediaKeyStatusMap");
+                if (arguments.length < 1) throw new TypeErrorCtor("get requires a keyId");
+                const id = hex(bufferBytes(keyId, "keyId"));
+                const entry = record.entries.find(entry => hex(entry[0]) === id);
+                return entry === undefined ? undefined : entry[1];
+            }
+            forEach(callback, thisArg = undefined) {
+                const record = emeRecord(this, "MediaKeyStatusMap");
+                if (typeof callback !== "function") throw new TypeErrorCtor("forEach requires a function");
+                for (const [id, status] of record.entries.slice()) apply(callback, thisArg, [status, arrayBuffer(id), this]);
+            }
+            *entries() {
+                const record = emeRecord(this, "MediaKeyStatusMap");
+                for (const [id, status] of record.entries.slice()) yield [arrayBuffer(id), status];
+            }
+            *keys() {
+                const record = emeRecord(this, "MediaKeyStatusMap");
+                for (const [id] of record.entries.slice()) yield arrayBuffer(id);
+            }
+            *values() {
+                const record = emeRecord(this, "MediaKeyStatusMap");
+                for (const [, status] of record.entries.slice()) yield status;
+            }
+        }
+        define(MediaKeyStatusMap.prototype, Symbol.iterator,
+            {value: MediaKeyStatusMap.prototype.entries, writable: true, configurable: true});
+        const messageTypes = ["license-request", "license-renewal", "license-release", "individualization-request"];
+        class MediaKeyMessageEvent extends Event {
+            constructor(type, eventInitDict) {
+                if (arguments.length < 2) throw new TypeErrorCtor("MediaKeyMessageEvent requires type and eventInitDict");
+                type = `${type}`;
+                if (eventInitDict === null || (typeof eventInitDict !== "object" && typeof eventInitDict !== "function"))
+                    throw new TypeErrorCtor("MediaKeyMessageEventInit must be a dictionary");
+                const message = eventInitDict.message;
+                if (message === undefined) throw new TypeErrorCtor("MediaKeyMessageEventInit.message is required");
+                if (!(message instanceof ArrayBufferCtor)) throw new TypeErrorCtor("message must be an ArrayBuffer");
+                const messageType = eventInitDict.messageType;
+                if (messageType === undefined) throw new TypeErrorCtor("MediaKeyMessageEventInit.messageType is required");
+                if (!messageTypes.includes(`${messageType}`)) throw new TypeErrorCtor(`"${messageType}" is not a valid MediaKeyMessageType`);
+                super(type, eventInitDict);
+                emeRecords.set(this, {type: "MediaKeyMessageEvent", messageType: `${messageType}`, message});
+            }
+            get messageType() { return emeRecord(this, "MediaKeyMessageEvent").messageType; }
+            get message() { return emeRecord(this, "MediaKeyMessageEvent").message; }
+        }
+        class MediaEncryptedEvent extends Event {
+            constructor(type, eventInitDict = {}) {
+                if (arguments.length < 1) throw new TypeErrorCtor("MediaEncryptedEvent requires a type");
+                type = `${type}`;
+                if (eventInitDict !== null && typeof eventInitDict !== "object" && typeof eventInitDict !== "function")
+                    throw new TypeErrorCtor("MediaEncryptedEventInit must be a dictionary");
+                const init = eventInitDict || {};
+                const initData = init.initData === undefined ? null : init.initData;
+                if (initData !== null && !(initData instanceof ArrayBufferCtor)) throw new TypeErrorCtor("initData must be an ArrayBuffer");
+                const initDataType = init.initDataType === undefined ? "" : `${init.initDataType}`;
+                super(type, init);
+                emeRecords.set(this, {type: "MediaEncryptedEvent", initDataType, initData});
+            }
+            get initDataType() { return emeRecord(this, "MediaEncryptedEvent").initDataType; }
+            get initData() { return emeRecord(this, "MediaEncryptedEvent").initData; }
+        }
+        // #initdata-encountered: MSE reports the initialization data its
+        // segments carry (media appended by script is CORS-same-origin).
+        mediaInitDataEncountered = function (element, initDataType, initData) {
+            const state = mediaState(element);
+            queueMediaTask(element, state, () => dispatch(element, createTrustedEvent(MediaEncryptedEvent, "encrypted",
+                {initDataType, initData: arrayBuffer(initData)}), false));
+        };
+        // #dom-htmlmediaelement-setmediakeys
+        function setMediaKeys(mediaKeys) {
+            return promised(() => {
+                const state = mediaRecord(this);
+                if (arguments.length < 1) throw new TypeErrorCtor("setMediaKeys requires a MediaKeys or null");
+                const keys = mediaKeys === null ? null : emeRecord(mediaKeys, "MediaKeys");
+                if (state.attachingMediaKeys) throw new DOMException("Media keys are being attached", "InvalidStateError");
+                if (mediaKeys === state.mediaKeys) return PromiseCtor.resolve(undefined);
+                state.attachingMediaKeys = true;
+                const element = this;
+                return new PromiseCtor(function (resolve) {
+                    __queue_dom_task(function () {
+                        if (state.mediaKeys !== null) emeRecords.get(state.mediaKeys).elements.delete(element);
+                        state.mediaKeys = mediaKeys;
+                        state.cdm = keys === null ? -1 : keys.cdm;
+                        if (keys !== null) keys.elements.add(element);
+                        // The player decrypts with the CDM's keys, retrying
+                        // what waited for them (#resume-playback).
+                        if (state.player >= 0) __eme("attach", state.cdm, state.player);
+                        state.attachingMediaKeys = false;
+                        resolve(undefined);
+                    });
+                });
+            });
+        }
+        // #navigator-extension-requestmediakeysystemaccess
+        function requestMediaKeySystemAccess(keySystem, supportedConfigurations) {
+            return promised(() => {
+                if (this !== g.navigator) throw new TypeErrorCtor("Illegal Navigator invocation");
+                if (arguments.length < 2) throw new TypeErrorCtor("requestMediaKeySystemAccess requires 2 arguments");
+                keySystem = `${keySystem}`;
+                const configurations = sequence(supportedConfigurations, "supportedConfigurations").map(systemConfiguration);
+                if (keySystem === "") throw new TypeErrorCtor("keySystem is empty");
+                if (!configurations.length) throw new TypeErrorCtor("supportedConfigurations is empty");
+                return new PromiseCtor(function (resolve, reject) {
+                    __queue_dom_task(function () {
+                        if (keySystem !== KEY_SYSTEM) {
+                            reject(new DOMException(`The key system "${keySystem}" is not supported`, "NotSupportedError"));
+                            return;
+                        }
+                        for (const candidate of configurations) {
+                            const configuration = supportedConfiguration(candidate);
+                            if (configuration === null) continue;
+                            const access = Object.create(MediaKeySystemAccess.prototype);
+                            emeRecords.set(access, {type: "MediaKeySystemAccess", keySystem, configuration});
+                            resolve(access);
+                            return;
+                        }
+                        reject(new DOMException("No configuration is supported", "NotSupportedError"));
+                    });
+                });
+            });
+        }
+        installHandlerProps(MediaKeySession.prototype, ["keystatuseschange", "message"]);
+        installHandlerProps(HTMLMediaElement.prototype, ["encrypted", "waitingforkey"]);
+        const exposed = secure
+            ? [[MediaKeySystemAccess, 0], [MediaKeys, 0], [MediaKeySession, 0], [MediaKeyStatusMap, 0], [MediaKeyMessageEvent, 2]]
+            : [];
+        exposed.push([MediaEncryptedEvent, 1]);
+        for (const [C, length] of exposed) {
+            for (const name of Object.getOwnPropertyNames(C.prototype)) {
+                if (name !== "constructor") define(C.prototype, name, {enumerable: true});
+            }
+            define(C, "length", {value: length, configurable: true});
+            define(C.prototype, Symbol.toStringTag, {value: C.name, configurable: true});
+            define(g, C.name, {value: C, writable: true, configurable: true});
+        }
+        if (secure) {
+            const method = (name, length, body) => {
+                define(body, "name", {value: name, configurable: true});
+                define(body, "length", {value: length, configurable: true});
+                return body;
+            };
+            define(Object.getPrototypeOf(g.navigator), "requestMediaKeySystemAccess", {configurable: true, enumerable: true,
+                writable: true, value: method("requestMediaKeySystemAccess", 2, requestMediaKeySystemAccess)});
+            define(HTMLMediaElement.prototype, "setMediaKeys", {configurable: true, enumerable: true, writable: true,
+                value: method("setMediaKeys", 1, setMediaKeys)});
+            define(HTMLMediaElement.prototype, "mediaKeys", {configurable: true, enumerable: true,
+                get: Object.getOwnPropertyDescriptor({get mediaKeys() { return mediaRecord(this).mediaKeys; }}, "mediaKeys").get});
+        }
+    })();
     windowViewportWidth = windowViewportDimension("width");
     windowViewportHeight = windowViewportDimension("height");
     (() => {
@@ -38917,6 +40916,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     g.__blob_url_adapter = {
         origin() { const owner = windowMessageState(g); return owner ? owner.origin || "null" : "null"; },
         register(api) { blobURLAPI = api; },
+        // MSE: URL.createObjectURL(MediaSource) and its revocation.
+        mediaSourceURL(object, url) { return mediaSourceObjectURL(object, url); },
+        revoked(url) { mediaSourceURLs.delete(url); },
     };
     /*__FILE_BEGIN__*/
     // File API (local w3c/FileAPI@1341d26) and XHR's ProgressEvent
@@ -39953,10 +41955,16 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // environment obtains a Blob whose type is a JavaScript MIME type.
         function moduleScript(url) { return __blob_url("module", `${url}`, null, null) === true; }
         const statics = {
-            // (Blob or MediaSource): this user agent has no MediaSource.
+            // (Blob or MediaSource): a MediaSource object URL where the
+            // realm has MediaSource (Media Source Extensions).
             createObjectURL(obj) {
                 if (arguments.length < 1) throw new TypeErrorCtor("createObjectURL requires 1 argument");
-                if (!fileAPI.isBlob(obj)) throw new TypeErrorCtor("createObjectURL requires a Blob");
+                if (!fileAPI.isBlob(obj)) {
+                    const url = adapter.mediaSourceURL
+                        ? adapter.mediaSourceURL(obj, "blob:" + adapter.origin() + "/" + uuid()) : null;
+                    if (url === null) throw new TypeErrorCtor("createObjectURL requires a Blob or MediaSource");
+                    return url;
+                }
                 // #unicodeBlobURL and #add-an-entry.
                 const url = "blob:" + adapter.origin() + "/" + uuid();
                 __blob_url("create", url, fileAPI.type(obj), hostLeaves(obj));
@@ -39969,6 +41977,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 if (record === null || record[1] !== "blob:") return;
                 // Steps 3-7 (the entry, the partition check, the removal).
                 __blob_url("revoke", record[0], null, null);
+                if (adapter.revoked) adapter.revoked(record[0]);
             },
         };
         for (const name of ["createObjectURL", "revokeObjectURL"])

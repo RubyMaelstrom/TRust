@@ -20,7 +20,7 @@ pub mod filter_graph;
 pub mod headless;
 mod hit_index;
 pub(crate) mod matrix3d;
-mod media_controls;
+pub(crate) mod media_controls;
 pub mod selection;
 pub use command_panel::{CommandPanelGeometry, CommandResponse};
 pub use context_menu::{ContextMenuGeometry, ContextMenuIcon, ContextMenuItem, paint_context_menu};
@@ -592,6 +592,47 @@ impl ImageHandle {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Self((1 << 63) | NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
     }
+
+    /// The current frame of the media player surface `surface`
+    /// (`crate::media::player::surface`): a video element's paint source.
+    pub(crate) fn for_video(surface: u64) -> Self {
+        Self((1 << 63) | (1 << 62) | (surface & ((1 << 62) - 1)))
+    }
+
+    /// The media surface a video handle names.
+    pub fn video_surface(self) -> Option<u64> {
+        (self.0 >> 62 == 0b11).then_some(self.0 & ((1 << 62) - 1))
+    }
+}
+
+/// A video element's current frame as an image: converted to RGBA once per
+/// frame (keyed by surface and frame serial) and shared by every draw of it.
+pub(crate) fn video_frame_image(handle: ImageHandle) -> Option<(ImageResource, u64)> {
+    use std::sync::{Mutex, OnceLock};
+    type Cache = Mutex<HashMap<u64, (u64, ImageResource)>>;
+    static CACHE: OnceLock<Cache> = OnceLock::new();
+    let surface_id = handle.video_surface()?;
+    let surface = crate::media::player::surface(surface_id)?;
+    let (frame, serial) = surface.current()?;
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some((cached_serial, image)) = cache.lock().ok()?.get(&surface_id)
+        && *cached_serial == serial
+    {
+        return Some((image.clone(), serial));
+    }
+    let (rgba, width, height) = frame.to_rgba(1)?;
+    let image = ImageResource {
+        svg_source: None,
+        width,
+        height,
+        rgba: Arc::from(rgba),
+        has_alpha: false,
+    };
+    let mut cache = cache.lock().ok()?;
+    // Forget surfaces whose players are gone.
+    cache.retain(|id, _| *id == surface_id || crate::media::player::surface(*id).is_some());
+    cache.insert(surface_id, (serial, image.clone()));
+    Some((image, serial))
 }
 
 impl PagePaint {
@@ -2625,12 +2666,18 @@ impl Scene {
         }
         let store = self.image_store.0.read().expect("image store poisoned");
         for (handle, revision) in &mut visible {
-            *revision = store.entries.get(handle).map(|entry| entry.revision);
+            *revision = match handle.video_surface() {
+                Some(surface) => crate::media::player::surface(surface).map(|s| s.serial()),
+                None => store.entries.get(handle).map(|entry| entry.revision),
+            };
         }
         visible
     }
 
     pub(crate) fn image(&self, handle: ImageHandle) -> Option<ImageResource> {
+        if handle.video_surface().is_some() {
+            return video_frame_image(handle).map(|(image, _)| image);
+        }
         self.canvas_images
             .get(&handle)
             .map(|canvas| canvas.image.clone())
@@ -2638,6 +2685,9 @@ impl Scene {
     }
 
     pub(crate) fn image_revision(&self, handle: ImageHandle) -> Option<u64> {
+        if let Some(surface) = handle.video_surface() {
+            return crate::media::player::surface(surface).map(|surface| surface.serial());
+        }
         self.canvas_images
             .get(&handle)
             .map(|canvas| canvas.generation)

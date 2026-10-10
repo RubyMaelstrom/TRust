@@ -984,6 +984,56 @@ pub fn image_navigation_response(mut response: Response, mime: &str) -> Response
     response
 }
 
+/// Whether a top-level response is media a graphical frontend plays in a
+/// media document (HTML #read-media): not an attachment, and an audio or
+/// video type the decoders can play.
+pub fn plays_as_media_document(response: &Response, computed_type: &str) -> bool {
+    let essence = computed_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    (essence.starts_with("video/") || essence.starts_with("audio/"))
+        && !crate::download::content_disposition(response)
+            .is_some_and(|disposition| !disposition.eq_ignore_ascii_case("inline"))
+        && crate::media::container::can_play_type(&essence, crate::media::decode::Registry::get())
+            != crate::media::container::CanPlay::No
+}
+
+/// HTML #read-media for audio and video: a document whose body holds a
+/// `video` (or `audio`) element playing the response's URL, which remains
+/// the document URL. The element fetches the resource itself (with range
+/// requests), so the navigation's body is never read.
+pub fn media_navigation_response(mut response: Response, computed_type: &str) -> Response {
+    let audio = computed_type
+        .trim_start()
+        .to_ascii_lowercase()
+        .starts_with("audio/");
+    let element = if audio { "audio" } else { "video" };
+    let src = response
+        .url
+        .as_str()
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;");
+    response.content_type = String::from("text/html; charset=utf-8");
+    response.body = format!(
+        "<!doctype html><meta charset=utf-8><style>html,body{{margin:0;height:100%}}\
+         body{{display:flex;align-items:center;justify-content:center;background:#0e0e0e}}\
+         video{{max-width:100%;max-height:100%}}audio{{width:min(600px,90%)}}</style>\
+         <{element} controls autoplay src=\"{src}\"></{element}>"
+    )
+    .into_bytes();
+    response.rendered = None;
+    response.js = None;
+    response.blobs = None;
+    response.live = None;
+    response.images = None;
+    response.declarative_refresh = None;
+    response
+}
+
 /// The terminal frontend's deliberately small adapter over the shared pixel
 /// layout. No HTML is parsed here: layout has already consumed the canonical
 /// DOM, and this function performs only the CSS-pixel-to-cell quantization plus
@@ -2565,7 +2615,38 @@ fn cors_safelisted_header(name: &str, value: &str) -> bool {
                 || matches!(*byte, b' ' | b'*' | b',' | b'-' | b'.' | b';' | b'=')
         }),
         "content-type" => cors_safelisted_content_type(raw),
+        // Fetch #cors-safelisted-request-header: a single range with a
+        // start (`bytes=N-` or `bytes=N-M`), as media element requests
+        // send; suffix ranges (`bytes=-500`) are not safelisted.
+        "range" => parse_single_range(raw).is_some_and(|(start, _)| start.is_some()),
         _ => false,
+    }
+}
+
+/// Fetch #simple-range-header-value: "parse a single range header value"
+/// with allowWhitespace false. Returns (rangeStart, rangeEnd), either of
+/// which may be absent but not both.
+pub(crate) fn parse_single_range(value: &str) -> Option<(Option<u64>, Option<u64>)> {
+    value
+        .get(..6)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("bytes="))?;
+    let rest = &value[6..];
+    let (start, end) = rest.split_once('-')?;
+    let digits = |text: &str| -> Option<Option<u64>> {
+        if text.is_empty() {
+            return Some(None);
+        }
+        if !text.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        text.parse().ok().map(Some)
+    };
+    let start = digits(start)?;
+    let end = digits(end)?;
+    match (start, end) {
+        (None, None) => None,
+        (Some(start), Some(end)) if start > end => None,
+        range => Some(range),
     }
 }
 
@@ -5766,24 +5847,6 @@ async fn read_response_head<R: AsyncRead + Unpin>(
         });
     }
 
-    // Media subresources are not presentation documents. Top-level media
-    // navigations have already returned above for the Save/Open prompt;
-    // downloading background media bodies here would only consume the page
-    // memory budget (sites commonly prefetch video previews). Skip the body so
-    // the page falls back to its poster. The unread socket cannot be pooled.
-    if headers.get("content-type").is_some_and(|c| {
-        let c = c.trim_start().to_ascii_lowercase();
-        c.starts_with("video/") || c.starts_with("audio/")
-    }) {
-        return Ok(Http1Head {
-            status,
-            headers,
-            set_cookies,
-            reusable: false,
-            framing: Http1Framing::None,
-        });
-    }
-
     let framing = if transfer_encoding.is_some() {
         Http1Framing::Chunked
     } else if let Some(len) = content_length {
@@ -6517,6 +6580,9 @@ async fn execute_js_with_presentation(
             let mut probe = crate::js::css_prepare(&html, viewport, cell_px);
             probe.attach_external_sheets(&sheets);
             crate::js::needs_live_dom(&probe)
+                // HTML #media-elements: a graphical frontend plays media
+                // inline, which only the page actor's media elements do.
+                || (!terminal_presentation && crate::js::has_media_elements(&probe))
         };
         // HTML #the-iframe-element: each nested document runs its own
         // scripts (webring widgets, counters) even when the parent has none.

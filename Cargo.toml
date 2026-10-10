@@ -91,6 +91,10 @@ brotli-decompressor = "5.0.3"
 brotli = "8.0.4"
 ruzstd = "0.9.0"
 futures = "0.3.34"
+# Run-time loading of optional system libraries: the system FFmpeg for
+# OS-provided codecs and libasound as the audio fallback (`media`). Never
+# linked, so a missing library only disables what it provides.
+libloading = "0.8.9"
 # HTTP/2 framing, HPACK and stream state; TRust owns connections and all
 # browser policy. This is not a second general-purpose HTTP client.
 h2 = "0.4.20"
@@ -164,6 +168,12 @@ ratatui = "0.30.2"
 # `av1::Decoder`'s containment, plus later Rust-path optimizations and a
 # T.35 metadata underflow fix. Move to a crates.io release that has the Rust API.
 rav1d = { git = "https://github.com/memorysafety/rav1d", rev = "d3d1cd67059f47803919be8276650e5870c9fd02", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
+# Royalty-free audio codecs and the Ogg, MP3, FLAC and WAV container
+# readers for inline media (`media::decode::audio`, `media::demux`).
+# AAC stays OS-provided (Media Foundation, system FFmpeg) like H.264, so
+# Symphonia's AAC decoder is deliberately not enabled; MP4 and WebM use
+# TRust's own parsers (`media::isobmff`, `media::webm`), shared with MSE.
+symphonia = { version = "0.6.1", default-features = false, features = ["mp3", "flac", "vorbis", "pcm", "ogg", "wav", "adpcm", "opt-simd"] }
 ratatui-image = { version = "11.1.0", default-features = false, features = ["crossterm"] }
 # FxHash for the DOM's hot maps (per-epoch caches, rule buckets, winner
 # maps). Pure Rust; SipHash's HashDoS
@@ -270,10 +280,27 @@ rustix = { version = "1.1.5", features = ["fs", "thread"] }
 # QueryPointer supplies the drop target's position (HTML DnD's immediate user
 # selection). The same x11rb release winit already uses; pure Rust connection.
 x11rb = { version = "0.13.2", default-features = false }
+# Inline media audio output speaks the PulseAudio native protocol (served by
+# PulseAudio and by PipeWire's pipewire-pulse), like Firefox and Chrome, in
+# pure Rust: no libpulse at build or run time (`media::audio::pulse`).
+pulseaudio = "0.3.1"
 
 [target.'cfg(windows)'.dependencies]
 # GetCursorPos/ScreenToClient for native file drags (see x11rb above).
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging"] }
+# Media: WASAPI output and the system's Media Foundation decoders (H.264,
+# HEVC, AAC, VP9), as Firefox and Chrome use them. The same release the
+# graphics and accessibility stacks already link.
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_Media_MediaFoundation",
+    "Win32_Media_Multimedia",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+] }
 
 [target.'cfg(not(any(target_os = "linux", target_os = "freebsd")))'.dependencies]
 parley = { version = "0.11.1", default-features = false, features = ["system", "complex-scripts"] }

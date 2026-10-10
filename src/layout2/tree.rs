@@ -1052,6 +1052,28 @@ impl Builder<'_> {
                 control: self.controls.get(&id).copied(),
             });
         }
+        if matches!(tag, "video" | "audio") && self.dom.inline_media() {
+            // HTML Rendering #embedded-content-rendering-rules: a video is a
+            // replaced element showing its poster frame or frame of video
+            // (painted from the player's surface, like a canvas bitmap); an
+            // audio element exposing controls is a replaced element one line
+            // high (one that does not is display:none). Their children
+            // (sources, tracks, fallback) never render.
+            let poster = (tag == "video")
+                .then(|| self.dom.attr(id, "poster"))
+                .flatten()
+                .map(str::trim)
+                .filter(|poster| !poster.is_empty())
+                .and_then(|poster| self.base.join(poster).ok())
+                .map(|url| url.to_string());
+            return Replaced::Atom(AtomKind::Img {
+                url: poster,
+                density: 1.0,
+                dimension_source: id,
+                alt: String::new(),
+                control: None,
+            });
+        }
         if matches!(tag, "video" | "audio") {
             // Children (sources/tracks/fallback) are consumed by the media
             // representation itself, never flowed as content.

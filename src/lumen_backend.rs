@@ -35,6 +35,8 @@ mod indexed_db_host;
 mod live_range_host;
 #[path = "lumen_wasm.rs"]
 mod lumen_wasm;
+#[path = "media_host.rs"]
+mod media_host;
 #[path = "message_port_host.rs"]
 mod message_port_host;
 #[path = "page_spare.rs"]
@@ -178,6 +180,11 @@ impl LumenResourceKind {
 #[allow(dead_code)] // Some task variants are exercised only by particular web-platform features.
 enum LumenHostTask {
     PortReady,
+    /// A media element's player reported (`media_host`).
+    Media {
+        id: u64,
+        task: media_host::MediaTask,
+    },
     /// HTML #offscreencanvas-placeholder: an OffscreenCanvas committed a
     /// frame for the placeholder canvas element `node`.
     CanvasFrame {
@@ -783,6 +790,8 @@ struct HostState {
     /// Presentation images the document requested for its rendering, in flight.
     pending_document_images: usize,
     task_events: Option<LumenTaskSender>,
+    /// The players of this document's media elements (`media_host`).
+    media: media_host::MediaHost,
     pending_resources: usize,
     /// HTML #link-type-preload fetches in flight. They never delay the load
     /// event, but the document is not quiescent until they settle.
@@ -964,6 +973,7 @@ impl HostState {
             next_image_payload: 1,
             pending_document_images: 0,
             task_events: None,
+            media: media_host::MediaHost::default(),
             pending_resources: 0,
             pending_preloads: 0,
             pending_module_evaluations: 0,
@@ -1276,6 +1286,7 @@ impl RetainedMemory for HostState {
             next_image_payload: _,
             pending_document_images: _,
             task_events,
+            media,
             pending_resources,
             pending_preloads: _,
             pending_module_evaluations: _,
@@ -1530,6 +1541,17 @@ impl RetainedMemory for HostState {
 
         // Element image request payloads share their compressed bytes with the
         // page's image store; report the native maps and the payload bytes.
+        // Media players own their buffers on their own threads; the agent
+        // retains only their table here.
+        let media_bytes = media.retained_bytes();
+        if media_bytes != 0 {
+            visitor.opaque_storage();
+            visitor.allocation(RetainedManagedAllocation::new(
+                "trust.media-players",
+                media as *const _ as usize,
+                media_bytes,
+            ));
+        }
         if image_payloads.capacity() != 0 || element_image_payloads.capacity() != 0 {
             visitor.opaque_storage();
         }
@@ -3688,6 +3710,9 @@ mod desktop {
             dom.set_device_pixel_ratio(env.device_pixel_ratio);
             dom.set_doc_url(url::Url::parse(&env.url).ok());
             dom.set_document_encoding(DOCUMENT, env.document_encoding);
+            // Graphical frontends play media inline; the terminal offers an
+            // external player instead.
+            dom.set_inline_media(!env.terminal_presentation);
             if !env.sheets.is_empty() {
                 let sheets: Vec<crate::http::PageSheet> = env
                     .sheets
@@ -3710,7 +3735,11 @@ mod desktop {
             .into_iter()
             .map(|(_, _, _, node)| node)
             .collect();
-        if scripts.is_empty() && !env.scripted_frames && !crate::js::needs_live_dom(&dom.borrow()) {
+        if scripts.is_empty()
+            && !env.scripted_frames
+            && !crate::js::needs_live_dom(&dom.borrow())
+            && (env.terminal_presentation || !crate::js::has_media_elements(&dom.borrow()))
+        {
             // HTML #meta-referrer: the parsed document's referrer metadata.
             outcome.referrer_policy = Some(
                 dom.borrow()
@@ -3819,6 +3848,7 @@ mod desktop {
                 }),
             env.last_modified,
             env.fullscreen_supported,
+            !env.terminal_presentation,
             MainWindowTraces::from_environment(),
         );
         if let Err(error) = eval(&mut engine, &config, "TRust configuration") {
@@ -11943,6 +11973,14 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__dom_offset_style", 1, guarded_offset_style),
     ("__image_current_src", 1, guarded_image_current_src),
     ("__media_failed", 2, guarded_media_failed),
+    ("__media_can_play", 1, media_host::can_play_type),
+    ("__media_mse_supported", 1, media_host::mse_type_supported),
+    ("__media_load", 5, guarded_media_load),
+    ("__media_control", 5, guarded_media_control),
+    ("__media_attach", 3, guarded_media_attach),
+    ("__media_source", 5, media_host::media_source),
+    ("__media_capabilities", 6, media_host::media_capabilities),
+    ("__eme", 5, media_host::eme),
     ("__match_media", 3, host_match_media),
     ("__dom_rect", 1, guarded_rect),
     ("__geometry_bind", 2, geometry_host::bind),
@@ -12799,6 +12837,9 @@ node_access_guards! {
     guarded_css_sheet = host_css_sheet, [0], Invalidate;
     guarded_image_current_src = host_image_current_src, [0], Invalidate;
     guarded_media_failed = host_media_failed, [0], Invalidate;
+    guarded_media_load = media_host::load, [0], Invalidate;
+    guarded_media_control = media_host::control, [0], Invalidate;
+    guarded_media_attach = media_host::attach, [0], Invalidate;
     guarded_load_frame = host_load_frame, [0], Invalidate;
     guarded_create_window_realm = host_create_window_realm, [1], Invalidate;
     guarded_run_injected_script = host_run_injected_script, [0], Invalidate;
@@ -15043,10 +15084,11 @@ fn main_window_config(
     navigation_timing: serde_json::Value,
     last_modified: Option<f64>,
     fullscreen_supported: bool,
+    inline_media: bool,
     traces: MainWindowTraces,
 ) -> String {
     format!(
-        "globalThis.__trust_cfg = {{ url: {}, referrer: {}, ua: {}, navigatorMode: {}, platform: {}, language: {}, languages: [{}, {}], width: {}, height: {}, devicePixelRatio: {}, hardwareConcurrency: {}, globalPrivacyControl: {}, secureContext: {}, frameTrace: {}, challengeMessageTrace: {}, navigationTiming: {}, lastModified: {}, fullscreenSupported: {} }};",
+        "globalThis.__trust_cfg = {{ url: {}, referrer: {}, ua: {}, navigatorMode: {}, platform: {}, language: {}, languages: [{}, {}], width: {}, height: {}, devicePixelRatio: {}, hardwareConcurrency: {}, globalPrivacyControl: {}, secureContext: {}, frameTrace: {}, challengeMessageTrace: {}, navigationTiming: {}, lastModified: {}, fullscreenSupported: {}, inlineMedia: {} }};",
         json_string(response_url.as_str()),
         json_string(referrer),
         json_string(crate::http::user_agent()),
@@ -15068,6 +15110,7 @@ fn main_window_config(
         navigation_timing,
         last_modified.map_or_else(|| String::from("null"), |time| time.to_string()),
         fullscreen_supported,
+        inline_media,
     )
 }
 
@@ -15441,6 +15484,7 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
             "frameTrace",
             "challengeMessageTrace",
             "fullscreenSupported",
+            "inlineMedia",
         ] {
             if let Ok(value) = realm_ctx.member_get(&source_config, name) {
                 realm_ctx.member_set(&config, name, value)?;
@@ -18969,6 +19013,7 @@ fn settle_network_task(
 fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result<(), String> {
     match task {
         LumenHostTask::PortReady => {}
+        LumenHostTask::Media { id, task } => media_host::dispatch(engine, id, task)?,
         LumenHostTask::CanvasFrame { node } => {
             let dom = engine
                 .ctx()
@@ -21468,6 +21513,19 @@ fn host_insertion_effects(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result
             };
         }
     }
+    // HTML #media-elements: a media element inserted into a document runs
+    // its resource selection algorithm when its networkState is
+    // NETWORK_EMPTY, and a source element inserted into a media element can
+    // resume one waiting for a candidate.
+    if dom.inline_media()
+        && ((dom.tag_name(node) == Some("source")
+            && matches!(dom.tag_name(parent), Some("video" | "audio")))
+            || std::iter::once(node)
+                .chain(dom.descendants(node))
+                .any(|id| matches!(dom.tag_name(id), Some("video" | "audio"))))
+    {
+        effects |= 256;
+    }
     Ok(Value::Num(effects as f64))
 }
 
@@ -21481,7 +21539,7 @@ fn host_removal_effects(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
     let dom = state.dom.borrow();
     let (Some(node), Some(parent)) = (host_arg_node(&dom, args, 0), host_arg_node(&dom, args, 1))
     else {
-        return Ok(Value::Num(31.0));
+        return Ok(Value::Num(63.0));
     };
     let mut effects = 0u32;
     if dom.shadow_including_subtree_has_frames(node) {
@@ -21500,6 +21558,21 @@ fn host_removal_effects(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
     // HTML option removing steps (the old select's selectedness).
     if dom.subtree_has_form_state_controls(node) {
         effects |= 8;
+    }
+    // HTML #playing-the-media-resource: a removed media element with a
+    // player pauses once it stays out of the document.
+    let media_removed = state.media.player_nodes().any(|media| {
+        let mut current = Some(media);
+        while let Some(id) = current {
+            if id == node {
+                return true;
+            }
+            current = dom.node(id).parent;
+        }
+        false
+    });
+    if media_removed {
+        effects |= 32;
     }
     Ok(Value::Num(effects as f64))
 }
@@ -24772,6 +24845,9 @@ fn value_string(engine: &mut lumen::Engine, value: &Value) -> String {
 #[cfg(test)]
 #[path = "fetch_stream_tests.rs"]
 mod fetch_stream_tests;
+#[cfg(test)]
+#[path = "media_host_tests.rs"]
+mod media_host_tests;
 
 #[cfg(test)]
 mod tests {
@@ -30942,6 +31018,7 @@ mod tests {
                 serde_json::Value::Null,
                 None,
                 false,
+                true,
                 MainWindowTraces::default(),
             )
             .contains("fullscreenSupported: false")
@@ -33364,7 +33441,10 @@ mod tests {
         engine
     }
 
-    fn configured_engine_before_prelude(mut state: HostState, url: &str) -> lumen::Engine {
+    pub(super) fn configured_engine_before_prelude(
+        mut state: HostState,
+        url: &str,
+    ) -> lumen::Engine {
         state.test_hooks.internals = true;
         state
             .window_request_urls
@@ -33569,7 +33649,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 249, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 257, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -33580,7 +33660,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 249);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 257);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(

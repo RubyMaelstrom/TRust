@@ -388,6 +388,20 @@ impl<'a> Builder<'a> {
     }
 
     fn replaced_image(&mut self, node: NodeId, source: Option<&String>) -> Option<ImageHandle> {
+        // HTML #the-video-element: the poster frame while the show poster
+        // flag is set and there is one, else the current frame of video
+        // (nothing until the first frame).
+        if node != NO_NODE
+            && let Some(presentation) = self.dom.media_presentation(node)
+        {
+            if presentation.show_poster
+                && let Some(poster) = source
+            {
+                return Some(self.image(resolve_image_source(self.base, poster)));
+            }
+            return (self.dom.tag_name(node) == Some("video"))
+                .then(|| ImageHandle::for_video(presentation.surface));
+        }
         if source.is_none() && node != NO_NODE && self.dom.canvas_size(node).is_some() {
             let canvas = self.dom.canvas_image(node)?;
             let handle = canvas.handle;
@@ -1106,10 +1120,30 @@ fn paint_in_spaces(
         replaced_images: std::mem::take(&mut builder.replaced_images),
     };
     let media_fallbacks = dom.retained_media_controls();
-    if builder.has_media_controls || !media_fallbacks.is_empty() {
+    let inline_controls = dom.inline_media() && dom.has_media_controls();
+    if builder.has_media_controls || !media_fallbacks.is_empty() || inline_controls {
+        use crate::render::media_controls::MediaAnchor;
         paint.collect_browser_media(|hit| {
             if let Some(target) = media_fallbacks.get(&hit.node) {
-                return Some((hit.rect, crate::doc::Link::Media(target.clone())));
+                return Some(MediaAnchor::External(
+                    hit.rect,
+                    crate::doc::Link::Media(target.clone()),
+                ));
+            }
+            // HTML #expose-a-user-interface-to-the-user: an inline media
+            // element's controls overlay its box (HTML Rendering: "overlaid
+            // above the page content without causing any layout changes").
+            if let Some(controls) = dom.media_presentation(hit.node).and_then(|p| p.controls) {
+                if dom.paint_suppressed(hit.node) || dom.visibility_hidden(hit.node) {
+                    return None;
+                }
+                let rect = builder
+                    .replaced_border_boxes
+                    .get(&hit.node)
+                    .copied()
+                    .unwrap_or(hit.rect);
+                let video = dom.tag_name(hit.node) == Some("video");
+                return Some(MediaAnchor::Controls(rect, controls, video));
             }
             let Some(link @ crate::doc::Link::Media(_)) = &hit.link else {
                 return None;
@@ -1121,7 +1155,7 @@ fn paint_in_spaces(
                 if let crate::doc::Link::Media(target) = link {
                     dom.remember_media_target(hit.node, target);
                 }
-                (
+                MediaAnchor::External(
                     builder
                         .replaced_border_boxes
                         .get(&hit.node)
@@ -2263,6 +2297,7 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
             } else if piece.item.graphical_image.is_some()
                 || piece.item.image.is_some()
                 || (node != NO_NODE && builder.dom.canvas_size(node).is_some())
+                || (node != NO_NODE && builder.dom.media_presentation(node).is_some())
             {
                 let handle = builder.replaced_image(
                     node,
@@ -2342,7 +2377,11 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
                         .iter()
                         .filter_map(|source| builder.images.get(source))
                         .any(|&(w, h)| w > 0 && h > 0 && (w, h) != (u32::MAX, u32::MAX)),
-                    None => node != NO_NODE && builder.dom.canvas_size(node).is_some(),
+                    None => {
+                        node != NO_NODE
+                            && (builder.dom.canvas_size(node).is_some()
+                                || builder.dom.media_natural_size(node).is_some())
+                    }
                 };
                 if let Some(handle) = handle {
                     if node != NO_NODE {
