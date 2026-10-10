@@ -31,6 +31,12 @@ pub enum Operation {
         title: String,
     },
     Remove(u64),
+    /// Remove the bookmark of a destination (`canonical` address), as the
+    /// desktop's context menu offers for the page shown.
+    RemoveUrl(String),
+    /// Whether a destination (`canonical` address) is bookmarked; reads the
+    /// store without changing it.
+    Lookup(String),
     Undo,
 }
 #[derive(Debug)]
@@ -41,6 +47,9 @@ pub struct Completion {
 pub struct Outcome {
     pub message: String,
     pub listing: Option<String>,
+    /// The answer to `Operation::Lookup`: the address and the IDs of its
+    /// bookmarks (none when it is not bookmarked).
+    pub lookup: Option<(String, Vec<u64>)>,
 }
 #[derive(Clone, Default)]
 pub struct Context {
@@ -265,6 +274,19 @@ fn apply(
         return Ok(Outcome {
             message: "Bookmarks".into(),
             listing: Some(listing(&entries(&read(path)?)?, filter)),
+            lookup: None,
+        });
+    }
+    if let Operation::Lookup(url) = &operation {
+        let ids = entries(&read(path)?)?
+            .iter()
+            .filter(|entry| entry.url == *url)
+            .map(|entry| entry.id)
+            .collect();
+        return Ok(Outcome {
+            message: String::new(),
+            listing: None,
+            lookup: Some((url.clone(), ids)),
         });
     }
     let store_lock = lock(path)?;
@@ -343,6 +365,17 @@ fn apply(
             new_removed = Some(items.remove(i));
             format!("Removed bookmark #{id} · bookmark undo restores it")
         }
+        Operation::RemoveUrl(url) => {
+            let items = data["bookmarks"].as_array_mut().unwrap();
+            let i = items
+                .iter()
+                .position(|v| v["url"].as_str() == Some(url.as_str()))
+                .ok_or("This page is not bookmarked")?;
+            let entry = items.remove(i);
+            let id = entry["id"].as_u64().unwrap_or_default();
+            new_removed = Some(entry);
+            format!("Removed bookmark #{id} · bookmark undo restores it")
+        }
         Operation::Undo => {
             let entry = new_removed
                 .take()
@@ -358,7 +391,7 @@ fn apply(
             items.push(entry);
             "Bookmark restored".into()
         }
-        Operation::List(_) => unreachable!(),
+        Operation::List(_) | Operation::Lookup(_) => unreachable!(),
     };
     entries(&data)?;
     crate::site_storage::before_bookmarks_write(path, &before, &data)?;
@@ -370,6 +403,7 @@ fn apply(
     Ok(Outcome {
         message,
         listing: None,
+        lookup: None,
     })
 }
 pub fn listing(entries: &[Entry], filter: &str) -> String {
@@ -495,6 +529,37 @@ mod tests {
         let filtered = listing(&saved, "BOOKS");
         assert!(filtered.contains("Books"));
         assert!(!filtered.contains("https://e/new"));
+    }
+    #[test]
+    fn lookup_and_removal_by_address_follow_the_page_shown() {
+        // The desktop context menu's Add/Remove Bookmark item asks whether
+        // the page's destination is saved and removes exactly that entry,
+        // which bookmark undo restores.
+        let f = Fixture::new();
+        let mut undo = None;
+        let url = "https://example.test/page".to_string();
+        let lookup = |undo: &mut Option<Value>| {
+            apply(&f.path(), Operation::Lookup(url.clone()), undo)
+                .unwrap()
+                .lookup
+                .unwrap()
+        };
+        assert_eq!(lookup(&mut undo), (url.clone(), Vec::new()));
+        apply(&f.path(), add(&url, "Page"), &mut undo).unwrap();
+        apply(
+            &f.path(),
+            add("https://example.test/other", "Other"),
+            &mut undo,
+        )
+        .unwrap();
+        assert_eq!(lookup(&mut undo).1, vec![1]);
+        let removed = apply(&f.path(), Operation::RemoveUrl(url.clone()), &mut undo).unwrap();
+        assert!(removed.message.contains("#1"));
+        assert!(lookup(&mut undo).1.is_empty());
+        assert!(apply(&f.path(), Operation::RemoveUrl(url.clone()), &mut undo).is_err());
+        apply(&f.path(), Operation::Undo, &mut undo).unwrap();
+        assert_eq!(lookup(&mut undo).1, vec![1]);
+        assert_eq!(entries(&read(&f.path()).unwrap()).unwrap().len(), 2);
     }
     #[test]
     fn concurrent_instances_do_not_lose_updates() {
