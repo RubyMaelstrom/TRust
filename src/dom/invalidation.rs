@@ -17,6 +17,10 @@ mod attributes;
 
 pub(super) use attributes::LiveState;
 
+/// A detached tree is searched for shadow hosts up to this many nodes per
+/// shadow host of the arena, the cost of comparing every host's root instead.
+const SHADOW_DEPENDENCY_WALK_FACTOR: usize = 4;
+
 /// CSSOM #dom-window-getcomputedstyle requires current, live values at reads;
 /// it does not require retiring derived cache entries after every write.
 /// Keep only stable node IDs and flush before any style/layout observation.
@@ -1088,25 +1092,70 @@ impl Dom {
     /// inheritance and slot distribution cannot couple separate shadow-
     /// including trees. A detached feature probe must not make unrelated
     /// detached construction invalidate the live document's style cache.
+    ///
+    /// Whether `node`'s shadow-including tree holds a shadow host. This runs
+    /// on every child-list, attribute and input-value mutation, so on a page
+    /// with hundreds of components its cost is the page's mutation rate. A
+    /// detached tree (a template clone, a fragment under construction) is
+    /// small and asks the question of its own members; only a tree too large
+    /// for that, or a Document, compares the roots of the hosts.
     pub(super) fn shadow_style_dependencies(&self, node: NodeId) -> bool {
         if self.shadow_roots.is_empty() {
             return false;
         }
-        let root = |mut id| {
-            // A Document's arena parent is only a presentation edge to its
-            // iframe. DOM's shadow-including root never traverses that edge.
-            while !matches!(self.nodes[id].data, NodeData::Document) {
-                let Some(parent) = self.parent_composed(id) else {
-                    break;
-                };
-                id = parent;
-            }
-            id
-        };
-        let mutation_root = root(node);
+        let mutation_root = self.shadow_tree_root(node);
+        if !matches!(self.nodes[mutation_root].data, NodeData::Document)
+            && let Some(holds_host) = self.detached_tree_holds_shadow_host(
+                mutation_root,
+                SHADOW_DEPENDENCY_WALK_FACTOR * self.shadow_roots.len() + 32,
+            )
+        {
+            return holds_host;
+        }
         self.shadow_roots
             .keys()
-            .any(|&host| root(host) == mutation_root)
+            .any(|&host| self.shadow_tree_root(host) == mutation_root)
+    }
+
+    /// DOM #concept-shadow-including-root of `id`. A Document's arena parent
+    /// is only a presentation edge to its iframe; DOM's shadow-including root
+    /// never traverses that edge.
+    fn shadow_tree_root(&self, mut id: NodeId) -> NodeId {
+        while !matches!(self.nodes[id].data, NodeData::Document) {
+            let Some(parent) = self.parent_composed(id) else {
+                break;
+            };
+            id = parent;
+        }
+        id
+    }
+
+    /// Whether a shadow host is an inclusive shadow-including descendant of
+    /// `root`, a tree root that is not a Document. `None` when the tree
+    /// exceeds `budget` nodes before the answer is known, which leaves the
+    /// comparison of roots as the cheaper question.
+    fn detached_tree_holds_shadow_host(&self, root: NodeId, budget: usize) -> Option<bool> {
+        let leaf = |id: NodeId| self.nodes[id].first_child.is_none();
+        if leaf(root) && !self.shadow_roots.contains_key(&root) {
+            return Some(false);
+        }
+        let mut stack = vec![root];
+        let mut visited = 0;
+        while let Some(id) = stack.pop() {
+            // A Document below the tree is its own shadow-including root.
+            if matches!(self.nodes[id].data, NodeData::Document) {
+                continue;
+            }
+            if self.shadow_roots.contains_key(&id) {
+                return Some(true);
+            }
+            visited += 1;
+            if visited > budget {
+                return None;
+            }
+            self.push_composed_children(id, &mut stack);
+        }
+        Some(false)
     }
 
     #[cfg(test)]
@@ -1125,9 +1174,9 @@ impl Dom {
         // a child-list mutation. That is an implicit cross-tree dependency,
         // including for state resolved through the style parent, even when
         // no rule contains a literal [slot] or [name] selector.
-        if self.shadow_style_dependencies(node)
-            && (name.eq_ignore_ascii_case("slot")
-                || (name.eq_ignore_ascii_case("name") && self.tag_name(node) == Some("slot")))
+        if (name.eq_ignore_ascii_case("slot")
+            || (name.eq_ignore_ascii_case("name") && self.tag_name(node) == Some("slot")))
+            && self.shadow_style_dependencies(node)
         {
             self.selector_epoch = self.selector_epoch.wrapping_add(1);
             return None;
@@ -1163,8 +1212,8 @@ impl Dom {
         // that expired every style of the live document. Only that fallback
         // takes the detached tree: a local proof stays cheaper than a walk.
         if subjects.is_none()
-            && !self.shadow_style_dependencies(node)
             && !self.is_dom_connected(node)
+            && !self.shadow_style_dependencies(node)
         {
             let mut root = node;
             while let Some(parent) = self.parent_composed(root) {
@@ -1657,7 +1706,14 @@ impl Dom {
         // Detached construction uses the same dependency proof. Recursively
         // invalidating its entire growing root on each append would make a
         // fragment-building loop quadratic even without structural selectors.
-        let local = (!self.child_list_may_reassign_slots(parent, changed))
+        // Without a current rule index there is no proof of independence, so
+        // slot assignment need not be asked about.
+        let index_current = self
+            .style_cache
+            .borrow()
+            .as_ref()
+            .is_some_and(|(epoch, _)| *epoch == self.style_epoch);
+        let local = (index_current && !self.child_list_may_reassign_slots(parent, changed))
             .then(|| {
                 let index = self.style_cache.borrow();
                 index.as_ref().and_then(|(epoch, index)| {
@@ -2463,6 +2519,117 @@ mod tests {
             );
             assert_style_values_match_cold(&mut dom);
         }
+    }
+
+    /// DOM #concept-shadow-including-root: the answer is whether some shadow
+    /// host shares the node's root, however it is found.
+    fn shadow_dependencies_by_roots(dom: &Dom, node: NodeId) -> bool {
+        let root = dom.shadow_tree_root(node);
+        dom.shadow_roots
+            .keys()
+            .any(|&host| dom.shadow_tree_root(host) == root)
+    }
+
+    fn assert_shadow_dependencies_match_roots(dom: &Dom) {
+        for node in 0..dom.node_count() {
+            if dom.nodes.get(node).is_some() {
+                assert_eq!(
+                    dom.shadow_style_dependencies(node),
+                    shadow_dependencies_by_roots(dom, node),
+                    "node {node}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shadow_dependencies_search_small_detached_trees_for_their_hosts() {
+        let mut dom = Dom::parse_document(
+            "<body><main id=live><x-live id=host></x-live></main><iframe id=frame></iframe></body>",
+        );
+        let frame = dom.get_by_id("frame").unwrap();
+        dom.install_frame_document(frame, "<body><p>frame</p></body>", "https://frame.test/")
+            .unwrap();
+        let live_host = dom.get_by_id("host").unwrap();
+        let live_shadow = dom.attach_shadow(live_host);
+        let live_leaf = dom.create_element("span");
+        dom.append(live_shadow, live_leaf);
+        assert_shadow_dependencies_match_roots(&dom);
+
+        // A detached template clone without a host in it shares no tree with
+        // the hosts of the live Document.
+        let clone = dom.create_element("section");
+        let mut parent = clone;
+        for _ in 0..6 {
+            let child = dom.create_element("div");
+            dom.append(parent, child);
+            parent = child;
+        }
+        assert!(!dom.shadow_style_dependencies(clone));
+        assert!(!dom.shadow_style_dependencies(parent));
+        assert_shadow_dependencies_match_roots(&dom);
+
+        // A host anywhere inside it, below its shadow root too, couples the
+        // whole detached tree...
+        let inner = dom.create_element("x-inner");
+        dom.append(parent, inner);
+        let inner_shadow = dom.attach_shadow(inner);
+        let nested = dom.create_element("x-nested");
+        dom.append(inner_shadow, nested);
+        assert!(dom.shadow_style_dependencies(clone));
+        assert!(dom.shadow_style_dependencies(nested));
+        let nested_shadow = dom.attach_shadow(nested);
+        let deep = dom.create_element("i");
+        dom.append(nested_shadow, deep);
+        assert!(dom.shadow_style_dependencies(deep));
+        assert_shadow_dependencies_match_roots(&dom);
+
+        // ...a detached fragment is a root too...
+        let fragment = dom.create_fragment();
+        let item = dom.create_element("li");
+        dom.append(fragment, item);
+        assert!(!dom.shadow_style_dependencies(item));
+        let fragment_host = dom.create_element("x-fragment");
+        dom.append(fragment, fragment_host);
+        dom.attach_shadow(fragment_host);
+        assert!(dom.shadow_style_dependencies(item));
+        assert_shadow_dependencies_match_roots(&dom);
+
+        // ...and a host that is itself the root of an otherwise empty tree.
+        let lone = dom.create_element("x-lone");
+        assert!(!dom.shadow_style_dependencies(lone));
+        dom.attach_shadow(lone);
+        assert!(dom.shadow_style_dependencies(lone));
+
+        // Moving the tree into the live Document joins it with the live hosts.
+        let live = dom.get_by_id("live").unwrap();
+        dom.append(live, clone);
+        assert!(dom.shadow_style_dependencies(live_leaf));
+        assert!(dom.shadow_style_dependencies(deep));
+        assert_shadow_dependencies_match_roots(&dom);
+    }
+
+    #[test]
+    fn shadow_dependencies_of_a_tree_beyond_the_walk_budget_compare_roots() {
+        let mut dom = Dom::parse_document("<body><x-live id=host></x-live></body>");
+        let host = dom.get_by_id("host").unwrap();
+        dom.attach_shadow(host);
+        // One host: a walk of at most 4 * 1 + 32 nodes. A detached tree of
+        // several times that, without a host, still answers exactly.
+        let big = dom.create_element("section");
+        let mut last = big;
+        for _ in 0..(SHADOW_DEPENDENCY_WALK_FACTOR * 8 + 100) {
+            last = dom.create_element("p");
+            dom.append(big, last);
+        }
+        assert!(!dom.shadow_style_dependencies(big));
+        assert!(!dom.shadow_style_dependencies(last));
+        let inner_host = dom.create_element("x-late");
+        dom.append(big, inner_host);
+        dom.attach_shadow(inner_host);
+        assert!(dom.shadow_style_dependencies(big));
+        assert!(dom.shadow_style_dependencies(last));
+        assert_shadow_dependencies_match_roots(&dom);
     }
 
     #[test]
