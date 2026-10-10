@@ -1532,6 +1532,40 @@ impl Canvas {
         let bottom = (y + h).min(height as i64).min(self.height as i64 - dy);
         x = x.max(0).max(-dx);
         y = y.max(0).max(-dy);
+        if !half && color_space == 0 {
+            // 8-bit sRGB ImageData: no color conversion, so premultiplying by the 8-bit alpha
+            // is the whole job. round(c * a / 255) in integers is exactly what the float
+            // path below computes, since c * a / 255 is never within 1/510 of a half-integer
+            // (the f32 error is far smaller); x -> (t + (t >> 8)) >> 8 with t = x + 128 is the
+            // exact rounded division by 255 on 0..=255*255.
+            if right > x {
+                let columns = (right - x) as usize;
+                let opaque = !self.alpha;
+                for sy in y..bottom {
+                    let source = (sy * width as i64 + x) as usize * 4;
+                    let target = (((sy + dy) * self.width as i64 + x + dx) * 4) as usize;
+                    let from = &bytes[source..source + columns * 4];
+                    let to = &mut bitmap.data_mut()[target..target + columns * 4];
+                    for (out, pixel) in to.chunks_exact_mut(4).zip(from.chunks_exact(4)) {
+                        let alpha = if opaque { 255 } else { u32::from(pixel[3]) };
+                        if alpha == 255 {
+                            out.copy_from_slice(&[pixel[0], pixel[1], pixel[2], 255]);
+                        } else {
+                            let premultiply = |c: u8| {
+                                let t = u32::from(c) * alpha + 128;
+                                ((t + (t >> 8)) >> 8) as u8
+                            };
+                            out[0] = premultiply(pixel[0]);
+                            out[1] = premultiply(pixel[1]);
+                            out[2] = premultiply(pixel[2]);
+                            out[3] = alpha as u8;
+                        }
+                    }
+                }
+            }
+            self.changed();
+            return;
+        }
         for sy in y..bottom {
             for sx in x..right {
                 let source = (sy * width as i64 + sx) as usize * stride;
@@ -2077,6 +2111,67 @@ mod tests {
             mode,
             clip.as_deref(),
         );
+    }
+
+    /// HTML #dom-context-2d-putimagedata ("put pixels"): the 8-bit sRGB path premultiplies by
+    /// the integer alpha. It must equal the float formula for every channel/alpha pair, with
+    /// and without a canvas alpha channel, clipped by a dirty rectangle and a destination offset.
+    #[test]
+    fn put_image_data_integer_premultiply_matches_the_float_formula() {
+        let (width, height) = (37u32, 23u32);
+        let mut bytes = Vec::with_capacity((width * height * 4) as usize);
+        let mut seed = 0x9e3779b9u32;
+        for i in 0..width * height {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            // Cover every alpha against every channel value over the whole image.
+            let alpha = (i % 256) as u8;
+            let c = (seed >> 24) as u8;
+            bytes.extend_from_slice(&[c, (i / 3 % 256) as u8, 255 - c, alpha]);
+        }
+        for alpha_channel in [true, false] {
+            let mut canvas = Canvas::new(40, 30, alpha_channel).unwrap();
+            // dx, dy, dirty x, y, w, h (negative extents flip), then half = false, sRGB.
+            let n = [3., 2., 5., -4., 20., 30.];
+            canvas.put(&bytes, width, height, &n, false, 0);
+            let reference = |c: u8, a: u8| {
+                let alpha = if alpha_channel { a } else { 255 };
+                ((c as f32 / 255. * alpha as f32).round()) as u8
+            };
+            let (dx, dy) = (3i64, 2i64);
+            let x0 = 5i64.max(0).max(-dx);
+            let y0 = (-4i64).max(0).max(-dy);
+            let x1 = (5 + 20).min(width as i64).min(40 - dx);
+            let y1 = (-4 + 30).min(height as i64).min(30 - dy);
+            let pixels = canvas.bitmap.as_ref().unwrap().data().to_vec();
+            let mut written = 0;
+            for sy in y0..y1 {
+                for sx in x0..x1 {
+                    let source = ((sy * width as i64 + sx) * 4) as usize;
+                    let target = (((sy + dy) * 40 + sx + dx) * 4) as usize;
+                    let px = &bytes[source..source + 4];
+                    let a = if alpha_channel { px[3] } else { 255 };
+                    let expected = [
+                        reference(px[0], px[3]),
+                        reference(px[1], px[3]),
+                        reference(px[2], px[3]),
+                        a,
+                    ];
+                    assert_eq!(&pixels[target..target + 4], &expected, "({sx},{sy})");
+                    written += 1;
+                }
+            }
+            assert!(written > 100, "the dirty rectangle covers pixels");
+            // Pixels outside the destination rectangle stay transparent (or opaque black).
+            let untouched = &pixels[..4];
+            assert_eq!(
+                untouched,
+                if alpha_channel {
+                    [0, 0, 0, 0]
+                } else {
+                    [0, 0, 0, 255]
+                }
+            );
+        }
     }
 
     #[test]

@@ -1271,17 +1271,22 @@ fn context_op(
                 .collect(),
         ),
         "put" => {
+            // The pixels are read in place: ImageData is a whole-canvas-sized buffer in the
+            // emulator/video case, and a copy per frame would double the memory traffic.
             if n.len() >= 10
-                && let Some(bytes) = ctx.typed_array_bytes(payload)
+                && ctx
+                    .with_typed_array_bytes(payload, |bytes| {
+                        canvas.put(
+                            bytes,
+                            n[0] as u32,
+                            n[1] as u32,
+                            &n[2..],
+                            n[8] != 0.,
+                            n[9] as u8,
+                        );
+                    })
+                    .is_some()
             {
-                canvas.put(
-                    &bytes,
-                    n[0] as u32,
-                    n[1] as u32,
-                    &n[2..],
-                    n[8] != 0.,
-                    n[9] as u8,
-                );
                 changed = true;
             }
             Value::Undefined
