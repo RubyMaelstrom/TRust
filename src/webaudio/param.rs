@@ -438,8 +438,11 @@ pub struct Descriptor {
 }
 
 impl Param {
+    /// `current` is [[current value]] as the control thread sees it. That
+    /// thread created it holding defaultValue and may have set the value
+    /// since (#dom-audioparam-value), before this message arrived; it
+    /// changes here only from the next render quantum's computation.
     pub fn new(descriptor: Descriptor, current: Arc<AtomicU32>) -> Self {
-        current.store(descriptor.default.to_bits(), Ordering::Relaxed);
         Self {
             timeline: Timeline::new(descriptor.default),
             rate: descriptor.rate,
@@ -580,6 +583,28 @@ mod tests {
         );
         assert_eq!(block(&mut p, 0, 1.0, 5), [1.0, 2.0, 4.0, 8.0, 16.0]);
         assert_eq!(f32::from_bits(p.current.load(Ordering::Relaxed)), 1.0);
+    }
+
+    #[test]
+    fn a_value_set_before_the_rendering_thread_has_the_param_survives() {
+        // #dom-audioparam-value: setting `value` assigns [[current value]]
+        // at once. The rendering thread learning of the parameter later must
+        // not put defaultValue back (getFrequencyResponse reads it).
+        let current = Arc::new(AtomicU32::new(500f32.to_bits()));
+        let mut p = Param::new(
+            Descriptor {
+                default: 350.0,
+                min: 0.0,
+                max: 1000.0,
+                rate: Rate::A,
+                compound: false,
+            },
+            current.clone(),
+        );
+        assert_eq!(f32::from_bits(current.load(Ordering::Relaxed)), 500.0);
+        p.apply(Automation::Value(500.0), 0.0);
+        assert_eq!(block(&mut p, 0, 1.0, 2), [500.0, 500.0]);
+        assert_eq!(f32::from_bits(current.load(Ordering::Relaxed)), 500.0);
     }
 
     #[test]
