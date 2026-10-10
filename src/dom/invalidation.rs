@@ -6,9 +6,10 @@
 //! DOM revision changed. Dependency proofs are owned by a Document, including
 //! its shadow trees, rather than the whole presentation arena. Shadow rules
 //! reach across trees only through `:host()` and `::slotted()` routes, and
-//! restyling follows the flat tree; slot reassignment, hover and focus state
-//! in shadow-including trees, and untracked state associations retain an
-//! explicit full fallback. Optional cache budgets never truncate content.
+//! restyling follows the flat tree, for attributes and for the hover,
+//! active, focus and target states alike; slot reassignment and untracked
+//! state associations retain an explicit full fallback. Optional cache
+//! budgets never truncate content.
 
 use super::*;
 
@@ -652,7 +653,8 @@ impl SelectorDependencies {
     }
 
     fn record(&mut self, rule: &StyleRule) {
-        self.attributes.record(&rule.selector);
+        self.attributes
+            .record(&rule.selector, std::sync::Arc::as_ptr(&rule.data) as usize);
         self.complex(&rule.selector);
         self.record_structure(&rule.selector, &[], Impact::Element);
     }
@@ -1157,16 +1159,17 @@ impl Dom {
 
     /// The focus update steps (HTML #focus-update-steps) change :focus and
     /// :focus-within (Selectors 4 #the-focus-pseudo,
-    /// #the-focus-within-pseudo), and scrolling to a fragment changes
-    /// :target (HTML #selector-target), on exactly the elements of `changed`.
-    /// Like an attribute write, that can only change the selector subjects
-    /// reached through compiled routes: the element itself, descendant and
-    /// sibling dependents, `:has()` anchors and their dependents, and
-    /// `:nth-child(of …)` siblings. Restyle those and, for inheritance, their
+    /// #the-focus-within-pseudo), scrolling to a fragment changes :target
+    /// (HTML #selector-target), and activation changes :active (HTML
+    /// #selector-active), on exactly the elements of `changed`. Like an
+    /// attribute write, that can only change the selector subjects reached
+    /// through compiled routes: the element itself, descendant and sibling
+    /// dependents, `:has()` anchors and their dependents, `:nth-child(of …)`
+    /// siblings, and across trees the `:host()` and `::slotted()` routes
+    /// (CSS Shadow 1 #host-selector, #slotted-pseudo; a state change never
+    /// reassigns slots). Restyle those and, for inheritance, their flat-tree
     /// descendants. `index` must reflect the current sheet set. Returns
-    /// false when only a complete invalidation is provably correct: shadow
-    /// trees can couple tree scopes (`:host`, `::slotted()`, slot
-    /// distribution) beyond these routes.
+    /// false when only a complete invalidation is provably correct.
     pub(super) fn invalidate_live_state(
         &mut self,
         index: &StyleIndex,
@@ -1187,15 +1190,6 @@ impl Dom {
             // No selector in the node's Document reads the state; matches()
             // reads Document state directly and caches nothing.
             return true;
-        }
-        if observed
-            .iter()
-            .any(|&(node, _)| self.shadow_style_dependencies(node))
-        {
-            if casc_diag_on() {
-                eprintln!("DIAGINVALID live-state shadow={changed:?}");
-            }
-            return false;
         }
         let mut subjects = FxHashSet::default();
         for &(node, state) in &observed {
@@ -1229,6 +1223,21 @@ impl Dom {
             self.record_geometry_dirty(subject, DirtyKind::Attr);
         }
         true
+    }
+
+    /// Whether the style sheets of shadow tree `shadow` hold the rule whose
+    /// data lives at `rule` (CSS Shadow 1 #host-selector: `:host` is
+    /// evaluated in the context of the host's own shadow tree). Without a
+    /// current index there is no proof that they do not.
+    pub(super) fn shadow_tree_holds_rule(&self, shadow: NodeId, rule: usize) -> bool {
+        let Some(index) = self.current_style_index() else {
+            return true;
+        };
+        index.scopes.get(&shadow).is_some_and(|rules| {
+            rules
+                .iter()
+                .any(|candidate| std::sync::Arc::as_ptr(&candidate.data) as usize == rule)
+        })
     }
 
     /// The parsed rule index when it reflects the current sheet set, without
@@ -2592,6 +2601,180 @@ mod tests {
         }
     }
 
+    /// A light tree and two nested shadow trees whose sheets read `:hover`,
+    /// `:active`, `:focus` and `:focus-within` through every route that
+    /// crosses trees: `:host()`, `::slotted()`, `::part()`, plus ordinary
+    /// descendant, child, sibling, `:not()` and `:has()` paths.
+    fn shadow_state_document() -> (Dom, Vec<NodeId>) {
+        let mut dom = Dom::parse_document(
+            "<style>.x:hover .y {color:rgb(1, 0, 0)} x-outer:active {font-size:12px} \
+             :focus-within > .y {padding-left:3px} .a:focus {width:5px} \
+             :active > .y {line-height:2} .b :active {text-decoration:overline} .c:not(:hover) {height:4px} \
+             .b:has(:focus) {text-decoration:underline} :hover + .y {display:block} \
+             x-outer::part(p):hover {color:rgb(0, 9, 0)} \
+             x-outer:focus-within::part(p) {width:9px} \
+             x-outer:active::part(p) {padding-left:9px}</style>\
+             <body><div id=l0 class=x><span id=l1 class=y>t</span></div>\
+             <x-outer id=outer><p id=s0 class=x>one</p><p id=s1 class=y>two</p></x-outer>\
+             <section id=l2 class=b><i id=l3 class=a>i</i><b id=l4 class=y>b</b></section></body>",
+        );
+        let outer = dom.get_by_id("outer").unwrap();
+        let outer_root = dom.attach_shadow(outer);
+        let shadow_css = ":host(:hover) {font-size:21px} :host(:hover) .x {color:rgb(2, 0, 0)} \
+             :host(:active) .y {padding-left:5px} :host(:focus-within) .x {text-decoration:underline} \
+             ::slotted(:hover) {line-height:3} :host(:hover) ::slotted(.y) {height:3px} \
+             ::slotted(:focus) {width:4px} ::slotted(:active) {padding-left:6px} \
+             slot:hover::slotted(*) {color:rgb(0, 0, 2)} .x:hover > .y {font-size:13px} \
+             :focus {height:7px} .x:active {width:8px} :host(:not(:hover)) .y {line-height:4}";
+        let mut elements = vec![
+            dom.get_by_id("l0").unwrap(),
+            dom.get_by_id("l1").unwrap(),
+            dom.get_by_id("l2").unwrap(),
+            dom.get_by_id("l3").unwrap(),
+            dom.get_by_id("l4").unwrap(),
+            dom.get_by_id("s0").unwrap(),
+            dom.get_by_id("s1").unwrap(),
+            outer,
+        ];
+        let build = |dom: &mut Dom, root: NodeId, elements: &mut Vec<NodeId>| {
+            let style = dom.create_element("style");
+            let text = dom.create_text(shadow_css);
+            dom.append(style, text);
+            dom.append(root, style);
+            let wrap = dom.create_element("div");
+            dom.set_attr(wrap, "class", "x");
+            let leaf = dom.create_element("span");
+            dom.set_attr(leaf, "class", "y");
+            dom.set_attr(leaf, "part", "p");
+            let text = dom.create_text("leaf");
+            dom.append(leaf, text);
+            let slot = dom.create_element("slot");
+            dom.append(wrap, leaf);
+            dom.append(wrap, slot);
+            dom.append(root, wrap);
+            elements.extend([wrap, leaf, slot]);
+            wrap
+        };
+        let outer_wrap = build(&mut dom, outer_root, &mut elements);
+        // A nested host forwards the outer slot's content through its own.
+        let inner = dom.create_element("x-inner");
+        dom.append(outer_wrap, inner);
+        let forward = dom.create_element("slot");
+        dom.append(inner, forward);
+        let inner_root = dom.attach_shadow(inner);
+        build(&mut dom, inner_root, &mut elements);
+        elements.extend([inner, forward]);
+        (dom, elements)
+    }
+
+    #[test]
+    fn hover_active_and_focus_across_shadow_trees_match_full_recascade() {
+        for seed in [
+            0x2545_f491_4f6c_dd1du64,
+            0x9e37_79b9_7f4a_7c15,
+            0xdead_beef_cafe_f00d,
+        ] {
+            random_shadow_states(seed, 400);
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn stress_random_shadow_states() {
+        for seed in 1..=60u64 {
+            random_shadow_states(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1, 800);
+        }
+    }
+
+    fn random_shadow_states(seed: u64, steps: usize) {
+        // Selectors 4 #the-hover-pseudo, #the-focus-within-pseudo, HTML
+        // #selector-active and #selector-focus, across CSS Shadow 1
+        // #host-selector, #slotted-pseudo, #part and #flattening: state
+        // changes in a fixed pseudo-random order, interleaved with class
+        // writes, must agree with a full recascade after every step.
+        let (mut dom, elements) = shadow_state_document();
+        assert_style_values_match_cold(&mut dom);
+        let mut state = seed;
+        let mut next = |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % bound as u64) as usize
+        };
+        let classes = ["a", "b", "c", "x", "y"];
+        for _ in 0..steps {
+            let pick = next(elements.len() + 1);
+            let node = elements.get(pick).copied();
+            match next(4) {
+                0 => {
+                    dom.set_hover_chain(node);
+                }
+                1 => dom.set_active_element(node),
+                2 => dom.set_focused_area(DOCUMENT, node),
+                _ => {
+                    let node = node.unwrap_or(elements[0]);
+                    let tokens: Vec<_> = classes.iter().filter(|_| next(3) == 0).copied().collect();
+                    dom.set_attr(node, "class", &tokens.join(" "));
+                }
+            }
+            assert_style_values_match_cold(&mut dom);
+        }
+    }
+
+    #[test]
+    fn pointer_states_in_shadow_documents_restyle_only_their_subjects() {
+        // A press on shadow content makes the whole flat-tree chain up to
+        // <html> :active, :hover and (after focusing) :focus-within. None of
+        // that may expire every computed style, nor restyle the subtree of
+        // an ancestor no rule observes in that state.
+        let (mut dom, _) = shadow_state_document();
+        let stable = dom.get_by_id("l4").unwrap();
+        let outer = dom.get_by_id("outer").unwrap();
+        let shadow = dom.shadow_root(outer).unwrap();
+        let target = dom
+            .descendants(shadow)
+            .find(|&node| dom.attr(node, "part") == Some("p"))
+            .unwrap();
+        assert_style_values_match_cold(&mut dom);
+        let before = dom.cascaded_maps(stable);
+        let epoch = dom.style_value_epoch;
+        dom.set_hover_chain(Some(target));
+        dom.set_active_element(Some(target));
+        dom.set_focused_area(DOCUMENT, Some(target));
+        assert_eq!(
+            dom.computed_value_resolved(target, "padding-left")
+                .as_deref(),
+            Some("9px"),
+            "x-outer:active::part(p)"
+        );
+        assert_eq!(dom.font_px(outer), 12., "x-outer:active");
+        assert_eq!(
+            dom.computed_value_resolved(target, "color").as_deref(),
+            Some("rgb(0, 9, 0)"),
+            "x-outer::part(p):hover"
+        );
+        assert_eq!(
+            dom.style_value_epoch, epoch,
+            "a pointer state expired every style"
+        );
+        assert!(
+            std::rc::Rc::ptr_eq(&before, &dom.cascaded_maps(stable)),
+            "an unrelated branch was restyled"
+        );
+        assert_style_values_match_cold(&mut dom);
+        let before = dom.cascaded_maps(stable);
+        let epoch = dom.style_value_epoch;
+        dom.set_active_element(None);
+        dom.set_hover_chain(None);
+        dom.set_focused_area(DOCUMENT, None);
+        assert_eq!(
+            dom.style_value_epoch, epoch,
+            "a pointer release expired every style"
+        );
+        assert!(std::rc::Rc::ptr_eq(&before, &dom.cascaded_maps(stable)));
+        assert_style_values_match_cold(&mut dom);
+    }
+
     #[test]
     fn detached_shadow_inheritance_and_adoption_expire_cross_tree_styles() {
         let mut dom = Dom::parse_document("<body>live document</body>");
@@ -3123,22 +3306,91 @@ mod tests {
     }
 
     #[test]
-    fn focus_in_a_shadow_including_tree_keeps_the_complete_fallback() {
+    fn route_guards_need_their_ancestors_and_host_rules_their_own_shadow_tree() {
+        // Selectors 4 #descendant-combinators: `.menu :focus` cannot match
+        // an element without a `.menu` ancestor, whatever its focus. CSS
+        // Shadow 1 #host-selector: `:host(.on)` is evaluated in the context
+        // of the shadow tree holding it, so it cannot select another host.
+        let mut dom = Dom::parse_document(
+            "<style>.menu :focus{color:red} .menu :active{width:3px}</style>\
+             <nav class=menu><a id=inside href=#>in</a></nav>\
+             <main><a id=outside href=#>out</a><div id=a></div><div id=b></div></main>",
+        );
+        let (a, b) = (dom.get_by_id("a").unwrap(), dom.get_by_id("b").unwrap());
+        let shadow_a = dom.attach_shadow(a);
+        let style = dom.create_element("style");
+        let css = dom.create_text(":host(.on) .x{color:rgb(0, 0, 255)}");
+        dom.append(style, css);
+        dom.append(shadow_a, style);
+        let leaf = |dom: &mut Dom, shadow| {
+            let span = dom.create_element("span");
+            dom.set_attr(span, "class", "x");
+            dom.append(shadow, span);
+            span
+        };
+        let a_leaf = leaf(&mut dom, shadow_a);
+        let shadow_b = dom.attach_shadow(b);
+        let b_leaf = leaf(&mut dom, shadow_b);
+        let selectors = |dom: &Dom, node| {
+            let _ = dom.matched_rules(node);
+            dom.selector_cache
+                .borrow()
+                .get(node, dom.selector_epoch)
+                .unwrap()
+                .clone()
+        };
+        assert_style_values_match_cold(&mut dom);
+
+        let outside = dom.get_by_id("outside").unwrap();
+        let before = selectors(&dom, outside);
+        focus(&mut dom, Some("outside"));
+        dom.set_active_element(Some(outside));
+        assert!(std::rc::Rc::ptr_eq(&before, &selectors(&dom, outside)));
+        focus(&mut dom, Some("inside"));
+        dom.set_active_element(dom.get_by_id("inside"));
+        assert_eq!(value_of(&dom, "inside", "color").as_deref(), Some("red"));
+        assert_eq!(value_of(&dom, "inside", "width").as_deref(), Some("3px"));
+        assert_style_values_match_cold(&mut dom);
+
+        let before = selectors(&dom, b_leaf);
+        dom.set_attr(b, "class", "on");
+        assert!(std::rc::Rc::ptr_eq(&before, &selectors(&dom, b_leaf)));
+        assert_ne!(
+            dom.computed_value_resolved(b_leaf, "color").as_deref(),
+            Some("rgb(0, 0, 255)")
+        );
+        dom.set_attr(a, "class", "on");
+        assert_eq!(
+            dom.computed_value_resolved(a_leaf, "color").as_deref(),
+            Some("rgb(0, 0, 255)")
+        );
+        assert_style_values_match_cold(&mut dom);
+    }
+
+    #[test]
+    fn focus_in_a_shadow_including_tree_restyles_only_its_subjects() {
+        // CSS Shadow 1 #host-selector, #slotted-pseudo: routes reach across
+        // trees only through `:host()` and `::slotted()`, so focus moving
+        // into or out of a shadow tree need not expire every style.
         let mut dom = Dom::parse_document(
             "<style>.wrap:focus-within .hint{color:red}</style>\
-             <div class=wrap><input id=a><p class=hint id=hint>h</p></div><x-host id=host></x-host>",
+             <div class=wrap><input id=a><p class=hint id=hint>h</p></div><x-host id=host></x-host>\
+             <aside><span id=stable>independent</span></aside>",
         );
         let host = dom.get_by_id("host").unwrap();
         let shadow = dom.attach_shadow(host);
         let inner = dom.create_element("button");
         dom.append(shadow, inner);
         assert_ne!(value_of(&dom, "hint", "color").as_deref(), Some("red"));
+        let before = cached(&dom, "stable");
         let epoch = dom.style_value_epoch;
         focus(&mut dom, Some("a"));
-        assert_ne!(dom.style_value_epoch, epoch);
+        assert_eq!(dom.style_value_epoch, epoch);
         assert_eq!(value_of(&dom, "hint", "color").as_deref(), Some("red"));
         dom.set_focused_area(DOCUMENT, Some(inner));
+        assert_eq!(dom.style_value_epoch, epoch);
         assert_ne!(value_of(&dom, "hint", "color").as_deref(), Some("red"));
+        assert!(std::rc::Rc::ptr_eq(&before, &cached(&dom, "stable")));
         assert_matches_full_scan(&dom);
         assert_style_values_match_cold(&mut dom);
     }

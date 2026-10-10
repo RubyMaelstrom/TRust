@@ -109,8 +109,7 @@ pub(super) const VALIDITY_DEPENDENCY: &str = "\0validity";
 /// The dependency name of a select's drop-down box or an input's picker
 /// opening or closing (`:open`).
 pub(super) const OPEN_DEPENDENCY: &str = "\0open";
-/// The dependency names of `:active` and of a media element's muted state.
-pub(super) const ACTIVE_DEPENDENCY: &str = "\0active";
+/// The dependency name of a media element's muted state.
 pub(super) const MUTED_DEPENDENCY: &str = "\0muted";
 
 impl ElementState {

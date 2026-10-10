@@ -37,8 +37,9 @@ impl Dom {
     /// #the-focus-within-pseudo (local HTML e5071a20, CSSWG 81c27f68).
     /// Focus can restyle descendants, siblings, :has() subjects and shadow
     /// scopes. The elements whose state changes are known exactly, so the
-    /// selector dependency routes name the subjects to restyle; shadow trees
-    /// keep the whole-render fallback. Repeated focus is a no-op.
+    /// selector dependency routes, including the `:host()` and `::slotted()`
+    /// routes across shadow trees, name the subjects to restyle. Repeated
+    /// focus is a no-op.
     pub(crate) fn set_focused_area(&mut self, document: NodeId, target: Option<NodeId>) {
         let target = target.filter(|&node| {
             self.is_valid(node)

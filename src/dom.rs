@@ -2534,6 +2534,58 @@ impl Dom {
             }
         }
 
+        // CSS Shadow 1 #slotted-pseudo: a shadow tree's `::slotted()` rule
+        // selects the elements assigned, after flattening, to its slots.
+        // They belong to other trees, so the buckets above never offer them
+        // the rule; hovering can change its argument's or its slot's match.
+        type SlottedHoverSnapshot = (NodeId, Vec<(NodeId, NodeId)>, Vec<(NodeId, u32, bool)>);
+        let hover_slotted: Vec<(NodeId, u32)> = index
+            .slotted_rules
+            .iter()
+            .copied()
+            .filter(|&(scope, ri)| {
+                index
+                    .scopes
+                    .get(&scope)
+                    .and_then(|rules| rules.get(ri as usize))
+                    .is_some_and(|rule| rule_affects_render(rule) && rule_uses_hover(rule))
+            })
+            .collect();
+        let mut old_slotted: Vec<SlottedHoverSnapshot> = Vec::new();
+        if !hover_slotted.is_empty() {
+            let scopes: FxHashSet<NodeId> = hover_slotted.iter().map(|&(scope, _)| scope).collect();
+            let mut assigned: Vec<NodeId> = scopes
+                .into_iter()
+                .flat_map(|scope| {
+                    self.descendants(scope)
+                        .filter(|&node| self.tag_name(node) == Some("slot"))
+                        .collect::<Vec<_>>()
+                })
+                .flat_map(|slot| self.flat_assigned_slot_nodes(slot))
+                .filter(|&node| self.tag_name(node).is_some())
+                .collect();
+            assigned.sort_unstable();
+            assigned.dedup();
+            for id in assigned {
+                let slots = index.slotted_assignments(self, id);
+                let matches: Vec<_> = hover_slotted
+                    .iter()
+                    .filter(|&&(scope, _)| slots.iter().any(|&(slot_scope, _)| slot_scope == scope))
+                    .map(|&(scope, ri)| {
+                        let rule = &index.scopes[&scope][ri as usize];
+                        (
+                            scope,
+                            ri,
+                            self.slotted_rule_matches(id, scope, rule, &slots),
+                        )
+                    })
+                    .collect();
+                if !matches.is_empty() {
+                    old_slotted.push((id, slots, matches));
+                }
+            }
+        }
+
         // CSS Shadow 1 #part: `::part()` rules are matched across trees by
         // the cascade, outside the hover buckets. A hover change on a part
         // element (`::part(x):hover`) or on a shadow host (`x:hover::part(y)`)
@@ -2560,6 +2612,14 @@ impl Dom {
         let mut changed: FxHashMap<NodeId, DirtyKind> = FxHashMap::default();
         for element in part_hover {
             changed.insert(element, DirtyKind::Attr);
+        }
+        for (id, slots, prior) in old_slotted {
+            if prior.into_iter().any(|(scope, ri, was)| {
+                let rule = &index.scopes[&scope][ri as usize];
+                was != self.slotted_rule_matches(id, scope, rule, &slots)
+            }) {
+                changed.insert(id, DirtyKind::Attr);
+            }
         }
         for (id, scope, prior) in old {
             let rules = &index.scopes[&scope];
@@ -2616,21 +2676,16 @@ impl Dom {
             return false;
         }
         // Selectors 4 #the-hover-pseudo: the comparison above identifies
-        // every changed rule subject, including relational/sibling selectors.
-        // CSS Cascade 5 #inheriting also requires restyling its descendants,
-        // but unrelated branches retain their computed styles and layout.
-        // Keep the broad fallback for cross-tree inheritance/distribution.
-        if changed
-            .keys()
-            .all(|&node| !self.shadow_style_dependencies(node))
-        {
-            for &node in changed.keys() {
-                self.invalidate_style_subtree(node, true);
-            }
-            self.mark_dom_revision();
-        } else {
-            self.mark();
+        // every changed rule subject, including relational/sibling selectors
+        // and, across shadow trees, `:host()`, `::slotted()` and `::part()`
+        // subjects. CSS Cascade 5 #inheriting also requires restyling their
+        // descendants, which follows the flat tree (CSS Shadow 1
+        // #flattening), but unrelated branches retain their computed styles
+        // and layout. Hovering never reassigns slots.
+        for &node in changed.keys() {
+            self.invalidate_style_subtree(node, true);
         }
+        self.mark_dom_revision();
         for (&node, &kind) in &changed {
             self.record_geometry_dirty(node, kind);
         }
@@ -22009,7 +22064,8 @@ impl HoverProbe {
 }
 
 /// Whether `:hover` occurs anywhere INSIDE the compound's logical arguments
-/// (`:is`/`:where`/`:not`/`:host(...)`) — as opposed to directly on it.
+/// (`:is`/`:where`/`:not`/`:host(...)`/`::slotted(...)`) — as opposed to
+/// directly on it.
 fn compound_has_nested_hover(c: &Compound) -> bool {
     c.nots.iter().flatten().any(|n| {
         n.0.iter()
@@ -22032,10 +22088,10 @@ fn compound_has_nested_hover(c: &Compound) -> bool {
                 .any(|(_, inner)| inner.hover || compound_has_nested_hover(inner))
         }),
         _ => false,
-    }) || c
-        .host_inner
-        .as_deref()
-        .is_some_and(|h| h.hover || compound_has_nested_hover(h))
+    }) || [c.host_inner.as_deref(), c.slotted.as_deref()]
+        .into_iter()
+        .flatten()
+        .any(|inner| inner.hover || compound_has_nested_hover(inner))
 }
 
 fn rule_uses_hover(rule: &StyleRule) -> bool {

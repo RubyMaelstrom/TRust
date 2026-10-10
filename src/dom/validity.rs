@@ -13,9 +13,10 @@
 //! `data-trust-*` attributes.
 
 use super::input::{
-    ACTIVE_DEPENDENCY, ElementState, MUTED_DEPENDENCY, OPEN_DEPENDENCY, VALIDITY_DEPENDENCY,
+    ElementState, MUTED_DEPENDENCY, OPEN_DEPENDENCY, VALIDITY_DEPENDENCY,
     parse_non_negative_integer,
 };
+use super::invalidation::LiveState;
 use super::{Dom, NodeId, StyleView};
 use crate::input::NumericType;
 
@@ -761,15 +762,28 @@ impl Dom {
             .filter(|(_, state)| state.active)
             .map(|(&node, _)| node)
             .collect();
+        let mut changed = Vec::new();
         for &node in previous.iter().filter(|node| !chain.contains(node)) {
             self.update_control_state(node, |state| state.active = false);
-            self.touch_attr(node, ACTIVE_DEPENDENCY);
+            changed.push((node, LiveState::Active));
         }
         for node in chain {
             if !previous.contains(&node) {
                 self.update_control_state(node, |state| state.active = true);
-                self.touch_attr(node, ACTIVE_DEPENDENCY);
+                changed.push((node, LiveState::Active));
             }
+        }
+        if changed.is_empty() {
+            return;
+        }
+        // Like the focus update steps: the state is no attribute and no
+        // presentational hint, so only the selector subjects its routes
+        // reach (and their flat-tree descendants) restyle, never every
+        // element under the activated chain's root.
+        changed.sort_unstable_by_key(|&(node, _)| node);
+        let index = self.style_index();
+        if !self.invalidate_live_state(&index, &changed) {
+            self.touch();
         }
     }
 

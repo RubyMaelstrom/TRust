@@ -5,6 +5,9 @@
 //! mutated element: testing only its new value would lose former matches.
 //! `:has()` reverses the path to its anchor, while `:nth-child(of S)` fans out
 //! from changed membership to inclusive siblings before resuming the outer path.
+//! The guard a path starts from also requires the tags, ids and classes that
+//! its selector's descendant and child combinators demand of ancestors, which
+//! no mutation of the element itself changes (`AncestorKey`).
 //! See https://drafts.csswg.org/selectors-4/#match-a-selector-against-an-element
 //! (local CSSWG snapshot 81c27f68690138345b2b3b6af8ccc42dad3dca1d).
 //!
@@ -12,9 +15,10 @@
 //! except where CSS Shadow 1 (formerly CSS Scoping 1, same snapshot) lets a
 //! shadow tree's rules reach a host or its slottables: `:host()` tests the
 //! host in its own context while its compound's combinators continue inside
-//! the shadow tree (#host-element-in-tree, #host-selector), and
-//! `::slotted()` represents the elements assigned, after flattening, to a
-//! slot (#slotted-pseudo). Inheritance follows the flat tree (#flattening);
+//! the shadow tree (#host-element-in-tree, #host-selector), so it reaches only
+//! a host whose shadow tree holds the rule, and `::slotted()` represents the
+//! elements assigned, after flattening, to a slot (#slotted-pseudo).
+//! Inheritance follows the flat tree (#flattening);
 //! `Dom::apply_style_invalidations` restyles flat-tree descendants of every
 //! subject, so these paths need only name the subjects themselves.
 
@@ -40,9 +44,76 @@ enum Axis {
     HostScope,
     /// From a slot to the elements assigned to it after flattening.
     Assigned,
+    /// The element itself when it is assigned to a slot: only such an
+    /// element can be a `::slotted()` subject.
+    Slottable,
     /// From an element whose validity inputs changed to the elements whose
     /// validity pseudo-classes can change (`Dom::validity_subjects`).
     Validity,
+}
+
+/// A tag, id or class that some ancestor of an element must carry for a
+/// compound to match it: those of the compounds left of a descendant or
+/// child combinator (Selectors 4 #descendant-combinators,
+/// #child-combinators), each an ancestor of every compound to its right.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum AncestorKey {
+    Tag(String),
+    Id(String),
+    Class(String),
+}
+
+impl AncestorKey {
+    /// The keys of the compounds left of `selector.0[index]` that must match
+    /// its ancestors. Shadow-crossing compounds (`:host`, `::part()`,
+    /// `::slotted()`) contribute none.
+    fn of(selector: &Complex, index: usize) -> Vec<Self> {
+        let mut keys = Vec::new();
+        for (left, (following, _)) in selector.0[..index].iter().zip(&selector.0[1..=index]) {
+            let compound = &left.1;
+            if !matches!(following, Combinator::Child | Combinator::Descendant)
+                || compound.host
+                || compound.part.is_some()
+                || compound.slotted.is_some()
+            {
+                continue;
+            }
+            if let Some(tag) = compound.tag.as_ref().filter(|tag| tag.as_str() != "*") {
+                keys.push(Self::Tag(tag.clone()));
+            }
+            if let Some(id) = &compound.id {
+                keys.push(Self::Id(id.clone()));
+            }
+            keys.extend(compound.classes.iter().cloned().map(Self::Class));
+        }
+        keys
+    }
+
+    /// Whether a shadow-including ancestor of `node` carries the key: a
+    /// superset of the ancestors selector matching walks in `node`'s tree.
+    fn present(&self, dom: &Dom, node: NodeId) -> bool {
+        let mut current = dom.parent_composed(node);
+        while let Some(ancestor) = current {
+            if match self {
+                Self::Tag(tag) => dom.tag_name(ancestor) == Some(tag.as_str()),
+                Self::Id(id) => dom.attr(ancestor, "id") == Some(id.as_str()),
+                Self::Class(class) => {
+                    dom.tag_name(ancestor).is_some()
+                        && dom.matches_classes(ancestor, std::slice::from_ref(class))
+                }
+            } {
+                return true;
+            }
+            current = dom.parent_composed(ancestor);
+        }
+        false
+    }
+
+    fn retained_bytes(&self) -> usize {
+        match self {
+            Self::Tag(text) | Self::Id(text) | Self::Class(text) => text.capacity(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -52,6 +123,14 @@ struct Step {
     id: Option<String>,
     classes: Vec<String>,
     attributes: Vec<String>,
+    /// A `HostScope` step's rule (its data's address): only a host whose
+    /// own shadow tree holds the rule can match its `:host`.
+    rule: usize,
+    /// On the guard of the compound a route starts from: keys its element's
+    /// ancestors must carry. A mutation never changes its node's strict
+    /// ancestors, so lacking one, the element matched before and matches
+    /// after neither.
+    ancestors: Vec<AncestorKey>,
 }
 
 impl Step {
@@ -62,6 +141,8 @@ impl Step {
             id: None,
             classes: Vec::new(),
             attributes: Vec::new(),
+            rule: 0,
+            ancestors: Vec::new(),
         }
     }
 
@@ -89,11 +170,18 @@ impl Step {
             && self.attributes.iter().all(|attribute| {
                 node == changed && name == attribute || dom.attr(node, attribute).is_some()
             })
+            && self.ancestors.iter().all(|key| key.present(dom, node))
     }
 
     fn retained_bytes(&self) -> usize {
         self.tag.as_ref().map_or(0, String::capacity)
             + self.id.as_ref().map_or(0, String::capacity)
+            + self.ancestors.capacity() * std::mem::size_of::<AncestorKey>()
+            + self
+                .ancestors
+                .iter()
+                .map(AncestorKey::retained_bytes)
+                .sum::<usize>()
             + [&self.classes, &self.attributes]
                 .into_iter()
                 .map(|v| {
@@ -164,15 +252,18 @@ struct Route {
 
 /// Element states held by Document state rather than attributes or the
 /// tree: HTML #selector-focus, Selectors 4 #the-focus-within-pseudo (both
-/// changed by the focus update steps) and HTML #selector-target (changed by
-/// scrolling to a fragment). Their routes start at an element whose state
-/// changed.
+/// changed by the focus update steps), HTML #selector-target (changed by
+/// scrolling to a fragment) and HTML #selector-active (changed by pointer and
+/// key activation). Their routes start at an element whose state changed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::dom) enum LiveState {
     Focus,
     FocusWithin,
     Target,
+    Active,
 }
+
+const LIVE_STATES: usize = 4;
 
 /// Overflow expires optional caches; it NEVER truncates selector matching or
 /// document content. Deduplication keeps repeated utility rules cheap.
@@ -182,12 +273,12 @@ pub(super) struct Dependencies {
     classes: FxHashMap<String, FxHashSet<Route>>,
     /// Indexed by `LiveState`; kept apart from `attributes` so that no
     /// author attribute name can alias a state.
-    states: [FxHashSet<Route>; 3],
+    states: [FxHashSet<Route>; LIVE_STATES],
     broad: FxHashSet<String>,
     /// A state inside an argument these paths cannot follow (such as a
     /// `:has()` in `:host()`), which takes the complete fallback. Indexed by
     /// `LiveState`.
-    broad_states: [bool; 3],
+    broad_states: [bool; LIVE_STATES],
     overflow: bool,
     routes: usize,
     steps: usize,
@@ -195,6 +286,8 @@ pub(super) struct Dependencies {
     /// A validity pseudo-class or `:default` occurs: changes that move a
     /// control between form owners or radio groups take the fallback.
     form_state: bool,
+    /// The rule being recorded (its data's address), for `HostScope` steps.
+    rule: usize,
 }
 
 /// Where a dependency path starts: an attribute (or class token) name, or a
@@ -205,7 +298,8 @@ enum Source<'a> {
 }
 
 impl Dependencies {
-    pub(super) fn record(&mut self, selector: &Complex) {
+    pub(super) fn record(&mut self, selector: &Complex, rule: usize) {
+        self.rule = rule;
         self.complex(selector, &[], false);
     }
 
@@ -275,19 +369,38 @@ impl Dependencies {
                 path.push(Step::compound(Axis::Assigned, slotted));
             }
             path.extend_from_slice(outer);
-            self.compound(compound, &path, broad);
+            self.compound_within(compound, &path, broad, AncestorKey::of(selector, index));
         }
     }
 
     fn compound(&mut self, compound: &Compound, path: &[Step], broad: bool) {
+        self.compound_within(compound, path, broad, Vec::new());
+    }
+
+    /// Record `compound`'s dependencies; `ancestors` are the keys its
+    /// complex selector requires of the element's ancestors.
+    fn compound_within(
+        &mut self,
+        compound: &Compound,
+        path: &[Step],
+        broad: bool,
+        ancestors: Vec<AncestorKey>,
+    ) {
         // A `:host` compound matches the host, whose combinators lead into
         // its shadow tree rather than along the host's own light tree.
-        let host_scope = [Step::new(Axis::HostScope, &None)];
+        let host_scope = [Step {
+            rule: self.rule,
+            ..Step::new(Axis::HostScope, &None)
+        }];
         let path = if compound.host { &host_scope[..] } else { path };
         // `:host:has()` reads the shadow tree as the host's children, which
         // the reverse light-tree axes below cannot climb back out of.
         let broad = broad || (compound.host && !compound.has.is_empty());
-        let mut guarded_path = vec![Step::compound(Axis::SelfOnly, compound)];
+        let mut guard = Step::compound(Axis::SelfOnly, compound);
+        if !compound.host {
+            guard.ancestors = ancestors;
+        }
+        let mut guarded_path = vec![guard];
         guarded_path.extend_from_slice(path);
         let path = guarded_path.as_slice();
         // Keep this exhaustive: adding a selector requires a dependency choice.
@@ -377,7 +490,11 @@ impl Dependencies {
         if let Some(inner) = slotted {
             // CSS Shadow 1 #slotted-pseudo: the argument tests the assigned
             // element itself, which is then the subject.
-            self.compound(inner, &[], broad || !inner.has.is_empty());
+            self.compound(
+                inner,
+                &[Step::new(Axis::Slottable, &None)],
+                broad || !inner.has.is_empty(),
+            );
         }
         for state in states {
             let (names, inherited): (&[&str], bool) = match state {
@@ -505,8 +622,11 @@ impl Dependencies {
                 // `headingreset`.
                 StatePseudo::Heading(None) => (&[], false),
                 // HTML #selector-active: `set_active_element` names every
-                // element whose state flips.
-                StatePseudo::Active => (&[super::super::input::ACTIVE_DEPENDENCY], false),
+                // element whose state flips, its flat-tree ancestors included.
+                StatePseudo::Active => {
+                    self.add_source(Source::State(LiveState::Active), tag, path, broad);
+                    continue;
+                }
                 StatePseudo::Media(_) => (&[super::super::input::MUTED_DEPENDENCY, "muted"], false),
                 StatePseudo::Heading(Some(_)) => (&["headingoffset", "headingreset"], true),
             };
@@ -664,15 +784,25 @@ impl Dependencies {
                                 }
                             }
                         }
+                        // CSS Shadow 1 #host-selector: `:host` and `:host()`
+                        // match nothing but a shadow host, and only "in the
+                        // context of" its own shadow tree.
                         Axis::HostScope => {
-                            visit(node)?;
-                            if let Some(shadow) = dom.shadow_root(node) {
+                            if let Some(shadow) = dom.shadow_root(node)
+                                && dom.shadow_tree_holds_rule(shadow, step.rule)
+                            {
+                                visit(node)?;
                                 for id in dom.descendants(shadow) {
                                     visit(id)?;
                                 }
+                                for id in dom.child_iter(node) {
+                                    visit(id)?;
+                                }
                             }
-                            for id in dom.child_iter(node) {
-                                visit(id)?;
+                        }
+                        Axis::Slottable => {
+                            if dom.assigned_slot(node).is_some() {
+                                visit(node)?;
                             }
                         }
                         Axis::Assigned => {
