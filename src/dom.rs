@@ -2935,6 +2935,12 @@ impl Dom {
     /// "style epoch never advances without the main epoch" invariant.
     #[track_caller]
     fn touch_style(&mut self) {
+        if casc_diag_on() {
+            eprintln!(
+                "DIAGINVALID sheet-set document caller={}",
+                std::panic::Location::caller()
+            );
+        }
         self.style_epoch = self.style_epoch.wrapping_add(1);
         self.touch();
     }
@@ -2942,14 +2948,27 @@ impl Dom {
     /// A style-sheet-set mutation rooted at `scope`. Connected style changes
     /// can restyle arbitrary rendered descendants and therefore remain a full
     /// invalidation. A disconnected tree has no effect on the rendered
-    /// document (DOM connectedness / HTML style processing), but its CSSOM and
-    /// cascade epoch still change; retain the concrete target so the live-page
-    /// pipeline can discard it as detached. If that tree is later inserted,
-    /// the insertion path independently invalidates the connected sheet set.
+    /// document (DOM connectedness / HTML style processing): HTML
+    /// #update-a-style-block creates a style element's sheet only while it is
+    /// connected, and the parsed style index holds only connected trees'
+    /// sheets and adopted sheets, so the index stays current and the style
+    /// epoch does not advance. (A stale index would deny every later
+    /// mutation of the live document its local invalidation proof.) The
+    /// concrete target is retained so the live-page pipeline can discard it as
+    /// detached. If that tree is later inserted, `subtree_has_style` finds its
+    /// sheets and the insertion invalidates the connected sheet set.
     #[track_caller]
     fn touch_style_at(&mut self, scope: NodeId) {
-        self.style_epoch = self.style_epoch.wrapping_add(1);
-        if self.is_connected(scope) {
+        let connected = self.is_connected(scope);
+        if casc_diag_on() {
+            eprintln!(
+                "DIAGINVALID sheet-set scope={scope} tag={:?} connected={connected} caller={}",
+                self.tag_name(scope),
+                std::panic::Location::caller()
+            );
+        }
+        if connected {
+            self.style_epoch = self.style_epoch.wrapping_add(1);
             // A stylesheet invalidates its whole tree scope, so the frontend still needs the
             // conservative full-render signal. Retain the scope for geometry separately: HTML's
             // child Document cannot restyle the navigable container in its container Document.
@@ -2993,20 +3012,30 @@ impl Dom {
     fn tree_mutation_changes_style(&self, parent: NodeId, child: NodeId) -> bool {
         match &self.nodes[child].data {
             NodeData::Text(_) => self.tag_name(parent) == Some("style"),
-            NodeData::Element { .. } | NodeData::Fragment => self.subtree_has_style(child),
+            // A child navigable's Document joins (or leaves) the composed
+            // tree whole, with the sheets it was built with.
+            NodeData::Element { .. } | NodeData::Fragment | NodeData::Document => {
+                self.subtree_has_style(child)
+            }
             _ => false,
         }
     }
 
     /// Whether `root`'s composed subtree (inclusive) contains a `<style>` or
-    /// `<link>` element, or a `<meta name=color-scheme>` (HTML
-    /// #meta-color-scheme re-runs on insertion and removal). Early-exits on
-    /// the first hit; a childless node is a single tag check.
+    /// `<link>` element, a shadow root with adopted style sheets, or a
+    /// `<meta name=color-scheme>` (HTML #meta-color-scheme re-runs on
+    /// insertion and removal). Early-exits on the first hit; a childless node
+    /// is a single tag check.
     fn subtree_has_style(&self, root: NodeId) -> bool {
         let mut stack = vec![root];
         while let Some(id) = stack.pop() {
             if matches!(self.tag_name(id), Some("style" | "link"))
                 || (self.tag_name(id) == Some("meta") && self.is_color_scheme_meta(id))
+                // CSSOM #dom-documentorshadowroot-adoptedstylesheets: a shadow
+                // root's adopted sheets join the connected sheet set with it.
+                || self
+                    .shadow_root(id)
+                    .is_some_and(|shadow| self.adopted_styles.contains_key(&shadow))
             {
                 return true;
             }
@@ -9713,6 +9742,9 @@ impl Dom {
             return idx.clone();
         }
         let t = std::time::Instant::now();
+        if casc_diag_on() {
+            eprintln!("DIAGINVALID style-index rebuild epoch={}", self.style_epoch);
+        }
         let built = self.build_style_index();
         let rules = built.scopes.values().map(|v| v.len() as u64).sum::<u64>();
         let us = t.elapsed().as_micros() as u64;

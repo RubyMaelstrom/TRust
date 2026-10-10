@@ -1566,12 +1566,27 @@ impl Dom {
             })
             .flatten();
         let Some((empty_siblings, restyle_children, relational_root)) = local else {
+            // Selector matching never leaves a tree and a detached tree has
+            // no rendered style: without a local proof, restyle the detached
+            // tree alone (as `invalidate_attribute_selectors` does). Repeated
+            // appends coalesce into one pending root until the next flush.
+            if !self.is_dom_connected(parent) {
+                let mut root = parent;
+                while let Some(parent) = self.parent_composed(root) {
+                    root = parent;
+                }
+                self.invalidate_style_subtree(root, true);
+                return;
+            }
             if casc_diag_on() {
                 let index = self.style_cache.borrow();
                 eprintln!(
-                    "DIAGINVALID structure node={parent} tag={:?} id={:?} slots={} dependencies={:?}",
+                    "DIAGINVALID structure node={parent} tag={:?} id={:?} connected={} style_epoch={} index_epoch={:?} slots={} dependencies={:?}",
                     self.tag_name(parent),
                     self.attr(parent, "id"),
+                    self.is_connected(parent),
+                    self.style_epoch,
+                    index.as_ref().map(|(epoch, _)| *epoch),
                     self.child_list_may_reassign_slots(parent, changed),
                     index.as_ref().map(|(epoch, index)| {
                         let dependencies = index.selector_dependencies.for_node(self, parent);
@@ -1925,6 +1940,58 @@ mod tests {
             dom.set_attr(child, "class", "wide");
         }
         assert!(std::rc::Rc::ptr_eq(&before, &dom.cascaded_maps(stable)));
+        assert_style_values_match_cold(&mut dom);
+    }
+
+    #[test]
+    fn detached_sheets_and_structure_leave_the_live_styles_and_index_current() {
+        // HTML #update-a-style-block creates a style element's sheet only
+        // while it is connected, so a detached tree's sheet and child-list
+        // churn neither stale the parsed index nor expire live styles; the
+        // insertion applies the sheet. Adopted sheets of a detached shadow
+        // root likewise apply when its host is inserted (CSSOM
+        // #dom-documentorshadowroot-adoptedstylesheets).
+        let mut dom = Dom::parse_document(
+            "<style>p:first-child{width:5px}</style><div id=live><p id=p>x</p></div>",
+        );
+        let (live, p) = (dom.get_by_id("live").unwrap(), dom.get_by_id("p").unwrap());
+        assert_eq!(dom.computed_value(p, "width").as_deref(), Some("5px"));
+        let stable = dom.cascaded_maps(p);
+        let (values, sheets) = (dom.style_value_epoch, dom.style_epoch);
+        let tree = dom.create_element("section");
+        let style = dom.create_element("style");
+        let css = dom.create_text("#p{height:7px} .late{color:rgb(1, 2, 3)}");
+        dom.append(style, css);
+        dom.append(tree, style);
+        for _ in 0..20 {
+            let child = dom.create_element("em");
+            dom.set_attr(child, "class", "late");
+            dom.append(tree, child);
+        }
+        let host = dom.create_element("x-host");
+        let root = dom.attach_shadow(host);
+        let inner = dom.create_element("b");
+        dom.append(root, inner);
+        dom.set_adopted_styles(root, "b{font-size:23px}");
+        dom.append(tree, host);
+        assert_eq!(dom.style_epoch, sheets, "a detached sheet staled the index");
+        assert_eq!(
+            dom.style_value_epoch, values,
+            "detached churn expired every style"
+        );
+        assert!(std::rc::Rc::ptr_eq(&stable, &dom.cascaded_maps(p)));
+        dom.append(live, tree);
+        assert_ne!(dom.style_epoch, sheets);
+        assert_eq!(dom.computed_value(p, "height").as_deref(), Some("7px"));
+        assert_eq!(dom.font_px(inner), 23.);
+        // A host whose only sheets are its shadow root's adopted ones.
+        let lone = dom.create_element("x-host");
+        let lone_root = dom.attach_shadow(lone);
+        let lone_inner = dom.create_element("i");
+        dom.append(lone_root, lone_inner);
+        dom.set_adopted_styles(lone_root, "i{font-size:29px}");
+        dom.append(live, lone);
+        assert_eq!(dom.font_px(lone_inner), 29.);
         assert_style_values_match_cold(&mut dom);
     }
 
