@@ -121,6 +121,12 @@ impl Dom {
         if previous.and_then(|p| p.natural) != presentation.and_then(|p| p.natural)
             || previous.is_none() != presentation.is_none()
         {
+            // The natural size sizes the box and fits the frame into it
+            // (`object-fit`), but unlike an image's it is not a URL read the
+            // layout memo observes, so retained boxes of the element and of
+            // the ancestors sized by it would otherwise outlive the change
+            // (a frame laid out before the metadata arrived stayed stretched).
+            self.invalidate_layout_paths([media]);
             self.image_changed(media);
         } else {
             self.replaced_pixels_changed(media);

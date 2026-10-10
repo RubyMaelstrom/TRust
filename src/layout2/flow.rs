@@ -4361,10 +4361,15 @@ impl Flow<'_> {
         x: f32,
         y: f32,
     ) -> Frag {
-        let natural = crate::responsive_image::density_corrected_size(
-            url.and_then(|url| super::memo::image_size(self.dom, self.images, url)),
-            density,
-        );
+        // A canvas's bitmap and a playing video's frames have natural
+        // dimensions of their own (`replaced::size` sizes by the same):
+        // `object-fit` fits them, not a poster's or a missing image's.
+        let natural = super::replaced::embedded_natural(self.dom, node).or_else(|| {
+            crate::responsive_image::density_corrected_size(
+                url.and_then(|url| super::memo::image_size(self.dom, self.images, url)),
+                density,
+            )
+        });
         // CSS Flexbox 1 #algo-cross-item: without a definite height the
         // hypothetical cross size comes through the natural ratio, which for
         // a ratio-only SVG is its viewBox's, not the default object size's.

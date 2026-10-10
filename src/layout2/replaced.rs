@@ -47,6 +47,22 @@ pub(crate) struct ImageInput<'a> {
     pub url: Option<&'a str>,
 }
 
+/// The natural dimensions of replaced content that is not an image
+/// resource: a canvas's bitmap (HTML #the-canvas-element), or the video of
+/// an inline media element once its player knows it (HTML
+/// #the-video-element). Every replaced layout path sizes and fits such
+/// content by these, ahead of any image URL's; `None` while the content
+/// has none.
+pub(crate) fn embedded_natural(dom: &Dom, node: NodeId) -> Option<(f32, f32)> {
+    let replacement = dom.content_replacement_image(node).is_some();
+    let media = dom.inline_media() && matches!(dom.tag_name(node), Some("video" | "audio"));
+    (!replacement)
+        .then(|| dom.canvas_size(node))
+        .flatten()
+        .or_else(|| media.then(|| dom.media_natural_size(node)).flatten())
+        .map(|(w, h)| (w as f32, h as f32))
+}
+
 /// Resolve a replaced element's used size. `natural` is the decoded
 /// intrinsic size in px when known. `None` = nothing determines a box (no
 /// natural size, no usable specified sizes, no ratio): the element renders
@@ -74,11 +90,7 @@ pub(crate) fn size(
         .then(|| dom.tag_name(node))
         .flatten()
         .filter(|tag| matches!(*tag, "video" | "audio"));
-    let natural = (!replacement)
-        .then(|| dom.canvas_size(node))
-        .flatten()
-        .or_else(|| media.and_then(|_| dom.media_natural_size(node)))
-        .map(|(w, h)| (w as f32, h as f32))
+    let natural = embedded_natural(dom, node)
         .or(natural)
         .or_else(|| (media == Some("audio")).then_some(AUDIO_CONTROLS))
         // CSS Content 3 #replaced: an unavailable replacement has zero
@@ -714,6 +726,95 @@ mod tests {
             rect(&fit("object-fit:cover", None, None)),
             (0.0, 0.0, 100.0, 100.0, false)
         );
+    }
+
+    /// The painted rectangle of the frame of video `surface` after laying
+    /// `dom` out again on its retained caches (as a live page's render does).
+    fn video_frame_rect(dom: &Dom, surface: u64) -> crate::render::CssRect {
+        let layout = crate::layout2::lay_out_graphical(
+            dom,
+            &url::Url::parse("https://example.test/").unwrap(),
+            crate::layout2::Viewport::new(400.0, 300.0),
+            &[],
+            &Default::default(),
+            &Default::default(),
+        );
+        layout
+            .paint
+            .primitives
+            .iter()
+            .find_map(|command| match command {
+                crate::render::DisplayCommand::Image { rect, handle, .. }
+                    if handle.video_surface() == Some(surface) =>
+                {
+                    Some(*rect)
+                }
+                _ => None,
+            })
+            .expect("the video paints its frame")
+    }
+
+    /// HTML Rendering #embedded-content-rendering-rules and
+    /// #the-video-element: a video's frame is the largest one that keeps its
+    /// aspect ratio within the element (`video { object-fit: contain }`), so
+    /// a frame whose size arrives after the first layout (the player's
+    /// metadata) letterboxes the element's already laid-out box. The natural
+    /// size is a layout input no retained computation observed as an image
+    /// read; the arrival must drop the element's cached boxes.
+    #[test]
+    fn a_video_whose_natural_size_arrives_later_is_letterboxed() {
+        for (name, container, video_style) in [
+            (
+                "in flow",
+                "width:300px;height:240px",
+                "width:300px;height:240px;display:block",
+            ),
+            (
+                "absolutely positioned",
+                "position:relative;width:300px;height:240px",
+                "position:absolute;inset:0;width:100%;height:100%",
+            ),
+            (
+                "absolutely positioned, auto margins",
+                "position:relative;width:300px;height:240px",
+                "position:absolute;top:0;right:0;bottom:0;left:0;width:100%;height:100%;margin:auto",
+            ),
+        ] {
+            let mut dom = Dom::parse_document(&format!(
+                "<!doctype html><body style='margin:0'><div style='{container}'>\
+                 <video id=v style='{video_style}'></video></div>"
+            ));
+            dom.set_inline_media(true);
+            let video = dom.get_by_id("v").unwrap();
+            let presentation = |natural| crate::dom::media::MediaPresentation {
+                surface: 11,
+                natural,
+                show_poster: false,
+                controls: None,
+            };
+            dom.set_media_presentation(video, Some(presentation(None)));
+            // No natural size yet: the frame fills the box.
+            assert_eq!(
+                video_frame_rect(&dom, 11),
+                crate::render::CssRect::new(0.0, 0.0, 300.0, 240.0),
+                "{name}"
+            );
+            // 96x64 (3:2) in 300x240 (5:4): 300x200, centered vertically.
+            dom.set_media_presentation(video, Some(presentation(Some((96, 64)))));
+            assert_eq!(
+                video_frame_rect(&dom, 11),
+                crate::render::CssRect::new(0.0, 20.0, 300.0, 200.0),
+                "{name}"
+            );
+            // A resize of the video (an adaptive stream switching
+            // renditions) lays the frame out again.
+            dom.set_media_presentation(video, Some(presentation(Some((64, 96)))));
+            assert_eq!(
+                video_frame_rect(&dom, 11),
+                crate::render::CssRect::new(70.0, 0.0, 160.0, 240.0),
+                "{name}"
+            );
+        }
     }
 
     /// css-images-3 #the-object-position: a `<position>` resolved with the
