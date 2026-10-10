@@ -2987,6 +2987,9 @@ mod desktop {
         // document has become inert (see `retire_if_inert`).
         let mut retirement_check_due = true;
 
+        // An interaction taken from the queue ahead of its turn (see the
+        // primary release below); it is the head of the interaction queue.
+        let mut interaction_lookahead: Option<PageCmd> = None;
         'event_loop: loop {
             if matches!(
                 interrupt.current_reason(),
@@ -2998,6 +3001,7 @@ mod desktop {
                 task_gc_defer_until = None;
             }
             let defer_task_gc = task_gc_defer_until.is_some()
+                || interaction_lookahead.is_some()
                 || !interactions.is_empty()
                 || hover.has_changed().unwrap_or(false);
             page.engine.defer_task_garbage_collection(defer_task_gc);
@@ -3075,7 +3079,10 @@ mod desktop {
                 count == 0 || (count < 8 && started.elapsed() < BACKGROUND_SERVICE_BUDGET)
             }) || interaction_burst_started
                 .is_some_and(|started| started.elapsed() >= input_burst_budget);
-            if !yield_interactions && let Ok(command) = interactions.try_recv() {
+            if !yield_interactions
+                && let Some(command) =
+                    next_interaction(&mut interaction_lookahead, &mut interactions)
+            {
                 immediate = Some(Wake::Interaction(Some(command)));
             } else if !yield_interactions && hover.has_changed().unwrap_or(false) {
                 immediate = Some(Wake::Hover(Some(*hover.borrow_and_update())));
@@ -3112,7 +3119,9 @@ mod desktop {
                 // No page-owned source was runnable, so drain the command lane
                 // without manufacturing an idle turn solely for alternation.
                 immediate = Some(Wake::Cmd(Some(command)));
-            } else if let Ok(command) = interactions.try_recv() {
+            } else if let Some(command) =
+                next_interaction(&mut interaction_lookahead, &mut interactions)
+            {
                 immediate = Some(Wake::Interaction(Some(command)));
             } else if hover.has_changed().unwrap_or(false) {
                 immediate = Some(Wake::Hover(Some(*hover.borrow_and_update())));
@@ -3256,6 +3265,44 @@ mod desktop {
 
             match wake {
                 Wake::Maintenance => {}
+                // UI Events #handle-native-mouse-click: the platform calls it
+                // "immediately after handle native mouse up for mouseups that
+                // generate clicks". The frontend queues the click it decided on
+                // in the same native event as the release, so once pointerup
+                // and mouseup have run the click is ordinarily waiting: run it
+                // in this task, with one rendering update. Anything else keeps
+                // its turn at the head of the interaction queue; a click not
+                // yet queued runs as the next task, as before.
+                Wake::Interaction(Some(PageCmd::PointerButton {
+                    node,
+                    pressed: false,
+                    x,
+                    y,
+                    button: 0,
+                    metadata,
+                })) => {
+                    prepare_interaction(&mut page, &interrupt);
+                    run_pointer_button(&mut page, node, false, x, y, 0, metadata);
+                    checkpoint(&mut page, "pointer button");
+                    // The frontend's own focus of the activated control rides
+                    // with the gesture too.
+                    let mut next = next_interaction(&mut interaction_lookahead, &mut interactions);
+                    while let Some(PageCmd::Focus(focus)) = next {
+                        run_focus(&mut page, focus);
+                        next = next_interaction(&mut interaction_lookahead, &mut interactions);
+                    }
+                    let released = match next {
+                        Some(PageCmd::Click(click)) => run_click(&mut page, &events, click),
+                        other => {
+                            interaction_lookahead = other;
+                            finish_task_with_ack(&mut page, &events, false)
+                        }
+                    };
+                    if !released {
+                        break;
+                    }
+                    prefer_command = false;
+                }
                 Wake::Interaction(Some(command)) | Wake::Cmd(Some(command)) => {
                     if !dispatch_command(&mut page, command, &events, &interrupt) {
                         break;
@@ -6009,37 +6056,7 @@ mod desktop {
                 metadata,
             } => {
                 prepare_interaction(page, interrupt);
-                // Selectors 4 #the-focus-visible-pseudo: pointer interaction;
-                // HTML #selector-active: the element actively pointed at.
-                if button == 0 {
-                    let mut dom = page.dom.borrow_mut();
-                    if pressed {
-                        dom.set_input_modality(false);
-                    }
-                    let target = node.filter(|&node| pressed && dom.is_valid(node));
-                    dom.set_active_element(target);
-                }
-                let (text_node, text_offset) = note_selection_gesture(page, metadata);
-                let _ = call_trust(
-                    page,
-                    "pointerButton",
-                    &[
-                        node.map_or(Value::Null, |node| Value::Num(node as f64)),
-                        Value::Bool(pressed),
-                        Value::Num(finite_or_zero(x)),
-                        Value::Num(finite_or_zero(y)),
-                        Value::Num(finite_or_zero(metadata.screen.map_or(x, |p| p.0))),
-                        Value::Num(finite_or_zero(metadata.screen.map_or(y, |p| p.1))),
-                        Value::Num(f64::from(button)),
-                        Value::Num(f64::from(metadata.modifier_bits())),
-                        Value::Bool(false),
-                        text_node,
-                        text_offset,
-                        Value::Bool(metadata.selection.is_some()),
-                        Value::Bool(metadata.bypass_context_menu),
-                    ],
-                    "pointer button",
-                );
+                run_pointer_button(page, node, pressed, x, y, button, metadata);
                 checkpoint(page, "pointer button");
                 finish_task_with_ack(page, events, false)
             }
@@ -6048,56 +6065,14 @@ mod desktop {
                 if matches!(command, PageCmd::KeyboardFocus(_)) {
                     page.dom.borrow_mut().set_input_modality(true);
                 }
-                let _ = call_trust(
-                    page,
-                    "focusPage",
-                    &[node.map_or(Value::Null, |node| Value::Num(node as f64))],
-                    "page focus",
-                );
-                checkpoint(page, "page focus");
+                run_focus(page, node);
                 // Focus has no frontend busy/settle request of its own. Its
                 // notification must not acknowledge a queued edit or click.
                 finish_task_with_ack(page, events, false)
             }
             PageCmd::Click(node) => {
                 prepare_interaction(page, interrupt);
-                let prevented = call_trust(page, "click", &[Value::Num(node as f64)], "click")
-                    .is_some_and(|value| page.engine.ctx().to_boolean(&value));
-                let anchor = if prevented {
-                    None
-                } else {
-                    call_trust(
-                        page,
-                        "followAnchorDefault",
-                        &[Value::Num(node as f64)],
-                        "hyperlink navigation",
-                    )
-                    .filter(|value| !value_is_nullish(value))
-                    .and_then(|value| value_to_string(page, &value))
-                    .filter(|value| !value.trim().is_empty())
-                };
-                checkpoint(page, "click");
-                if let Some((url, replace)) = take_navigation(page)
-                    .or_else(|| anchor.map(|url| hyperlink_navigation(page, url)))
-                {
-                    return send_navigation(page, events, url, replace);
-                }
-                let click_submit = take_click_submit(page);
-                if !finish_task_with_ack(page, events, click_submit.is_none()) {
-                    return false;
-                }
-                if let Some((form, submitter, submission)) = click_submit {
-                    // A form submission navigates (HTML #form-submission-algorithm).
-                    abort_for_navigation(page);
-                    return events
-                        .blocking_send(PageEvt::SubmitForm {
-                            form,
-                            submitter: Some(submitter),
-                            submission,
-                        })
-                        .is_ok();
-                }
-                true
+                run_click(page, events, node)
             }
             PageCmd::Key { node, input } => {
                 dispatch_key_command(page, events, interrupt, node, input, None)
@@ -6572,6 +6547,115 @@ mod desktop {
         let unchanged = previous.is_some_and(|(_, previous)| previous == report);
         state.selection_report = Some((epoch, report.clone()));
         (!unchanged).then_some(report)
+    }
+
+    fn next_interaction(
+        lookahead: &mut Option<PageCmd>,
+        interactions: &mut tokio::sync::mpsc::Receiver<PageCmd>,
+    ) -> Option<PageCmd> {
+        lookahead.take().or_else(|| interactions.try_recv().ok())
+    }
+
+    /// The frontend's focus of `node` (the document viewport when `None`).
+    fn run_focus(page: &mut LumenPage, node: Option<usize>) {
+        let _ = call_trust(
+            page,
+            "focusPage",
+            &[node.map_or(Value::Null, |node| Value::Num(node as f64))],
+            "page focus",
+        );
+        checkpoint(page, "page focus");
+    }
+
+    /// UI Events #handle-native-mouse-down / #handle-native-mouse-up for the
+    /// frontend's button transition, with their Pointer Events mapping.
+    fn run_pointer_button(
+        page: &mut LumenPage,
+        node: Option<usize>,
+        pressed: bool,
+        x: f64,
+        y: f64,
+        button: i16,
+        metadata: crate::js::PointerMetadata,
+    ) {
+        // Selectors 4 #the-focus-visible-pseudo: pointer interaction;
+        // HTML #selector-active: the element actively pointed at.
+        if button == 0 {
+            let mut dom = page.dom.borrow_mut();
+            if pressed {
+                dom.set_input_modality(false);
+            }
+            let target = node.filter(|&node| pressed && dom.is_valid(node));
+            dom.set_active_element(target);
+        }
+        let (text_node, text_offset) = note_selection_gesture(page, metadata);
+        let _ = call_trust(
+            page,
+            "pointerButton",
+            &[
+                node.map_or(Value::Null, |node| Value::Num(node as f64)),
+                Value::Bool(pressed),
+                Value::Num(finite_or_zero(x)),
+                Value::Num(finite_or_zero(y)),
+                Value::Num(finite_or_zero(metadata.screen.map_or(x, |p| p.0))),
+                Value::Num(finite_or_zero(metadata.screen.map_or(y, |p| p.1))),
+                Value::Num(f64::from(button)),
+                Value::Num(f64::from(metadata.modifier_bits())),
+                Value::Bool(false),
+                text_node,
+                text_offset,
+                Value::Bool(metadata.selection.is_some()),
+                Value::Bool(metadata.bypass_context_menu),
+            ],
+            "pointer button",
+        );
+    }
+
+    /// UI Events #send-click-event for the frontend's native click on
+    /// `node` (the pending pointer click target replaces it in the prelude),
+    /// then the activation's navigation or form submission, ending the task.
+    fn run_click(
+        page: &mut LumenPage,
+        events: &tokio::sync::mpsc::Sender<PageEvt>,
+        node: usize,
+    ) -> bool {
+        let prevented = call_trust(page, "click", &[Value::Num(node as f64)], "click")
+            .is_some_and(|value| page.engine.ctx().to_boolean(&value));
+        let anchor = if prevented {
+            None
+        } else {
+            call_trust(
+                page,
+                "followAnchorDefault",
+                &[Value::Num(node as f64)],
+                "hyperlink navigation",
+            )
+            .filter(|value| !value_is_nullish(value))
+            .and_then(|value| value_to_string(page, &value))
+            .filter(|value| !value.trim().is_empty())
+        };
+        checkpoint(page, "click");
+        if let Some((url, replace)) =
+            take_navigation(page).or_else(|| anchor.map(|url| hyperlink_navigation(page, url)))
+        {
+            return send_navigation(page, events, url, replace);
+        }
+        let click_submit = take_click_submit(page);
+        if !finish_task_with_ack(page, events, click_submit.is_none()) {
+            return false;
+        }
+        if let Some((form, submitter, submission)) = click_submit {
+            // A form submission navigates (HTML #form-submission-algorithm).
+            abort_for_navigation(page);
+            return events
+                .blocking_send(PageEvt::SubmitForm {
+                    form,
+                    submitter: Some(submitter),
+                    submission,
+                })
+                .is_ok();
+        }
+        true
     }
 
     fn prepare_interaction(page: &mut LumenPage, interrupt: &Arc<lumen::RuntimeInterrupt>) {
@@ -32119,6 +32203,121 @@ mod tests {
                     None => panic!("actor ended before reporting focus"),
                 }
             }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_primary_release_and_its_click_share_one_task() {
+        // UI Events #handle-native-mouse-click: the platform calls it
+        // "immediately after handle native mouse up" for a mouseup that
+        // generates a click, so no rendering update shows the mouseup without
+        // its click; the frontend's focus of the activated control, which it
+        // sends between them, rides along (d, u, f, c below). The slow
+        // mousedown holds the actor until the frontend's release and click are
+        // both queued, as one native event queues them.
+        let html = "<button id=b>go</button><input id=i><input id=j><output id=o></output><script>\
+            const o = document.getElementById('o'), b = document.getElementById('b');\
+            const log = (s) => { o.textContent += s; };\
+            b.addEventListener('mousedown', () => {\
+                log('d'); const t = performance.now(); while (performance.now() - t < 80) {}\
+            });\
+            b.addEventListener('mouseup', () => log('u'));\
+            b.addEventListener('click', () => log('c'));\
+            document.getElementById('i').addEventListener('focus', () => log('f'));\
+            document.getElementById('j').addEventListener('input', () => log('g'), {once: true});</script>";
+        let dom = Dom::parse_document(html);
+        let (button, input) = (dom.get_by_id("b").unwrap(), dom.get_by_id("i").unwrap());
+        let other = dom.get_by_id("j").unwrap();
+        let mut env = crate::js::PageEnv::bare(DEFAULT_URL);
+        env.terminal_presentation = false;
+        let (handle, mut events) = spawn_page(html.into(), env);
+        let pointer = |pressed| crate::js::PageCmd::PointerButton {
+            node: Some(button),
+            pressed,
+            x: 5.0,
+            y: 5.0,
+            button: 0,
+            metadata: Default::default(),
+        };
+        let output = |html: &str| {
+            let start = html.find("<output")?;
+            let open = start + html[start..].find('>')? + 1;
+            let close = open + html[open..].find("</output>")?;
+            Some(html[open..close].to_owned())
+        };
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !matches!(
+                events.recv().await,
+                Some(crate::js::PageEvt::Updated { .. })
+            ) {}
+            let mut seen = Vec::new();
+            for (gesture, expected) in [
+                (
+                    vec![
+                        pointer(true),
+                        pointer(false),
+                        crate::js::PageCmd::Click(button),
+                    ],
+                    "duc",
+                ),
+                (
+                    vec![
+                        pointer(true),
+                        pointer(false),
+                        crate::js::PageCmd::Focus(Some(input)),
+                        crate::js::PageCmd::Click(button),
+                    ],
+                    "ducdufc",
+                ),
+                // Any other command keeps its place ahead of the click.
+                (
+                    vec![
+                        pointer(true),
+                        pointer(false),
+                        crate::js::PageCmd::SetValue {
+                            node: other,
+                            value: String::from("x"),
+                            checked: None,
+                            commit: false,
+                        },
+                        crate::js::PageCmd::Click(button),
+                    ],
+                    "ducdufcdugc",
+                ),
+            ] {
+                for command in gesture {
+                    handle.try_send_user(command).unwrap();
+                }
+                loop {
+                    match events.recv().await {
+                        Some(crate::js::PageEvt::Updated { html, .. }) => {
+                            let Some(text) = output(&html) else { continue };
+                            if seen.last() != Some(&text) {
+                                seen.push(text.clone());
+                            }
+                            if text == expected {
+                                break;
+                            }
+                        }
+                        Some(crate::js::PageEvt::Trouble(errors)) => panic!("{errors:?}"),
+                        Some(_) => {}
+                        None => panic!("actor ended before the click; saw {seen:?}"),
+                    }
+                }
+            }
+            assert!(
+                seen.iter()
+                    .filter(|text| text.len() <= "ducdufc".len())
+                    .all(|text| !text.ends_with('u')),
+                "a rendering update showed a mouseup without its click: {seen:?}"
+            );
+            assert_eq!(
+                seen.last().map(String::as_str),
+                Some("ducdufcdugc"),
+                "{seen:?}"
+            );
         })
         .await
         .unwrap();
