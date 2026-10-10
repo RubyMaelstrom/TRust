@@ -1,4 +1,4 @@
-//! Audio output for media elements (and, later, Web Audio).
+//! Audio output for media elements and Web Audio.
 //!
 //! Like Firefox's cubeb and Chrome's audio service, each playing element
 //! gets its own stream on the platform's mixer, which mixes and resamples:
@@ -26,8 +26,11 @@ mod alsa;
 mod null;
 #[cfg(target_os = "linux")]
 mod pulse;
+mod tap;
 #[cfg(windows)]
 mod wasapi;
+
+pub use tap::Tap;
 
 /// The sample format of a stream: interleaved 32-bit float.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -191,6 +194,16 @@ impl Output {
             errors.push(String::from("no audio backend on this platform"));
         }
         Err(Error(errors.join("; ")))
+    }
+
+    /// A stream that a Web Audio graph pulls through `tap`; its position
+    /// starts at `base` frames (the frames already rendered, when a playing
+    /// element is rerouted).
+    pub fn tap(format: Format, render: Arc<dyn Render>, tap: &Tap, base: u64) -> Self {
+        Self {
+            backend: Box::new(tap::TapOutput::open(format, render, tap, base)),
+            format,
+        }
     }
 
     /// A silent stream that consumes audio in real time (no device).

@@ -96,7 +96,13 @@ impl AudioSink {
         self.format
     }
 
-    /// Attach the device stream (opened with this sink as its renderer).
+    /// Output frames rendered so far.
+    pub(crate) fn rendered(&self) -> u64 {
+        self.rendered.load(Ordering::Acquire)
+    }
+
+    /// Attach the device stream (opened with this sink as its renderer),
+    /// replacing (and closing) the previous one.
     pub(crate) fn attach(&self, output: Output) {
         *self.output.lock().unwrap_or_else(|e| e.into_inner()) = Some(output);
     }

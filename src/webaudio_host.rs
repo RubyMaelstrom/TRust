@@ -285,6 +285,10 @@ pub(super) fn binding(ctx: &mut Ctx, op: &str, args: &[Value]) -> Result<Value, 
     let Some(state) = ctx.host_mut::<HostState>() else {
         return Ok(Value::Undefined);
     };
+    // createMediaElementSource(): the element's audio leaves its output
+    // for the graph.
+    let element_tap =
+        (op == "node" && name == "media-element").then(|| state.media.tap(whole(args, 9) as usize));
     let host = &mut state.webaudio;
     if op == "drop" {
         host.contexts.remove(&context);
@@ -449,6 +453,10 @@ pub(super) fn binding(ctx: &mut Ctx, op: &str, args: &[Value]) -> Result<Value, 
                     Box::new(nodes::Analyser::new(shared))
                 }
                 "convolver" => Box::new(nodes::Convolver::new()),
+                "media-element" => match element_tap {
+                    Some(tap) => Box::new(nodes::MediaElementSource::new(tap)),
+                    None => Box::new(nodes::Silent { channels: 1 }),
+                },
                 _ => Box::new(nodes::Silent {
                     channels: whole(args, 9) as usize,
                 }),

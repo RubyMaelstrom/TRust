@@ -74,6 +74,23 @@ struct Shared {
     resume: tokio::sync::Notify,
     aborted: AtomicBool,
     next_id: AtomicU64,
+    /// The origins of the URLs that answered (after redirects), for
+    /// whether the resource is CORS-cross-origin.
+    origins: Mutex<Vec<url::Origin>>,
+}
+
+/// The origins that answered a media resource's requests.
+#[derive(Clone)]
+pub struct ResponseOrigins(Arc<Shared>);
+
+impl ResponseOrigins {
+    pub fn get(&self) -> Vec<url::Origin> {
+        self.0
+            .origins
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
 }
 
 /// An HTTP(S) media resource.
@@ -118,6 +135,7 @@ impl HttpSource {
                 resume: tokio::sync::Notify::new(),
                 aborted: AtomicBool::new(false),
                 next_id: AtomicU64::new(1),
+                origins: Mutex::new(Vec::new()),
             }),
             request,
             runtime,
@@ -127,6 +145,10 @@ impl HttpSource {
 
     pub fn abort_handle(&self) -> AbortHandle {
         AbortHandle(self.shared.clone())
+    }
+
+    pub fn response_origins(&self) -> ResponseOrigins {
+        ResponseOrigins(self.shared.clone())
     }
 
     /// Whether the server honoured a range request; `None` before the
@@ -213,6 +235,13 @@ async fn download(
         Ok(result) => result,
         Err(error) => return fail(error.message),
     };
+    {
+        let origin = response.url.origin();
+        let mut origins = shared.origins.lock().unwrap_or_else(|e| e.into_inner());
+        if !origins.contains(&origin) {
+            origins.push(origin);
+        }
+    }
     // HTML #verify-a-media-response: an ok status, and for a ranged
     // request a 206 whose Content-Range starts where asked (a 200 to
     // `bytes=0-` is the whole resource from a server without ranges).

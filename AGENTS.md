@@ -744,9 +744,14 @@ current behavior and limits; consult the governing standards before changing it.
   copies back lazily) and `decodeAudioData()` (decoding threads, first
   audio track, windowed-sinc resampling). Keep the rendering deterministic;
   the compressor probe test pins it. `PannerNode`/HRTF are deliberately not
-  implemented. `ScriptProcessorNode` renders silence without
-  `audioprocess`; `MediaElementAudioSourceNode` and worklets are
-  unimplemented. A collected node is released to the rendering thread and
+  implemented. `createMediaElementSource()` reroutes the element's player
+  into the graph through a `media::audio::Tap` output (also for later
+  players of the element): the node pulls the player's audio and resamples
+  it (streaming windowed sinc); while nothing pulls (the context is
+  suspended) the element plays on with its output ignored, consumed in real
+  time. A CORS-cross-origin resource (a no-cors response from another
+  origin, after redirects) is heard as silence. `ScriptProcessorNode`
+  renders silence without `audioprocess`; worklets are unimplemented. A collected node is released to the rendering thread and
   leaves the graph once silent; a started source and a running context stay
   alive until they end or suspend.
 - WebAssembly exception handling runs both the legacy (`try`/`catch`/

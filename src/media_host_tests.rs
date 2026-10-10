@@ -841,3 +841,54 @@ fn clear_key_unlocks_encrypted_media() {
     assert!(log.contains("updated 1 1"), "{log}");
     assert!(log.contains("ended 2"), "{log}");
 }
+
+/// Web Audio 1.1 (local WebAudio/web-audio-api@2047f16)
+/// #MediaElementAudioSourceNode: createMediaElementSource() reroutes the
+/// element's playing audio into the graph (here read by an AnalyserNode),
+/// the element otherwise behaving as before; a CORS-cross-origin resource
+/// plays on but is heard as silence
+/// (#MediaElementAudioSourceOptions-security), and an element has one
+/// such node.
+#[test]
+fn an_element_rerouted_into_web_audio_is_heard_in_the_graph() {
+    let runtime = runtime();
+    let base = serve(&runtime);
+    // A second server (another port) is another origin.
+    let foreign = serve(&runtime);
+    let (mut engine, mut tasks) = page(&runtime, &format!("{base}/page.html"));
+    eval(
+        &mut engine,
+        &format!(
+            "__trust.key(document.body.__id,'a','KeyA',false,false,false,false,false,false);\n\
+             globalThis.ctx = new AudioContext();\n\
+             globalThis.heard = (analyser) => {{ const d = new Float32Array(2048); \
+                analyser.getFloatTimeDomainData(d); return d.reduce((m, x) => Math.max(m, Math.abs(x)), 0); }};\n\
+             globalThis.near = document.createElement('audio'); near.loop = true; near.src = '{base}/sine.mp3';\n\
+             globalThis.far = document.createElement('audio'); far.loop = true; far.src = '{foreign}/sine.mp3';\n\
+             document.body.append(near, far);\n\
+             globalThis.nearNode = ctx.createMediaElementSource(near);\n\
+             globalThis.farNode = new MediaElementAudioSourceNode(ctx, {{mediaElement: far}});\n\
+             try {{ ctx.createMediaElementSource(near); log.push('twice'); }} catch (e) {{ log.push(e.name); }}\n\
+             try {{ ctx.createMediaElementSource({{}}); }} catch (e) {{ log.push(e.name); }}\n\
+             globalThis.nearAnalyser = ctx.createAnalyser(); globalThis.farAnalyser = ctx.createAnalyser();\n\
+             nearNode.connect(nearAnalyser); farNode.connect(farAnalyser);\n\
+             near.play(); far.play();"
+        ),
+        "reroute",
+    )
+    .unwrap();
+    run_until(
+        &runtime,
+        &mut engine,
+        &mut tasks,
+        "ctx.state === 'running' && heard(nearAnalyser) > 0.05 && far.currentTime > 0.1",
+    );
+    assert_eq!(
+        string_value(
+            &mut engine,
+            "[log.filter(t => !t.includes(' ')).join(), nearNode.mediaElement === near, \
+              nearNode.numberOfInputs, heard(farAnalyser), near.paused].join('|')"
+        ),
+        "InvalidStateError,TypeError|true|0|0|false"
+    );
+}

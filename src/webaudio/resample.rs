@@ -74,6 +74,93 @@ pub fn resample(input: &[f32], from: f64, to: f64) -> Vec<f32> {
     output
 }
 
+/// Streaming conversion of interleaved audio, for a source that plays at
+/// its own rate into a context (MediaElementAudioSourceNode: "the output
+/// ... must be resampled to match the context's sample rate"). It holds a
+/// few frames of history and look-ahead.
+pub struct Stream {
+    ratio: f64,
+    cutoff: f64,
+    reach: usize,
+    channels: usize,
+    /// Planar input frames; `time` is the input position of the next
+    /// output frame within them.
+    input: Vec<Vec<f32>>,
+    time: f64,
+}
+
+impl Stream {
+    pub fn new(from: f64, to: f64, channels: usize) -> Self {
+        let cutoff = (to / from).min(1.0);
+        let reach = (ZERO_CROSSINGS as f64 / cutoff).ceil() as usize;
+        Self {
+            ratio: from / to,
+            cutoff,
+            reach,
+            channels,
+            // Silence before the start, so the first output is centered.
+            input: vec![vec![0.0; reach]; channels],
+            time: reach as f64,
+        }
+    }
+
+    /// Input frames still needed before `frames` outputs can be made.
+    pub fn needed(&self, frames: usize) -> usize {
+        let last = self.time + (frames.max(1) - 1) as f64 * self.ratio;
+        let required = last.floor() as usize + self.reach + 1;
+        required.saturating_sub(self.input.first().map_or(0, Vec::len))
+    }
+
+    /// Append interleaved input frames.
+    pub fn push(&mut self, interleaved: &[f32]) {
+        for (index, sample) in interleaved.iter().enumerate() {
+            self.input[index % self.channels].push(*sample);
+        }
+    }
+
+    /// Produce `frames` frames per channel into `out[channel]`.
+    pub fn produce(&mut self, frames: usize, out: &mut [&mut [f32]]) {
+        let table = kernel();
+        let scale = self.cutoff * STEPS as f64;
+        for index in 0..frames {
+            let position = self.time + index as f64 * self.ratio;
+            let center = position.floor() as isize;
+            for (channel, target) in out.iter_mut().enumerate().take(self.channels) {
+                let input = &self.input[channel];
+                let first = (center - self.reach as isize + 1).max(0);
+                let last = (center + self.reach as isize).min(input.len() as isize - 1);
+                let (mut sum, mut weights) = (0.0f64, 0.0f64);
+                for k in first..=last {
+                    let at = (position - k as f64).abs() * scale;
+                    let step = at as usize;
+                    if step >= ZERO_CROSSINGS * STEPS {
+                        continue;
+                    }
+                    let fraction = at - step as f64;
+                    let weight = f64::from(table[step])
+                        + (f64::from(table[step + 1]) - f64::from(table[step])) * fraction;
+                    sum += f64::from(input[k as usize]) * weight;
+                    weights += weight;
+                }
+                target[index] = if weights.abs() > 1e-9 {
+                    (sum / weights) as f32
+                } else {
+                    0.0
+                };
+            }
+        }
+        self.time += frames as f64 * self.ratio;
+        // Keep `reach` frames of history behind the next position.
+        let drop = (self.time.floor() as usize).saturating_sub(self.reach);
+        if drop > 0 {
+            for input in &mut self.input {
+                input.drain(..drop.min(input.len()));
+            }
+            self.time -= drop as f64;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -95,6 +182,30 @@ mod tests {
             .zip(&expected[1000..47_000])
             .fold(0f32, |worst, (a, b)| worst.max((a - b).abs()));
         assert!(error < 1e-3, "{error}");
+    }
+
+    #[test]
+    fn streaming_matches_a_tone() {
+        let input = sine(1000.0, 44_100.0, 44_100);
+        let mut stream = Stream::new(44_100.0, 48_000.0, 1);
+        let mut fed = 0;
+        let mut output = Vec::new();
+        while output.len() < 40_000 {
+            let need = stream.needed(128);
+            stream.push(&input[fed..fed + need]);
+            fed += need;
+            let mut block = vec![0.0; 128];
+            stream.produce(128, &mut [&mut block[..]]);
+            output.extend_from_slice(&block);
+        }
+        // Output frame n is at input time n·44100/48000 (after the
+        // history's latency of `reach` frames, which `time` starts at).
+        let expected = sine(1000.0, 48_000.0, 40_000);
+        let error = output[1000..39_000]
+            .iter()
+            .zip(&expected[1000..39_000])
+            .fold(0f32, |worst, (a, b)| worst.max((a - b).abs()));
+        assert!(error < 2e-3, "{error}");
     }
 
     #[test]

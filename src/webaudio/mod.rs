@@ -14,7 +14,7 @@ pub mod engine;
 pub mod graph;
 pub mod nodes;
 pub mod param;
-mod resample;
+pub(crate) mod resample;
 mod ring;
 pub mod wave;
 

@@ -46,6 +46,43 @@ struct Entry {
     context: u64,
     /// The attached MediaSource, for a Media Source Extensions player.
     source: Option<u64>,
+    taint: Taint,
+}
+
+/// Whether a player's resource is CORS-cross-origin (Fetch: an opaque
+/// response, which a MediaElementAudioSourceNode must not expose).
+#[derive(Clone)]
+pub(super) enum Taint {
+    /// Same-origin by construction: data:, same-partition blob:, local
+    /// files of local documents, MediaSource and Blob providers.
+    Clean,
+    /// An HTTP(S) resource: tainted when fetched without CORS from an
+    /// origin other than the document's.
+    Http {
+        origins: crate::media::resource::ResponseOrigins,
+        cors: bool,
+        document: url::Origin,
+    },
+}
+
+impl Taint {
+    /// `None` until the resource has answered.
+    fn opaque(&self) -> Option<bool> {
+        match self {
+            Self::Clean => Some(false),
+            Self::Http {
+                origins,
+                cors,
+                document,
+            } => {
+                let origins = origins.get();
+                if origins.is_empty() {
+                    return None;
+                }
+                Some(!cors && origins.iter().any(|origin| origin != document))
+            }
+        }
+    }
 }
 
 struct SourceEntry {
@@ -67,9 +104,38 @@ pub(super) struct MediaHost {
     /// Play audio silently in real time instead of on the audio device
     /// (headless rendering and tests).
     pub(super) silent: bool,
+    /// Media elements rerouted into a Web Audio graph, by node.
+    taps: HashMap<usize, crate::media::audio::Tap>,
 }
 
 impl MediaHost {
+    /// Reroute media element `node`'s audio into a Web Audio graph from now
+    /// on (createMediaElementSource()), including its current player's.
+    pub(super) fn tap(&mut self, node: usize) -> crate::media::audio::Tap {
+        if let Some(tap) = self.taps.get(&node) {
+            return tap.clone();
+        }
+        let tap = crate::media::audio::Tap::new();
+        for entry in self.players.values().filter(|entry| entry.node == node) {
+            entry.player.route(tap.clone());
+            if let Some(opaque) = entry.taint.opaque() {
+                tap.set_opaque(opaque);
+            }
+        }
+        self.taps.insert(node, tap.clone());
+        tap
+    }
+
+    /// Update a tapped element's silence once its resource has answered.
+    fn update_taint(&self, id: u64) {
+        if let Some(entry) = self.players.get(&id)
+            && let Some(tap) = self.taps.get(&entry.node)
+            && let Some(opaque) = entry.taint.opaque()
+        {
+            tap.set_opaque(opaque);
+        }
+    }
+
     /// The media elements that have players.
     pub(super) fn player_nodes(&self) -> impl Iterator<Item = usize> + '_ {
         self.players.values().map(|entry| entry.node)
@@ -225,6 +291,7 @@ pub(super) fn load(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
             calling,
             Input::Resource { source, hint },
             sender,
+            Taint::Clean,
         )));
     }
     let Ok(url) = url::Url::parse(&target) else {
@@ -234,6 +301,7 @@ pub(super) fn load(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
         "player {id}: load {}",
         url.as_str().chars().take(200).collect::<String>()
     );
+    let mut taint = Taint::Clean;
     let source: Box<dyn ByteSource> = match url.scheme() {
         "data" => match crate::img::decode_data_url(url.as_str()) {
             Some(bytes) => Box::new(MemorySource::new(bytes)),
@@ -281,7 +349,20 @@ pub(super) fn load(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
                     task: MediaTask::Network(event),
                 });
             });
-            Box::new(HttpSource::new(request, handle, events))
+            let source = HttpSource::new(request, handle, events);
+            let cors = {
+                let dom = host_dom(ctx);
+                let dom = dom.borrow();
+                dom.attr(node, "crossorigin").is_some()
+            };
+            if let Some(state) = ctx.host_mut::<HostState>() {
+                taint = Taint::Http {
+                    origins: source.response_origins(),
+                    cors,
+                    document: super::realm_origin(state, calling),
+                };
+            }
+            Box::new(source)
         }
         _ => return Ok(Value::Num(-1.0)),
     };
@@ -292,6 +373,7 @@ pub(super) fn load(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
         calling,
         Input::Resource { source, hint },
         sender,
+        taint,
     )))
 }
 
@@ -338,6 +420,7 @@ pub(super) fn attach(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
         calling,
         Input::Demuxer(Box::new(demuxer)),
         sender,
+        Taint::Clean,
     );
     if let Some(state) = ctx.host_mut::<HostState>() {
         if let Some(entry) = state.media.players.get_mut(&id) {
@@ -721,6 +804,7 @@ pub(super) fn media_source(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resul
 
 /// Create the player for element `node` reading `source`, and its
 /// presentation; returns the player id.
+#[allow(clippy::too_many_arguments)]
 fn start(
     ctx: &mut Ctx,
     node: usize,
@@ -728,18 +812,22 @@ fn start(
     calling: u64,
     input: Input,
     sender: LumenTaskSender,
+    taint: Taint,
 ) -> f64 {
     let player_sender = std::sync::Mutex::new(sender);
-    let silent = ctx
-        .host_mut::<HostState>()
-        .is_some_and(|state| state.media.silent);
+    let (silent, tap) = ctx.host_mut::<HostState>().map_or((false, None), |state| {
+        (state.media.silent, state.media.taps.get(&node).cloned())
+    });
+    if let (Some(tap), Some(opaque)) = (&tap, taint.opaque()) {
+        tap.set_opaque(opaque);
+    }
     let player = Player::new(
         input,
         Options {
-            audio: if silent {
-                AudioMode::Silent
-            } else {
-                AudioMode::Device
+            audio: match tap {
+                Some(tap) => AudioMode::Tap(tap),
+                None if silent => AudioMode::Silent,
+                None => AudioMode::Device,
             },
         },
         move |event| {
@@ -782,6 +870,7 @@ fn start(
                 node,
                 context,
                 source: None,
+                taint,
             },
         );
     }
@@ -936,6 +1025,12 @@ pub(super) fn dispatch(engine: &mut lumen::Engine, id: u64, task: MediaTask) -> 
         // The element moved on to another resource.
         return Ok(());
     };
+    if matches!(task, MediaTask::Player(Event::Metadata { .. }))
+        && let Some(state) = engine.ctx().host_mut::<HostState>()
+    {
+        // The resource has answered: whether a Web Audio graph may hear it.
+        state.media.update_taint(id);
+    }
     let string = |text: &str| Value::from_string(text.to_string());
     if logging() {
         match &task {

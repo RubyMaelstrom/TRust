@@ -13491,6 +13491,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             delay: {mode: "max"}, "stereo-panner": {mode: "clamped-max"}, splitter: {mode: "explicit"},
             merger: {mode: "explicit"}, shaper: {mode: "max"}, analyser: {mode: "max"},
             convolver: {mode: "clamped-max"}, listener: {mode: "explicit", inputs: 0, outputs: 0},
+            "media-element": {mode: "max", inputs: 0},
         };
         // Nodes whose channel count may not exceed two (#AudioNode-attributes
         // channelCount and channelCountMode constraints).
@@ -14264,6 +14265,27 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             get normalize() { return nodeRecord(this, "convolver").normalize; }
             set normalize(value) { nodeRecord(this, "convolver").normalize = !!value; }
         }
+        // MediaElementAudioSourceNode (#MediaElementAudioSourceNode): the
+        // element's player renders into the graph instead of its output
+        // (`MediaHost::tap`). An element has at most one such node, which it
+        // keeps alive.
+        const elementSources = new WeakMap();
+        class MediaElementAudioSourceNode extends AudioNode {
+            constructor(context, options) {
+                record(context);
+                if (arguments.length < 2) throw new TypeError("MediaElementAudioSourceNode requires options");
+                const dict = dictionary(options, "MediaElementAudioSourceOptions");
+                const element = member(dict, "mediaElement");
+                if (element === undefined) throw new TypeError("MediaElementAudioSourceOptions.mediaElement is required");
+                mediaRecord(element);
+                if (elementSources.has(element))
+                    throw new Exception("The media element already has a MediaElementAudioSourceNode", "InvalidStateError");
+                super(token, context, "media-element", 2, [], [nodeIds.get(element)]);
+                nodeRecord(this).mediaElement = element;
+                elementSources.set(element, this);
+            }
+            get mediaElement() { return nodeRecord(this, "media-element").mediaElement; }
+        }
         // AudioListener (#AudioListener): its parameters exist (and can be
         // automated), though no PannerNode reads them.
         const LISTENER_PARAMS = [["positionX", 0], ["positionY", 0], ["positionZ", 0],
@@ -14468,6 +14490,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 contextRelease.register(this, state.id);
                 state.destination = new AudioDestinationNode(token, this, min(2, device[1]), device[1]);
                 if (allowedToStart()) startRendering(state);
+            }
+            createMediaElementSource(mediaElement) {
+                record(this);
+                if (arguments.length < 1) throw new TypeError("createMediaElementSource requires a media element");
+                return new MediaElementAudioSourceNode(this, {mediaElement});
             }
             get baseLatency() { return host("latency", record(this).id)[0]; }
             get outputLatency() { return host("latency", record(this).id)[1]; }
@@ -14798,7 +14825,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             ScriptProcessorNode, AudioScheduledSourceNode, OscillatorNode, GainNode, DynamicsCompressorNode,
             AudioBufferSourceNode, AudioParam, AudioBuffer, PeriodicWave, OfflineAudioCompletionEvent,
             ConstantSourceNode, BiquadFilterNode, IIRFilterNode, DelayNode, StereoPannerNode, ChannelSplitterNode,
-            ChannelMergerNode, WaveShaperNode, AnalyserNode, ConvolverNode, AudioListener]) {
+            ChannelMergerNode, WaveShaperNode, AnalyserNode, ConvolverNode, AudioListener,
+            MediaElementAudioSourceNode]) {
             for (const name of Object.getOwnPropertyNames(ctor.prototype)) {
                 if (name === "constructor") continue;
                 const descriptor = Object.getOwnPropertyDescriptor(ctor.prototype, name);
@@ -14815,7 +14843,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             [OfflineAudioContext, 1], [OfflineAudioCompletionEvent, 2], [ConstantSourceNode, 1],
             [BiquadFilterNode, 1], [IIRFilterNode, 2], [DelayNode, 1], [StereoPannerNode, 1],
             [ChannelSplitterNode, 1], [ChannelMergerNode, 1], [WaveShaperNode, 1], [AnalyserNode, 1],
-            [ConvolverNode, 1], [AudioListener, 0]])
+            [ConvolverNode, 1], [AudioListener, 0], [MediaElementAudioSourceNode, 2]])
             define(ctor, "length", {value: length, configurable: true});
     }
     for (const [name,value] of [["NETWORK_EMPTY",0],["NETWORK_IDLE",1],["NETWORK_LOADING",2],

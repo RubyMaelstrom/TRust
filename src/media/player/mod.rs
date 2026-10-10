@@ -113,15 +113,17 @@ pub enum Input {
     Demuxer(Box<dyn Demuxer>),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone)]
 pub enum AudioMode {
     /// The platform's audio device (falling back to silent output).
     Device,
     /// Silent real-time output (headless use, tests).
     Silent,
+    /// Rerouted into a Web Audio graph (MediaElementAudioSourceNode).
+    Tap(crate::media::audio::Tap),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone)]
 pub struct Options {
     pub audio: AudioMode,
 }
@@ -133,6 +135,7 @@ enum Command {
     Volume { volume: f32, muted: bool },
     Rate { rate: f64, preserves_pitch: bool },
     Keys(Option<super::eme::KeyRing>),
+    Route(crate::media::audio::Tap),
 }
 
 type EventSink = Arc<dyn Fn(Event) + Send + Sync>;
@@ -240,6 +243,12 @@ impl Player {
     /// Decrypt with these keys (the media element's MediaKeys), or none.
     pub fn set_keys(&self, keys: Option<super::eme::KeyRing>) {
         self.command(Command::Keys(keys));
+    }
+
+    /// Reroute the audio into `tap` (a MediaElementAudioSourceNode): it is
+    /// no longer heard directly.
+    pub fn route(&self, tap: crate::media::audio::Tap) {
+        self.command(Command::Route(tap));
     }
 
     /// The current playback position.
@@ -740,6 +749,16 @@ impl Control {
                 }
                 self.keys = keys;
             }
+            Command::Route(tap) => {
+                if let Some(sink) = self.audio.as_ref().and_then(|a| a.sink.as_ref()) {
+                    // The device's unplayed buffer is dropped; the clock goes
+                    // on from what was rendered.
+                    let output = Output::tap(sink.format(), sink.clone(), &tap, sink.rendered());
+                    output.set_paused(!self.shared.clock.running());
+                    sink.attach(output);
+                }
+                self.options.audio = AudioMode::Tap(tap);
+            }
             Command::Rate {
                 rate,
                 preserves_pitch,
@@ -1041,10 +1060,11 @@ impl Control {
                 let sink = AudioSink::new(format, shared.wake.clone());
                 sink.set_volume(volume.0, volume.1);
                 sink.set_rate(rate.0, rate.1);
-                let output = match options.audio {
+                let output = match &options.audio {
                     AudioMode::Device => Output::open(format, sink.clone())
                         .unwrap_or_else(|_| Output::null(format, sink.clone())),
                     AudioMode::Silent => Output::null(format, sink.clone()),
+                    AudioMode::Tap(tap) => Output::tap(format, sink.clone(), tap, 0),
                 };
                 output.set_paused(!shared.clock.running());
                 sink.attach(output);
