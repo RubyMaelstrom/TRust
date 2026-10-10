@@ -35601,6 +35601,33 @@ mod tests {
     }
 
     #[test]
+    fn web_audio_processing_nodes_render_per_spec() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let (mut engine, mut tasks) = audio_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            eval(
+                &mut engine,
+                include_str!("fixtures/web_audio_nodes.mjs"),
+                "web audio nodes",
+            )
+            .unwrap();
+            pump_audio_until(
+                &mut engine,
+                &mut tasks,
+                "globalThis.webAudioNodesResult !== undefined",
+                30,
+            );
+            assert_eq!(
+                string_value(&mut engine, "webAudioNodesResult"),
+                "web-audio-nodes-ok",
+                "{tier:?}"
+            );
+            assert_eq!(string_value(&mut engine, "__trust.takeErrors()"), "");
+        }
+    }
+
+    #[test]
     fn audio_context_window_ownership_and_worker_exposure() {
         let mut engine = configured_engine(
             HostState::new(

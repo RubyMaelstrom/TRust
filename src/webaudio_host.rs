@@ -32,6 +32,17 @@ struct ContextEntry {
     values: HashMap<u32, Arc<AtomicU32>>,
     /// Each node's entries in `values`.
     node_values: HashMap<u32, Vec<u32>>,
+    /// BiquadFilterNode types and IIRFilterNode coefficients, for
+    /// getFrequencyResponse().
+    filters: HashMap<u32, Filter>,
+    /// AnalyserNodes' shared analysis state.
+    analysers: HashMap<u32, nodes::analyser::Shared>,
+}
+
+/// What getFrequencyResponse() evaluates.
+enum Filter {
+    Biquad(nodes::biquad::Kind),
+    Iir(nodes::iir::Coefficients),
 }
 
 #[derive(Default)]
@@ -251,8 +262,25 @@ pub(super) fn binding(ctx: &mut Ctx, op: &str, args: &[Value]) -> Result<Value, 
     } else {
         Vec::new()
     };
-    if op == "decode" {
-        return Ok(decode(ctx, context, args));
+    // IIRFilterNode coefficients and a WaveShaperNode curve.
+    let (feedforward, feedback) = if op == "node" && name == "iir" {
+        (
+            doubles(ctx, args.get(9)).unwrap_or_default(),
+            doubles(ctx, args.get(10)).unwrap_or_default(),
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let shaper_curve = match (op, name.as_str()) {
+        ("node", "shaper") => floats(ctx, args.get(9)),
+        ("control", "curve") => floats(ctx, args.get(4)),
+        _ => None,
+    };
+    match op {
+        "decode" => return Ok(decode(ctx, context, args)),
+        "frequencyResponse" => return Ok(frequency_response(ctx, context, args)),
+        "analyser" => return Ok(analyse(ctx, context, args)),
+        _ => {}
     }
     let Some(state) = ctx.host_mut::<HostState>() else {
         return Ok(Value::Undefined);
@@ -290,6 +318,24 @@ pub(super) fn binding(ctx: &mut Ctx, op: &str, args: &[Value]) -> Result<Value, 
                 "loop" => Some(Control::Loop(a != 0.0)),
                 "loopStart" => Some(Control::LoopStart(a)),
                 "loopEnd" => Some(Control::LoopEnd(a)),
+                "type" => Some(Control::FilterType(a as u64)),
+                "curve" => Some(Control::Curve(shaper_curve.clone().map(Arc::from))),
+                "oversample" => Some(Control::Oversample(a as usize)),
+                "response" => {
+                    let quantum = host
+                        .contexts
+                        .get(&context)
+                        .map_or(128, |entry| entry.engine.quantum);
+                    Some(Control::Response(if a > 0.0 {
+                        content(host, a as u64)
+                            .and_then(|data| {
+                                nodes::convolver::Response::new(&data, b != 0.0, quantum)
+                            })
+                            .map(Arc::new)
+                    } else {
+                        None
+                    }))
+                }
                 _ => None,
             }
         }
@@ -372,6 +418,37 @@ pub(super) fn binding(ctx: &mut Ctx, op: &str, args: &[Value]) -> Result<Value, 
                     values.push(id);
                     Box::new(nodes::Compressor::new(reduction))
                 }
+                "constant" => Box::new(nodes::ConstantSource::new()),
+                "stereo-panner" => Box::new(nodes::StereoPanner),
+                "splitter" => Box::new(nodes::Splitter),
+                "merger" => Box::new(nodes::Merger),
+                "delay" => Box::new(nodes::Delay::new(
+                    number(args, 9),
+                    entry.engine.rate,
+                    entry.engine.quantum,
+                )),
+                "biquad" => {
+                    let kind = nodes::biquad::Kind::from_index(whole(args, 9));
+                    entry.filters.insert(id, Filter::Biquad(kind));
+                    Box::new(nodes::Biquad::new(kind))
+                }
+                "iir"
+                    if !feedforward.is_empty() && feedback.first().is_some_and(|&a0| a0 != 0.0) =>
+                {
+                    let coefficients = nodes::iir::Coefficients::new(&feedforward, &feedback);
+                    entry.filters.insert(id, Filter::Iir(coefficients.clone()));
+                    Box::new(nodes::Iir::new(coefficients))
+                }
+                "shaper" => Box::new(nodes::WaveShaper::new(
+                    shaper_curve.map(Arc::from),
+                    whole(args, 10) as usize,
+                )),
+                "analyser" => {
+                    let shared = nodes::analyser::shared();
+                    entry.analysers.insert(id, shared.clone());
+                    Box::new(nodes::Analyser::new(shared))
+                }
+                "convolver" => Box::new(nodes::Convolver::new()),
                 _ => Box::new(nodes::Silent {
                     channels: whole(args, 9) as usize,
                 }),
@@ -397,6 +474,8 @@ pub(super) fn binding(ctx: &mut Ctx, op: &str, args: &[Value]) -> Result<Value, 
             for value in entry.node_values.remove(&node).unwrap_or_default() {
                 entry.values.remove(&value);
             }
+            entry.filters.remove(&node);
+            entry.analysers.remove(&node);
             send(entry, GraphMessage::Release(node));
         }
         "connect" | "disconnect" => {
@@ -510,6 +589,11 @@ pub(super) fn binding(ctx: &mut Ctx, op: &str, args: &[Value]) -> Result<Value, 
             );
         }
         "control" => {
+            if let (Some(Control::FilterType(kind)), Some(Filter::Biquad(current))) =
+                (&control, entry.filters.get_mut(&(whole(args, 2) as u32)))
+            {
+                *current = nodes::biquad::Kind::from_index(*kind);
+            }
             if let Some(control) = control {
                 send(
                     entry,
@@ -573,9 +657,129 @@ fn create(ctx: &mut Ctx, realtime: bool, args: &[Value]) -> Value {
             next_id: 1,
             values: HashMap::new(),
             node_values: HashMap::new(),
+            filters: HashMap::new(),
+            analysers: HashMap::new(),
         },
     );
     Value::Num(id as f64)
+}
+
+/// `frequencyResponse(context, node, frequencyHz, magResponse,
+/// phaseResponse)`: BiquadFilterNode's (from the parameters' [[current
+/// value]]s) or IIRFilterNode's getFrequencyResponse(). Frequencies outside
+/// [0, sampleRate/2] give NaN.
+fn frequency_response(ctx: &mut Ctx, context: u64, args: &[Value]) -> Value {
+    let node = whole(args, 2) as u32;
+    let frequencies = floats(ctx, args.get(3)).unwrap_or_default();
+    let Some(state) = ctx.host_mut::<HostState>() else {
+        return Value::Undefined;
+    };
+    let Some(entry) = state.webaudio.contexts.get(&context) else {
+        return Value::Undefined;
+    };
+    let rate = entry.engine.rate;
+    let current = |id: u32| {
+        entry
+            .values
+            .get(&id)
+            .map_or(0.0, |value| f32::from_bits(value.load(Ordering::Relaxed)))
+    };
+    let evaluate: Box<dyn Fn(f64) -> (f64, f64)> = match entry.filters.get(&node) {
+        Some(Filter::Biquad(kind)) => {
+            let frequency =
+                nodes::biquad::computed_frequency(current(node + 1), current(node + 2), rate);
+            let coefficients = nodes::biquad::Coefficients::compute(
+                *kind,
+                frequency,
+                f64::from(current(node + 3)),
+                f64::from(current(node + 4)),
+                f64::from(rate),
+            );
+            Box::new(move |hz| coefficients.response(hz, f64::from(rate)))
+        }
+        Some(Filter::Iir(coefficients)) => {
+            let coefficients = coefficients.clone();
+            Box::new(move |hz| coefficients.response(hz, f64::from(rate)))
+        }
+        None => return Value::Undefined,
+    };
+    let nyquist = f64::from(rate) / 2.0;
+    let (mut magnitudes, mut phases) = (Vec::new(), Vec::new());
+    for &frequency in &frequencies {
+        let frequency = f64::from(frequency);
+        let (magnitude, phase) = if (0.0..=nyquist).contains(&frequency) {
+            evaluate(frequency)
+        } else {
+            (f64::NAN, f64::NAN)
+        };
+        magnitudes.push(magnitude as f32);
+        phases.push(phase as f32);
+    }
+    if let Some(target) = args.get(4) {
+        ctx.typed_array_set_bytes(target, &float_bytes(&magnitudes));
+    }
+    if let Some(target) = args.get(5) {
+        ctx.typed_array_set_bytes(target, &float_bytes(&phases));
+    }
+    Value::Undefined
+}
+
+/// `analyser(context, node, op, fftSize, smoothing, minDecibels,
+/// maxDecibels, array, byteLength)`: an AnalyserNode's data written into
+/// `array` (#AnalyserNode-methods): "floatFrequency", "byteFrequency",
+/// "floatTime", "byteTime", or "reset" (fftSize changed).
+fn analyse(ctx: &mut Ctx, context: u64, args: &[Value]) -> Value {
+    let node = whole(args, 2) as u32;
+    let op = host_arg_string(ctx, args, 3);
+    let size = (whole(args, 4) as usize).clamp(32, nodes::analyser::MAX_FFT);
+    let (a, b, c) = (number(args, 5), number(args, 6), number(args, 7));
+    let Some(shared) = ctx
+        .host_mut::<HostState>()
+        .and_then(|state| state.webaudio.contexts.get(&context))
+        .and_then(|entry| entry.analysers.get(&node).cloned())
+    else {
+        return Value::Undefined;
+    };
+    let bytes: Vec<u8> = {
+        let mut state = shared.lock().unwrap_or_else(|e| e.into_inner());
+        match op.as_str() {
+            "reset" => {
+                state.reset();
+                return Value::Undefined;
+            }
+            "floatFrequency" => float_bytes(state.frequency(size, a)),
+            "byteFrequency" => {
+                // b[k] = floor(255 / (dBmax - dBmin) · (Y[k] - dBmin)), clipped.
+                let (min, max) = (b, c);
+                state
+                    .frequency(size, a)
+                    .iter()
+                    .map(|&db| {
+                        let value = (255.0 / (max - min) * (f64::from(db) - min)).floor();
+                        if value.is_nan() {
+                            0
+                        } else {
+                            value.clamp(0.0, 255.0) as u8
+                        }
+                    })
+                    .collect()
+            }
+            "floatTime" => float_bytes(&state.time_domain(size)),
+            "byteTime" => state
+                .time_domain(size)
+                .iter()
+                .map(|&x| (128.0 * (1.0 + f64::from(x))).floor().clamp(0.0, 255.0) as u8)
+                .collect(),
+            _ => return Value::Undefined,
+        }
+    };
+    if let Some(target) = args.get(8) {
+        // The view's own length (in bytes, from script) bounds the write:
+        // excess data is dropped.
+        let room = whole(args, 9) as usize;
+        ctx.typed_array_set_bytes(target, &bytes[..bytes.len().min(room)]);
+    }
+    Value::Undefined
 }
 
 /// `decode(context, bytes)`: decodeAudioData()'s decoding operation on a

@@ -730,14 +730,25 @@ current behavior and limits; consult the governing standards before changing it.
   Implemented: sample-accurate `AudioParam` automation, speaker channel
   mixing, `OscillatorNode` (band-limited `PeriodicWave` tables), `GainNode`,
   `DynamicsCompressorNode` (TRust's documented knee/detector/envelope
-  curves), `AudioBufferSourceNode`, `AudioBuffer` (content acquired into the
-  host, `getChannelData()` copies back lazily) and `decodeAudioData()`
-  (decoding threads, first audio track, windowed-sinc resampling). Keep the
-  rendering deterministic; the compressor probe test pins it.
-  `ScriptProcessorNode` renders silence without `audioprocess`; other node
-  types and worklets are unimplemented. A collected node is released to the
-  rendering thread and leaves the graph once silent; a started source and a
-  running context stay alive until they end or suspend.
+  curves), `AudioBufferSourceNode`, `ConstantSourceNode`,
+  `BiquadFilterNode` (the spec's cookbook coefficients, their limits where
+  they degenerate), `IIRFilterNode`, `DelayNode` (a DelayNode in a cycle
+  becomes a DelayReader/DelayWriter pair clamped to one render quantum),
+  `StereoPannerNode`, `ChannelSplitterNode`/`ChannelMergerNode`,
+  `WaveShaperNode` (windowed-sinc 2x/4x oversampling), `AnalyserNode` (the
+  last 32768 down-mixed frames shared with the control thread, which runs
+  the FFT and smoothing when script asks), `ConvolverNode` (two-stage
+  uniformly partitioned FFT convolution without added latency; the tail
+  stage's work lands every 8 render quanta), `AudioListener` (parameters
+  only), `AudioBuffer` (content acquired into the host, `getChannelData()`
+  copies back lazily) and `decodeAudioData()` (decoding threads, first
+  audio track, windowed-sinc resampling). Keep the rendering deterministic;
+  the compressor probe test pins it. `PannerNode`/HRTF are deliberately not
+  implemented. `ScriptProcessorNode` renders silence without
+  `audioprocess`; `MediaElementAudioSourceNode` and worklets are
+  unimplemented. A collected node is released to the rendering thread and
+  leaves the graph once silent; a started source and a running context stay
+  alive until they end or suspend.
 - WebAssembly exception handling runs both the legacy (`try`/`catch`/
   `rethrow`/`delegate`) and the standardized (`try_table`, `throw_ref`,
   `exnref`) instructions in the Wasmi fork; exceptions caught by reference

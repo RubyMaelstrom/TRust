@@ -13487,15 +13487,26 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             processor: {mode: "explicit"}, destination: {mode: "explicit"},
             oscillator: {mode: "max", inputs: 0}, gain: {mode: "max"},
             compressor: {mode: "clamped-max"}, "buffer-source": {mode: "max", inputs: 0},
+            constant: {mode: "max", inputs: 0}, biquad: {mode: "max"}, iir: {mode: "max"},
+            delay: {mode: "max"}, "stereo-panner": {mode: "clamped-max"}, splitter: {mode: "explicit"},
+            merger: {mode: "explicit"}, shaper: {mode: "max"}, analyser: {mode: "max"},
+            convolver: {mode: "clamped-max"}, listener: {mode: "explicit", inputs: 0, outputs: 0},
         };
+        // Nodes whose channel count may not exceed two (#AudioNode-attributes
+        // channelCount and channelCountMode constraints).
+        const STEREO_LIMITED = ["compressor", "stereo-panner", "convolver"];
         class AudioNode extends EventTarget {
-            constructor(key, context, kind, channelCount, params, init) {
+            constructor(key, context, kind, channelCount, params, init, ports) {
                 if (key !== token) throw new TypeError("Illegal constructor");
                 super();
                 const defaults = NODE_DEFAULTS[kind], owner = get(context);
-                const inputs = defaults.inputs === undefined ? 1 : defaults.inputs;
+                const inputs = ports && ports.inputs !== undefined ? ports.inputs
+                    : defaults.inputs === undefined ? 1 : defaults.inputs;
+                const outputs = ports && ports.outputs !== undefined ? ports.outputs
+                    : defaults.outputs === undefined ? 1 : defaults.outputs;
+                const interpretation = ports && ports.interpretation || "speakers";
                 const state = {node: true, kind, context, channelCount, mode: defaults.mode,
-                    interpretation: "speakers", inputs, outputs: 1,
+                    interpretation, inputs, outputs,
                     edges: new SetCtor(), params: create(null), id: 0};
                 eventTargetState(this, state);
                 set(this, state);
@@ -13504,8 +13515,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                     descriptors.set([spec.value, spec.min, spec.max, spec.rate === "k-rate" ? 1 : 0,
                         spec.compound ? 1 : 0], index * 5);
                 });
-                state.id = host("node", owner.id, kind, inputs, 1, channelCount, MODES.indexOf(state.mode),
-                    0, descriptors, ...(init || []));
+                state.id = host("node", owner.id, kind, inputs, max(outputs, 1), channelCount,
+                    MODES.indexOf(state.mode), interpretation === "discrete" ? 1 : 0, descriptors, ...(init || []));
                 params.forEach((spec, index) => {
                     state.params[spec.name] = createParam(context, this, state.id + 1 + index, spec);
                 });
@@ -13521,6 +13532,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 if (state.kind === "processor") {
                     if (value !== state.channelCount)
                         throw new Exception("ScriptProcessor channel count is fixed", "NotSupportedError");
+                } else if (state.kind === "merger" || state.kind === "splitter") {
+                    if (value !== state.channelCount)
+                        throw new Exception("This node's channel count is fixed", "InvalidStateError");
                 } else if (state.kind === "destination") {
                     if (get(state.context).kind === "offline") {
                         if (value !== state.channelCount)
@@ -13529,7 +13543,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                         throw new Exception("Destination channel count is out of range", "IndexSizeError");
                     }
                 } else if (value < 1 || value > MAX_CHANNELS ||
-                    (state.kind === "compressor" && value > 2)) {
+                    (STEREO_LIMITED.includes(state.kind) && value > 2)) {
                     throw new Exception("Unsupported channel count", "NotSupportedError");
                 }
                 state.channelCount = value;
@@ -13543,8 +13557,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 if (value !== "max" && value !== "clamped-max" && value !== "explicit") return;
                 if (state.kind === "processor" && value !== "explicit")
                     throw new Exception("ScriptProcessor channel mode is explicit", "NotSupportedError");
-                if (state.kind === "compressor" && value === "max")
-                    throw new Exception("DynamicsCompressor channel mode cannot be max", "NotSupportedError");
+                if (STEREO_LIMITED.includes(state.kind) && value === "max")
+                    throw new Exception("This node's channel mode cannot be max", "NotSupportedError");
+                if ((state.kind === "merger" || state.kind === "splitter") && value !== "explicit")
+                    throw new Exception("This node's channel mode is explicit", "InvalidStateError");
                 if (state.kind === "destination" && get(state.context).kind === "offline" && value !== state.mode)
                     throw new Exception("OfflineAudioContext destination mode is fixed", "InvalidStateError");
                 state.mode = value;
@@ -13555,6 +13571,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 const state = nodeRecord(this);
                 value = `${value}`;
                 if (value !== "speakers" && value !== "discrete") return;
+                if (state.kind === "splitter" && value !== "discrete")
+                    throw new Exception("ChannelSplitter channels are discrete", "InvalidStateError");
                 state.interpretation = value;
                 channelMessage(state);
             }
@@ -13894,6 +13912,402 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             }
         }
 
+        // ConstantSourceNode (#ConstantSourceNode).
+        class ConstantSourceNode extends AudioScheduledSourceNode {
+            constructor(context, options = undefined) {
+                contextRecord(context);
+                const dict = dictionary(options, "ConstantSourceOptions");
+                const offset = member(dict, "offset");
+                const offsetValue = offset === undefined ? undefined : float(offset, "offset");
+                super(token, context, "constant", [
+                    {name: "offset", value: 1, min: -MAX_FLOAT, max: MAX_FLOAT, rate: "a-rate"},
+                ]);
+                if (offsetValue !== undefined) nodeRecord(this).params.offset.value = offsetValue;
+            }
+            get offset() { return nodeRecord(this, "constant").params.offset; }
+        }
+        // BiquadFilterNode (#BiquadFilterNode).
+        const BIQUAD_TYPES = ["lowpass", "highpass", "bandpass", "lowshelf", "highshelf", "peaking", "notch", "allpass"];
+        class BiquadFilterNode extends AudioNode {
+            constructor(context, options = undefined) {
+                const owner = contextRecord(context);
+                const dict = dictionary(options, "BiquadFilterOptions");
+                const converted = nodeOptions(dict);
+                const values = {};
+                for (const name of ["Q", "detune", "frequency", "gain"]) {
+                    const value = member(dict, name);
+                    if (value !== undefined) values[name] = float(value, name);
+                }
+                const type = member(dict, "type");
+                const typeValue = type === undefined ? "lowpass" : enumValue(type, BIQUAD_TYPES);
+                const nyquist = owner.rate / 2, detuneLimit = 1200 * log2(MAX_FLOAT);
+                super(token, context, "biquad", 2, [
+                    {name: "frequency", value: 350, min: 0, max: nyquist, rate: "a-rate", compound: true},
+                    {name: "detune", value: 0, min: -detuneLimit, max: detuneLimit, rate: "a-rate", compound: true},
+                    {name: "Q", value: 1, min: -MAX_FLOAT, max: MAX_FLOAT, rate: "a-rate"},
+                    {name: "gain", value: 0, min: -MAX_FLOAT, max: 40 * Math.log10(MAX_FLOAT), rate: "a-rate"},
+                ], [BIQUAD_TYPES.indexOf(typeValue)]);
+                const state = nodeRecord(this);
+                state.type = typeValue;
+                applyNodeOptions(this, converted);
+                for (const name of ["Q", "detune", "frequency", "gain"])
+                    if (values[name] !== undefined) state.params[name].value = values[name];
+            }
+            get type() { return nodeRecord(this, "biquad").type; }
+            set type(value) {
+                const state = nodeRecord(this, "biquad");
+                value = `${value}`;
+                if (!BIQUAD_TYPES.includes(value)) return;
+                state.type = value;
+                control(this, "type", BIQUAD_TYPES.indexOf(value));
+            }
+            getFrequencyResponse(frequencyHz, magResponse, phaseResponse) {
+                const state = nodeRecord(this, "biquad");
+                frequencyResponse(state, frequencyHz, magResponse, phaseResponse, arguments.length);
+            }
+        }
+        for (const name of ["frequency", "detune", "Q", "gain"]) {
+            define(BiquadFilterNode.prototype, name, {configurable: true, enumerable: true,
+                get: {[name]() { return nodeRecord(this, "biquad").params[name]; }}[name]});
+            define(Object.getOwnPropertyDescriptor(BiquadFilterNode.prototype, name).get,
+                "name", {value: "get " + name, configurable: true});
+        }
+        // getFrequencyResponse() of a BiquadFilterNode or IIRFilterNode.
+        function frequencyResponse(state, frequencyHz, magResponse, phaseResponse, count) {
+            if (count < 3) throw new TypeError("getFrequencyResponse requires three arrays");
+            frequencyHz = float32Array(frequencyHz, "frequencyHz");
+            magResponse = float32Array(magResponse, "magResponse");
+            phaseResponse = float32Array(phaseResponse, "phaseResponse");
+            const length = apply(typedArrayLength, frequencyHz, []);
+            if (apply(typedArrayLength, magResponse, []) !== length ||
+                apply(typedArrayLength, phaseResponse, []) !== length)
+                throw new Exception("The response arrays must have the same length", "InvalidAccessError");
+            host("frequencyResponse", get(state.context).id, state.id, frequencyHz, magResponse, phaseResponse);
+        }
+        // IIRFilterNode (#IIRFilterNode).
+        function doubleSequence(value, name) {
+            if (value === null || (typeof value !== "object" && typeof value !== "function"))
+                throw new TypeError(name + " must be a sequence of doubles");
+            const method = value[iteratorSymbol];
+            if (typeof method !== "function") throw new TypeError(name + " must be a sequence of doubles");
+            const result = [];
+            for (const item of {[iteratorSymbol]: () => apply(method, value, [])}) result.push(double(item, name));
+            return result;
+        }
+        function iirCoefficients(feedforward, feedback) {
+            // #dom-baseaudiocontext-createiirfilter
+            if (feedforward.length === 0 || feedforward.length > 20)
+                throw new Exception("feedforward must have 1 to 20 coefficients", "NotSupportedError");
+            if (feedback.length === 0 || feedback.length > 20)
+                throw new Exception("feedback must have 1 to 20 coefficients", "NotSupportedError");
+            if (feedforward.every(value => value === 0))
+                throw new Exception("feedforward coefficients cannot all be zero", "InvalidStateError");
+            if (feedback[0] === 0)
+                throw new Exception("The first feedback coefficient cannot be zero", "InvalidStateError");
+        }
+        class IIRFilterNode extends AudioNode {
+            constructor(context, options) {
+                contextRecord(context);
+                if (arguments.length < 2) throw new TypeError("IIRFilterNode requires options");
+                const dict = dictionary(options, "IIRFilterOptions");
+                const converted = nodeOptions(dict);
+                const feedbackValue = member(dict, "feedback");
+                if (feedbackValue === undefined) throw new TypeError("IIRFilterOptions.feedback is required");
+                const feedback = doubleSequence(feedbackValue, "feedback");
+                const feedforwardValue = member(dict, "feedforward");
+                if (feedforwardValue === undefined) throw new TypeError("IIRFilterOptions.feedforward is required");
+                const feedforward = doubleSequence(feedforwardValue, "feedforward");
+                iirCoefficients(feedforward, feedback);
+                super(token, context, "iir", 2, [], [new F64(feedforward), new F64(feedback)]);
+                applyNodeOptions(this, converted);
+            }
+            getFrequencyResponse(frequencyHz, magResponse, phaseResponse) {
+                const state = nodeRecord(this, "iir");
+                frequencyResponse(state, frequencyHz, magResponse, phaseResponse, arguments.length);
+            }
+        }
+        // DelayNode (#DelayNode).
+        class DelayNode extends AudioNode {
+            constructor(context, options = undefined) {
+                contextRecord(context);
+                const dict = dictionary(options, "DelayOptions");
+                const converted = nodeOptions(dict);
+                const delay = member(dict, "delayTime");
+                const delayValue = delay === undefined ? undefined : double(delay, "delayTime");
+                const maximum = member(dict, "maxDelayTime");
+                const maxDelay = maximum === undefined ? 1 : double(maximum, "maxDelayTime");
+                // #dom-baseaudiocontext-createdelay: (0, 180) seconds.
+                if (!(maxDelay > 0 && maxDelay < 180))
+                    throw new Exception("maxDelayTime must be between 0 and 180 seconds", "NotSupportedError");
+                super(token, context, "delay", 2, [
+                    {name: "delayTime", value: 0, min: 0, max: maxDelay, rate: "a-rate"},
+                ], [maxDelay]);
+                applyNodeOptions(this, converted);
+                if (delayValue !== undefined) nodeRecord(this).params.delayTime.value = delayValue;
+            }
+            get delayTime() { return nodeRecord(this, "delay").params.delayTime; }
+        }
+        // StereoPannerNode (#stereopannernode).
+        class StereoPannerNode extends AudioNode {
+            constructor(context, options = undefined) {
+                contextRecord(context);
+                const dict = dictionary(options, "StereoPannerOptions");
+                const converted = nodeOptions(dict);
+                const pan = member(dict, "pan");
+                const panValue = pan === undefined ? undefined : float(pan, "pan");
+                super(token, context, "stereo-panner", 2, [
+                    {name: "pan", value: 0, min: -1, max: 1, rate: "a-rate"},
+                ]);
+                applyNodeOptions(this, converted);
+                if (panValue !== undefined) nodeRecord(this).params.pan.value = panValue;
+            }
+            get pan() { return nodeRecord(this, "stereo-panner").params.pan; }
+        }
+        // ChannelSplitterNode and ChannelMergerNode (#ChannelSplitterNode,
+        // #ChannelMergerNode): 1 to 32 ports.
+        function portCount(value, name) {
+            const count = value === undefined ? 6 : unsignedLong(value);
+            if (count < 1 || count > MAX_CHANNELS)
+                throw new Exception(name + " must be between 1 and 32", "IndexSizeError");
+            return count;
+        }
+        class ChannelSplitterNode extends AudioNode {
+            constructor(context, options = undefined) {
+                contextRecord(context);
+                const dict = dictionary(options, "ChannelSplitterOptions");
+                const converted = nodeOptions(dict);
+                const outputs = portCount(member(dict, "numberOfOutputs"), "numberOfOutputs");
+                super(token, context, "splitter", outputs, [], [], {outputs, interpretation: "discrete"});
+                applyNodeOptions(this, converted);
+            }
+        }
+        class ChannelMergerNode extends AudioNode {
+            constructor(context, options = undefined) {
+                contextRecord(context);
+                const dict = dictionary(options, "ChannelMergerOptions");
+                const converted = nodeOptions(dict);
+                const inputs = portCount(member(dict, "numberOfInputs"), "numberOfInputs");
+                super(token, context, "merger", 1, [], [], {inputs});
+                applyNodeOptions(this, converted);
+            }
+        }
+        // WaveShaperNode (#WaveShaperNode).
+        const OVERSAMPLE = ["none", "2x", "4x"];
+        function setCurve(node, state, curve) {
+            // #WaveShaperNode curve setter.
+            if (curve !== null) {
+                if (apply(typedArrayLength, curve, []) < 2)
+                    throw new Exception("A curve needs at least two values", "InvalidStateError");
+                if (state.curveSet) throw new Exception("The curve can only be set once", "InvalidStateError");
+                state.curveSet = true;
+                curve = new F32(curve);
+            }
+            state.curve = curve;
+            control(node, "curve", curve);
+        }
+        class WaveShaperNode extends AudioNode {
+            constructor(context, options = undefined) {
+                contextRecord(context);
+                const dict = dictionary(options, "WaveShaperOptions");
+                const converted = nodeOptions(dict);
+                const curveValue = member(dict, "curve");
+                const curve = curveValue === undefined ? undefined : new F32(floatSequence(curveValue));
+                const oversample = member(dict, "oversample");
+                const oversampleValue = oversample === undefined ? "none" : enumValue(oversample, OVERSAMPLE);
+                if (curve !== undefined && curve.length < 2)
+                    throw new Exception("A curve needs at least two values", "InvalidStateError");
+                super(token, context, "shaper", 2, [], [curve || null, [1, 2, 4][OVERSAMPLE.indexOf(oversampleValue)]]);
+                const state = nodeRecord(this);
+                state.curve = curve || null;
+                state.curveSet = curve !== undefined;
+                state.oversample = oversampleValue;
+                applyNodeOptions(this, converted);
+            }
+            get curve() { return nodeRecord(this, "shaper").curve; }
+            set curve(value) {
+                const state = nodeRecord(this, "shaper");
+                setCurve(this, state, value === null || value === undefined ? null : float32Array(value, "curve"));
+            }
+            get oversample() { return nodeRecord(this, "shaper").oversample; }
+            set oversample(value) {
+                const state = nodeRecord(this, "shaper");
+                value = `${value}`;
+                if (!OVERSAMPLE.includes(value)) return;
+                state.oversample = value;
+                control(this, "oversample", [1, 2, 4][OVERSAMPLE.indexOf(value)]);
+            }
+        }
+        // AnalyserNode (#AnalyserNode): the host keeps the input's last
+        // 32768 frames; script's calls compute their data there.
+        const uint8Tag = array => {
+            let tag;
+            try { tag = apply(typedArrayTag, array, []); } catch (_) { tag = undefined; }
+            if (tag !== "Uint8Array") throw new TypeError("Expected a Uint8Array");
+            return array;
+        };
+        function analyserData(node, op, array, bytes) {
+            const state = nodeRecord(node, "analyser");
+            host("analyser", get(state.context).id, state.id, op, state.fftSize, state.smoothing,
+                state.minDecibels, state.maxDecibels, array, apply(typedArrayLength, array, []) * bytes);
+        }
+        class AnalyserNode extends AudioNode {
+            constructor(context, options = undefined) {
+                contextRecord(context);
+                const dict = dictionary(options, "AnalyserOptions");
+                const converted = nodeOptions(dict);
+                const fft = member(dict, "fftSize");
+                const fftSize = fft === undefined ? 2048 : unsignedLong(fft);
+                const maxValue = member(dict, "maxDecibels");
+                const maxDecibels = maxValue === undefined ? -30 : double(maxValue, "maxDecibels");
+                const minValue = member(dict, "minDecibels");
+                const minDecibels = minValue === undefined ? -100 : double(minValue, "minDecibels");
+                const smoothingValue = member(dict, "smoothingTimeConstant");
+                const smoothing = smoothingValue === undefined ? 0.8 : double(smoothingValue, "smoothingTimeConstant");
+                super(token, context, "analyser", 2, []);
+                const state = nodeRecord(this);
+                state.fftSize = 2048;
+                state.minDecibels = -100;
+                state.maxDecibels = -30;
+                state.smoothing = 0.8;
+                applyNodeOptions(this, converted);
+                this.fftSize = fftSize;
+                if (minDecibels >= maxDecibels)
+                    throw new Exception("minDecibels must be less than maxDecibels", "IndexSizeError");
+                state.minDecibels = minDecibels;
+                state.maxDecibels = maxDecibels;
+                this.smoothingTimeConstant = smoothing;
+            }
+            get fftSize() { return nodeRecord(this, "analyser").fftSize; }
+            set fftSize(value) {
+                const state = nodeRecord(this, "analyser");
+                value = unsignedLong(value);
+                if (value < 32 || value > 32768 || (value & (value - 1)))
+                    throw new Exception("fftSize must be a power of two from 32 to 32768", "IndexSizeError");
+                if (value !== state.fftSize) {
+                    state.fftSize = value;
+                    host("analyser", get(state.context).id, state.id, "reset", value);
+                }
+            }
+            get frequencyBinCount() { return nodeRecord(this, "analyser").fftSize / 2; }
+            get minDecibels() { return nodeRecord(this, "analyser").minDecibels; }
+            set minDecibels(value) {
+                const state = nodeRecord(this, "analyser");
+                value = double(value, "minDecibels");
+                if (value >= state.maxDecibels)
+                    throw new Exception("minDecibels must be less than maxDecibels", "IndexSizeError");
+                state.minDecibels = value;
+            }
+            get maxDecibels() { return nodeRecord(this, "analyser").maxDecibels; }
+            set maxDecibels(value) {
+                const state = nodeRecord(this, "analyser");
+                value = double(value, "maxDecibels");
+                if (value <= state.minDecibels)
+                    throw new Exception("maxDecibels must be more than minDecibels", "IndexSizeError");
+                state.maxDecibels = value;
+            }
+            get smoothingTimeConstant() { return nodeRecord(this, "analyser").smoothing; }
+            set smoothingTimeConstant(value) {
+                const state = nodeRecord(this, "analyser");
+                value = double(value, "smoothingTimeConstant");
+                if (value < 0 || value > 1)
+                    throw new Exception("smoothingTimeConstant must be in [0, 1]", "IndexSizeError");
+                state.smoothing = value;
+            }
+            getFloatFrequencyData(array) {
+                if (arguments.length < 1) throw new TypeError("An array is required");
+                analyserData(this, "floatFrequency", float32Array(array, "array"), 4);
+            }
+            getByteFrequencyData(array) {
+                if (arguments.length < 1) throw new TypeError("An array is required");
+                analyserData(this, "byteFrequency", uint8Tag(array), 1);
+            }
+            getFloatTimeDomainData(array) {
+                if (arguments.length < 1) throw new TypeError("An array is required");
+                analyserData(this, "floatTime", float32Array(array, "array"), 4);
+            }
+            getByteTimeDomainData(array) {
+                if (arguments.length < 1) throw new TypeError("An array is required");
+                analyserData(this, "byteTime", uint8Tag(array), 1);
+            }
+        }
+        // ConvolverNode (#ConvolverNode).
+        class ConvolverNode extends AudioNode {
+            constructor(context, options = undefined) {
+                contextRecord(context);
+                const dict = dictionary(options, "ConvolverOptions");
+                const converted = nodeOptions(dict);
+                const bufferValue = member(dict, "buffer");
+                const buffer = bufferValue === undefined || bufferValue === null ? null : (bufferRecord(bufferValue), bufferValue);
+                const disable = !!member(dict, "disableNormalization");
+                super(token, context, "convolver", 2, []);
+                const state = nodeRecord(this);
+                state.normalize = !disable;
+                state.buffer = null;
+                if (buffer) this.buffer = buffer;
+                applyNodeOptions(this, converted);
+            }
+            get buffer() { return nodeRecord(this, "convolver").buffer; }
+            set buffer(value) {
+                const state = nodeRecord(this, "convolver");
+                if (value === undefined || value === null) {
+                    state.buffer = null;
+                    control(this, "response", 0, 0);
+                    return;
+                }
+                const buffer = bufferRecord(value);
+                // #set-convolver-buffer: 1, 2 or 4 channels at the context's rate.
+                if (![1, 2, 4].includes(buffer.count) || buffer.rate !== get(state.context).rate)
+                    throw new Exception("The impulse response is not supported", "NotSupportedError");
+                state.buffer = value;
+                control(this, "response", acquireContent(value), state.normalize ? 1 : 0);
+            }
+            get normalize() { return nodeRecord(this, "convolver").normalize; }
+            set normalize(value) { nodeRecord(this, "convolver").normalize = !!value; }
+        }
+        // AudioListener (#AudioListener): its parameters exist (and can be
+        // automated), though no PannerNode reads them.
+        const LISTENER_PARAMS = [["positionX", 0], ["positionY", 0], ["positionZ", 0],
+            ["forwardX", 0], ["forwardY", 0], ["forwardZ", -1], ["upX", 0], ["upY", 1], ["upZ", 0]];
+        class AudioListener {
+            constructor() { throw new TypeError("Illegal constructor"); }
+            setPosition(x, y, z) {
+                const state = listenerRecord(this);
+                if (arguments.length < 3) throw new TypeError("setPosition requires three values");
+                const values = [float(x), float(y), float(z)];
+                ["positionX", "positionY", "positionZ"].forEach((name, index) => { state.params[name].value = values[index]; });
+            }
+            setOrientation(x, y, z, xUp, yUp, zUp) {
+                const state = listenerRecord(this);
+                if (arguments.length < 6) throw new TypeError("setOrientation requires six values");
+                const values = [x, y, z, xUp, yUp, zUp].map(value => float(value));
+                ["forwardX", "forwardY", "forwardZ", "upX", "upY", "upZ"].forEach((name, index) => {
+                    state.params[name].value = values[index];
+                });
+            }
+        }
+        function listenerRecord(listener) {
+            const state = get(listener);
+            if (!state || state.kind !== "listener-object") throw new TypeError("Illegal AudioListener invocation");
+            return state;
+        }
+        for (const [name] of LISTENER_PARAMS) {
+            define(AudioListener.prototype, name, {configurable: true, enumerable: true,
+                get: {[name]() { return listenerRecord(this).params[name]; }}[name]});
+            define(Object.getOwnPropertyDescriptor(AudioListener.prototype, name).get,
+                "name", {value: "get " + name, configurable: true});
+        }
+        // The context's [SameObject] listener, made on first use.
+        function contextListener(context, state) {
+            if (!state.listener) {
+                const node = new AudioNode(token, context, "listener", 1, LISTENER_PARAMS.map(([name, value]) =>
+                    ({name, value, min: -MAX_FLOAT, max: MAX_FLOAT, rate: "a-rate"})));
+                const listener = create(AudioListener.prototype);
+                set(listener, {kind: "listener-object", node, params: nodeRecord(node).params});
+                state.listener = listener;
+            }
+            return state.listener;
+        }
+
         // ---- contexts ----
         // [[control thread state]] is `state.state`; `state.reported` is the
         // state the last statechange announced, so each transition the
@@ -13953,6 +14367,30 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             createOscillator() { contextRecord(this); return new OscillatorNode(this); }
             createDynamicsCompressor() { contextRecord(this); return new DynamicsCompressorNode(this); }
             createBufferSource() { contextRecord(this); return new AudioBufferSourceNode(this); }
+            createConstantSource() { contextRecord(this); return new ConstantSourceNode(this); }
+            createBiquadFilter() { contextRecord(this); return new BiquadFilterNode(this); }
+            createIIRFilter(feedforward, feedback) {
+                contextRecord(this);
+                if (arguments.length < 2) throw new TypeError("createIIRFilter requires feedforward and feedback");
+                return new IIRFilterNode(this, {feedforward, feedback});
+            }
+            createDelay(maxDelayTime = 1) {
+                contextRecord(this);
+                return new DelayNode(this, {maxDelayTime: double(maxDelayTime, "maxDelayTime")});
+            }
+            createStereoPanner() { contextRecord(this); return new StereoPannerNode(this); }
+            createChannelSplitter(numberOfOutputs = 6) {
+                contextRecord(this);
+                return new ChannelSplitterNode(this, {numberOfOutputs: unsignedLong(numberOfOutputs)});
+            }
+            createChannelMerger(numberOfInputs = 6) {
+                contextRecord(this);
+                return new ChannelMergerNode(this, {numberOfInputs: unsignedLong(numberOfInputs)});
+            }
+            createWaveShaper() { contextRecord(this); return new WaveShaperNode(this); }
+            createAnalyser() { contextRecord(this); return new AnalyserNode(this); }
+            createConvolver() { contextRecord(this); return new ConvolverNode(this); }
+            get listener() { return contextListener(this, contextRecord(this)); }
             createBuffer(numberOfChannels, length, sampleRate) {
                 contextRecord(this);
                 if (arguments.length < 3) throw new TypeError("createBuffer requires three arguments");
@@ -14358,7 +14796,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         }
         for (const ctor of [BaseAudioContext, AudioContext, OfflineAudioContext, AudioNode, AudioDestinationNode,
             ScriptProcessorNode, AudioScheduledSourceNode, OscillatorNode, GainNode, DynamicsCompressorNode,
-            AudioBufferSourceNode, AudioParam, AudioBuffer, PeriodicWave, OfflineAudioCompletionEvent]) {
+            AudioBufferSourceNode, AudioParam, AudioBuffer, PeriodicWave, OfflineAudioCompletionEvent,
+            ConstantSourceNode, BiquadFilterNode, IIRFilterNode, DelayNode, StereoPannerNode, ChannelSplitterNode,
+            ChannelMergerNode, WaveShaperNode, AnalyserNode, ConvolverNode, AudioListener]) {
             for (const name of Object.getOwnPropertyNames(ctor.prototype)) {
                 if (name === "constructor") continue;
                 const descriptor = Object.getOwnPropertyDescriptor(ctor.prototype, name);
@@ -14372,7 +14812,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         for (const [ctor, length] of [[AudioNode, 0], [AudioDestinationNode, 0], [ScriptProcessorNode, 0],
             [AudioScheduledSourceNode, 0], [BaseAudioContext, 0], [OscillatorNode, 1], [GainNode, 1],
             [DynamicsCompressorNode, 1], [AudioBufferSourceNode, 1], [PeriodicWave, 1], [AudioBuffer, 1],
-            [OfflineAudioContext, 1], [OfflineAudioCompletionEvent, 2]])
+            [OfflineAudioContext, 1], [OfflineAudioCompletionEvent, 2], [ConstantSourceNode, 1],
+            [BiquadFilterNode, 1], [IIRFilterNode, 2], [DelayNode, 1], [StereoPannerNode, 1],
+            [ChannelSplitterNode, 1], [ChannelMergerNode, 1], [WaveShaperNode, 1], [AnalyserNode, 1],
+            [ConvolverNode, 1], [AudioListener, 0]])
             define(ctor, "length", {value: length, configurable: true});
     }
     for (const [name,value] of [["NETWORK_EMPTY",0],["NETWORK_IDLE",1],["NETWORK_LOADING",2],

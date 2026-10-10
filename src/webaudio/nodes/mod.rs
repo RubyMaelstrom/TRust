@@ -9,15 +9,33 @@ use super::engine::Notice;
 use super::param::Param;
 use super::wave::Wave;
 
+pub mod analyser;
+pub mod biquad;
 mod buffer_source;
+mod channels;
 mod compressor;
+mod constant;
+pub mod convolver;
+mod delay;
 mod gain;
+pub mod iir;
 mod oscillator;
+mod shaper;
+mod stereo_panner;
 
+pub use analyser::Analyser;
+pub use biquad::Biquad;
 pub use buffer_source::BufferSource;
+pub use channels::{Merger, Splitter};
 pub use compressor::Compressor;
+pub use constant::ConstantSource;
+pub use convolver::Convolver;
+pub use delay::Delay;
 pub use gain::Gain;
+pub use iir::Iir;
 pub use oscillator::Oscillator;
+pub use shaper::WaveShaper;
+pub use stereo_panner::StereoPanner;
 
 /// What a processor knows about the render quantum it computes.
 pub struct Scope<'a> {
@@ -78,6 +96,14 @@ pub enum Control {
     Loop(bool),
     LoopStart(f64),
     LoopEnd(f64),
+    /// BiquadFilterNode `type` (a `biquad::Kind` index).
+    FilterType(u64),
+    /// WaveShaperNode `curve`.
+    Curve(Option<Arc<[f32]>>),
+    /// WaveShaperNode `oversample` factor (1, 2 or 4).
+    Oversample(usize),
+    /// ConvolverNode `buffer`, prepared on the control thread.
+    Response(Option<Arc<convolver::Response>>),
 }
 
 /// One node type's processing.
