@@ -1554,11 +1554,19 @@ impl Canvas {
                     }
                     if opaque {
                         to.copy_from_slice(from);
-                        to.chunks_exact_mut(4).for_each(|pixel| pixel[3] = 255);
+                        to.as_chunks_mut::<4>()
+                            .0
+                            .iter_mut()
+                            .for_each(|pixel| pixel[3] = 255);
                         continue;
                     }
-                    for (out, pixel) in to.chunks_exact_mut(4).zip(from.chunks_exact(4)) {
-                        let alpha = if opaque { 255 } else { u32::from(pixel[3]) };
+                    for (out, pixel) in to
+                        .as_chunks_mut::<4>()
+                        .0
+                        .iter_mut()
+                        .zip(from.as_chunks::<4>().0)
+                    {
+                        let alpha = u32::from(pixel[3]);
                         if alpha == 255 {
                             out.copy_from_slice(&[pixel[0], pixel[1], pixel[2], 255]);
                         } else {
@@ -1951,7 +1959,9 @@ impl Canvas {
 /// Whether every RGBA8 pixel of `rgba` has alpha 255. A bitwise AND over all of them (no early
 /// exit), which the compiler vectorizes; the answer equals "all alpha bytes are 255".
 fn opaque_alpha(rgba: &[u8]) -> bool {
-    rgba.chunks_exact(4)
+    rgba.as_chunks::<4>()
+        .0
+        .iter()
         .fold(255u8, |all, pixel| all & pixel[3])
         == 255
 }
@@ -2187,8 +2197,9 @@ mod tests {
                 ((c as f32 / 255. * alpha as f32).round()) as u8
             };
             let (dx, dy) = (3i64, 2i64);
-            let x0 = 5i64.max(0).max(-dx);
-            let y0 = (-4i64).max(0).max(-dy);
+            // Dirty x = 5, y = -4 (clipped to the image and the destination offset).
+            let x0 = 5i64.max(-dx);
+            let y0 = 0i64.max(-dy);
             let x1 = (5 + 20).min(width as i64).min(40 - dx);
             let y1 = (-4 + 30).min(height as i64).min(30 - dy);
             let pixels = canvas.bitmap.as_ref().unwrap().data().to_vec();
@@ -2254,7 +2265,9 @@ mod tests {
         assert!(image.image.has_alpha);
         // A fully opaque frame presents as opaque pixels and the same bytes.
         let opaque: Vec<u8> = bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .flat_map(|p| [p[0], p[1], p[2], 255])
             .collect();
         let mut canvas = Canvas::new(width, height, true).unwrap();
