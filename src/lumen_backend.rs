@@ -5006,14 +5006,16 @@ mod desktop {
         prime_page_svg_sprites(page);
         let clickable_listeners = listener_ids(page, "clickables");
         let hover_listeners = listener_ids(page, "hoverables");
-        let (clickable, has_interaction) = {
-            let dom = page.dom.borrow();
-            crate::js::clickable_set_for_dom(&dom, &clickable_listeners)
-        };
-        let (hover, complete_hover_hits) = {
-            let dom = page.dom.borrow();
-            crate::js::hover_set_for_dom(&dom, &hover_listeners)
-        };
+        let crate::js::InteractionSets {
+            clickable,
+            has_interaction,
+            hover,
+            complete_hover_hits,
+        } = crate::js::interaction_sets_for_dom(
+            &page.dom.borrow(),
+            &clickable_listeners,
+            &hover_listeners,
+        );
         let paint = page
             .dom
             .borrow()

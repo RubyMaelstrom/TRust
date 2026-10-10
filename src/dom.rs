@@ -852,18 +852,19 @@ pub struct Dom {
     dirty_attributed: bool,
     /// Actor nodes eligible for pointer hit correlation (computed by the
     /// actor's `hover_set` before each serialize): CSS-only pages keep sparse
-    /// selector candidates; pages exposing pointer/mouse boundary events carry
-    /// every element so target and relatedTarget remain exact. The serializer
-    /// bakes `data-trust-hover` on them. Deliberately a DEDICATED attribute —
+    /// selector candidates; pages exposing pointer/mouse boundary events mark
+    /// every element (`hover_hits_complete`) so target and relatedTarget
+    /// remain exact. The serializer bakes `data-trust-hover` on them. Deliberately a DEDICATED attribute —
     /// `data-trust-node` is load-bearing for incremental-layout boundary
     /// sparsity and scroll-region correlation, so hit targets must not carry it.
     hover_hosts: std::collections::HashSet<NodeId>,
-    /// Whether `hover_hosts` names every rendered element rather than only CSS
-    /// hover candidates. UI Events requires the actual hit-test target (and
-    /// `relatedTarget`) even when that element has no listener of its own, so
-    /// any page with pointer/mouse boundary listeners uses complete markers.
-    /// Kept separately because a CSS-only `:hover` page can retain its sparse
-    /// candidate set without losing observable event targets.
+    /// Whether every rendered element is a hover host rather than only CSS
+    /// hover candidates (`hover_hosts` then holds just the listener hosts).
+    /// UI Events requires the actual hit-test target (and `relatedTarget`)
+    /// even when that element has no listener of its own, so any page with
+    /// pointer/mouse boundary listeners uses complete markers. Kept separately
+    /// because a CSS-only `:hover` page can retain its sparse candidate set
+    /// without losing observable event targets.
     hover_hits_complete: bool,
     /// Selector subjects of paint-only hover rules. These receive a separate
     /// presentation marker so graphical frontends can update baked paint style
@@ -13488,7 +13489,7 @@ impl Dom {
         // onto the items flowed beneath it, so a hovered cell resolves back to
         // the actor node whose listeners (or whose ancestors', via bubbling)
         // should hear the pointer.
-        if self.hover_hosts.contains(&id) {
+        if self.hover_hits_complete || self.hover_hosts.contains(&id) {
             out.push_str(&format!(" data-trust-hover=\"{id}\""));
         }
         // Paint-only hover selector subjects are correlated independently of

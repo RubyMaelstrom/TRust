@@ -1282,12 +1282,50 @@ pub(crate) fn clickable_set_for_dom(
     dom: &Dom,
     listeners: &std::collections::HashSet<usize>,
 ) -> (std::collections::HashSet<usize>, bool) {
+    clickable_set_in(dom, &listening_walk(dom, listeners), listeners)
+}
+
+/// Every composed descendant of the Document (as `Dom::composed_descendants`
+/// visits them), with whether it or a composed ancestor (shadow roots
+/// included, as `parent_composed` reaches them) has a click listener or an
+/// `onclick` content attribute. One walk replaces a composed-ancestor walk
+/// per element.
+fn listening_walk(dom: &Dom, listeners: &std::collections::HashSet<usize>) -> Vec<(usize, bool)> {
+    let listens = |node: usize| listeners.contains(&node) || dom.attr(node, "onclick").is_some();
+    let mut walk = Vec::new();
+    let mut stack = vec![(DOCUMENT, listens(DOCUMENT))];
+    while let Some((node, listening)) = stack.pop() {
+        if node != DOCUMENT {
+            walk.push((node, listening));
+        }
+        let start = stack.len();
+        stack.extend(
+            dom.child_iter(node)
+                .map(|child| (child, listening || listens(child))),
+        );
+        if let Some(shadow) = dom.shadow_root(node) {
+            let listening = listening || listens(shadow);
+            stack.extend(
+                dom.child_iter(shadow)
+                    .map(|child| (child, listening || listens(child))),
+            );
+        }
+        stack[start..].reverse();
+    }
+    walk
+}
+
+fn clickable_set_in(
+    dom: &Dom,
+    walk: &[(usize, bool)],
+    listeners: &std::collections::HashSet<usize>,
+) -> (std::collections::HashSet<usize>, bool) {
+    use rustc_hash::FxHashSet;
     use std::collections::HashSet;
 
-    let everyone = dom.composed_descendants(DOCUMENT);
-    let inherent: Vec<usize> = everyone
+    let mut candidates: FxHashSet<usize> = walk
         .iter()
-        .copied()
+        .map(|&(node, _)| node)
         .filter(|&node| {
             dom.tag_name(node) == Some("button")
                 || dom.is_details_summary(node)
@@ -1295,41 +1333,36 @@ pub(crate) fn clickable_set_for_dom(
                 || dom.attr(node, "role") == Some("button")
         })
         .collect();
-    let listens = |node: usize| -> bool {
-        let mut current = Some(node);
-        while let Some(candidate) = current {
-            if listeners.contains(&candidate) || dom.attr(candidate, "onclick").is_some() {
-                return true;
-            }
-            current = dom.parent_composed(candidate);
-        }
-        false
-    };
     // A hyperlink with its own referrer policy is followed by the page actor,
     // which applies it (HTML #following-hyperlinks-2).
-    let anchors: Vec<usize> = everyone
+    let anchors: Vec<usize> = walk
         .iter()
-        .copied()
-        .filter(|&node| {
-            dom.tag_name(node) == Some("a")
-                && (listens(node) || hyperlink_chooses_referrer(dom, node))
+        .filter(|&&(node, listening)| {
+            dom.tag_name(node) == Some("a") && (listening || hyperlink_chooses_referrer(dom, node))
         })
+        .map(|&(node, _)| node)
         .collect();
-    let mut candidates: HashSet<usize> = inherent.into_iter().collect();
     candidates.extend(listeners.iter().copied());
     let cursor_started = Instant::now();
-    for node in dom.cursor_style_candidates(&everyone) {
-        if listens(node) && dom.computed_style(node, "cursor").as_deref() == Some("pointer") {
+    // Only an element with a click listener on itself or a composed ancestor
+    // becomes an activation target by its `cursor: pointer`.
+    let listening: Vec<usize> = walk
+        .iter()
+        .filter(|&&(_, listening)| listening)
+        .map(|&(node, _)| node)
+        .collect();
+    for node in dom.cursor_style_candidates(&listening) {
+        if dom.computed_style(node, "cursor").as_deref() == Some("pointer") {
             candidates.insert(node);
         }
     }
     phase(&format!(
         "extract_live: cursor loop over {} nodes +{}ms",
-        everyone.len(),
+        listening.len(),
         cursor_started.elapsed().as_millis()
     ));
     candidates.retain(|&node| !matches!(dom.tag_name(node), None | Some("html" | "body")));
-    let mut containers = HashSet::new();
+    let mut containers = FxHashSet::default();
     for node in candidates.iter().chain(&anchors) {
         let mut current = dom.parent_composed(*node);
         while let Some(parent) = current {
@@ -1341,18 +1374,21 @@ pub(crate) fn clickable_set_for_dom(
             current = dom.parent_composed(parent);
         }
     }
-    let mut clickable: HashSet<usize> = candidates.difference(&containers).copied().collect();
+    let mut clickable: HashSet<usize> = candidates
+        .iter()
+        .copied()
+        .filter(|node| !containers.contains(node))
+        .collect();
     clickable.extend(anchors);
     // HTML #tabindex-value / #click-focusable: generic focusable elements
     // need their own native activation identity, including nested menus.
     // Do not prune a focus target merely because it contains another target.
     clickable.extend(
-        everyone
-            .iter()
-            .copied()
+        walk.iter()
+            .map(|&(node, _)| node)
             .filter(|&node| dom.has_tabindex(node)),
     );
-    let has_forms = everyone.iter().copied().any(|node| {
+    let has_forms = walk.iter().any(|&(node, _)| {
         matches!(
             dom.tag_name(node),
             Some("form" | "input" | "button" | "select" | "textarea")
@@ -1360,6 +1396,32 @@ pub(crate) fn clickable_set_for_dom(
     });
     let has_any = !clickable.is_empty() || has_forms;
     (clickable, has_any)
+}
+
+/// The rendering update's activation and hover hit-test metadata from one
+/// composed walk: `clickable_set_for_dom` and `hover_set_for_dom`.
+pub(crate) fn interaction_sets_for_dom(
+    dom: &Dom,
+    click_listeners: &std::collections::HashSet<usize>,
+    hover_listeners: &std::collections::HashSet<usize>,
+) -> InteractionSets {
+    let walk = listening_walk(dom, click_listeners);
+    let (clickable, has_interaction) = clickable_set_in(dom, &walk, click_listeners);
+    let (hover, complete_hover_hits) =
+        hover_set_in(dom, walk.iter().map(|&(node, _)| node), hover_listeners);
+    InteractionSets {
+        clickable,
+        has_interaction,
+        hover,
+        complete_hover_hits,
+    }
+}
+
+pub(crate) struct InteractionSets {
+    pub(crate) clickable: std::collections::HashSet<usize>,
+    pub(crate) has_interaction: bool,
+    pub(crate) hover: std::collections::HashSet<usize>,
+    pub(crate) complete_hover_hits: bool,
 }
 
 const HOVER_ATTRS: &[&str] = &[
@@ -1375,30 +1437,107 @@ const HOVER_ATTRS: &[&str] = &[
     "onpointermove",
 ];
 
+/// The hover hit-test hosts: elements with pointer/mouse boundary listeners
+/// or handler attributes, and whether there are any. With such listeners UI
+/// Events needs every element as a possible target (`Dom::set_hover_hosts`
+/// treats the set as complete); otherwise the CSS `:hover` candidates.
+#[cfg(test)]
 pub(crate) fn hover_set_for_dom(
     dom: &Dom,
     listener_hosts: &std::collections::HashSet<usize>,
 ) -> (std::collections::HashSet<usize>, bool) {
+    hover_set_in(
+        dom,
+        dom.composed_descendants(DOCUMENT).into_iter(),
+        listener_hosts,
+    )
+}
+
+fn hover_set_in(
+    dom: &Dom,
+    nodes: impl Iterator<Item = usize>,
+    listener_hosts: &std::collections::HashSet<usize>,
+) -> (std::collections::HashSet<usize>, bool) {
     let mut hosts = listener_hosts.clone();
-    for node in dom.composed_descendants(DOCUMENT) {
-        if HOVER_ATTRS
+    hosts.extend(nodes.filter(|&node| {
+        HOVER_ATTRS
             .iter()
             .any(|attribute| dom.attr(node, attribute).is_some())
-        {
-            hosts.insert(node);
-        }
-    }
+    }));
     let complete = !hosts.is_empty();
-    let mut marked: std::collections::HashSet<usize> = if complete {
-        dom.composed_descendants(DOCUMENT)
-            .into_iter()
-            .filter(|&node| dom.tag_name(node).is_some())
-            .collect()
+    let mut marked = if complete {
+        hosts
     } else {
         dom.hover_css_candidates().into_iter().collect()
     };
     marked.retain(|&node| dom.tag_name(node).is_some());
     (marked, complete)
+}
+
+#[cfg(test)]
+mod interaction_set_tests {
+    use super::*;
+
+    /// The single listening walk agrees with the definition it replaces:
+    /// a node listens when it or a composed ancestor (`parent_composed`,
+    /// which reaches shadow roots and then their hosts) has a click listener
+    /// or an `onclick` attribute.
+    #[test]
+    fn the_listening_walk_matches_the_composed_ancestor_definition() {
+        let mut dom = Dom::parse_document(
+            "<div id=a onclick=''><p id=p>x<b>y</b></p></div><div id=h><span id=s>light</span></div>\
+             <section id=q><a id=link href=/x>z</a><i id=i>w</i></section>\
+             <iframe id=f srcdoc='<p>inner</p>'></iframe>",
+        );
+        let host = dom.get_by_id("h").unwrap();
+        let root = dom.attach_shadow(host);
+        let wrap = dom.create_element("div");
+        let slot = dom.create_element("slot");
+        let deep = dom.create_element("em");
+        dom.append(wrap, deep);
+        dom.append(wrap, slot);
+        dom.append(root, wrap);
+        let i = dom.get_by_id("i").unwrap();
+        for listeners in [
+            std::collections::HashSet::new(),
+            std::collections::HashSet::from([root]),
+            std::collections::HashSet::from([host, i]),
+            std::collections::HashSet::from([DOCUMENT]),
+        ] {
+            let walk = listening_walk(&dom, &listeners);
+            let nodes: Vec<usize> = walk.iter().map(|&(node, _)| node).collect();
+            assert_eq!(nodes, dom.composed_descendants(DOCUMENT));
+            for (node, listening) in walk {
+                let mut expected = false;
+                let mut current = Some(node);
+                while let Some(candidate) = current {
+                    if listeners.contains(&candidate) || dom.attr(candidate, "onclick").is_some() {
+                        expected = true;
+                    }
+                    current = dom.parent_composed(candidate);
+                }
+                assert_eq!(listening, expected, "node {node} with {listeners:?}");
+            }
+        }
+    }
+
+    /// With pointer boundary listeners every element is a hover target; the
+    /// set then holds only the listener hosts and the serializer marks all.
+    #[test]
+    fn complete_hover_hits_mark_every_element_without_listing_them() {
+        let mut dom =
+            Dom::parse_document("<div id=a onmouseover=''><p id=p>x</p></div><span id=s>y</span>");
+        let (a, s) = (dom.get_by_id("a").unwrap(), dom.get_by_id("s").unwrap());
+        let sets = interaction_sets_for_dom(&dom, &Default::default(), &Default::default());
+        assert!(sets.complete_hover_hits);
+        assert_eq!(sets.hover, std::collections::HashSet::from([a]));
+        dom.set_hover_hosts(sets.hover, sets.complete_hover_hits);
+        let html = dom.serialize_live(DOCUMENT, &Default::default());
+        assert!(
+            html.contains(&format!("data-trust-hover=\"{s}\"")),
+            "{html}"
+        );
+    }
 }
 
 #[cfg(test)]
