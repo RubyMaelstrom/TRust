@@ -72,9 +72,19 @@ impl MediaFallbacks {
                 .sum::<usize>()
     }
 
+    /// Retire what belongs to the document's previous URL: the retained
+    /// external-playback targets (see [`Dom::retained_media_controls`]).
+    /// Presentations are not among them. A presentation is the live state of
+    /// one element's player, which `media_host` sets when the player starts
+    /// and clears when it closes. The arena's URL changes only through
+    /// same-document navigations (HTML #url-and-history-update-steps for
+    /// `history.pushState()` and `replaceState()`, #navigate-fragid, and
+    /// same-document history traversal): the Document and its media elements
+    /// persist, so a playing video must keep painting its frames. Dropping its
+    /// surface here left the player running with nothing to show (archive.org
+    /// pushes `/details/ID/FILE` as its player starts).
     pub(super) fn clear(&mut self) {
         self.entries.clear();
-        self.presentations.clear();
     }
 }
 
@@ -250,5 +260,80 @@ impl Dom {
         }
         controls.retain(|node, _| !ambiguous.contains(node));
         controls
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn playing() -> MediaPresentation {
+        MediaPresentation {
+            surface: 7,
+            natural: Some((512, 384)),
+            show_poster: false,
+            controls: None,
+        }
+    }
+
+    /// HTML #url-and-history-update-steps: `history.pushState()` and
+    /// `replaceState()` set the Document's URL and neither reload nor stop a
+    /// media element, so the player's presentation (its frame surface and the
+    /// video's natural size, which sizes a `width: auto` box) outlives any
+    /// same-document URL change: a different path, query or fragment.
+    #[test]
+    fn a_same_document_url_change_keeps_a_players_presentation() {
+        let mut dom = Dom::parse_document("<body><video id=v></video><video id=w></video>");
+        let (video, other) = (dom.get_by_id("v").unwrap(), dom.get_by_id("w").unwrap());
+        let url = |text: &str| url::Url::parse(text).ok();
+        dom.set_doc_url(url("https://example.test/details/clip"));
+        dom.set_media_presentation(video, Some(playing()));
+        let paused = MediaPresentation {
+            surface: 8,
+            natural: None,
+            show_poster: true,
+            controls: None,
+        };
+        dom.set_media_presentation(other, Some(paused));
+        for next in [
+            "https://example.test/details/clip/episode.avi",
+            "https://example.test/search?q=clip",
+            "https://example.test/search?q=clip#results",
+        ] {
+            dom.set_doc_url(url(next));
+            assert_eq!(dom.media_presentation(video), Some(playing()), "{next}");
+            assert_eq!(dom.media_presentation(other), Some(paused), "{next}");
+            assert_eq!(dom.media_natural_size(video), Some((512, 384)), "{next}");
+        }
+        // The player alone ends a presentation (`media_host` clears it when
+        // it closes).
+        dom.set_media_presentation(video, None);
+        assert_eq!(dom.media_presentation(video), None);
+        assert_eq!(dom.media_presentation(other), Some(paused));
+    }
+
+    /// What does belong to the previous URL: the terminal's retained
+    /// external-playback targets, retired by a route change but not by a
+    /// fragment navigation (the pre-existing contract of
+    /// `retained_media_controls`).
+    #[test]
+    fn a_route_change_retires_retained_playback_targets_but_not_presentations() {
+        let mut dom = Dom::parse_document(
+            r#"<body><div id=player><video id=v src="/clip.mp4"></video></div>"#,
+        );
+        let base = url::Url::parse("https://example.test/").unwrap();
+        let video = dom.get_by_id("v").unwrap();
+        dom.set_doc_url(Some(base.clone()));
+        dom.remember_media(video, &base);
+        dom.set_media_presentation(video, Some(playing()));
+        dom.detach(video);
+        assert_eq!(dom.retained_media_controls().len(), 1);
+        dom.set_doc_url(Some(
+            url::Url::parse("https://example.test/#chapter").unwrap(),
+        ));
+        assert_eq!(dom.retained_media_controls().len(), 1);
+        dom.set_doc_url(Some(url::Url::parse("https://example.test/next").unwrap()));
+        assert!(dom.retained_media_controls().is_empty());
+        assert_eq!(dom.media_presentation(video), Some(playing()));
     }
 }

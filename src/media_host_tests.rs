@@ -408,6 +408,84 @@ fn a_video_paints_its_frames() {
     assert!(inside.windows(2).any(|w| w[0] != w[1]), "flat {inside:?}");
 }
 
+/// HTML #url-and-history-update-steps: `history.pushState()` sets the
+/// Document's URL and nothing else, so a playing video keeps its box (its
+/// natural size) and keeps painting its frames. A player that pushes its
+/// own `/details/ID/FILE` URL as playback starts (archive.org's JW Player)
+/// lost the frame surface when the URL change retired the Document's media
+/// state: the video went on playing, drawn nowhere.
+#[test]
+fn a_video_keeps_painting_after_a_same_document_url_change() {
+    let runtime = runtime();
+    let base = serve(&runtime);
+    let (mut engine, mut tasks) = page(&runtime, &format!("{base}/details/clip"));
+    eval(
+        &mut engine,
+        &format!(
+            "document.body.style.margin = '0'; document.body.style.background = 'black'; \
+             globalThis.v = document.createElement('video'); v.muted = true; \
+             v.oncanplaythrough = () => log.push('ready'); v.src = '{base}/av1.mp4'; \
+             document.body.appendChild(v);"
+        ),
+        "video",
+    )
+    .unwrap();
+    run_until(&runtime, &mut engine, &mut tasks, "log.includes('ready')");
+    let dom = engine.ctx().host_mut::<HostState>().unwrap().dom.clone();
+    let base_url = url::Url::parse(&base).unwrap();
+    let paint = |engine: &mut lumen::Engine| {
+        let rect = string_value(
+            engine,
+            "(r => [r.width, r.height].join())(v.getBoundingClientRect())",
+        );
+        let frame = crate::render::headless::render_dom_with_resources(
+            &dom.borrow(),
+            &base_url,
+            crate::core::CssSize::new(160.0, 120.0),
+            &[],
+            &Default::default(),
+            &Default::default(),
+            Default::default(),
+        )
+        .unwrap();
+        let pixel = |x: u32, y: u32| {
+            let index = ((y * frame.size.width + x) * 4) as usize;
+            [
+                frame.pixels[index],
+                frame.pixels[index + 1],
+                frame.pixels[index + 2],
+            ]
+        };
+        // Outside the 96x64 video the page is black; inside, the first
+        // frame of testsrc2 (colour bars) is not.
+        assert_eq!(pixel(140, 100), [0, 0, 0]);
+        let inside: Vec<[u8; 3]> = (0..8).map(|i| pixel(6 + i * 11, 30)).collect();
+        (rect, inside.iter().any(|p| *p != [0, 0, 0]))
+    };
+    assert_eq!(paint(&mut engine), ("96,64".to_string(), true));
+    // The page's `history.pushState()`: the actor applies each update to the
+    // arena's document URL (`take_history_updates`) as its task ends.
+    eval(
+        &mut engine,
+        "history.pushState(null, '', '/details/clip/episode.avi');",
+        "pushState",
+    )
+    .unwrap();
+    let updates = crate::js::decode_history_updates(&string_value(
+        &mut engine,
+        "__trust.takeHistoryUpdates()",
+    ));
+    assert_eq!(updates.len(), 1, "{updates:?}");
+    dom.borrow_mut()
+        .set_doc_url(url::Url::parse(&updates[0].0).ok());
+    assert!(updates[0].0.ends_with("/details/clip/episode.avi"));
+    assert_eq!(
+        paint(&mut engine),
+        ("96,64".to_string(), true),
+        "the video still shows its frames and its natural size after the push"
+    );
+}
+
 /// HTML #expose-a-user-interface-to-the-user: the controls attribute shows
 /// the user agent's controls over the element; pressing them operates the
 /// element through the DOM API and dispatches no page events.
