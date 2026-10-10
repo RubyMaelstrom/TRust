@@ -1141,9 +1141,19 @@ four local slots) and the bytecode operation whose machine code contains the
 sample. Code between two operation offsets is charged to the earlier operation, so
 fused templates and the shared call-finish stub appear under a neighboring op.
 `LUMEN_JIT_MAP` is presence-only and ARM64-only: at each native compilation it
-prints `[jit-map-range] <base> <len> <names>` and one
-`[jit-map-pc] <base> <offset> <pc> <op> <names>` line per operation to stderr.
+prints `[jit-map-range] <base> <len> <names>@<start>+<length>/<ops>ops/<slots>slots`
+(the function's byte offset and length in its script, so a hot chunk can be looked up
+in the script text, and its bytecode operation and slot counts), one
+`[jit-map-pc] <base> <offset> <pc> <op> <names>` line per operation, and
+`[jit-map-mark] <base> <offset> <family>` lines to stderr.
 Without `--jitmap`, generated code is reported as `[jit]`.
+
+The marks give the template family whose code begins at an offset (`typed-load`,
+`typed-store`, `get-elem`, `set-elem`, `load-name`, `call`, `chain`, `helper-call`; `-`
+closes a nested family back to its parent). `tools/jit_families.py OUT.txt -- COMMAND`
+runs the same sampler and reports the share of each family; the time of a
+register-region function (most compiled functions) appears as `other`, charged to the
+single operation under which the region begins.
 
 Two environment inputs to the script add instruction-level detail:
 
@@ -1161,6 +1171,39 @@ value also prints a `[jit-map] fn(<names>) base=<address> len=<bytes>` line per
 chunk. Write the words little-endian to a file and disassemble it with
 `objdump -D -b binary -m aarch64 FILE`. Base addresses change from run to run;
 take a dump and its map from the same run.
+
+### DOS emulation benchmark (archive.org's `doom_dos`)
+
+archive.org's DOS emulation (Emularity) runs DOSBox compiled by Emscripten 1.37.3 to
+asm.js, not WebAssembly: `emularity-engine.ux-b.archive.org/dosbox.json` names
+`dosbox-sync.js.gz` (a 5.5 MB plain-JavaScript file despite the name; an asm.js module of
+about 6,300 functions over a 128 MiB heap, with an Emterpreter for the code that must
+yield) and its `.mem` file. The page draws through `putImageData` on a 2D canvas and plays
+audio through an SDL2 `ScriptProcessorNode`; the game zip comes from
+`cors.archive.org/cors/doom_dos/doom.zip` through BrowserFS. The whole benchmark therefore
+measures Lumen's JIT on asm.js. Download the engine, `.mem` and zip once (archive.org
+throttles repeated downloads), unzip the game into a directory, and run the emulator's own
+JavaScript without a browser:
+
+```sh
+DOSBOX_JS=dosbox-sync.js.gz DOSBOX_MEM=dosbox-sync.mem.gz GAME_DIR=./doom-c EXIT_ON_GFX=1 \
+  taskset -c 17 target/release/lumen-cli tools/em_dosbox_harness.js 400   # or: node ...
+```
+
+`tools/em_dosbox_harness.js` stubs the DOM, canvas and AudioContext, mounts `GAME_DIR` as `C:`
+and prints `graphics ... first seen at t=<s>`: the time until DOOM's first graphics frame
+(its title screen), a fixed amount of guest work (296 emulated frames) and so a repeatable
+measure of emulation speed. With `FRAME_PNG=out.png` it writes the last frame. Pin to one
+core: this host's X925 cores (5-9, 15-19) run the JIT about 1.8 times faster than its A725
+cores, and the host's load varies run to run, so compare engines in concurrent runs. Measured
+on 2026-10-10 at Lumen eb0c9e9: node (V8) 10.1 s, Lumen JIT 106 s (10.5x); in the browser
+the same page needs about 190 s to reach the title screen.
+
+Micro-benchmarks of the asm.js patterns (one iteration of a loop, ns): a typed-array element
+access costs 20-40 in Lumen against 1-2 in V8, a JavaScript call 40-56 against 1.4, a closure
+variable store 16 against 1.3, and `Math.imul` through an identifier 80 against 1.4 (32 with
+inline Math intrinsics). Per-function profiles show 75-95% of the time in generated code with
+no dominant template: see `tools/jit_families.py`.
 
 ### `tools/js_ab.py`: interleaved A/B timing
 
