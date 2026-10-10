@@ -65,6 +65,27 @@ impl SlotSignals {
     }
 }
 
+/// DOM #find-a-slot step 6 answered for every shadow root at once: the
+/// first slot in tree order with each name. Finding a slot walks its shadow
+/// tree, and painting and layout ask for every flat-tree parent of every
+/// slotted node, so one walk per DOM revision replaces one per question.
+#[derive(Default)]
+pub(crate) struct SlotDirectory(FxHashMap<NodeId, FxHashMap<Box<str>, NodeId>>);
+
+impl SlotDirectory {
+    fn retained_bytes(&self) -> usize {
+        self.0.capacity() * std::mem::size_of::<(NodeId, FxHashMap<Box<str>, NodeId>)>()
+            + self
+                .0
+                .values()
+                .map(|names| {
+                    names.capacity() * std::mem::size_of::<(Box<str>, NodeId)>()
+                        + names.keys().map(|name| name.len()).sum::<usize>()
+                })
+                .sum::<usize>()
+    }
+}
+
 impl StyleView<'_> {
     /// DOM #concept-slot: a slot is an HTML `slot` element.
     #[inline]
@@ -77,15 +98,25 @@ impl StyleView<'_> {
     /// is `name` (DOM #find-a-slot step 6). A child navigable's Document is
     /// an arena child of its container but not part of this tree.
     pub(super) fn first_slot_named(&self, shadow: NodeId, name: &str) -> Option<NodeId> {
-        let mut found = None;
-        self.visit_tree_descendants(shadow, |id| {
-            if self.is_slot(id) && self.attr(id, "name").unwrap_or("") == name {
-                found = Some(id);
-                return false;
+        let directory = self.state.slot_directory.get_or_init(|| {
+            let mut directory = SlotDirectory::default();
+            for &root in self.state.shadow_hosts.keys() {
+                let mut names = FxHashMap::default();
+                self.visit_tree_descendants(root, |id| {
+                    if self.is_slot(id) {
+                        names
+                            .entry(self.attr(id, "name").unwrap_or("").into())
+                            .or_insert(id);
+                    }
+                    true
+                });
+                if !names.is_empty() {
+                    directory.0.insert(root, names);
+                }
             }
-            true
+            directory
         });
-        found
+        directory.0.get(&shadow)?.get(name).copied()
     }
 
     /// Visit `root`'s descendants in tree order, stopping when `visit`
@@ -480,7 +511,12 @@ impl Dom {
     }
 
     pub(super) fn slotting_retained_bytes(&self) -> usize {
-        self.manual_slots.retained_bytes() + self.slot_signals.retained_bytes()
+        self.manual_slots.retained_bytes()
+            + self.slot_signals.retained_bytes()
+            + self
+                .slot_directory
+                .get()
+                .map_or(0, SlotDirectory::retained_bytes)
     }
 
     /// Slots awaiting `slotchange` stay alive until it is fired.
@@ -536,6 +572,38 @@ mod tests {
 
     fn query(dom: &Dom, root: NodeId, selector: &str) -> NodeId {
         dom.query(root, &SelectorList::parse(selector).unwrap(), true)[0]
+    }
+
+    #[test]
+    fn slot_lookups_follow_slot_insertion_renaming_and_removal() {
+        // DOM #find-a-slot: the first slot in tree order with the
+        // slottable's name, re-evaluated after every change of the shadow
+        // tree or of a slot's name.
+        let mut dom = Dom::parse_document("<div id=host><span id=light slot=a>x</span></div>");
+        let (host, light) = (
+            dom.get_by_id("host").unwrap(),
+            dom.get_by_id("light").unwrap(),
+        );
+        let root = dom.attach_shadow(host);
+        let late = dom.create_element("slot");
+        dom.set_attr(late, "name", "a");
+        dom.append(root, late);
+        assert_eq!(dom.assigned_slot(light), Some(late));
+        let early = dom.create_element("slot");
+        dom.set_attr(early, "name", "a");
+        dom.insert_before(root, early, Some(late));
+        assert_eq!(dom.assigned_slot(light), Some(early));
+        dom.set_attr(early, "name", "b");
+        assert_eq!(dom.assigned_slot(light), Some(late));
+        dom.set_attr(light, "slot", "b");
+        assert_eq!(dom.assigned_slot(light), Some(early));
+        dom.detach(early);
+        assert_eq!(dom.assigned_slot(light), None);
+        dom.remove_attr(light, "slot");
+        let default = dom.create_element("slot");
+        dom.append(root, default);
+        assert_eq!(dom.assigned_slot(light), Some(default));
+        assert_eq!(dom.parent_flat(light), Some(default));
     }
 
     fn manual_host(dom: &mut Dom) -> (NodeId, NodeId) {

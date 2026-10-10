@@ -650,6 +650,9 @@ pub struct Dom {
     shadow_data: FxHashMap<NodeId, shadow::ShadowRootData>,
     /// HTML #manually-assigned-nodes and DOM's manual slot assignment.
     manual_slots: slotting::ManualSlots,
+    /// DOM #find-a-slot step 6 for every shadow root, built on the first
+    /// lookup after a mutation (`mark_dom_revision` resets it).
+    slot_directory: std::sync::OnceLock<slotting::SlotDirectory>,
     /// DOM #signal-slot-list and each slot's last signalled assignment.
     slot_signals: slotting::SlotSignals,
     /// Custom element registry associations (see `custom_registry`).
@@ -1193,6 +1196,7 @@ impl Dom {
             shadow_hosts,
             shadow_data,
             manual_slots: _,
+            slot_directory: _,
             slot_signals: _,
             ce_registries,
             media_tracks,
@@ -1767,6 +1771,7 @@ impl Dom {
             shadow_hosts: FxHashMap::default(),
             shadow_data: FxHashMap::default(),
             manual_slots: slotting::ManualSlots::default(),
+            slot_directory: std::sync::OnceLock::new(),
             slot_signals: slotting::SlotSignals::default(),
             ce_registries: custom_registry::State::default(),
             media_tracks: media_tracks::State::default(),
@@ -2785,6 +2790,7 @@ impl Dom {
 
     fn mark_dom_revision(&mut self) {
         self.invalidate_untracked_svg_resources();
+        self.slot_directory.take();
         self.dirty = true;
         self.epoch = self.epoch.wrapping_add(1);
         // Diagnostic: record WHEN the DOM last changed, so we can size the
@@ -4274,6 +4280,7 @@ impl Dom {
     /// Parser tree surgery is not a mutation of the live page, so it must not
     /// invalidate style/layout caches or walk node-document ownership.
     fn parser_detach(&mut self, id: NodeId) {
+        self.slot_directory.take();
         let (parent, previous, next) = {
             let node = &self.nodes[id];
             (node.parent, node.prev_sibling, node.next_sibling)

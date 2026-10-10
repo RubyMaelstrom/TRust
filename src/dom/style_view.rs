@@ -223,6 +223,7 @@ pub(super) struct ViewState<'a> {
     pub(super) document_encodings: &'a FxHashMap<NodeId, &'static encoding_rs::Encoding>,
     pub(super) cssom_inline: &'a FxHashMap<NodeId, cssom::Declarations>,
     pub(super) manual_slots: &'a slotting::ManualSlots,
+    pub(super) slot_directory: &'a std::sync::OnceLock<slotting::SlotDirectory>,
 }
 
 const _: () = {
@@ -265,6 +266,7 @@ impl Dom {
                 document_encodings: &self.document_encodings,
                 cssom_inline: &self.cssom_inline,
                 manual_slots: &self.manual_slots,
+                slot_directory: &self.slot_directory,
             },
         }
     }
