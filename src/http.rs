@@ -10314,12 +10314,16 @@ fn collect_image_urls_for_boxes(
             .then(|| crate::responsive_image::select(dom, id, base, viewport, device_pixel_ratio))
             .flatten()
             .filter(crate::responsive_image::loadable_source);
-        let svg = (dom.tag_name(id) == Some("svg"))
-            .then(|| match painted_svgs.and_then(|svgs| svgs.get(&id)) {
-                Some(source) => Some(dom.painted_svg_source(id, source).to_owned()),
-                None => dom.svg_image_data(id, Some(base)).map(|(source, _)| source),
-            })
-            .flatten();
+        // An inline SVG is not fetched: its image is its own serialization,
+        // which only a rendered box paints (CSS Display 3 §2.5 omits the
+        // rest), so a laid-out page serializes no unrendered SVG.
+        let svg = (dom.tag_name(id) == Some("svg")
+            && boxes.is_none_or(|boxes| boxes.contains_key(&id)))
+        .then(|| match painted_svgs.and_then(|svgs| svgs.get(&id)) {
+            Some(source) => Some(dom.painted_svg_source(id, source).to_owned()),
+            None => dom.svg_image_data(id, Some(base)).map(|(source, _)| source),
+        })
+        .flatten();
         let poster = (dom.tag_name(id) == Some("video"))
             .then(|| dom.attr(id, "poster"))
             .flatten()
@@ -14085,6 +14089,42 @@ mod tests {
         let shape = dom.get_by_id("shape").unwrap();
         dom.set_attr(shape, "fill", "blue");
         assert_ne!(render(&dom), first);
+    }
+
+    #[test]
+    fn unrendered_inline_svgs_are_not_collected_as_images() {
+        // CSS Display 3 §2.5: a display:none subtree generates no boxes, and an
+        // inline SVG's image is only its own serialization, so a laid-out
+        // page has no image to collect for it until it renders.
+        let _stable = crate::layout2::stable_global_layout_inputs();
+        let base = Url::parse("https://example.test/").unwrap();
+        let mut dom = crate::dom::Dom::parse_document(
+            "<body><div id=menu style=display:none><svg width=8 height=8>\
+             <rect fill=blue width=8 height=8 /></svg></div>\
+             <svg width=24 height=24><rect fill=red width=24 height=24 /></svg></body>",
+        );
+        let collected = |dom: &crate::dom::Dom| {
+            render_arena(
+                dom,
+                &base,
+                crate::layout2::Viewport::new(640.0, 480.0),
+                1.0,
+                None,
+                &Default::default(),
+            )
+            .image_urls
+            .iter()
+            .filter(|source| source.starts_with("data:image/svg+xml"))
+            .cloned()
+            .collect::<Vec<_>>()
+        };
+        let shown = collected(&dom);
+        assert_eq!(shown.len(), 1, "{shown:?}");
+        let menu = dom.get_by_id("menu").unwrap();
+        dom.remove_attr(menu, "style");
+        let both = collected(&dom);
+        assert_eq!(both.len(), 2, "{both:?}");
+        assert!(both.contains(&shown[0]), "{both:?}");
     }
 
     #[test]
