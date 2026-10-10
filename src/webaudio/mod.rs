@@ -17,6 +17,7 @@ pub mod param;
 pub(crate) mod resample;
 mod ring;
 pub mod wave;
+pub mod worklet;
 
 /// The most channels an AudioBuffer or node may have (#BaseAudioContext
 /// createBuffer: at least 32 must be supported).

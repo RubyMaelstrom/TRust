@@ -1154,6 +1154,30 @@ pub(crate) fn worker_prelude() -> &'static str {
         .as_str()
 }
 
+/// The AudioWorkletGlobalScope bootstrap (Web Audio #AudioWorkletGlobalScope):
+/// the worker platform with the worklet layer, which still sees the port
+/// API the worker bootstrap hands out.
+pub(crate) fn audio_worklet_prelude() -> &'static str {
+    static PRELUDE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PRELUDE
+        .get_or_init(|| {
+            // The worklet layer sees the port API the worker bootstrap hands
+            // out; the interfaces a worklet lacks go after everything else.
+            let (layer, cleanup) = include_str!("js_audio_worklet.js")
+                .split_once("/*__AUDIO_WORKLET_SCOPE_END__*/")
+                .expect("the worklet layer has its cleanup part");
+            format!(
+                "{}\n{cleanup}",
+                worker_prelude().replacen(
+                    "delete globalThis.__port_api;",
+                    &format!("{layer}\ndelete globalThis.__port_api;"),
+                    1,
+                )
+            )
+        })
+        .as_str()
+}
+
 fn platform_block(begin: &str, end: &str) -> &'static str {
     PRELUDE
         .split_once(begin)

@@ -353,6 +353,8 @@ mod tests {
             bus.channel_mut(0)[..chunk.len()].copy_from_slice(chunk);
             let mut outputs = [Bus::default()];
             let mut scope = Scope {
+                worklet: None,
+                inputs_active_each: &[true],
                 frame: 0,
                 rate: 48_000.0,
                 frames: quantum,

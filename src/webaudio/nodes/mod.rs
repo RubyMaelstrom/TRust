@@ -43,6 +43,10 @@ pub use stereo_panner::StereoPanner;
 
 /// What a processor knows about the render quantum it computes.
 pub struct Scope<'a> {
+    /// The context's AudioWorkletGlobalScope, once it has one.
+    pub worklet: Option<&'a mut (dyn crate::webaudio::worklet::Worklet + 'static)>,
+    /// Per input, whether an actively processing node is connected to it.
+    pub inputs_active_each: &'a [bool],
     /// [[current frame]] at the start of the quantum.
     pub frame: u64,
     pub rate: f32,
@@ -71,6 +75,14 @@ pub struct Params<'a> {
 }
 
 impl Params<'_> {
+    pub fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+
     pub fn get(&self, index: usize) -> &Param {
         &self.slab[self.ids[index]]
             .as_ref()
@@ -110,6 +122,9 @@ pub enum Control {
     Oversample(usize),
     /// ConvolverNode `buffer`, prepared on the control thread.
     Response(Option<Arc<convolver::Response>>),
+    /// An AudioWorkletNode's processor was constructed, or failed to be.
+    WorkletReady,
+    WorkletFailed,
 }
 
 /// One node type's processing.

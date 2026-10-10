@@ -288,6 +288,24 @@ pub(super) fn binding(ctx: &mut Ctx, op: &str, args: &[Value]) -> Result<Value, 
         ("control", "curve") => floats(ctx, args.get(4)),
         _ => None,
     };
+    // AudioWorkletNode outputChannelCount, and the worklet scope's factory
+    // for addModule() (built from this realm's document).
+    let worklet_outputs = if op == "node" && name == "worklet" {
+        doubles(ctx, args.get(9))
+    } else {
+        None
+    };
+    let factory = if op == "addModule" {
+        super::audio_worklet_host::factory(ctx)
+    } else {
+        None
+    };
+    let (module_url, packet) = match op {
+        "addModule" => (host_arg_string(ctx, args, 3), host_arg_string(ctx, args, 4)),
+        "workletNode" => (host_arg_string(ctx, args, 3), host_arg_string(ctx, args, 4)),
+        "globalPort" => (String::new(), host_arg_string(ctx, args, 2)),
+        _ => (String::new(), String::new()),
+    };
     match op {
         "decode" => return Ok(decode(ctx, context, args)),
         "frequencyResponse" => return Ok(frequency_response(ctx, context, args)),
@@ -382,6 +400,21 @@ pub(super) fn binding(ctx: &mut Ctx, op: &str, args: &[Value]) -> Result<Value, 
             }
             entry.engine.send(Command::Close(whole(args, 2) as u32))
         }
+        "addModule" => {
+            // AudioWorklet addModule(): the first one builds the scope.
+            entry.engine.send(Command::AddModule {
+                token: whole(args, 2) as u32,
+                url: module_url,
+                factory,
+                port: (!packet.is_empty()).then_some(packet),
+            });
+        }
+        "workletNode" => entry.engine.send(Command::CreateProcessor {
+            node: whole(args, 2) as u32,
+            name: module_url,
+            packet,
+        }),
+        "globalPort" => entry.engine.send(Command::GlobalPort(packet)),
         "scriptOutput" => {
             // A ScriptProcessorNode's filled outputBuffer.
             if let (Some(script), Some(data)) =
@@ -495,6 +528,12 @@ pub(super) fn binding(ctx: &mut Ctx, op: &str, args: &[Value]) -> Result<Value, 
                         shared,
                     ))
                 }
+                "worklet" => Box::new(crate::webaudio::worklet::WorkletNode::new(
+                    worklet_outputs
+                        .map(|counts| counts.iter().map(|&count| count as usize).collect()),
+                    args.get(10)
+                        .is_some_and(|value| matches!(value, Value::Bool(true))),
+                )),
                 "media-element" => match element_tap {
                     Some(tap) => Box::new(nodes::MediaElementSource::new(tap)),
                     None => Box::new(nodes::Silent { channels: 1 }),
@@ -931,6 +970,7 @@ pub(super) fn dispatch(engine: &mut lumen::Engine, task: WebAudioTask) -> Result
     let context = Value::Num(task.context as f64);
     let mut calls = Vec::with_capacity(task.notices.len());
     for notice in task.notices {
+        let mut text = String::new();
         let (kind, a, b, c, d) = match notice {
             Notice::Ended(node) => ("ended", f64::from(node), 0.0, 0.0, 0.0),
             Notice::Running(token) => ("running", f64::from(token), 0.0, 0.0, 0.0),
@@ -959,6 +999,28 @@ pub(super) fn dispatch(engine: &mut lumen::Engine, task: WebAudioTask) -> Result
                 Some((id, length, channels)) => ("decoded", job as f64, id, length, channels),
                 None => ("decoded", job as f64, 0.0, 0.0, 0.0),
             },
+            Notice::WorkletModule { token, result } => {
+                let ok = result.is_ok();
+                text = result.unwrap_or_else(|error| error);
+                (
+                    "module",
+                    f64::from(token),
+                    f64::from(u8::from(ok)),
+                    0.0,
+                    0.0,
+                )
+            }
+            Notice::ProcessorError { node, error } => {
+                text = serde_json::json!({"message": error.message, "filename": error.filename})
+                    .to_string();
+                (
+                    "processorerror",
+                    f64::from(node),
+                    f64::from(error.line),
+                    f64::from(error.column),
+                    0.0,
+                )
+            }
         };
         calls.push([
             context.clone(),
@@ -967,6 +1029,7 @@ pub(super) fn dispatch(engine: &mut lumen::Engine, task: WebAudioTask) -> Result
             Value::Num(b),
             Value::Num(c),
             Value::Num(d),
+            Value::from_string(text),
         ]);
     }
     super::run_in_context_realm(engine, realm, "Web Audio task", move |engine| {

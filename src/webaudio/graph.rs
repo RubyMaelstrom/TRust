@@ -87,6 +87,8 @@ struct Node {
     /// Per input: the (node index, output) connections into it.
     inputs: Vec<Vec<(usize, usize)>>,
     input_buses: Vec<Bus>,
+    /// Per input: an actively processing node is connected to it.
+    inputs_active: Vec<bool>,
     outputs: Vec<Bus>,
     params: Vec<usize>,
     released: bool,
@@ -127,6 +129,8 @@ pub struct Graph {
     dirty: bool,
     destination: Option<usize>,
     mono: Bus,
+    /// Ids of nodes removed since the last take_removed().
+    removed: Vec<u32>,
     pub rate: f32,
     pub quantum: usize,
     /// [[current frame]].
@@ -146,6 +150,7 @@ impl Graph {
             dirty: false,
             destination: None,
             mono: Bus::default(),
+            removed: Vec::new(),
             rate,
             quantum,
             frame: 0,
@@ -164,6 +169,11 @@ impl Graph {
         self.destination
             .and_then(|index| self.nodes[index].as_ref())
             .map_or(Interpretation::Speakers, |node| node.channel.interpretation)
+    }
+
+    /// The ids of the nodes that left the graph since the last call.
+    pub fn take_removed(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.removed)
     }
 
     pub fn node_count(&self) -> usize {
@@ -317,6 +327,7 @@ impl Graph {
             channel: init.channel,
             inputs: vec![Vec::new(); init.inputs],
             input_buses: vec![Bus::default(); init.inputs],
+            inputs_active: vec![false; init.inputs],
             outputs: vec![Bus::silent(self.quantum); init.outputs],
             params,
             released: false,
@@ -334,6 +345,7 @@ impl Graph {
             return;
         };
         self.node_ids.remove(&node.id);
+        self.removed.push(node.id);
         for param in node.params {
             if let Some(slot) = self.params[param].take() {
                 self.param_ids.remove(&slot.id);
@@ -455,6 +467,7 @@ impl Graph {
     /// it; returns whether any of them is actively processing.
     fn mix_inputs(nodes: &[Option<Node>], node: &mut Node, frames: usize) -> bool {
         let mut any_active = false;
+        node.inputs_active.fill(false);
         for (input, edges) in node.inputs.iter().enumerate() {
             let channels = node.channel.computed(edges.iter().map(|&(source, output)| {
                 nodes[source]
@@ -468,6 +481,7 @@ impl Graph {
                     && other.active
                 {
                     any_active = true;
+                    node.inputs_active[input] = true;
                     bus.mix_from(&other.outputs[output], node.channel.interpretation);
                 }
             }
@@ -477,7 +491,11 @@ impl Graph {
 
     /// Render one quantum (#rendering-loop step 4) and advance
     /// [[current frame]].
-    pub fn render(&mut self, notices: &mut Vec<Notice>) {
+    pub fn render(
+        &mut self,
+        notices: &mut Vec<Notice>,
+        mut worklet: Option<&mut (dyn crate::webaudio::worklet::Worklet + 'static)>,
+    ) {
         if self.dirty {
             self.sort();
         }
@@ -496,6 +514,8 @@ impl Graph {
                     ids: &node.params,
                 };
                 let mut scope = Scope {
+                    worklet: worklet.as_deref_mut(),
+                    inputs_active_each: &node.inputs_active,
                     frame,
                     rate,
                     frames,
@@ -529,6 +549,8 @@ impl Graph {
                     ids: &node.params,
                 };
                 let mut scope = Scope {
+                    worklet: worklet.as_deref_mut(),
+                    inputs_active_each: &node.inputs_active,
                     frame,
                     rate,
                     frames,
@@ -737,7 +759,7 @@ mod tests {
             input: 0,
         });
         let mut notices = Vec::new();
-        graph.render(&mut notices);
+        graph.render(&mut notices, None);
         assert!(graph.destination_output().unwrap().is_silent());
         graph.apply(GraphMessage::Control {
             node: 10,
@@ -751,7 +773,7 @@ mod tests {
             node: 10,
             control: Control::Stop(0.04),
         });
-        graph.render(&mut notices);
+        graph.render(&mut notices, None);
         let output = graph.destination_output().unwrap();
         assert_eq!(output.channels(), 2);
         let peak = output
@@ -759,13 +781,13 @@ mod tests {
             .iter()
             .fold(0f32, |peak, sample| peak.max(sample.abs()));
         assert!(peak > 0.4 && peak < 0.6, "{peak}");
-        graph.render(&mut notices);
-        graph.render(&mut notices);
+        graph.render(&mut notices, None);
+        graph.render(&mut notices, None);
         assert!(matches!(notices[..], [Notice::Ended(10)]));
         // Released silent nodes leave the graph.
         graph.apply(GraphMessage::Release(10));
         graph.apply(GraphMessage::Release(20));
-        graph.render(&mut notices);
+        graph.render(&mut notices, None);
         assert_eq!(graph.node_count(), 1);
     }
 
@@ -792,7 +814,7 @@ mod tests {
             },
         });
         let mut notices = Vec::new();
-        graph.render(&mut notices);
+        graph.render(&mut notices, None);
         assert!(graph.destination_output().unwrap().is_silent());
         graph.apply(GraphMessage::Disconnect {
             from: 30,
@@ -800,7 +822,7 @@ mod tests {
             to: 20,
             input: 0,
         });
-        graph.render(&mut notices);
+        graph.render(&mut notices, None);
         assert!(!graph.destination_output().unwrap().is_silent());
     }
 }

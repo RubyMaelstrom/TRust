@@ -9352,7 +9352,7 @@ pub(crate) fn same_origin_for_host(a: &Url, b: &Url) -> bool {
 /// is a local development endpoint. This is the gate used by Fetch Metadata's
 /// integration algorithm; ordinary `http:` origins must not receive the
 /// `Sec-Fetch-*` family merely because a page supplied a navigation context.
-fn potentially_trustworthy(url: &Url) -> bool {
+pub(crate) fn potentially_trustworthy(url: &Url) -> bool {
     match url.scheme() {
         "https" | "wss" => true,
         "http" => match url.host() {

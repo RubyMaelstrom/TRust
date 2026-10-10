@@ -23,6 +23,8 @@ mod canvas_host;
 #[path = "challenge_message_trace.rs"]
 mod challenge_message_trace;
 use crate::compression_host;
+#[path = "audio_worklet_host.rs"]
+mod audio_worklet_host;
 #[path = "geometry_host.rs"]
 mod geometry_host;
 #[path = "image_bitmap_host.rs"]
@@ -35180,6 +35182,8 @@ mod tests {
                 dispatch_host_task(engine, task).unwrap();
             } else if string_value(engine, "__trust.hasPlatformTask()") == "true" {
                 eval(engine, "__trust.runPlatformTask()", "audio task").unwrap();
+            } else if string_value(engine, "String(__trust.hasPortMessageTask())") == "true" {
+                eval(engine, "__trust.runPortMessageTask()", "port task").unwrap();
             } else if string_value(engine, "String(__trust.tick())") != "true" {
                 std::thread::sleep(Duration::from_millis(1));
             }
@@ -35690,6 +35694,93 @@ mod tests {
             30,
         );
         assert_eq!(string_value(&mut engine, "scriptProbe"), "ok");
+    }
+
+    #[test]
+    fn audio_worklet_processors_run_on_the_rendering_thread() {
+        // Web Audio 1.1 (local WebAudio/web-audio-api@2047f16) #AudioWorklet,
+        // #AudioWorkletGlobalScope, #AudioWorkletNode and
+        // #AudioWorkletProcessor, with HTML #dom-worklet-addmodule: a module
+        // registers processors whose descriptors become the node's
+        // AudioParamMap; process() runs each render quantum with its
+        // parameters and processorOptions; ports reach the processor and the
+        // global scope; an exception fires processorerror and silences the
+        // processor; fetch and syntax failures reject addModule().
+        let probe = r#"
+            (async () => {
+                const source = `
+                    class Gain extends AudioWorkletProcessor {
+                        static get parameterDescriptors() {
+                            return [{name: 'gain', defaultValue: 0.5, minValue: 0, maxValue: 1, automationRate: 'k-rate'}];
+                        }
+                        constructor(options) {
+                            super();
+                            this.scale = options.processorOptions.scale;
+                            this.port.onmessage = event => this.port.postMessage(
+                                'pong:' + event.data + ':' + sampleRate + ':' + renderQuantumSize);
+                        }
+                        process(inputs, outputs, parameters) {
+                            const input = inputs[0], output = outputs[0];
+                            for (let c = 0; c < output.length; c++)
+                                for (let i = 0; i < output[c].length; i++)
+                                    output[c][i] = (input[c] ? input[c][i] : 0) * parameters.gain[0] * this.scale;
+                            return true;
+                        }
+                    }
+                    registerProcessor('gain', Gain);
+                    class Broken extends AudioWorkletProcessor { process() { throw new RangeError('boom'); } }
+                    registerProcessor('broken', Broken);
+                    port.onmessage = event => port.postMessage(
+                        'global:' + event.data + ':' + typeof fetch + ':' + typeof setTimeout + ':' + typeof registerProcessor);
+                `;
+                const context = new OfflineAudioContext(1, 512, 8000);
+                check(context.audioWorklet === context.audioWorklet && context.audioWorklet instanceof AudioWorklet, 'worklet');
+                await context.audioWorklet.addModule('data:text/javascript,' + encodeURIComponent(source));
+                const constant = new ConstantSourceNode(context, {offset: 1});
+                const node = new AudioWorkletNode(context, 'gain', {processorOptions: {scale: 2}, parameterData: {gain: 0.25}});
+                check(node.parameters.size === 1 && node.parameters.get('gain').value === 0.25 &&
+                    node.parameters.get('gain').defaultValue === 0.5 && [...node.parameters.keys()].join() === 'gain' &&
+                    node.port instanceof MessagePort && node.numberOfInputs === 1, 'node shape');
+                constant.connect(node).connect(context.destination);
+                constant.start();
+                const broken = new AudioWorkletNode(context, 'broken');
+                const errors = [];
+                broken.onprocessorerror = event => errors.push(event.constructor.name + ':' + event.message);
+                broken.connect(context.destination);
+                const replies = [];
+                node.port.onmessage = event => replies.push(event.data);
+                node.port.postMessage('ping');
+                context.audioWorklet.port.onmessage = event => replies.push(event.data);
+                context.audioWorklet.port.postMessage('hi');
+                const failures = [];
+                try { new AudioWorkletNode(context, 'missing'); } catch (e) { failures.push(e.name); }
+                try { new AudioWorkletNode(context, 'gain', {numberOfInputs: 0, numberOfOutputs: 0}); } catch (e) { failures.push(e.name); }
+                try { new AudioWorkletNode(context, 'gain', {outputChannelCount: [1, 2]}); } catch (e) { failures.push(e.name); }
+                await context.audioWorklet.addModule('data:text/javascript,syntax error(').catch(e => failures.push(e.name));
+                await context.audioWorklet.addModule('https://[').catch(e => failures.push(e.name));
+                await context.audioWorklet.addModule('missing.js').catch(e => failures.push(e.name));
+                const rendered = (await context.startRendering()).getChannelData(0);
+                await new Promise(resolve => {
+                    const poll = () => replies.length >= 2 && errors.length ? resolve() : setTimeout(poll, 5);
+                    poll();
+                });
+                return [rendered[0], rendered[511], replies.sort().join(), errors.join(), failures.join()].join('|');
+            })().then(value => globalThis.workletProbe = value,
+                error => globalThis.workletProbe = 'ERROR:' + error.name + ':' + error.message);
+            function check(ok, message) { if (!ok) throw Error(message); }
+        "#;
+        let (_runtime, mut engine, mut tasks) = worker_test_environment();
+        eval(&mut engine, probe, "worklet probe").unwrap();
+        pump_audio_until(
+            &mut engine,
+            &mut tasks,
+            "globalThis.workletProbe !== undefined",
+            30,
+        );
+        assert_eq!(
+            string_value(&mut engine, "workletProbe"),
+            "0.5|0.5|global:hi:undefined:undefined:function,pong:ping:8000:128|ErrorEvent:boom|InvalidStateError,NotSupportedError,IndexSizeError,SyntaxError,SyntaxError,AbortError"
+        );
     }
 
     #[test]

@@ -22,7 +22,9 @@ use std::time::{Duration, Instant};
 use super::AudioData;
 use super::bus::Bus;
 use super::graph::{Graph, GraphMessage};
+use super::nodes::Control;
 use super::ring::Ring;
+use super::worklet::{Factory, Setup, Worklet};
 use crate::media::audio::{Format, Output, Render};
 
 /// A control message.
@@ -36,6 +38,115 @@ pub enum Command {
     Render(usize),
     /// OfflineAudioContext suspend(): stop before rendering this frame.
     SuspendAt(u64),
+    /// AudioWorklet addModule(): build the AudioWorkletGlobalScope with
+    /// `factory` first if there is none yet.
+    AddModule {
+        token: u32,
+        url: String,
+        factory: Option<Factory>,
+        /// The AudioWorklet's port, for a scope being built.
+        port: Option<String>,
+    },
+    /// Construct AudioWorkletNode `node`'s processor (its graph node exists).
+    CreateProcessor {
+        node: u32,
+        name: String,
+        packet: String,
+    },
+    /// The AudioWorklet's port, for the global scope.
+    GlobalPort(String),
+}
+
+/// Run a worklet command on the rendering thread.
+fn worklet_command(
+    command: Command,
+    worklet: &mut Option<Box<dyn Worklet>>,
+    graph: &mut Graph,
+    notices: &mut Vec<Notice>,
+    setup: &Setup,
+) {
+    match command {
+        Command::AddModule {
+            token,
+            url,
+            factory,
+            port,
+        } => {
+            if worklet.is_none()
+                && let Some(factory) = factory
+            {
+                match factory(setup.clone()) {
+                    Ok(mut scope) => {
+                        // #AudioContext-constructors: the scope's port is
+                        // set before any module runs.
+                        if let Some(packet) = port {
+                            scope.global_port(&packet);
+                        }
+                        *worklet = Some(scope);
+                    }
+                    Err(error) => {
+                        notices.push(Notice::WorkletModule {
+                            token,
+                            result: Err(error),
+                        });
+                        return;
+                    }
+                }
+            }
+            let result = match worklet.as_mut() {
+                Some(scope) => scope.add_module(&url),
+                None => Err(String::from("AudioWorklet is unavailable")),
+            };
+            notices.push(Notice::WorkletModule { token, result });
+        }
+        Command::CreateProcessor { node, name, packet } => {
+            let result = match worklet.as_mut() {
+                Some(scope) => scope.create(node, &name, &packet),
+                None => Err(super::worklet::ProcessorError {
+                    message: String::from("AudioWorklet is unavailable"),
+                    ..Default::default()
+                }),
+            };
+            let control = match result {
+                Ok(()) => Control::WorkletReady,
+                Err(error) => {
+                    notices.push(Notice::ProcessorError { node, error });
+                    Control::WorkletFailed
+                }
+            };
+            graph.apply(GraphMessage::Control { node, control });
+        }
+        Command::GlobalPort(packet) => {
+            if let Some(scope) = worklet.as_mut() {
+                scope.global_port(&packet);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Render one quantum with the worklet scope's clock, tasks and released
+/// processors kept in step.
+fn render_quantum(
+    graph: &mut Graph,
+    notices: &mut Vec<Notice>,
+    worklet: &mut Option<Box<dyn Worklet>>,
+) {
+    if let Some(scope) = worklet.as_mut() {
+        // #rendering-loop step 3: the associated task queue, then the
+        // quantum with currentFrame set.
+        scope.run_tasks();
+        scope.set_time(graph.frame);
+    }
+    graph.render(notices, worklet.as_deref_mut());
+    if let Some(scope) = worklet.as_mut() {
+        for node in graph.take_removed() {
+            scope.release(node);
+        }
+        scope.run_tasks();
+    } else {
+        graph.take_removed();
+    }
 }
 
 /// A report from the rendering thread.
@@ -55,6 +166,17 @@ pub enum Notice {
     Rendered(Arc<AudioData>),
     /// A startRendering() buffer could not be allocated.
     RenderFailed,
+    /// An AudioWorkletProcessor threw (fire `processorerror`).
+    ProcessorError {
+        node: u32,
+        error: super::worklet::ProcessorError,
+    },
+    /// An addModule() finished: the processors it registered (JSON) or why
+    /// it failed.
+    WorkletModule {
+        token: u32,
+        result: Result<String, String>,
+    },
     /// A ScriptProcessorNode collected a buffer of input
     /// (#AudioProcessingEvent).
     ScriptProcess {
@@ -247,6 +369,17 @@ impl Drop for Engine {
     }
 }
 
+/// The worklet scope's view of its context: a message for its ports
+/// wakes the rendering thread.
+fn setup(shared: &Arc<Shared>, graph: &Graph) -> Setup {
+    let waker_shared = shared.clone();
+    Setup {
+        rate: graph.rate,
+        quantum: graph.quantum,
+        waker: Arc::new(move || waker_shared.wake()),
+    }
+}
+
 /// The device side: drains the ring, pads an underrun with silence and
 /// wakes the renderer when there is room for a render quantum.
 struct Feed {
@@ -289,6 +422,8 @@ fn run_realtime(
     let mut device_bus = Bus::new(channels, quantum);
     let mut interleaved = vec![0f32; room];
     let mut notices = Vec::new();
+    let mut worklet: Option<Box<dyn Worklet>> = None;
+    let setup = setup(shared, &graph);
     let mut running = false;
     loop {
         if shared.stop.load(Ordering::Acquire) {
@@ -353,10 +488,11 @@ fn run_realtime(
                     return;
                 }
                 Command::Render(_) | Command::SuspendAt(_) => {}
+                command => worklet_command(command, &mut worklet, &mut graph, &mut notices, &setup),
             }
         }
         while running && ring.free() >= room {
-            graph.render(&mut notices);
+            render_quantum(&mut graph, &mut notices, &mut worklet);
             device_bus.reset(channels, quantum);
             if let Some(output) = graph.destination_output() {
                 device_bus.mix_from(output, graph.destination_interpretation());
@@ -396,6 +532,8 @@ fn run_offline(shared: &Arc<Shared>, mut graph: Graph, channels: usize, notify: 
     let mut jobs: VecDeque<Job> = VecDeque::new();
     let mut suspends: BTreeSet<u64> = BTreeSet::new();
     let mut notices = Vec::new();
+    let mut worklet: Option<Box<dyn Worklet>> = None;
+    let setup = setup(shared, &graph);
     let mut running = false;
     loop {
         if shared.stop.load(Ordering::Acquire) {
@@ -445,6 +583,7 @@ fn run_offline(shared: &Arc<Shared>, mut graph: Graph, channels: usize, notify: 
                     notify(std::mem::take(&mut notices));
                     return;
                 }
+                command => worklet_command(command, &mut worklet, &mut graph, &mut notices, &setup),
             }
         }
         // #rendering-loop for an OfflineAudioContext: render until a
@@ -456,7 +595,7 @@ fn run_offline(shared: &Arc<Shared>, mut graph: Graph, channels: usize, notify: 
                 notices.push(Notice::OfflineSuspended(graph.frame));
                 break;
             }
-            graph.render(&mut notices);
+            render_quantum(&mut graph, &mut notices, &mut worklet);
             let count = quantum.min(job.length - job.written);
             if let Some(output) = graph.destination_output() {
                 for (channel, data) in job.channels.iter_mut().enumerate().take(output.channels()) {

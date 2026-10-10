@@ -13111,7 +13111,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (state.object) apply(mapSet, live, [state.id, state.object]);
         }
         function updateRetention(state) {
-            const busy = state.tokens.size || state.sources.size || state.decodes.size ||
+            const busy = state.tokens.size || state.sources.size || state.decodes.size || state.modules.size ||
                 (state.kind === "context" ? state.state === "running" && !state.closed
                     : state.jobs.length || state.state === "running");
             if (busy) retain(state);
@@ -13490,7 +13490,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             delay: {mode: "max"}, "stereo-panner": {mode: "clamped-max"}, splitter: {mode: "explicit"},
             merger: {mode: "explicit"}, shaper: {mode: "max"}, analyser: {mode: "max"},
             convolver: {mode: "clamped-max"}, listener: {mode: "explicit", inputs: 0, outputs: 0},
-            "media-element": {mode: "max", inputs: 0},
+            "media-element": {mode: "max", inputs: 0}, worklet: {mode: "max"},
         };
         // Nodes whose channel count may not exceed two (#AudioNode-attributes
         // channelCount and channelCountMode constraints).
@@ -14329,6 +14329,176 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             }
             get mediaElement() { return nodeRecord(this, "media-element").mediaElement; }
         }
+        // ---- AudioWorklet (#AudioWorklet, #AudioWorkletNode) ----
+        // The AudioWorkletGlobalScope runs on the context's rendering thread
+        // (`audio_worklet_host`); addModule() resolves once its processors'
+        // descriptors are in the node name to parameter descriptor map.
+        function workletRecord(worklet) {
+            const state = get(worklet);
+            if (!state || state.kind !== "worklet") throw new TypeError("Illegal Worklet invocation");
+            return state;
+        }
+        class Worklet {
+            constructor() { throw new TypeError("Illegal constructor"); }
+            // HTML #dom-worklet-addmodule
+            addModule(moduleURL, options = undefined) {
+                let state, parsed;
+                try {
+                    state = workletRecord(this);
+                    if (arguments.length < 1) throw new TypeError("addModule requires a module URL");
+                    moduleURL = `${moduleURL}`;
+                    const dict = dictionary(options, "WorkletOptions");
+                    const credentials = member(dict, "credentials");
+                    if (credentials !== undefined) enumValue(credentials, ["omit", "same-origin", "include"]);
+                    parsed = __url_parse(moduleURL, baseHref());
+                } catch (error) { return rejected(error); }
+                if (!parsed) return rejected(new Exception("The module URL is invalid", "SyntaxError"));
+                const context = get(state.context);
+                return new PromiseCtor((resolve, reject) => {
+                    const tokenId = ++context.nextToken;
+                    apply(mapSet, context.modules, [tokenId, {resolve, reject}]);
+                    retain(context);
+                    // The scope's port goes with the module that builds it.
+                    if (!state.started) workletPort(state);
+                    host("addModule", context.id, tokenId, parsed[0], state.portPacket || "");
+                    state.portPacket = null;
+                    state.started = true;
+                });
+            }
+        }
+        class AudioWorklet extends Worklet {
+            // #AudioWorklet-attributes: entangled with the global scope's port.
+            get port() { return workletPort(workletRecord(this)); }
+        }
+        // The AudioWorklet's port, entangled with the global scope's
+        // (#AudioContext-constructors): its other end travels with the
+        // first addModule().
+        function workletPort(state) {
+            if (!state.port) {
+                const channel = new pristineMessageChannel();
+                state.port = channel.port1;
+                const packet = JSON.stringify(portAPI.serialize(undefined, [channel.port2]));
+                if (state.started) host("globalPort", get(state.context).id, packet);
+                else state.portPacket = packet;
+            }
+            return state.port;
+        }
+        function contextWorklet(context, state) {
+            if (!state.worklet) {
+                const worklet = create(AudioWorklet.prototype);
+                set(worklet, {kind: "worklet", context, port: null, started: false, portPacket: null});
+                state.worklet = worklet;
+            }
+            return state.worklet;
+        }
+        // AudioParamMap: readonly maplike<DOMString, AudioParam>.
+        const mapEntries = Map.prototype.entries, mapKeys = Map.prototype.keys, mapValues = Map.prototype.values;
+        const mapHas = Map.prototype.has, mapForEach = Map.prototype.forEach, mapSize =
+            Object.getOwnPropertyDescriptor(Map.prototype, "size").get;
+        function paramMapRecord(map) {
+            const state = get(map);
+            if (!state || state.kind !== "param-map") throw new TypeError("Illegal AudioParamMap invocation");
+            return state.map;
+        }
+        class AudioParamMap {
+            constructor() { throw new TypeError("Illegal constructor"); }
+            get size() { return apply(mapSize, paramMapRecord(this), []); }
+            entries() { return apply(mapEntries, paramMapRecord(this), []); }
+            keys() { return apply(mapKeys, paramMapRecord(this), []); }
+            values() { return apply(mapValues, paramMapRecord(this), []); }
+            get(key) { return apply(mapGet, paramMapRecord(this), [`${key}`]); }
+            has(key) { return apply(mapHas, paramMapRecord(this), [`${key}`]); }
+            forEach(callback, thisArg = undefined) {
+                const map = paramMapRecord(this);
+                if (typeof callback !== "function") throw new TypeError("forEach requires a callback");
+                apply(mapForEach, map, [(value, key) => apply(callback, thisArg, [value, key, this])]);
+            }
+        }
+        define(AudioParamMap.prototype, Symbol.iterator, {value: AudioParamMap.prototype.entries,
+            writable: true, configurable: true});
+        class AudioWorkletNode extends AudioNode {
+            constructor(context, name, options = undefined) {
+                const owner = contextRecord(context);
+                if (arguments.length < 2) throw new TypeError("AudioWorkletNode requires a processor name");
+                name = `${name}`;
+                const dict = dictionary(options, "AudioWorkletNodeOptions");
+                const converted = nodeOptions(dict);
+                const inputsValue = member(dict, "numberOfInputs");
+                const inputs = inputsValue === undefined ? 1 : unsignedLong(inputsValue);
+                const outputsValue = member(dict, "numberOfOutputs");
+                const outputs = outputsValue === undefined ? 1 : unsignedLong(outputsValue);
+                const countsValue = member(dict, "outputChannelCount");
+                let counts;
+                if (countsValue !== undefined) {
+                    if (countsValue === null || (typeof countsValue !== "object" && typeof countsValue !== "function"))
+                        throw new TypeError("outputChannelCount must be a sequence");
+                    counts = [];
+                    for (const count of countsValue) counts.push(unsignedLong(count));
+                }
+                const dataValue = member(dict, "parameterData");
+                let parameterData;
+                if (dataValue !== undefined) {
+                    if (dataValue === null || (typeof dataValue !== "object" && typeof dataValue !== "function"))
+                        throw new TypeError("parameterData must be a record");
+                    parameterData = create(null);
+                    for (const key of Reflect.ownKeys(dataValue)) {
+                        if (typeof key !== "string") continue;
+                        const property = Reflect.getOwnPropertyDescriptor(dataValue, key);
+                        if (!property || !property.enumerable) continue;
+                        parameterData[key] = double(dataValue[key], "parameterData");
+                    }
+                }
+                const processorOptions = member(dict, "processorOptions");
+                if (processorOptions !== undefined && (processorOptions === null ||
+                    (typeof processorOptions !== "object" && typeof processorOptions !== "function")))
+                    throw new TypeError("processorOptions must be an object");
+                // #AudioWorkletNode-constructors step 1.
+                const descriptors = apply(mapGet, owner.processorDescriptors, [name]);
+                if (!descriptors) throw new Exception("No processor named " + name + " is registered", "InvalidStateError");
+                // #configure-with-audioworkletnodeoptions
+                if (inputs === 0 && outputs === 0)
+                    throw new Exception("An AudioWorkletNode needs an input or an output", "NotSupportedError");
+                if (counts) {
+                    for (const count of counts) {
+                        if (count === 0 || count > MAX_CHANNELS)
+                            throw new Exception("Invalid output channel count", "NotSupportedError");
+                    }
+                    if (counts.length !== outputs)
+                        throw new Exception("outputChannelCount must give each output's count", "IndexSizeError");
+                }
+                super(token, context, "worklet", 2, descriptors.map(descriptor => ({name: descriptor.name,
+                    value: descriptor.defaultValue, min: descriptor.minValue, max: descriptor.maxValue,
+                    rate: descriptor.automationRate})),
+                    [counts ? new F64(counts) : null, !counts && inputs === 1 && outputs === 1], {inputs, outputs});
+                applyNodeOptions(this, converted);
+                const state = nodeRecord(this);
+                const optionsObject = {numberOfInputs: inputs, numberOfOutputs: outputs};
+                for (const key of ["channelCount", "channelCountMode", "channelInterpretation"])
+                    if (converted[key] !== undefined) optionsObject[key] = converted[key];
+                if (counts) optionsObject.outputChannelCount = counts;
+                if (parameterData) optionsObject.parameterData = parameterData;
+                if (processorOptions !== undefined) optionsObject.processorOptions = processorOptions;
+                const channel = new pristineMessageChannel();
+                const packet = JSON.stringify(portAPI.serialize(optionsObject, [channel.port2]));
+                state.port = channel.port1;
+                const map = new MapCtor();
+                for (const descriptor of descriptors)
+                    apply(mapSet, map, [descriptor.name, state.params[descriptor.name]]);
+                const parameters = create(AudioParamMap.prototype);
+                set(parameters, {kind: "param-map", map});
+                state.parameters = parameters;
+                if (parameterData) {
+                    for (const key in parameterData) {
+                        const param = apply(mapGet, map, [key]);
+                        if (param) param.value = parameterData[key];
+                    }
+                }
+                apply(mapSet, owner.workletNodes, [state.id, this]);
+                host("workletNode", owner.id, state.id, name, packet);
+            }
+            get parameters() { return nodeRecord(this, "worklet").parameters; }
+            get port() { return nodeRecord(this, "worklet").port; }
+        }
         // AudioListener (#AudioListener): its parameters exist (and can be
         // automated), though no PannerNode reads them.
         const LISTENER_PARAMS = [["positionX", 0], ["positionY", 0], ["positionZ", 0],
@@ -14456,6 +14626,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             createAnalyser() { contextRecord(this); return new AnalyserNode(this); }
             createConvolver() { contextRecord(this); return new ConvolverNode(this); }
             get listener() { return contextListener(this, contextRecord(this)); }
+            get audioWorklet() { return contextWorklet(this, contextRecord(this)); }
             createBuffer(numberOfChannels, length, sampleRate) {
                 contextRecord(this);
                 if (arguments.length < 3) throw new TypeError("createBuffer requires three arguments");
@@ -14510,7 +14681,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         function contextState(kind, fields) {
             const state = {kind, id: 0, object: null, destination: null, state: "suspended",
                 reported: "suspended", closed: false, tokens: new MapCtor(), nextToken: 0,
-                sources: new MapCtor(), decodes: new MapCtor(), processors: new MapCtor()};
+                sources: new MapCtor(), decodes: new MapCtor(), processors: new MapCtor(),
+                modules: new MapCtor(), workletNodes: new MapCtor(), processorDescriptors: new MapCtor(),
+                worklet: null};
             for (const key in fields) state[key] = fields[key];
             return state;
         }
@@ -14749,7 +14922,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         }
         // The rendering threads' reports (`webaudio_host::dispatch`), each a
         // task of the context's media element event task source.
-        trust.webAudioEvent = function (id, kind, a, b, c, d) {
+        trust.webAudioEvent = function (id, kind, a, b, c, d, e) {
             const context = liveGet(id);
             const state = context && get(context);
             if (!state) return;
@@ -14789,6 +14962,34 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 case "rendered":
                     offlineRendered(context, state, contentBuffer(a, b, state.rate, c));
                     break;
+                case "module": {
+                    const pending = apply(mapGet, state.modules, [a]);
+                    apply(mapDelete, state.modules, [a]);
+                    if (!pending) break;
+                    if (b) {
+                        let list = [];
+                        try { list = JSON.parse(e); } catch (_) { list = []; }
+                        for (const entry of list)
+                            apply(mapSet, state.processorDescriptors, [entry.name, entry.descriptors]);
+                        pending.resolve(undefined);
+                    } else {
+                        const separator = e.indexOf(":");
+                        const name = separator < 0 ? "AbortError" : e.slice(0, separator);
+                        const message = separator < 0 ? e : e.slice(separator + 1);
+                        pending.reject(name === "SyntaxError" ? new SyntaxError(message)
+                            : new Exception(message || "The module could not be loaded", "AbortError"));
+                    }
+                    break;
+                }
+                case "processorerror": {
+                    const node = apply(mapGet, state.workletNodes, [a]);
+                    if (!node) break;
+                    let info = {};
+                    try { info = JSON.parse(e); } catch (_) { info = {}; }
+                    dispatch(node, createTrustedEvent(ErrorEvent, "processorerror", {message: `${info.message || ""}`,
+                        filename: `${info.filename || ""}`, lineno: b, colno: c}), false);
+                    break;
+                }
                 case "audioprocess": {
                     const node = apply(mapGet, state.processors, [a]);
                     if (node) audioProcess(state, node, b, c);
@@ -14846,7 +15047,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 if (!state.source) throw new TypeError("Illegal AudioScheduledSourceNode invocation");
                 return state;
             }],
-            [ScriptProcessorNode.prototype, "audioprocess", target => nodeRecord(target, "processor")]]) {
+            [ScriptProcessorNode.prototype, "audioprocess", target => nodeRecord(target, "processor")],
+            [AudioWorkletNode.prototype, "processorerror", target => nodeRecord(target, "worklet")]]) {
             define(proto, "on" + type, {
                 configurable: true, enumerable: true,
                 get() { const handler = getState(this).handlers[type]; return handler ? handler.value : null; },
@@ -14875,7 +15077,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             AudioBufferSourceNode, AudioParam, AudioBuffer, PeriodicWave, OfflineAudioCompletionEvent,
             ConstantSourceNode, BiquadFilterNode, IIRFilterNode, DelayNode, StereoPannerNode, ChannelSplitterNode,
             ChannelMergerNode, WaveShaperNode, AnalyserNode, ConvolverNode, AudioListener,
-            MediaElementAudioSourceNode, AudioProcessingEvent]) {
+            MediaElementAudioSourceNode, AudioProcessingEvent, Worklet, AudioWorklet, AudioWorkletNode,
+            AudioParamMap]) {
             for (const name of Object.getOwnPropertyNames(ctor.prototype)) {
                 if (name === "constructor") continue;
                 const descriptor = Object.getOwnPropertyDescriptor(ctor.prototype, name);
@@ -14893,8 +15096,14 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             [BiquadFilterNode, 1], [IIRFilterNode, 2], [DelayNode, 1], [StereoPannerNode, 1],
             [ChannelSplitterNode, 1], [ChannelMergerNode, 1], [WaveShaperNode, 1], [AnalyserNode, 1],
             [ConvolverNode, 1], [AudioListener, 0], [MediaElementAudioSourceNode, 2],
-            [AudioProcessingEvent, 2]])
+            [AudioProcessingEvent, 2], [Worklet, 0], [AudioWorklet, 0], [AudioWorkletNode, 2],
+            [AudioParamMap, 0]])
             define(ctor, "length", {value: length, configurable: true});
+        // [SecureContext]: AudioWorklet exists only in secure contexts.
+        if (!secureContext) {
+            for (const name of ["Worklet", "AudioWorklet", "AudioWorkletNode"]) Reflect.deleteProperty(g, name);
+            Reflect.deleteProperty(BaseAudioContext.prototype, "audioWorklet");
+        }
     }
     for (const [name,value] of [["NETWORK_EMPTY",0],["NETWORK_IDLE",1],["NETWORK_LOADING",2],
         ["NETWORK_NO_SOURCE",3],["HAVE_NOTHING",0],["HAVE_METADATA",1],["HAVE_CURRENT_DATA",2],
@@ -46903,6 +47112,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     })(globalThis);
     /*__PORTS_END__*/
     const portAPI = g.__port_api;
+    // The platform's own MessageChannel, for AudioWorklet's ports.
+    const pristineMessageChannel = g.MessageChannel;
     delete g.__port_api;
     function portState(value) { return portAPI.state(value); }
     const serializeMessage = portAPI.serialize, deserializeMessage = portAPI.deserialize;

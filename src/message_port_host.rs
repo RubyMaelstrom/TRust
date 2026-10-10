@@ -18,6 +18,8 @@ pub(super) enum Wake {
     None,
     Page(tokio::sync::mpsc::WeakUnboundedSender<LumenHostTask>),
     Worker(Weak<LumenWorkerInbox>),
+    /// An AudioWorkletGlobalScope: wake its context's rendering thread.
+    Callback(Arc<dyn Fn() + Send + Sync>),
 }
 
 impl Wake {
@@ -34,6 +36,7 @@ impl Wake {
                     sender.wake_ports();
                 }
             }
+            Self::Callback(wake) => wake(),
         }
     }
 }

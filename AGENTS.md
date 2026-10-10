@@ -754,8 +754,24 @@ current behavior and limits; consult the governing standards before changing it.
   sends each `bufferSize` chunk of input as an `audioprocess` task while it
   is connected; the filled `outputBuffer` plays two buffers later (double
   buffering), and an `OfflineAudioContext` waits for each answer (closing
-  the context, or 10 s without one, ends the wait). Worklets are
-  unimplemented. A collected node is released to the rendering thread and
+  the context, or 10 s without one, ends the wait).
+- AudioWorklet: each context's `AudioWorkletGlobalScope` is a Lumen engine on
+  its rendering thread (`src/audio_worklet_host.rs`), built by the first
+  `addModule()` from the worker platform plus `js_audio_worklet.js`
+  (`js::audio_worklet_prelude`, which removes what a WorkletGlobalScope does
+  not expose: worker messaging, timers, fetch, storage, `performance`).
+  Modules load through the page's module fetch (`module_dependency_loader`,
+  blocking on that thread, so a load during playback can glitch); a module
+  runs once per scope; fetch failure rejects with AbortError and a parse
+  error with SyntaxError. `registerProcessor()` descriptors reach the
+  control thread before `addModule()` resolves. Each `AudioWorkletNode`'s
+  processor gets its options and a transferred `MessagePort` through the
+  page's port registry (`Wake::Callback` wakes the rendering thread, which
+  runs the scope's port tasks before each quantum and while idle); per
+  quantum `process()` gets frozen input/output/parameter arrays reused until
+  their shape changes (`workletPrepare`/`workletRun`). An exception fires
+  `processorerror` (ErrorEvent) and silences the processor. AudioWorklet is
+  `[SecureContext]`. A collected node is released to the rendering thread and
   leaves the graph once silent; a started source and a running context stay
   alive until they end or suspend.
 - WebAssembly exception handling runs both the legacy (`try`/`catch`/

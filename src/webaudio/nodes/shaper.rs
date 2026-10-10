@@ -196,6 +196,8 @@ mod tests {
         let mut shaper = WaveShaper::new(Some(Arc::from([-1.0f32, 1.0])), 4);
         let mut notices = Vec::new();
         let mut scope = Scope {
+            worklet: None,
+            inputs_active_each: &[true],
             frame: 0,
             rate: 48_000.0,
             frames: 128,
