@@ -545,9 +545,10 @@ impl Dom {
         {
             return;
         }
-        self.adopted_styles.insert(scope, text);
+        let old = self.adopted_styles.insert(scope, text);
         self.properties.adopted_sources.insert(scope, sources);
-        self.touch_style_at(scope);
+        let new = self.adopted_styles[&scope].clone();
+        self.touch_adopted_styles(scope, old.as_deref(), &new);
     }
 }
 

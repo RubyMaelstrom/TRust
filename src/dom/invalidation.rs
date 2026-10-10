@@ -24,10 +24,48 @@ pub(super) use attributes::LiveState;
 pub(super) struct Pending {
     dirty: std::cell::Cell<bool>,
     roots: RefCell<FxHashMap<NodeId, bool>>,
+    /// Shadow roots whose adopted sheets changed since the parsed index
+    /// `old` was current (see `Dom::touch_adopted_styles`).
+    scoped_sheets: RefCell<Option<ScopedSheets>>,
     #[cfg(test)]
     flushes: std::cell::Cell<usize>,
     #[cfg(test)]
     visited: std::cell::Cell<usize>,
+}
+
+#[derive(Clone)]
+struct ScopedSheets {
+    old: std::rc::Rc<StyleIndex>,
+    scopes: Vec<NodeId>,
+}
+
+impl ScopedSheets {
+    /// Whether `index` keeps every other tree scope's rules, in the same
+    /// cascade order: the styles cached outside the changed scopes' hosts
+    /// were computed from exactly these rules (their parses are shared
+    /// across builds, `sheet_cache`), and no document-wide registry changed.
+    fn kept_elsewhere(&self, index: &StyleIndex) -> bool {
+        let same_rules = |a: &[StyleRule], b: &[StyleRule]| {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b)
+                    .all(|(a, b)| std::sync::Arc::ptr_eq(&a.data, &b.data) && a.order == b.order)
+        };
+        let other = |scope: &NodeId| !self.scopes.contains(scope);
+        self.old.scopes.keys().filter(|scope| other(scope)).count()
+            == index.scopes.keys().filter(|scope| other(scope)).count()
+            && index
+                .scopes
+                .iter()
+                .filter(|(scope, _)| other(scope))
+                .all(|(scope, rules)| {
+                    self.old
+                        .scopes
+                        .get(scope)
+                        .is_some_and(|old| same_rules(old, rules))
+                })
+            && self.old.keyframes.len() == index.keyframes.len()
+    }
 }
 
 impl Pending {
@@ -1240,6 +1278,73 @@ impl Dom {
         })
     }
 
+    /// A shadow root's adopted style sheets changed (CSSOM
+    /// #dom-documentorshadowroot-adoptedstylesheets). CSS Shadow 1 scopes its
+    /// rules to its shadow tree: they select only that tree's elements, the
+    /// host (`:host`), the host's slottables (`::slotted()`) and parts of
+    /// shadow trees inside it (`::part()`), and inheritance reaches only the
+    /// host's flat-tree descendants. So a connected root restyles its host's
+    /// shadow-including subtree, not the document, unless its old or new
+    /// sheets name document-wide constructs (this arena registers
+    /// `@keyframes` names and `@property` per Document). The next flush
+    /// proves against the rebuilt index that every other scope kept its
+    /// rules and cascade order, and restyles the document if not.
+    #[track_caller]
+    pub(super) fn touch_adopted_styles(&mut self, scope: NodeId, old: Option<&str>, new: &str) {
+        let host = self
+            .shadow_hosts
+            .get(&scope)
+            .copied()
+            .filter(|&host| self.is_connected(host));
+        let names_document_constructs = |css: &str| {
+            let css = css.to_ascii_lowercase();
+            css.contains("keyframes") || css.contains("@property")
+        };
+        let document_wide =
+            names_document_constructs(old.unwrap_or("")) || names_document_constructs(new);
+        let Some(host) = host.filter(|_| !document_wide) else {
+            if casc_diag_on() {
+                eprintln!(
+                    "DIAGINVALID adopted-sheets scope={scope} unscoped connected_host={} document_wide={document_wide}",
+                    host.is_some()
+                );
+            }
+            self.touch_style_at(scope);
+            return;
+        };
+        let pending = self.pending_style_invalidations.scoped_sheets.get_mut();
+        if pending.is_none() {
+            let Some(old) = self.current_style_index() else {
+                // No current index to compare against: a sheet change
+                // already awaits the full restyle.
+                if casc_diag_on() {
+                    eprintln!("DIAGINVALID adopted-sheets scope={scope} unscoped stale-index");
+                }
+                self.touch_style_at(scope);
+                return;
+            };
+            *self.pending_style_invalidations.scoped_sheets.get_mut() = Some(ScopedSheets {
+                old,
+                scopes: Vec::new(),
+            });
+        }
+        if casc_diag_on() {
+            eprintln!(
+                "DIAGINVALID adopted-sheets scope={scope} host={host} caller={}",
+                std::panic::Location::caller()
+            );
+        }
+        if let Some(pending) = self.pending_style_invalidations.scoped_sheets.get_mut() {
+            pending.scopes.push(scope);
+        }
+        self.style_epoch = self.style_epoch.wrapping_add(1);
+        self.invalidate_style_subtree(host, true);
+        self.pending_style_invalidations.dirty.set(true);
+        self.mark_dom_revision();
+        self.dirty_nodes.push((host, DirtyKind::Attr));
+        self.record_geometry_dirty(host, DirtyKind::Attr);
+    }
+
     /// The parsed rule index when it reflects the current sheet set, without
     /// building one: no current index means no proof of independence.
     pub(super) fn current_style_index(&self) -> Option<std::rc::Rc<StyleIndex>> {
@@ -1387,6 +1492,21 @@ impl Dom {
         let pending = &self.pending_style_invalidations;
         if !pending.dirty.replace(false) {
             return;
+        }
+        // Prove a scoped sheet change local against the rebuilt index before
+        // any cached style is read; otherwise restyle the whole document.
+        let scoped = pending.scoped_sheets.borrow_mut().take();
+        if let Some(scoped) = scoped
+            && (self.style_cache.try_borrow_mut().is_err()
+                || !scoped.kept_elsewhere(&self.style_index()))
+        {
+            if casc_diag_on() {
+                eprintln!(
+                    "DIAGINVALID adopted-sheets scopes={:?} reached other scopes",
+                    scoped.scopes
+                );
+            }
+            pending.roots.borrow_mut().insert(DOCUMENT, true);
         }
         let mut roots = std::mem::take(&mut *pending.roots.borrow_mut());
         #[cfg(test)]
@@ -2750,6 +2870,129 @@ mod tests {
     fn stress_random_shadow_states() {
         for seed in 1..=60u64 {
             random_shadow_states(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1, 800);
+        }
+    }
+
+    /// A document whose shadow trees style themselves with adopted sheets,
+    /// as Lit components do: nested hosts, slots forwarding light children,
+    /// a document `::part()` rule and an unrelated light element.
+    fn adopted_sheet_document() -> (Dom, Vec<NodeId>, [NodeId; 2], NodeId) {
+        let mut dom = Dom::parse_document(
+            "<style>x-outer::part(p) {width:11px} .a x-outer {font-size:14px}</style>\
+             <body><div id=stable class=x><span class=y>t</span></div>\
+             <x-outer id=outer><p id=s0 class=x>one</p><p id=s1 class=y>two</p></x-outer></body>",
+        );
+        let stable = dom.get_by_id("stable").unwrap();
+        let outer = dom.get_by_id("outer").unwrap();
+        let outer_root = dom.attach_shadow(outer);
+        let mut elements = vec![
+            stable,
+            dom.get_by_id("s0").unwrap(),
+            dom.get_by_id("s1").unwrap(),
+            outer,
+        ];
+        let build = |dom: &mut Dom, root: NodeId, elements: &mut Vec<NodeId>| {
+            let wrap = dom.create_element("div");
+            dom.set_attr(wrap, "class", "x");
+            let leaf = dom.create_element("span");
+            dom.set_attr(leaf, "class", "y");
+            dom.set_attr(leaf, "part", "p");
+            let text = dom.create_text("leaf");
+            dom.append(leaf, text);
+            let slot = dom.create_element("slot");
+            dom.append(wrap, leaf);
+            dom.append(wrap, slot);
+            dom.append(root, wrap);
+            elements.extend([wrap, leaf, slot]);
+            wrap
+        };
+        let outer_wrap = build(&mut dom, outer_root, &mut elements);
+        let inner = dom.create_element("x-inner");
+        dom.append(outer_wrap, inner);
+        let forward = dom.create_element("slot");
+        dom.append(inner, forward);
+        let inner_root = dom.attach_shadow(inner);
+        build(&mut dom, inner_root, &mut elements);
+        elements.extend([inner, forward]);
+        dom.set_adopted_styles(
+            outer_root,
+            ":host{color:rgb(5, 5, 5)} ::slotted(.y){height:2px}",
+        );
+        dom.set_adopted_styles(inner_root, ".y{padding-left:1px}");
+        (dom, elements, [outer_root, inner_root], stable)
+    }
+
+    const ADOPTED_SHEETS: [&str; 7] = [
+        ":host{font-size:18px} .x{color:rgb(1, 2, 3)} ::slotted(.y){padding-left:4px}",
+        ":host(.a){line-height:3} .y{width:6px} ::slotted(*){height:2px}",
+        ".x > .y{text-decoration:underline} :host{color:rgb(9, 9, 9)}",
+        "",
+        ":host{--v:7px} .y{padding-left:var(--v)} slot::slotted(.x){font-size:15px}",
+        "@keyframes k{from{opacity:0}} .x{width:3px}",
+        ".x{display:none} :host(.b) .y{display:inline}",
+    ];
+
+    #[test]
+    fn adopted_sheet_changes_restyle_only_their_hosts() {
+        // CSS Shadow 1: a shadow root's sheets select only its tree, its
+        // host and the host's slottables, so replacing a component's adopted
+        // sheets leaves styles elsewhere in place; a sheet declaring a
+        // document-wide name (`@keyframes`) restyles the document.
+        let (mut dom, _, [outer_root, inner_root], stable) = adopted_sheet_document();
+        assert_style_values_match_cold(&mut dom);
+        let before = dom.cascaded_maps(stable);
+        let values = dom.style_value_epoch;
+        for (root, css) in [
+            (outer_root, ADOPTED_SHEETS[0]),
+            (inner_root, ADOPTED_SHEETS[4]),
+        ] {
+            dom.set_adopted_styles(root, css);
+            assert_eq!(
+                dom.style_value_epoch, values,
+                "an adopted sheet expired every style"
+            );
+            assert!(std::rc::Rc::ptr_eq(&before, &dom.cascaded_maps(stable)));
+        }
+        let inner = dom.shadow_hosts[&inner_root];
+        assert_eq!(
+            dom.font_px(inner),
+            18.0,
+            "inherits the outer host's new font size"
+        );
+        assert_style_values_match_cold(&mut dom);
+        let values = dom.style_value_epoch;
+        dom.set_adopted_styles(inner_root, ADOPTED_SHEETS[5]);
+        assert_ne!(
+            dom.style_value_epoch, values,
+            "@keyframes names are document-wide"
+        );
+        assert_style_values_match_cold(&mut dom);
+    }
+
+    #[test]
+    fn adopted_sheet_changes_match_full_recascade() {
+        for seed in [7, 0x5eed, 0xadd0] {
+            let (mut dom, elements, roots, _) = adopted_sheet_document();
+            assert_style_values_match_cold(&mut dom);
+            let mut state: u64 = seed;
+            let mut next = |bound: usize| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state % bound as u64) as usize
+            };
+            let classes = ["a", "b", "x", "y"];
+            for _ in 0..120 {
+                if next(3) == 0 {
+                    let node = elements[next(elements.len())];
+                    let tokens: Vec<_> = classes.iter().filter(|_| next(3) == 0).copied().collect();
+                    dom.set_attr(node, "class", &tokens.join(" "));
+                } else {
+                    let root = roots[next(roots.len())];
+                    dom.set_adopted_styles(root, ADOPTED_SHEETS[next(ADOPTED_SHEETS.len())]);
+                }
+                assert_style_values_match_cold(&mut dom);
+            }
         }
     }
 

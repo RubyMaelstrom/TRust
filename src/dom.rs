@@ -583,6 +583,11 @@ pub fn last_mutation_ms() -> u128 {
     LAST_MUTATION_MS.with(|c| c.get())
 }
 
+/// Order of appearance of a tree scope's adopted style sheets: above every
+/// tree sheet's, and from a base of the scope's own (`build_style_index`).
+const ADOPTED_ORDER_BASE: usize = 1 << 60;
+const ADOPTED_ORDER_STRIDE: usize = 1 << 24;
+
 /// `@import` sheets awaiting a fetch, as (importing sheet's owner node,
 /// absolute URL) pairs, and every URL ever requested.
 type ImportRequests = (Vec<(NodeId, String)>, FxHashSet<String>);
@@ -9882,11 +9887,19 @@ impl Dom {
                 .get(scope)
                 .cloned()
                 .unwrap_or_else(|| vec![(0..css.len(), self.property_base(*scope).cloned())]);
+            // CSS Cascade 5 #cascade-sort ranks tree contexts before order of
+            // appearance (`cascade_context`), and a node's declarations from
+            // different tree scopes always differ in context, so source order
+            // only ranks one scope's rules. Each scope's adopted sheets count
+            // from a base of their own, after every tree sheet: replacing them
+            // keeps every other scope's order, and the styles cached from it.
+            let mut adopted_order =
+                ADOPTED_ORDER_BASE.saturating_add((*scope).saturating_mul(ADOPTED_ORDER_STRIDE));
             for (range, base) in sources {
                 let first = index.scopes.get(scope).map_or(0, Vec::len);
                 self.parsed_sheets.borrow_mut().append(
                     &css[range],
-                    &mut order,
+                    &mut adopted_order,
                     index.scopes.entry(*scope).or_default(),
                     &mut index.keyframes,
                     index.counter_styles.entry(*scope).or_default(),
@@ -10160,16 +10173,15 @@ impl Dom {
     /// pushed by the prelude on adoption and on replace/replaceSync.
     /// Idempotent pushes are free — no dirty, no rebuild.
     pub fn set_adopted_styles(&mut self, scope: NodeId, css: &str) {
-        if self.properties.adopted_sources.remove(&scope).is_some() {
-            self.touch_style_at(scope);
-        }
-        if self.adopted_styles.get(&scope).map(String::as_str) == Some(css)
-            || (css.trim().is_empty() && !self.adopted_styles.contains_key(&scope))
+        let sources = self.properties.adopted_sources.remove(&scope).is_some();
+        if !sources
+            && (self.adopted_styles.get(&scope).map(String::as_str) == Some(css)
+                || (css.trim().is_empty() && !self.adopted_styles.contains_key(&scope)))
         {
             return;
         }
-        self.adopted_styles.insert(scope, css.to_string());
-        self.touch_style_at(scope);
+        let old = self.adopted_styles.insert(scope, css.to_string());
+        self.touch_adopted_styles(scope, old.as_deref(), css);
     }
 
     fn is_stylesheet_link(&self, id: NodeId) -> bool {
