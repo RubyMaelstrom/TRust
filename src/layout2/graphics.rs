@@ -88,27 +88,27 @@ struct Builder<'a> {
     lines: Vec<PaintLine>,
     image_requests: Vec<ImageRequest>,
     canvas_images: Vec<(NodeId, crate::render::CanvasImage)>,
-    image_handles: HashSet<ImageHandle>,
+    image_handles: rustc_hash::FxHashSet<ImageHandle>,
     scroll_containers: Vec<ScrollContainer>,
     scrolling: ScrollAreas,
     sticky_constraints: Vec<StickyConstraint>,
-    marquee_scopes: HashMap<NodeId, MarqueeScope>,
+    marquee_scopes: rustc_hash::FxHashMap<NodeId, MarqueeScope>,
     /// CSS 2.2 `clip:rect()` regions keyed by the positioned element that
     /// establishes them. Unlike overflow clips these are not represented in
     /// the fragment geometry, so the paint adapter carries them down the flat
     /// ancestor chain for every descendant command.
-    legacy_clips: HashMap<NodeId, CssRect>,
+    legacy_clips: rustc_hash::FxHashMap<NodeId, CssRect>,
     /// Blockified replaced elements have a principal border box separate
     /// from their anonymous content line. Keep its used geometry for radii.
-    replaced_border_boxes: HashMap<NodeId, CssRect>,
+    replaced_border_boxes: rustc_hash::FxHashMap<NodeId, CssRect>,
     has_media_controls: bool,
     /// Overflow clips round the padding edge, independently of whether the
     /// box exposes a user scrolling mechanism (hidden/clip do not).
-    rounded_overflow_clips: HashMap<NodeId, PaintShape>,
+    rounded_overflow_clips: rustc_hash::FxHashMap<NodeId, PaintShape>,
     /// Keep rectangular overflow clips attached to their generating boxes.
     /// A flattened fragment clip loses which side of a scroll transform each
     /// edge belongs on, especially at a child document's viewport boundary.
-    overflow_clips: HashMap<NodeId, Clip>,
+    overflow_clips: rustc_hash::FxHashMap<NodeId, Clip>,
     scroll_tree: std::borrow::Cow<'a, super::spatial::ScrollTree>,
     patch_boundaries: Vec<super::GraphicalPatchBoundary>,
     boundaries: Vec<super::GraphicalBoundary>,
@@ -123,7 +123,7 @@ struct Builder<'a> {
     /// clips rather than wrapping them. Keeping the active prefix lets the
     /// ordinary fragment painter add only newly-entered scrollports.
     scroll_nodes: Vec<(NodeId, bool)>,
-    scroll_indices: HashMap<NodeId, usize>,
+    scroll_indices: rustc_hash::FxHashMap<NodeId, usize>,
     /// Some box has a `backdrop-filter`: groups for every Backdrop Root
     /// trigger are then emitted so backdrop filters stop at the right
     /// element (Filter Effects 2 #BackdropRoot).
@@ -233,16 +233,16 @@ impl<'a> Builder<'a> {
             lines: Vec::new(),
             image_requests: Vec::new(),
             canvas_images: Vec::new(),
-            image_handles: HashSet::new(),
+            image_handles: Default::default(),
             scroll_containers: Vec::new(),
             scrolling: ScrollAreas::new(dom, root),
             sticky_constraints: Vec::new(),
-            marquee_scopes: HashMap::new(),
-            legacy_clips: HashMap::new(),
-            replaced_border_boxes: HashMap::new(),
+            marquee_scopes: Default::default(),
+            legacy_clips: Default::default(),
+            replaced_border_boxes: Default::default(),
             has_media_controls: false,
-            rounded_overflow_clips: HashMap::new(),
-            overflow_clips: HashMap::new(),
+            rounded_overflow_clips: Default::default(),
+            overflow_clips: Default::default(),
             scroll_tree: scroll_tree.map_or_else(
                 || {
                     std::borrow::Cow::Owned(super::spatial::ScrollTree::new(
@@ -256,7 +256,7 @@ impl<'a> Builder<'a> {
             hard_clips: Vec::new(),
             transformed_clips: Vec::new(),
             scroll_nodes: Vec::new(),
-            scroll_indices: HashMap::new(),
+            scroll_indices: Default::default(),
             backdrop_filters: has_backdrop_filter(root)
                 || fixed.iter().any(has_backdrop_filter)
                 || top_layer
@@ -266,7 +266,7 @@ impl<'a> Builder<'a> {
             user_select: Default::default(),
             last_selection_paint: None,
             selection_rules: dom.has_selection_rules(),
-            replaced_images: HashSet::new(),
+            replaced_images: Default::default(),
         };
         this.collect_legacy_clips(root);
         this.collect_scroll_containers(root, false);
@@ -352,6 +352,10 @@ impl<'a> Builder<'a> {
     }
 
     fn marquee_scope(&self, node: NodeId, include_node: bool) -> Option<MarqueeScope> {
+        // Most pages have no marquee: skip the flat-tree ancestor walk.
+        if self.marquee_scopes.is_empty() {
+            return None;
+        }
         let mut current = if node == NO_NODE {
             None
         } else if include_node {
@@ -437,6 +441,10 @@ impl<'a> Builder<'a> {
         let mut clip = hard
             .filter(|_| !self.scroll_nodes.iter().any(|(_, scroll)| *scroll))
             .map(|clip| self.clip_rect(clip));
+        // Only `clip: rect()` regions need the flat-tree ancestor walk.
+        if self.legacy_clips.is_empty() {
+            return clip;
+        }
         let mut current = (node != NO_NODE).then_some(node);
         while let Some(id) = current {
             if let Some(rect) = self.legacy_clips.get(&id) {
