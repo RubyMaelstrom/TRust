@@ -41,6 +41,7 @@ mod input;
 mod invalidation;
 pub(crate) mod media;
 mod media_tracks;
+mod paint_journal;
 mod parallel_match;
 mod parallel_style;
 mod properties;
@@ -88,6 +89,7 @@ mod validity;
 mod xml;
 mod xml_serialize;
 pub(crate) mod xpath;
+pub(crate) use paint_journal::{JournalCursor, JournalDelta};
 pub use xml_serialize::NotWellFormed;
 
 pub type NodeId = usize;
@@ -682,6 +684,9 @@ pub struct Dom {
     /// Broad computed-style invalidation, independent of the observable DOM
     /// revision. Proven local mutations evict only their dependent elements.
     style_value_epoch: u64,
+    /// What a retained display-list consumer must re-derive
+    /// (`dom/paint_journal.rs`).
+    paint_journal: paint_journal::PaintJournal,
     pending_style_invalidations: invalidation::Pending,
     /// Bounded, document-owned independent formatting-context results.
     pub(crate) layout_cache: RefCell<crate::layout2::LayoutCache>,
@@ -1214,6 +1219,7 @@ impl Dom {
             epoch,
             window_names_epoch,
             style_value_epoch,
+            paint_journal: _,
             pending_style_invalidations,
             layout_cache,
             box_tree_cache,
@@ -1790,6 +1796,7 @@ impl Dom {
             epoch: 0,
             window_names_epoch: 0,
             style_value_epoch: 0,
+            paint_journal: paint_journal::PaintJournal::default(),
             pending_style_invalidations: invalidation::Pending::default(),
             layout_cache: RefCell::new(crate::layout2::LayoutCache::default()),
             box_tree_cache: RefCell::new(crate::layout2::BoxTreeCache::default()),
@@ -1913,6 +1920,7 @@ impl Dom {
             // activation links (inherited by inline descendants) and fallback
             // content need rebuilding. Retain independent formatting contexts.
             if self.render_live != live {
+                self.paint_journal.global();
                 self.layout_cache.get_mut().clear();
                 self.box_tree_cache.get_mut().clear();
             } else {
@@ -1922,6 +1930,9 @@ impl Dom {
                     .copied()
                     .filter(|&node| self.is_valid(node))
                     .collect();
+                // Generated boxes inside a link read whether it is clickable
+                // (`render_clickable`) when they paint.
+                self.paint_journal.note_all(&changed);
                 self.invalidate_activation_layout(&changed);
             }
         }
@@ -2728,8 +2739,9 @@ impl Dom {
         for &node in changed.keys() {
             self.invalidate_style_subtree(node, true);
         }
-        self.mark_dom_revision();
+        self.mark_dom_revision_attributed();
         for (&node, &kind) in &changed {
+            self.paint_journal.note(node);
             self.record_geometry_dirty(node, kind);
         }
         self.dirty_nodes.extend(changed);
@@ -2821,7 +2833,16 @@ impl Dom {
         self.mark_dom_revision();
     }
 
+    /// An unattributed DOM revision: anything may have changed, as far as a
+    /// retained paint is concerned. Mutators that name the nodes they changed
+    /// use `mark_dom_revision_attributed` and note them in the paint journal.
+    #[track_caller]
     fn mark_dom_revision(&mut self) {
+        self.paint_journal.global();
+        self.mark_dom_revision_core();
+    }
+
+    fn mark_dom_revision_core(&mut self) {
         self.invalidate_untracked_svg_resources();
         self.slot_directory.take();
         self.dirty = true;
@@ -2837,12 +2858,13 @@ impl Dom {
         }
     }
 
-    /// `mark_dom_revision` for a change that leaves every tree's slots and
-    /// their names as they were: Text and other attribute changes. DOM
-    /// #find-a-slot reads nothing else, so the slot directory stays valid.
-    fn mark_dom_revision_keeping_slots(&mut self) {
+    /// `mark_dom_revision_attributed` for a change that leaves every tree's
+    /// slots and their names as they were: Text and other attribute changes.
+    /// DOM #find-a-slot reads nothing else, so the slot directory stays
+    /// valid. The caller notes what it changed in the paint journal.
+    fn mark_dom_revision_keeping_slots_attributed(&mut self) {
         let slots = self.slot_directory.take();
-        self.mark_dom_revision();
+        self.mark_dom_revision_core();
         if let Some(slots) = slots {
             let _ = self.slot_directory.set(slots);
         }
@@ -2964,10 +2986,11 @@ impl Dom {
         let impact = self.invalidate_attribute_selectors(id, name, old_class);
         self.invalidate_attribute_style_values(id, name, impact);
         if name.eq_ignore_ascii_case("name") && self.tag_name(id) == Some("slot") {
-            self.mark_dom_revision();
+            self.mark_dom_revision_attributed();
         } else {
-            self.mark_dom_revision_keeping_slots();
+            self.mark_dom_revision_keeping_slots_attributed();
         }
+        self.paint_journal.note(id);
         self.dirty_nodes.push((id, DirtyKind::Attr));
         self.record_geometry_dirty(id, DirtyKind::Attr);
     }
@@ -3174,8 +3197,14 @@ impl Dom {
             }
             self.invalidate_structure(parent, changed);
         }
-        self.mark_dom_revision();
+        // A structural no-op (`id` is `None`: an already-orphan node)
+        // changes nothing a paint can see.
+        self.mark_dom_revision_attributed();
         if let Some(i) = id {
+            // The parent's child list changed; the changed children are the
+            // subtrees that were inserted, removed or moved.
+            self.paint_journal.note_self(i);
+            self.paint_journal.note_all(changed);
             self.dirty_nodes.push((i, DirtyKind::Content));
             self.record_geometry_dirty(i, DirtyKind::Content);
         }
@@ -5263,6 +5292,7 @@ impl Dom {
             // attributes still use touch_attr and invalidate geometry normally.
             self.dirty = true;
             self.layout_paint_epoch = self.layout_paint_epoch.wrapping_add(1);
+            self.paint_journal.note(id);
             if !self.dirty_nodes.iter().any(|(node, _)| *node == id) {
                 self.dirty_nodes.push((id, DirtyKind::Paint));
             }
@@ -5273,7 +5303,9 @@ impl Dom {
     /// dimensions, an inline SVG's document image) changed availability.
     /// Layout's observed resource reads invalidate what consumed it; request
     /// the next rendering opportunity without invalidating style or the tree.
+    #[track_caller]
     pub(crate) fn resource_changed(&mut self) {
+        self.paint_journal.global();
         self.dirty = true;
         self.layout_presentation_epoch = self.layout_presentation_epoch.wrapping_add(1);
     }
@@ -5289,6 +5321,7 @@ impl Dom {
             // which consumed the changed image. Keep the formatting tree.
             self.dirty = true;
             self.layout_presentation_epoch = self.layout_presentation_epoch.wrapping_add(1);
+            self.paint_journal.note(id);
             // The element's OWN box may resize, so use the outer-box scope
             // rather than Content's potentially self-contained patch boundary.
             self.dirty_nodes.push((id, DirtyKind::Attr));

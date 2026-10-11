@@ -1321,8 +1321,9 @@ impl Dom {
         // Descendants keep their selector matches: every element whose match
         // changed is a subject. They can still inherit changed values.
         self.invalidate_style_subtrees(&subjects, false);
-        self.mark_dom_revision();
+        self.mark_dom_revision_attributed();
         for &subject in &subjects {
+            self.paint_journal.note(subject);
             self.dirty_nodes.push((subject, DirtyKind::Attr));
             self.record_geometry_dirty(subject, DirtyKind::Attr);
         }
@@ -1390,6 +1391,7 @@ impl Dom {
             );
         }
         self.invalidate_style_subtree(host, true);
+        self.paint_journal.note(host);
         self.dirty_nodes.push((host, DirtyKind::Attr));
         self.record_geometry_dirty(host, DirtyKind::Attr);
     }
@@ -1506,6 +1508,7 @@ impl Dom {
             );
         }
         self.style_value_epoch = self.style_value_epoch.wrapping_add(1);
+        self.paint_journal.global();
         self.layout_cache.get_mut().clear();
         self.box_tree_cache.get_mut().clear();
         self.svg_dependencies.get_mut().clear_proofs();
@@ -1543,6 +1546,7 @@ impl Dom {
     /// Animation-origin values can affect explicit inheritance and containing
     /// block constraints, but cannot change selectors or base declarations.
     pub(super) fn invalidate_transition_layout(&mut self, changed: &[NodeId]) {
+        self.paint_journal.note_all(changed);
         self.invalidate_activation_layout(changed);
         let consumers = self.svg_dirty_consumers(changed, false);
         self.invalidate_layout_paths(consumers);
@@ -1667,6 +1671,8 @@ impl Dom {
         let mut seen = FxHashMap::<NodeId, bool>::default();
         let mut pending: Vec<_> = roots.into_iter().collect();
         let roots: Vec<_> = pending.iter().map(|&(node, _)| node).collect();
+        // Everything below a root may have a different computed style.
+        self.paint_journal.note_all(&roots);
         let selectors = pending.iter().any(|&(_, selectors)| selectors);
         let mut affected = Vec::new();
         while let Some((node, selectors)) = pending.pop() {
@@ -1927,7 +1933,8 @@ impl Dom {
             return;
         }
         self.invalidate_layout_ancestors(node);
-        self.mark_dom_revision();
+        self.mark_dom_revision_attributed();
+        self.paint_journal.note(node);
         self.dirty_nodes.push((node, DirtyKind::Content));
         self.record_geometry_dirty(node, DirtyKind::Content);
     }
@@ -1969,7 +1976,8 @@ impl Dom {
         let mut roots = self.svg_dirty_consumers(&[parent], false);
         roots.push(character_data.unwrap_or(parent));
         self.invalidate_layout_paths(roots);
-        self.mark_dom_revision_keeping_slots();
+        self.mark_dom_revision_keeping_slots_attributed();
+        self.paint_journal.note_self(parent);
         self.dirty_nodes.push((parent, DirtyKind::Content));
         // CSS Lists 3 #inheriting-counters / Content 3 #quote-values:
         // counters and quote depth follow elements and generated content.

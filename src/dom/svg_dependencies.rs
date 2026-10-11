@@ -425,7 +425,12 @@ impl Dom {
     pub(super) fn invalidate_layout_paths(&self, roots: impl IntoIterator<Item = NodeId>) {
         let mut work = std::mem::take(&mut self.svg_dependencies.borrow_mut().work);
         debug_assert!(work.pending.is_empty() && work.visited.is_empty());
-        work.pending.extend(roots);
+        for root in roots {
+            // The nodes whose formatting path changed also changed for any
+            // retained paint (SVG consumers, text and structure roots).
+            self.paint_journal.note_self(root);
+            work.pending.push(root);
+        }
         if work.pending.len() == 1 && self.shadow_roots.is_empty() {
             let mut next = work.pending.pop();
             #[cfg(test)]

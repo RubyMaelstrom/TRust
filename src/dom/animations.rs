@@ -1729,6 +1729,7 @@ impl Dom {
         if !paint.is_empty() {
             for &(id, property) in &paint {
                 self.forget_animated_value(id, property);
+                self.paint_journal.note(id);
             }
             // A presentation revision, not a DOM mutation: neither layout
             // nor the hit-test geometry changes.
