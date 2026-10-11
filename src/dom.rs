@@ -2994,8 +2994,8 @@ impl Dom {
 
     /// Bump the style epoch when a tree mutation involving `child` (being
     /// appended/inserted under, or detached from, `parent`) can change the
-    /// sheet set: the node is — or its subtree contains — a `<style>`/
-    /// `<link>` element, or it's a text node directly under a `<style>`
+    /// sheet set: the node is — or its subtree contains — a `<style>` or
+    /// style sheet `<link>`, or it's a text node directly under a `<style>`
     /// (HTML §4.2.6: the style element's sheet re-creates when its child
     /// nodes change or it enters/leaves the document). The dominant append
     /// (a fresh leaf node) pays one tag check; only subtree attaches walk,
@@ -3033,15 +3033,16 @@ impl Dom {
         }
     }
 
-    /// Whether `root`'s composed subtree (inclusive) contains a `<style>` or
-    /// `<link>` element, a shadow root with adopted style sheets, or a
-    /// `<meta name=color-scheme>` (HTML #meta-color-scheme re-runs on
-    /// insertion and removal). Early-exits on the first hit; a childless node
-    /// is a single tag check.
+    /// Whether `root`'s composed subtree (inclusive) contains a `<style>`
+    /// element, a `<link>` that may hold a style sheet, a shadow root with
+    /// adopted style sheets, or a `<meta name=color-scheme>` (HTML
+    /// #meta-color-scheme re-runs on insertion and removal). Early-exits on
+    /// the first hit; a childless node is a single tag check.
     fn subtree_has_style(&self, root: NodeId) -> bool {
         let mut stack = vec![root];
         while let Some(id) = stack.pop() {
-            if matches!(self.tag_name(id), Some("style" | "link"))
+            if self.tag_name(id) == Some("style")
+                || self.link_may_hold_sheet(id)
                 || (self.tag_name(id) == Some("meta") && self.is_color_scheme_meta(id))
                 // CSSOM #dom-documentorshadowroot-adoptedstylesheets: a shadow
                 // root's adopted sheets join the connected sheet set with it.
@@ -3054,6 +3055,21 @@ impl Dom {
             self.push_composed_children(id, &mut stack);
         }
         false
+    }
+
+    /// HTML link type "stylesheet": only that keyword creates an external
+    /// resource link that contributes to the styling processing model
+    /// (alternate and disabled ones included, which CSSOM can enable).
+    /// `preload`, `modulepreload`, `icon` and other links never join the
+    /// sheet set, so inserting one (bundlers add a modulepreload link for
+    /// each dynamic import) changes no style. A link still holding a CSSOM
+    /// sheet record counts too.
+    fn link_may_hold_sheet(&self, id: NodeId) -> bool {
+        self.tag_name(id) == Some("link")
+            && (self.attr(id, "rel").is_some_and(|rel| {
+                rel.split_ascii_whitespace()
+                    .any(|word| word.eq_ignore_ascii_case("stylesheet"))
+            }) || self.cssom_sheets.contains_key(&id))
     }
 
     /// A childList/text change whose content lives under `id` (the parent whose

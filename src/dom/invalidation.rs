@@ -2172,6 +2172,52 @@ mod tests {
     }
 
     #[test]
+    fn links_without_the_stylesheet_keyword_leave_the_sheet_set_alone() {
+        // HTML link type "stylesheet": only that keyword's external resource
+        // contributes to styling. A bundler inserts a modulepreload link for
+        // each dynamic import; neither it nor its removal may stale the index
+        // or expire live styles.
+        let mut dom = Dom::parse_document(
+            "<head id=h><style>p{width:5px}</style></head><body><p id=p>x</p></body>",
+        );
+        let (head, p) = (dom.get_by_id("h").unwrap(), dom.get_by_id("p").unwrap());
+        assert_eq!(dom.computed_value(p, "width").as_deref(), Some("5px"));
+        let stable = dom.cascaded_maps(p);
+        let (values, sheets) = (dom.style_value_epoch, dom.style_epoch);
+        let mut hints = Vec::new();
+        for rel in [
+            "modulepreload",
+            "preload",
+            "icon",
+            "PreConnect dns-prefetch",
+        ] {
+            let link = dom.create_element("link");
+            dom.set_attr(link, "rel", rel);
+            dom.set_attr(link, "href", "/chunk.js");
+            dom.append(head, link);
+            hints.push(link);
+        }
+        dom.detach(hints[1]);
+        assert_eq!(dom.style_epoch, sheets, "a resource hint staled the index");
+        assert_eq!(
+            dom.style_value_epoch, values,
+            "a resource hint expired styles"
+        );
+        assert!(std::rc::Rc::ptr_eq(&stable, &dom.cascaded_maps(p)));
+        // Alternate and disabled sheets still change the set (CSSOM can
+        // enable them), and so does a hint that becomes a style sheet.
+        let alternate = dom.create_element("link");
+        dom.set_attr(alternate, "rel", "alternate STYLESHEET");
+        dom.append(head, alternate);
+        assert_ne!(dom.style_epoch, sheets);
+        dom.computed_value(p, "width");
+        let sheets = dom.style_epoch;
+        dom.set_attr(hints[0], "rel", "stylesheet");
+        assert_ne!(dom.style_epoch, sheets);
+        assert_style_values_match_cold(&mut dom);
+    }
+
+    #[test]
     fn form_measurement_children_preserve_independent_control_styles() {
         let mut dom = Dom::parse_document(
             "<style>form {font-size:18px} input {color:purple} input:disabled {color:gray}</style>\
