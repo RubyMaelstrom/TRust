@@ -72,6 +72,14 @@ impl ScopedSheets {
     }
 }
 
+/// Whether a scoped sheet may register names for its whole Document: this
+/// arena keeps one `@keyframes` and one `@property` registry per Document,
+/// so such a sheet's change is not confined to its tree scope.
+fn names_document_constructs(css: &str) -> bool {
+    let css = css.to_ascii_lowercase();
+    css.contains("keyframes") || css.contains("@property")
+}
+
 impl Pending {
     pub(super) fn retain_nodes(&mut self, live: impl Fn(NodeId) -> bool) {
         self.roots.get_mut().retain(|&node, _| live(node));
@@ -1166,6 +1174,24 @@ impl Dom {
         self.layout_cache.get_mut().cold = true;
     }
 
+    /// Restyle the whole tree of a node outside the document, for a change
+    /// with no local proof; `None` for a connected node. Selector matching
+    /// never crosses into another tree, slot assignment (DOM #find-a-slot)
+    /// and part element maps (CSS Shadow 1 #part) stay within a node's
+    /// shadow-including root, a detached tree has no rendered style, and
+    /// inserting it restyles all of it.
+    fn invalidate_detached_tree(&mut self, node: NodeId) -> Option<Vec<NodeId>> {
+        if self.is_dom_connected(node) {
+            return None;
+        }
+        let mut root = node;
+        while let Some(parent) = self.parent_composed(root) {
+            root = parent;
+        }
+        self.invalidate_style_subtree(root, true);
+        Some(Vec::new())
+    }
+
     pub(super) fn invalidate_attribute_selectors(
         &mut self,
         node: NodeId,
@@ -1181,7 +1207,7 @@ impl Dom {
             && self.shadow_style_dependencies(node)
         {
             self.selector_epoch = self.selector_epoch.wrapping_add(1);
-            return None;
+            return self.invalidate_detached_tree(node);
         }
         // CSS Shadow 1 #part: `part` and `exportparts` change the part
         // element maps of the shadow roots above `node`, whose `::part()`
@@ -1194,7 +1220,7 @@ impl Dom {
                 .is_none_or(|(_, index)| !index.part_rules.is_empty())
         {
             self.selector_epoch = self.selector_epoch.wrapping_add(1);
-            return None;
+            return self.invalidate_detached_tree(node);
         }
         // No rule index to prove against: no proof of independence.
         let subjects = self.proof_style_index().and_then(|index| {
@@ -1204,21 +1230,14 @@ impl Dom {
                 .attributes
                 .subjects(self, node, name, old_class)
         });
-        // Selector matching never crosses into another tree, and inserting a
-        // detached tree restyles all of it. Frameworks set attributes on nodes
-        // before inserting them; with a broad dependency (`dir`, `lang`, …)
-        // that expired every style of the live document. Only that fallback
-        // takes the detached tree: a local proof stays cheaper than a walk.
+        // Frameworks set attributes on nodes before inserting them; with a
+        // broad dependency (`dir`, `lang`, …) that expired every style of the
+        // live document. Only that fallback takes the detached tree: a local
+        // proof stays cheaper than a walk.
         if subjects.is_none()
-            && !self.is_dom_connected(node)
-            && !self.shadow_style_dependencies(node)
+            && let Some(detached) = self.invalidate_detached_tree(node)
         {
-            let mut root = node;
-            while let Some(parent) = self.parent_composed(root) {
-                root = parent;
-            }
-            self.invalidate_style_subtree(root, true);
-            return Some(Vec::new());
+            return Some(detached);
         }
         // Shadow rules are in this Document's routes: `:host()` and
         // `::slotted()` reach the host, its shadow tree and its slottables,
@@ -1343,10 +1362,6 @@ impl Dom {
             .get(&scope)
             .copied()
             .filter(|&host| self.is_connected(host));
-        let names_document_constructs = |css: &str| {
-            let css = css.to_ascii_lowercase();
-            css.contains("keyframes") || css.contains("@property")
-        };
         let document_wide =
             names_document_constructs(old.unwrap_or("")) || names_document_constructs(new);
         let Some(host) = host.filter(|_| !document_wide) else {
@@ -1359,21 +1374,14 @@ impl Dom {
             self.touch_style_at(scope);
             return;
         };
-        let pending = self.pending_style_invalidations.scoped_sheets.get_mut();
-        if pending.is_none() {
-            let Some(old) = self.current_style_index() else {
-                // No current index to compare against: a sheet change
-                // already awaits the full restyle.
-                if casc_diag_on() {
-                    eprintln!("DIAGINVALID adopted-sheets scope={scope} unscoped stale-index");
-                }
-                self.touch_style_at(scope);
-                return;
-            };
-            *self.pending_style_invalidations.scoped_sheets.get_mut() = Some(ScopedSheets {
-                old,
-                scopes: Vec::new(),
-            });
+        if !self.note_scoped_sheet_change(&[scope]) {
+            // No current index to compare against: a sheet change
+            // already awaits the full restyle.
+            if casc_diag_on() {
+                eprintln!("DIAGINVALID adopted-sheets scope={scope} unscoped stale-index");
+            }
+            self.touch_style_at(scope);
+            return;
         }
         if casc_diag_on() {
             eprintln!(
@@ -1381,15 +1389,86 @@ impl Dom {
                 std::panic::Location::caller()
             );
         }
-        if let Some(pending) = self.pending_style_invalidations.scoped_sheets.get_mut() {
-            pending.scopes.push(scope);
-        }
-        self.style_epoch = self.style_epoch.wrapping_add(1);
         self.invalidate_style_subtree(host, true);
-        self.pending_style_invalidations.dirty.set(true);
-        self.mark_dom_revision();
         self.dirty_nodes.push((host, DirtyKind::Attr));
         self.record_geometry_dirty(host, DirtyKind::Attr);
+    }
+
+    /// A connected tree mutation inserting or removing `roots` under
+    /// `parent`, whose sheets are adopted style sheets of shadow roots
+    /// inside them and nothing else (`Dom::adopted_sheet_scopes`): those
+    /// shadow roots' sheets join or leave the sheet set (CSSOM
+    /// #dom-documentorshadowroot-adoptedstylesheets) and, as CSS Shadow 1
+    /// scopes them, select only inside their hosts, which lie within
+    /// `roots`. The tree operation restyles an inserted subtree whole, and a
+    /// removed one is no longer rendered, so the change stays in those
+    /// scopes like an adoption (`touch_adopted_styles`); the flush proves
+    /// that every other scope kept its rules. Returns false, leaving the
+    /// whole-document invalidation to the caller, when a root holds another
+    /// sheet, a sheet names document-wide constructs, or no current index
+    /// can prove it.
+    pub(super) fn touch_adopted_trees(&mut self, parent: NodeId, roots: &[NodeId]) -> bool {
+        // A style element's children are its sheet's text (HTML
+        // #update-a-style-block).
+        if !self.is_connected(parent) || self.tag_name(parent) == Some("style") {
+            return false;
+        }
+        let mut scopes = Vec::new();
+        if !roots
+            .iter()
+            .all(|&root| self.adopted_sheet_scopes(root, &mut scopes))
+            || scopes.is_empty()
+            || scopes.iter().any(|scope| {
+                self.adopted_styles
+                    .get(scope)
+                    .is_some_and(|css| names_document_constructs(css))
+            })
+        {
+            return false;
+        }
+        if !self.note_scoped_sheet_change(&scopes) {
+            if casc_diag_on() {
+                eprintln!("DIAGINVALID adopted-tree parent={parent} unscoped stale-index");
+            }
+            return false;
+        }
+        if casc_diag_on() {
+            eprintln!(
+                "DIAGINVALID adopted-tree parent={parent} scopes={} caller={}",
+                scopes.len(),
+                std::panic::Location::caller()
+            );
+        }
+        true
+    }
+
+    /// Record that the adopted sheets of `scopes` changed since the parsed
+    /// index that is current now, which the next flush compares the rebuilt
+    /// index against (`ScopedSheets::kept_elsewhere`). False when there is
+    /// no current index and no earlier scoped change pending: then nothing
+    /// can prove the change local.
+    fn note_scoped_sheet_change(&mut self, scopes: &[NodeId]) -> bool {
+        if self
+            .pending_style_invalidations
+            .scoped_sheets
+            .get_mut()
+            .is_none()
+        {
+            let Some(old) = self.current_style_index() else {
+                return false;
+            };
+            *self.pending_style_invalidations.scoped_sheets.get_mut() = Some(ScopedSheets {
+                old,
+                scopes: Vec::new(),
+            });
+        }
+        if let Some(pending) = self.pending_style_invalidations.scoped_sheets.get_mut() {
+            pending.scopes.extend_from_slice(scopes);
+        }
+        self.style_epoch = self.style_epoch.wrapping_add(1);
+        self.pending_style_invalidations.dirty.set(true);
+        self.mark_dom_revision();
+        true
     }
 
     /// The parsed rule index when it reflects the current sheet set, without
@@ -3283,6 +3362,78 @@ mod tests {
         assert_style_values_match_cold(&mut dom);
     }
 
+    /// A detached `x-card` component: a host whose shadow root has adopted
+    /// `sheet` and renders a slot and a part, with one slotted light child.
+    fn adopted_component(dom: &mut Dom, sheet: &str) -> NodeId {
+        let host = dom.create_element("x-card");
+        let light = dom.create_element("p");
+        dom.set_attr(light, "class", "y");
+        dom.append(host, light);
+        let root = dom.attach_shadow(host);
+        let wrap = dom.create_element("div");
+        dom.set_attr(wrap, "class", "x");
+        let slot = dom.create_element("slot");
+        let part = dom.create_element("span");
+        dom.set_attr(part, "class", "y");
+        dom.set_attr(part, "part", "p");
+        let text = dom.create_text("card");
+        dom.append(part, text);
+        dom.append(wrap, slot);
+        dom.append(wrap, part);
+        dom.append(root, wrap);
+        dom.set_adopted_styles(root, sheet);
+        host
+    }
+
+    #[test]
+    fn components_with_adopted_sheets_enter_and_leave_without_restyling_the_document() {
+        // CSSOM #dom-documentorshadowroot-adoptedstylesheets with CSS Shadow
+        // 1 scoping: inserting or removing a subtree whose only sheets are
+        // its shadow roots' adopted sheets changes the sheet set in those
+        // scopes alone. Nothing outside the subtree restyles.
+        let (mut dom, _, _, stable) = adopted_sheet_document();
+        let body = dom.nodes[stable].parent.unwrap();
+        assert_style_values_match_cold(&mut dom);
+        for sheet in [ADOPTED_SHEETS[0], ADOPTED_SHEETS[4], ADOPTED_SHEETS[6]] {
+            let kept = dom.cascaded_maps(stable);
+            let values = dom.style_value_epoch;
+            let section = dom.create_element("section");
+            let card = adopted_component(&mut dom, sheet);
+            dom.append(section, card);
+            let nested = adopted_component(&mut dom, ADOPTED_SHEETS[1]);
+            dom.append(card, nested);
+            dom.append(body, section);
+            assert_eq!(dom.style_value_epoch, values, "inserting {sheet:?}");
+            assert!(std::rc::Rc::ptr_eq(&kept, &dom.cascaded_maps(stable)));
+            assert_style_values_match_cold(&mut dom);
+            let kept = dom.cascaded_maps(stable);
+            let values = dom.style_value_epoch;
+            dom.detach(section);
+            assert_eq!(dom.style_value_epoch, values, "removing {sheet:?}");
+            assert!(std::rc::Rc::ptr_eq(&kept, &dom.cascaded_maps(stable)));
+            assert_style_values_match_cold(&mut dom);
+        }
+        // A tree sheet, or document-wide names, still restyle the document.
+        let values = dom.style_value_epoch;
+        let card = adopted_component(&mut dom, ADOPTED_SHEETS[5]);
+        dom.append(body, card);
+        assert_ne!(dom.style_value_epoch, values, "@keyframes is document-wide");
+        assert_style_values_match_cold(&mut dom);
+        let values = dom.style_value_epoch;
+        let card = adopted_component(&mut dom, ADOPTED_SHEETS[0]);
+        let style = dom.create_element("style");
+        let css = dom.create_text(".x{margin-top:1px}");
+        dom.append(style, css);
+        let root = dom.shadow_root(card).unwrap();
+        dom.append(root, style);
+        dom.append(body, card);
+        assert_ne!(
+            dom.style_value_epoch, values,
+            "a shadow tree's style element"
+        );
+        assert_style_values_match_cold(&mut dom);
+    }
+
     #[test]
     fn adopted_sheet_changes_match_full_recascade() {
         for seed in [7, 0x5eed, 0xadd0] {
@@ -3340,8 +3491,38 @@ mod tests {
             };
             let classes = ["a", "b", "x", "y"];
             let mut inserted = Vec::new();
+            let mut cards: Vec<NodeId> = Vec::new();
             for _ in 0..160 {
-                match next(5) {
+                match next(7) {
+                    // Components enter (fresh or previously removed) and
+                    // leave with their adopted sheets.
+                    5 => {
+                        let card = match cards
+                            .iter()
+                            .position(|&card| dom.nodes[card].parent.is_none())
+                        {
+                            Some(at) if next(2) == 0 => cards[at],
+                            _ => {
+                                let card = adopted_component(&mut dom, sheets[next(sheets.len())]);
+                                cards.push(card);
+                                elements.push(card);
+                                card
+                            }
+                        };
+                        let parent = elements[next(elements.len())];
+                        let mut above = Some(parent);
+                        while let Some(node) = above.filter(|&node| node != card) {
+                            above = dom.parent_composed(node);
+                        }
+                        if above.is_none() {
+                            dom.append(parent, card);
+                        }
+                    }
+                    6 => {
+                        if !cards.is_empty() {
+                            dom.detach(cards[next(cards.len())]);
+                        }
+                    }
                     0 => {
                         let node = elements[next(elements.len())];
                         let tokens: Vec<_> =

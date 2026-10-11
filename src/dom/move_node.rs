@@ -195,7 +195,9 @@ impl Dom {
         {
             self.reset_cssom_sheet(parent);
             self.touch_style_at(parent);
-        } else if self.tree_mutation_changes_style(parent, child) {
+        } else if self.tree_mutation_changes_style(parent, child)
+            && !self.touch_adopted_trees(parent, &[child])
+        {
             self.touch_style_at(parent);
         }
     }

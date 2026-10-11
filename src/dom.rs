@@ -3006,6 +3006,9 @@ impl Dom {
         }
         let styled = parent.is_some_and(|parent| self.tree_mutation_changes_style(parent, child));
         if styled && let Some(scope) = parent {
+            if self.touch_adopted_trees(scope, &[child]) {
+                return;
+            }
             let mut stack = vec![child];
             while let Some(node) = stack.pop() {
                 if matches!(self.tag_name(node), Some("style" | "link")) {
@@ -3055,6 +3058,35 @@ impl Dom {
             self.push_composed_children(id, &mut stack);
         }
         false
+    }
+
+    /// Collects into `scopes` the shadow roots with adopted style sheets in
+    /// `root`'s composed subtree (inclusive). False when the subtree holds
+    /// another sheet-set member (`subtree_has_style`): a tree sheet's
+    /// insertion shifts every later sheet's order of appearance.
+    pub(crate) fn adopted_sheet_scopes(&self, root: NodeId, scopes: &mut Vec<NodeId>) -> bool {
+        let mut stack = vec![root];
+        while let Some(id) = stack.pop() {
+            match &self.nodes[id].data {
+                NodeData::Element { .. } | NodeData::Fragment => {}
+                NodeData::Text(_) | NodeData::Comment(_) => continue,
+                _ => return false,
+            }
+            if self.tag_name(id) == Some("style")
+                || self.link_may_hold_sheet(id)
+                || (self.tag_name(id) == Some("meta") && self.is_color_scheme_meta(id))
+            {
+                return false;
+            }
+            if let Some(shadow) = self
+                .shadow_root(id)
+                .filter(|shadow| self.adopted_styles.contains_key(shadow))
+            {
+                scopes.push(shadow);
+            }
+            self.push_composed_children(id, &mut stack);
+        }
+        true
     }
 
     /// HTML link type "stylesheet": only that keyword creates an external
@@ -4433,6 +4465,13 @@ impl Dom {
             style_changed = self
                 .child_iter(parent)
                 .any(|child| self.tree_mutation_changes_style(parent, child));
+        }
+        if style_changed {
+            let forest: Vec<NodeId> = self
+                .child_iter(parent)
+                .chain(new_children.iter().copied())
+                .collect();
+            style_changed = !self.touch_adopted_trees(parent, &forest);
         }
 
         if style_changed {
