@@ -216,6 +216,12 @@ impl Dom {
 }
 
 impl Dom {
+    /// The retained paint a Dom carries between frames (`None` while a paint
+    /// holds it).
+    pub(crate) fn paint_cache_cell(&self) -> &RefCell<Option<Box<crate::layout2::PaintCache>>> {
+        &self.paint_cache
+    }
+
     /// Epochs whose advance means "any style may differ": the style value,
     /// sheet-set and selector epochs, and the process-wide font and SVG
     /// sprite revisions that length units and sprite references read.

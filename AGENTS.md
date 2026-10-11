@@ -103,6 +103,11 @@ The project favors:
   - `boundary.rs`: safe incremental-layout boundaries.
   - `paint.rs`: CSS painting order, cell compositor, clipping, fixed layers,
     regions, carousels, and the single CSS-pixel-to-cell quantization boundary.
+  - `graphics.rs`: graphical (display-list) paint in CSS 2.2 Appendix E order.
+    `graphics/paint_cache.rs` memoizes one `paint_fragment` call per fragment
+    for the live page actor, keyed by the fragment's own data and validated
+    against the Dom's paint journal (`dom/paint_journal.rs`); see its module
+    comment for the complete list of reuse conditions.
   - `contract.rs`: `Row`, `Item`, regions, fixed items, geometry, terminal-cell
     metrics, and the public layout/rendering contract.
 - `src/img.rs`: guarded raster/SVG decoding, sizing, tinting, alpha detection,
@@ -161,6 +166,14 @@ The project favors:
   it and creates its Window there exactly as in a new engine.
 - Incremental layout is an optimization. If a patch cannot be proven safe,
   fall back to the always-correct full relayout.
+- The retained graphical paint is an optimization of the same kind: a cached
+  fragment is replayed only when its output provably equals a fresh build's.
+  Every Dom mutation that bumps the epoch must either name the nodes it
+  changed in the paint journal (`mark_dom_revision_attributed` plus
+  `paint_journal.note`) or advance the global stamp (`mark_dom_revision`, the
+  default). `TRUST_PAINT_VERIFY=1` and every test compare the cached paint
+  with a full one; anything a leaf reads that the reuse conditions do not
+  cover must be added there or taint the chunk (`paint_cache::taint`).
 - Image intrinsic sizes must be shared with the live page geometry pass so DOM
   measurements match rendered boxes.
 - Background panics and per-resource failures must remain contained; only the
@@ -256,6 +269,11 @@ Focused checks and diagnostics:
   or incomplete harness runs. Keep the full failure results.
 - `cargo test --lib webgl -- --include-ignored` runs hardware-dependent WebGL
   pixel, shader, and API tests.
+- `cargo test --lib paint_cache::tests::fuzz_soak -- --ignored --nocapture`
+  runs the retained-paint differential fuzz test for many seeds
+  (`TRUST_PAINT_FUZZ_SEEDS=first..last`, `TRUST_PAINT_FUZZ_STEPS=n`); a failure
+  prints the seed and the operation log. `TRUST_PAINT_VERIFY=1` does the same
+  comparison against a live page in the release browser.
 - `src/fixtures/number_input.html` is the manual number-input acceptance page.
 - `DIAGNOSTICS.md` contains environment variables, ignored live-site gates,
   headless tools, and benchmark commands. `TRUST_DESKTOP_TRACE=1` enables frame

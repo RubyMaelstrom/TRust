@@ -52,6 +52,9 @@ mod flex;
 mod float;
 mod flow;
 mod graphics;
+pub(crate) use graphics::PaintCache;
+#[cfg(test)]
+pub(crate) use graphics::audit_read as paint_audit_read;
 mod grid;
 mod highlight;
 pub(crate) use grid::serialize_subgrid_rows;
@@ -924,7 +927,7 @@ pub(crate) fn paint_retained_layout(
 ) -> GraphicalLayout {
     let started = std::env::var_os("TRUST_DIAG_FRAME").map(|_| std::time::Instant::now());
     let (paint, patch_boundaries, boundaries) =
-        graphics::paint_retained(dom, base, images, &fragments);
+        graphics::paint_retained(dom, base, images, &fragments, true);
     let painted = started.map(|started| started.elapsed());
     let paint_boundaries = graphical_paint_boundaries(dom, &boxes);
     let terminal = terminal_presentation.then(|| {
@@ -962,7 +965,7 @@ pub(crate) fn paint_retained_hit_test(
     images: &ImageSizes,
     fragments: &LayoutFragments,
 ) -> crate::render::PagePaint {
-    graphics::paint_retained(dom, base, images, fragments).0
+    graphics::paint_retained(dom, base, images, fragments, false).0
 }
 
 /// Quantize one already-laid CSS-pixel page into the terminal compatibility

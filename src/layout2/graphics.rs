@@ -30,6 +30,11 @@ use super::overflow::{ScrollAreas, overflow_axes, viewport_overflow_disabled};
 use super::style::{Outline, OutlineStyle, outline_of};
 use super::value::{Len, Vp};
 
+mod paint_cache;
+pub(crate) use paint_cache::PaintCache;
+#[cfg(test)]
+pub(crate) use paint_cache::audit::read as audit_read;
+
 /// Computed-style source used by graphical box decoration. Generated boxes
 /// retain the originating element plus pseudo identity because they have no
 /// addressable DOM node of their own (CSS Pseudo 4 §4.1).
@@ -140,6 +145,11 @@ struct Builder<'a> {
     selection_rules: bool,
     /// Elements whose images are replaced content (`PagePaint::replaced_images`).
     replaced_images: HashSet<NodeId>,
+    /// The retained leaf cache of this paint (`paint_cache`); `None` paints
+    /// every fragment afresh.
+    retained: Option<Box<paint_cache::Session>>,
+    /// What the leaf being recorded reads and requests (`paint_cache`).
+    recording: std::cell::RefCell<Option<paint_cache::Recording>>,
 }
 
 /// Whether `fragment` or a descendant has a `backdrop-filter`.
@@ -197,6 +207,54 @@ impl<'a> Builder<'a> {
         Vp {
             w: self.viewport_w,
             h: self.viewport_h,
+        }
+    }
+
+    /// The blockified replaced element's principal border box, if it has one.
+    fn replaced_border_box(&self, node: NodeId) -> Option<CssRect> {
+        let found = self.replaced_border_boxes.get(&node).copied();
+        if let Some(recording) = self.recording.borrow_mut().as_mut() {
+            recording.read(paint_cache::Read::ReplacedBorder(node, found));
+        }
+        found
+    }
+
+    /// The decoded size of image `source`, if the page has it.
+    fn image_size(&self, source: &str) -> Option<(u32, u32)> {
+        let found = self.images.get(source).copied();
+        if let Some(recording) = self.recording.borrow_mut().as_mut() {
+            recording.read(paint_cache::Read::ImageSize(source.to_string(), found));
+        }
+        found
+    }
+
+    /// The intrinsic ratio of an SVG `source` that has a ratio but no size.
+    fn svg_ratio(&self, source: &str) -> Option<f32> {
+        let found = paint_cache::svg_ratio(source);
+        if let Some(recording) = self.recording.borrow_mut().as_mut() {
+            recording.read(paint_cache::Read::SvgRatio(
+                source.to_string(),
+                found.map(f32::to_bits),
+            ));
+        }
+        found
+    }
+
+    /// A painted `Image` replaced the content of `node`.
+    fn note_replaced_image(&mut self, node: NodeId) {
+        if let Some(recording) = self.recording.get_mut().as_mut() {
+            recording.replaced.push(node);
+        }
+        self.replaced_images.insert(node);
+    }
+
+    /// A hit region of a media link was painted.
+    fn note_media_controls(&mut self, media: bool) {
+        if media {
+            if let Some(recording) = self.recording.get_mut().as_mut() {
+                recording.media_controls = true;
+            }
+            self.has_media_controls = true;
         }
     }
 
@@ -267,6 +325,8 @@ impl<'a> Builder<'a> {
             last_selection_paint: None,
             selection_rules: dom.has_selection_rules(),
             replaced_images: Default::default(),
+            retained: None,
+            recording: Default::default(),
         };
         this.collect_legacy_clips(root);
         this.collect_scroll_containers(root, false);
@@ -385,6 +445,11 @@ impl<'a> Builder<'a> {
 
     fn image(&mut self, source: String) -> ImageHandle {
         let handle = ImageHandle::for_source(&source);
+        if let Some(recording) = self.recording.get_mut().as_mut()
+            && !recording.images.iter().any(|(seen, _)| *seen == handle)
+        {
+            recording.images.push((handle, source.clone()));
+        }
         if self.image_handles.insert(handle) {
             self.image_requests.push(ImageRequest { handle, source });
         }
@@ -398,6 +463,7 @@ impl<'a> Builder<'a> {
         if node != NO_NODE
             && let Some(presentation) = self.dom.media_presentation(node)
         {
+            paint_cache::taint(paint_cache::Taint::Media);
             if presentation.show_poster
                 && let Some(poster) = source
             {
@@ -407,6 +473,7 @@ impl<'a> Builder<'a> {
                 .then(|| ImageHandle::for_video(presentation.surface));
         }
         if source.is_none() && node != NO_NODE && self.dom.canvas_size(node).is_some() {
+            paint_cache::taint(paint_cache::Taint::Canvas);
             let canvas = self.dom.canvas_image(node)?;
             let handle = canvas.handle;
             if self.image_handles.insert(handle) {
@@ -495,6 +562,14 @@ impl<'a> Builder<'a> {
     }
 
     fn clip_rect(&self, clip: Clip) -> CssRect {
+        if !(clip.x0.is_finite()
+            && clip.y0.is_finite()
+            && clip.x1.is_finite()
+            && clip.y1.is_finite())
+            && let Some(recording) = self.recording.borrow_mut().as_mut()
+        {
+            recording.read(paint_cache::Read::ClipExtent(self.clip_extent));
+        }
         let extent_right = self.clip_extent.x + self.clip_extent.width;
         let extent_bottom = self.clip_extent.y + self.clip_extent.height;
         let x0 = if clip.x0.is_finite() {
@@ -543,10 +618,14 @@ impl<'a> Builder<'a> {
         self.push_scroll_chain(node, true)
     }
 
-    fn push_scroll_chain(&mut self, node: NodeId, include_node: bool) -> usize {
-        if node == NO_NODE {
-            return 0;
-        }
+    /// The scrollports and clips around `node`, outermost first: for each its
+    /// clip shape and whether it scrolls. A pure function of the builder's
+    /// per-document tables, which a retained leaf records and re-evaluates.
+    fn scroll_chain_links(
+        &self,
+        node: NodeId,
+        include_node: bool,
+    ) -> Vec<(NodeId, PaintShape, bool)> {
         let mut chain = Vec::new();
         // CSS Overflow 3 §2.3 clips the contents of a scroll container to
         // its scrollport.  A shadow tree is attached to the light tree through
@@ -578,6 +657,17 @@ impl<'a> Builder<'a> {
             }
         }
         chain.reverse();
+        chain
+    }
+
+    fn push_scroll_chain(&mut self, node: NodeId, include_node: bool) -> usize {
+        if node == NO_NODE {
+            return 0;
+        }
+        let chain = self.scroll_chain_links(node, include_node);
+        if let Some(recording) = self.recording.get_mut().as_mut() {
+            recording.read_chain(node, include_node, &chain);
+        }
         let common = self
             .scroll_nodes
             .iter()
@@ -965,14 +1055,18 @@ pub(super) fn paint(
         viewport_w,
         viewport_h,
         None,
+        false,
     )
 }
 
+/// Paint retained fragments. With `cache`, a live Dom's retained leaf cache
+/// (`paint_cache`) supplies what it can prove unchanged.
 pub(super) fn paint_retained(
     dom: &Dom,
     base: &Url,
     images: &ImageSizes,
     fragments: &super::LayoutFragments,
+    cache: bool,
 ) -> (
     PagePaint,
     Vec<super::GraphicalPatchBoundary>,
@@ -989,9 +1083,20 @@ pub(super) fn paint_retained(
         fragments.viewport.width,
         fragments.viewport.height,
         Some(fragments.scroll_tree(dom)),
+        cache,
     )
 }
 
+type Painted = (
+    PagePaint,
+    Vec<super::GraphicalPatchBoundary>,
+    Vec<super::GraphicalBoundary>,
+);
+
+/// One paint, through the retained leaf cache when `cache` and the Dom allow
+/// it. With verification on (`TRUST_PAINT_VERIFY`, always under `cfg(test)`)
+/// the result is compared with a full paint by a fresh builder; the full
+/// result wins and the cache is dropped on any difference (tests panic).
 #[allow(clippy::too_many_arguments)]
 fn paint_in_spaces(
     dom: &Dom,
@@ -1004,11 +1109,58 @@ fn paint_in_spaces(
     viewport_w: f32,
     viewport_h: f32,
     scroll_tree: Option<&super::spatial::ScrollTree>,
-) -> (
-    PagePaint,
-    Vec<super::GraphicalPatchBoundary>,
-    Vec<super::GraphicalBoundary>,
-) {
+    cache: bool,
+) -> Painted {
+    let run = |cache: bool| {
+        paint_once(
+            dom,
+            base,
+            images,
+            root,
+            fixed,
+            top_layer,
+            flow_bottom,
+            viewport_w,
+            viewport_h,
+            scroll_tree,
+            cache,
+        )
+    };
+    let started = std::time::Instant::now();
+    let (painted, session) = run(cache);
+    let Some(mut session) = session else {
+        return painted;
+    };
+    let elapsed = started.elapsed();
+    let mut painted = painted;
+    let mut mismatch = false;
+    if paint_cache::verify_enabled() {
+        let (full, _) = run(false);
+        if painted != full {
+            mismatch = true;
+            paint_cache::report_mismatch(&session, dom, &painted, &full);
+            session.poison();
+            painted = full;
+        }
+    }
+    paint_cache::finish(*session, dom, elapsed, mismatch);
+    painted
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_once(
+    dom: &Dom,
+    base: &Url,
+    images: &ImageSizes,
+    root: &Frag,
+    fixed: &'_ [Frag],
+    top_layer: &[TopFrag],
+    flow_bottom: f32,
+    viewport_w: f32,
+    viewport_h: f32,
+    scroll_tree: Option<&super::spatial::ScrollTree>,
+    cache: bool,
+) -> (Painted, Option<Box<paint_cache::Session>>) {
     let mut builder = Builder::new(
         dom,
         base,
@@ -1021,6 +1173,9 @@ fn paint_in_spaces(
         viewport_h,
         scroll_tree,
     );
+    if cache {
+        builder.retained = paint_cache::begin(&builder);
+    }
     // CSS Backgrounds 3 §§2.11.1–2: the root background becomes the canvas
     // background. For HTML, when the root has its initial transparent/none
     // background, the first BODY child's computed background is propagated to
@@ -1174,7 +1329,8 @@ fn paint_in_spaces(
             })
         });
     }
-    (paint, patch_boundaries, boundaries)
+    let session = builder.retained.take();
+    ((paint, patch_boundaries, boundaries), session)
 }
 
 /// CSS 2.2 Appendix E order for one real stacking context. Opacity and
@@ -1260,7 +1416,7 @@ fn build_sc(fragment: &Frag, builder: &mut Builder<'_>) {
     // opacity apply to the group, in that order.
     let mask = mask_paint(fragment, builder);
     let layers = push_layer(fragment, builder, mask.as_ref().map(|mask| mask.bounds));
-    paint_fragment(fragment, builder);
+    paint_cache::paint_leaf(fragment, builder);
     let mut negative = Vec::new();
     let mut zero = Vec::new();
     let mut positive = Vec::new();
@@ -1611,7 +1767,7 @@ fn graphical_boundary(fragment: &Frag, builder: &Builder<'_>) -> Option<(usize, 
 }
 
 fn build_pseudo(fragment: &Frag, builder: &mut Builder<'_>) {
-    paint_fragment(fragment, builder);
+    paint_cache::paint_leaf(fragment, builder);
     inflow_backgrounds(fragment, builder);
     paint_floats(fragment, builder);
     inflow_content(fragment, builder);
@@ -1623,7 +1779,7 @@ fn inflow_backgrounds(fragment: &Frag, builder: &mut Builder<'_>) {
             continue;
         }
         if matches!(child.kind, FragKind::Block | FragKind::TableCell(_)) {
-            paint_fragment(child, builder);
+            paint_cache::paint_leaf(child, builder);
         }
         inflow_backgrounds(child, builder);
     }
@@ -1635,7 +1791,7 @@ fn inflow_content(fragment: &Frag, builder: &mut Builder<'_>) {
             continue;
         }
         if !matches!(child.kind, FragKind::Block | FragKind::TableCell(_)) {
-            paint_fragment(child, builder);
+            paint_cache::paint_leaf(child, builder);
         }
         inflow_content(child, builder);
     }
@@ -1647,7 +1803,7 @@ fn paint_floats(fragment: &Frag, builder: &mut Builder<'_>) {
             continue;
         }
         if child.paint.float {
-            paint_fragment(child, builder);
+            paint_cache::paint_leaf(child, builder);
             inflow_backgrounds(child, builder);
             paint_floats(child, builder);
             inflow_content(child, builder);
@@ -1701,6 +1857,7 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
     if let Some(collapsed) = &fragment.paint.collapsed_borders
         && collapsed.cell.is_none()
     {
+        paint_cache::taint(paint_cache::Taint::Collapsed);
         paint_collapsed_borders(fragment, collapsed, builder);
         return;
     }
@@ -1840,6 +1997,7 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
             // (CSS 2.2 Appendix E); repaint them over its background. The
             // clip covers every device pixel the background touched, so its
             // antialiased edge cannot show through the snapped bands.
+            paint_cache::taint(paint_cache::Taint::Collapsed);
             let ratio = builder.dom.device_pixel_ratio().max(f32::EPSILON);
             let (left, top) = ((rect.x * ratio).floor(), (rect.y * ratio).floor());
             let right = ((rect.x + rect.width) * ratio).ceil();
@@ -1866,6 +2024,9 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
         let hit_testable = match style {
             PaintStyle::Element(node) => builder.dom.point_hit_testable(node),
             PaintStyle::Pseudo(..) => {
+                // The walk below reads ancestors' links, attributes and
+                // clickable state; those are covered by the paint journal
+                // (an ancestor's change dirties its descendants).
                 // HTML #inert-subtrees: the originating element's inertness
                 // (an `inert` ancestor or a blocking modal dialog) applies.
                 let mut suppressed = style.value(builder.dom, "visibility").as_deref()
@@ -1986,6 +2147,9 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
                     .push(DisplayCommand::PushTransform(transform));
             }
             let form_piece = matches!(piece.item.kind, super::ItemKind::Form);
+            if form_piece {
+                paint_cache::taint(paint_cache::Taint::Form);
+            }
             let piece_rect = form_piece
                 .then(|| {
                     CssRect::new(
@@ -2307,6 +2471,12 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
                 || (node != NO_NODE && builder.dom.canvas_size(node).is_some())
                 || (node != NO_NODE && builder.dom.media_presentation(node).is_some())
             {
+                if node != NO_NODE
+                    && (builder.dom.canvas_size(node).is_some()
+                        || builder.dom.media_presentation(node).is_some())
+                {
+                    paint_cache::taint(paint_cache::Taint::Canvas);
+                }
                 let handle = builder.replaced_image(
                     node,
                     piece
@@ -2336,7 +2506,7 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
                 );
                 let inline_border = piece
                     .replaced_box
-                    .filter(|_| !builder.replaced_border_boxes.contains_key(&node))
+                    .filter(|_| builder.replaced_border_box(node).is_none())
                     .and_then(|replaced| match replaced {
                         super::inline::ReplacedBox::Content { .. } => Some(replaced.outsets().0),
                         super::inline::ReplacedBox::Border { .. } => None,
@@ -2363,9 +2533,7 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
                     );
                 }
                 let border = builder
-                    .replaced_border_boxes
-                    .get(&node)
-                    .copied()
+                    .replaced_border_box(node)
                     .or(inline_border)
                     .unwrap_or(content);
                 let radii = (style_node != NO_NODE)
@@ -2383,8 +2551,8 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
                 let natural_size_known = match source {
                     Some(source) => [source.clone(), resolve_image_source(builder.base, source)]
                         .iter()
-                        .filter_map(|source| builder.images.get(source))
-                        .any(|&(w, h)| w > 0 && h > 0 && (w, h) != (u32::MAX, u32::MAX)),
+                        .filter_map(|source| builder.image_size(source))
+                        .any(|(w, h)| w > 0 && h > 0 && (w, h) != (u32::MAX, u32::MAX)),
                     None => {
                         node != NO_NODE
                             && (builder.dom.canvas_size(node).is_some()
@@ -2393,7 +2561,7 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
                 };
                 if let Some(handle) = handle {
                     if node != NO_NODE {
-                        builder.replaced_images.insert(node);
+                        builder.note_replaced_image(node);
                     }
                     builder.push_clipped_marquee_content(
                         node,
@@ -2447,8 +2615,10 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
                 // Hit testing follows the element's box, not the object.
                 let rect = if piece.item.crop { content } else { rect };
                 if style_node == NO_NODE || builder.dom.point_hit_testable(style_node) {
-                    builder.has_media_controls |=
-                        matches!(piece.item.link, Some(crate::doc::Link::Media(_)));
+                    builder.note_media_controls(matches!(
+                        piece.item.link,
+                        Some(crate::doc::Link::Media(_))
+                    ));
                     builder.push_marquee_content(
                         node,
                         DisplayCommand::HitRegion(HitRegion {
@@ -2664,6 +2834,7 @@ fn paint_native_control_surface(fragment: &Frag, radii: CornerRadii, builder: &m
     {
         return;
     }
+    paint_cache::taint(paint_cache::Taint::Form);
 
     // CSS UI 4 #appearance-disabling-properties: an author-origin cascaded
     // value counts even when it is `initial` or `unset`, whose computed
@@ -2764,6 +2935,7 @@ fn paint_checkable_widget(
     border_box: CssRect,
     clip: Option<CssRect>,
 ) {
+    paint_cache::taint(paint_cache::Taint::Form);
     let dom = builder.dom;
     let style = super::style::BoxStyle::of(
         dom,
@@ -2941,6 +3113,7 @@ fn paint_number_spin_buttons(fragment: &Frag, builder: &mut Builder<'_>) {
     {
         return;
     }
+    paint_cache::taint(paint_cache::Taint::Form);
     let rect = CssRect::new(fragment.x, fragment.y, fragment.w, fragment.h);
     let rail = fragment.w.clamp(8.0, 18.0);
     let center_x = rect.x + rect.width - rail * 0.5 - 1.0;
@@ -3285,6 +3458,7 @@ fn resolve_filter_references(
         // fetching its document (#origin-restrictions: as if `none`).
         let graph = if local_reference(url, builder.base) {
             let target = dom.svg_resource_target(node, url, Some(builder.base));
+            paint_cache::taint(paint_cache::Taint::Svg);
             dom.note_svg_resource_use(node, target);
             let Some(target) = target.filter(|&target| is_filter(dom, target)) else {
                 return std::sync::Arc::from([]);
@@ -3494,6 +3668,7 @@ fn mask_paint(fragment: &Frag, builder: &mut Builder<'_>) -> Option<MaskPaint> {
         let mask_source = css_url(image.trim()).and_then(|url| {
             if local_reference(&url, builder.base) {
                 let target = dom.svg_resource_target(style.node(), &url, Some(builder.base));
+                paint_cache::taint(paint_cache::Taint::Svg);
                 dom.note_svg_resource_use(style.node(), target);
                 return Some(target.and_then(|mask| {
                     dom.svg_mask_image(
@@ -3716,11 +3891,13 @@ fn nested_canvas_background_source(dom: &Dom, node: NodeId) -> Option<NodeId> {
         return None;
     }
     let frame = dom.frame_owner(root)?;
+    paint_cache::taint(paint_cache::Taint::Frame);
     let (document_root, source) = frame_canvas_background(dom, frame)?;
     (document_root == root).then_some(source)
 }
 
 fn paint_nested_document_canvas(fragment: &Frag, builder: &mut Builder<'_>) {
+    paint_cache::taint(paint_cache::Taint::Frame);
     let Some((root, style_node)) = frame_canvas_background(builder.dom, fragment.node) else {
         return;
     };
@@ -3916,6 +4093,9 @@ fn paint_background_images_for_style(
             .find(|container| container.node == frame)
             .map(|container| (frame, container.viewport))
     });
+    if owner.is_some() {
+        paint_cache::taint(paint_cache::Taint::Frame);
+    }
     let viewport = frame.map_or(
         CssRect::new(0.0, 0.0, builder.viewport_w, builder.viewport_h),
         |(_, viewport)| viewport,
@@ -4127,17 +4307,13 @@ fn paint_image_layer(builder: &mut Builder<'_>, layer: ImageLayer<'_>) -> bool {
         // ratio but neither natural dimension uses contain. SVG decoder
         // fallback pixels are not intrinsic width/height. This also keeps
         // the exact ratio for contain/cover and a single definite axis.
-        let ratio_only = crate::img::svg_url_ratio_only(&source)
-            .or_else(|| crate::img::svg_ratio_only_get(&source))
-            .filter(|ratio| ratio.is_finite() && *ratio > 0.0);
+        let ratio_only = builder.svg_ratio(&source);
         // CSS Backgrounds 3 #background-image and CSS Images 3
         // #invalid-image: a loading image, or one that failed to load,
         // still counts as a layer but draws nothing. Only decoded
         // resources have an entry (pending ones carry a sentinel).
         let Some(natural) = builder
-            .images
-            .get(&source)
-            .copied()
+            .image_size(&source)
             .filter(|(w, h)| *w > 0 && *h > 0 && *w != u32::MAX && *h != u32::MAX)
             .map(|(w, h)| (w as f32, h as f32))
         else {
@@ -4446,6 +4622,8 @@ fn background_layer_shape(
         let content = content_box_with_style(dom, fragment, padding, viewport);
         return background_clip_shape(background_box(clip, rect, padding, content), border, rect);
     }
+    // The path is made of this fragment's descendant lines.
+    paint_cache::taint(paint_cache::Taint::TextClip);
     fn collect(f: &Frag, dom: &Dom, path: &mut Vec<crate::render::PathElement>) {
         if let FragKind::Line(line) = &f.kind {
             for piece in &line.pieces {
@@ -5967,7 +6145,7 @@ fn push_label_hit_region(
         rect.width <= 0.0 || rect.height <= 0.0
     };
     if !clipped_away && (style_node == NO_NODE || builder.dom.point_hit_testable(style_node)) {
-        builder.has_media_controls |= matches!(piece.item.link, Some(crate::doc::Link::Media(_)));
+        builder.note_media_controls(matches!(piece.item.link, Some(crate::doc::Link::Media(_))));
         builder.push_marquee_content(
             node,
             DisplayCommand::HitRegion(HitRegion {
@@ -7647,9 +7825,7 @@ fn paint_border_image(fragment: &Frag, style: PaintStyle, builder: &mut Builder<
             let source = resolve_image_source(&base, &source);
             let handle = builder.image(source.clone());
             let Some((iw, ih)) = builder
-                .images
-                .get(&source)
-                .copied()
+                .image_size(&source)
                 .filter(|(w, h)| *w > 0 && *h > 0 && *w != u32::MAX)
                 .map(|(w, h)| (w as f32, h as f32))
             else {

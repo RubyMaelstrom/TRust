@@ -687,6 +687,9 @@ pub struct Dom {
     /// What a retained display-list consumer must re-derive
     /// (`dom/paint_journal.rs`).
     paint_journal: paint_journal::PaintJournal,
+    /// The retained graphical paint of `layout2::paint_cache`, taken out
+    /// while a paint uses it.
+    pub(crate) paint_cache: RefCell<Option<Box<crate::layout2::PaintCache>>>,
     pending_style_invalidations: invalidation::Pending,
     /// Bounded, document-owned independent formatting-context results.
     pub(crate) layout_cache: RefCell<crate::layout2::LayoutCache>,
@@ -1220,6 +1223,7 @@ impl Dom {
             window_names_epoch,
             style_value_epoch,
             paint_journal: _,
+            paint_cache,
             pending_style_invalidations,
             layout_cache,
             box_tree_cache,
@@ -1458,6 +1462,14 @@ impl Dom {
         fixed_map!(external_sheets, (NodeId, cssom::LinkedSheet));
         bytes = bytes.saturating_add(properties.retained_bytes());
         bytes = bytes.saturating_add(pending_style_invalidations.retained_bytes());
+        match paint_cache.try_borrow() {
+            Ok(cache) => {
+                bytes =
+                    bytes.saturating_add(cache.as_ref().map_or(0, |cache| cache.retained_bytes()));
+                opaque |= cache.is_some();
+            }
+            Err(_) => unavailable += 1,
+        }
         bytes = bytes.saturating_add(transitions.retained_bytes());
         bytes = bytes.saturating_add(animations.retained_bytes());
         fixed_map!(cssom_sheets, (NodeId, cssom::Sheet));
@@ -1797,6 +1809,7 @@ impl Dom {
             window_names_epoch: 0,
             style_value_epoch: 0,
             paint_journal: paint_journal::PaintJournal::default(),
+            paint_cache: RefCell::new(None),
             pending_style_invalidations: invalidation::Pending::default(),
             layout_cache: RefCell::new(crate::layout2::LayoutCache::default()),
             box_tree_cache: RefCell::new(crate::layout2::BoxTreeCache::default()),
@@ -4904,6 +4917,8 @@ impl Dom {
     }
 
     pub fn attr(&self, id: NodeId, name: &str) -> Option<&str> {
+        #[cfg(test)]
+        crate::layout2::paint_audit_read(id, "attr");
         style_view::NodesRef::new(&self.nodes).attr(id, name)
     }
 
@@ -6247,6 +6262,8 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// here, so a property inherits everywhere by being marked `inherited`
     /// once.
     pub fn computed_value(&self, id: NodeId, name: &str) -> Option<String> {
+        #[cfg(test)]
+        crate::layout2::paint_audit_read(id, "computed_value");
         self.flush_style_invalidations();
         if name == "display" {
             return self.effective_display(id);
@@ -6520,6 +6537,8 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// `marginRight` back as the substituted value). A no-op when the value
     /// has no `var(`.
     pub fn computed_value_resolved(&self, id: NodeId, name: &str) -> Option<String> {
+        #[cfg(test)]
+        crate::layout2::paint_audit_read(id, "computed_value_resolved");
         if name == "overflow" {
             let x = self.computed_value_resolved(id, "overflow-x");
             let y = self.computed_value_resolved(id, "overflow-y");
@@ -8279,6 +8298,8 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// parent recursion implements that accumulation for the element ancestry
     /// represented by the current layout.
     pub fn text_decoration(&self, id: NodeId) -> (bool, bool) {
+        #[cfg(test)]
+        crate::layout2::paint_audit_read(id, "text_decoration");
         self.flush_style_invalidations();
         if let Some(&hit) = self
             .decoration_cache()
@@ -9423,6 +9444,8 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
         which: PseudoEl,
         prop: &str,
     ) -> Option<String> {
+        #[cfg(test)]
+        crate::layout2::paint_audit_read(id, "pseudo_layout_value");
         if prop.starts_with("--") {
             return match self.resolve_pseudo_custom_prop(id, which, prop, &mut Vec::new()) {
                 VarResult::Resolved(value) => Some(value),
