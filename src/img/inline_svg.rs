@@ -357,18 +357,24 @@ pub(crate) fn document_svg_image_requests(source: &str) -> Vec<String> {
     let Some(payload) = source.strip_prefix(DATA_PREFIX) else {
         return Vec::new();
     };
-    // Decode only the prefix that holds the marker.
-    let mut chars = 1024usize;
+    // Decode only the prefix that holds the marker, starting small: a marker
+    // without images is about 80 bytes, and the marker must open the text
+    // (`DocumentSvgContext::of`), so a source that does not begin with it (a
+    // page's own SVG image) is rejected without decoding the rest.
+    let mut chars = 128usize;
     let text = loop {
         let take = chars.min(payload.len()) / 4 * 4;
         let Some(bytes) = base64_decode(&payload[..take]) else {
             return Vec::new();
         };
         let text = String::from_utf8_lossy(&bytes).into_owned();
+        if !may_open_with_marker(&text) {
+            return Vec::new();
+        }
         if text.contains("?>") || take == payload.len() / 4 * 4 || chars >= MAX_MARKER_BYTES {
             break text;
         }
-        chars *= 4;
+        chars = (chars * 4).min(MAX_MARKER_BYTES);
     };
     let Some(context) = DocumentSvgContext::of(&text) else {
         return Vec::new();
@@ -382,6 +388,22 @@ pub(crate) fn document_svg_image_requests(source: &str) -> Vec<String> {
         .filter(|url| context.images.contains(*url))
         .map(|url| format!("{url}#{REQUEST_FRAGMENT}{}-{}", nonce(), context.navigation))
         .collect()
+}
+
+/// Whether decoded text (possibly only a prefix of the source) can still
+/// begin with the marker `DocumentSvgContext::of` recognizes.
+fn may_open_with_marker(text: &str) -> bool {
+    let mut rest = text;
+    for part in ["<?", MARKER, " "] {
+        if rest.len() < part.len() {
+            return part.starts_with(rest);
+        }
+        let Some(after) = rest.strip_prefix(part) else {
+            return false;
+        };
+        rest = after;
+    }
+    true
 }
 
 /// A document image a page-image request was made for: the URL the fetch
@@ -667,6 +689,18 @@ mod tests {
         );
         // Author data images never yield document requests.
         assert!(document_svg_image_requests(&super::super::svg_data_url(&svg)).is_empty());
+        // A marker whose image list outgrows the first decoded windows is
+        // still read whole.
+        let many: Vec<String> = (0..40)
+            .map(|i| format!("https://images.test/inline-svg-arrival/long-name-{i}.png"))
+            .collect();
+        assert_eq!(
+            document_svg_image_requests(&marked(&svg, &many, navigation)).len(),
+            many.len()
+        );
+        assert!(may_open_with_marker("<?trust-doc"));
+        assert!(!may_open_with_marker("<svg xmlns"));
+        assert!(!may_open_with_marker("<?xml version"));
 
         let revision = document_svg_revision();
         record_document_svg_image(&target, Some(&png([255, 0, 0, 255])));
