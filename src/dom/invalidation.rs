@@ -1969,7 +1969,7 @@ impl Dom {
         let mut roots = self.svg_dirty_consumers(&[parent], false);
         roots.push(character_data.unwrap_or(parent));
         self.invalidate_layout_paths(roots);
-        self.mark_dom_revision();
+        self.mark_dom_revision_keeping_slots();
         self.dirty_nodes.push((parent, DirtyKind::Content));
         // CSS Lists 3 #inheriting-counters / Content 3 #quote-values:
         // counters and quote depth follow elements and generated content.

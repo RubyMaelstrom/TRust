@@ -606,6 +606,47 @@ mod tests {
         assert_eq!(dom.parent_flat(light), Some(default));
     }
 
+    #[test]
+    fn the_slot_directory_survives_text_and_attribute_changes_only() {
+        // DOM #find-a-slot reads a shadow tree's slots, their tree order and
+        // their names. Text and other attribute changes keep the directory;
+        // a slot's rename (an attribute change) still re-evaluates lookups.
+        let mut dom = Dom::parse_document("<div id=host><span id=light slot=a>x</span></div>");
+        let (host, light) = (
+            dom.get_by_id("host").unwrap(),
+            dom.get_by_id("light").unwrap(),
+        );
+        let root = dom.attach_shadow(host);
+        let slot = dom.create_element("slot");
+        dom.set_attr(slot, "name", "a");
+        let label = dom.create_text("label");
+        dom.append(slot, label);
+        dom.append(root, slot);
+        // A rendered page has a current style index to prove changes local.
+        let _ = dom.computed_style(light, "color");
+        assert_eq!(dom.assigned_slot(light), Some(slot));
+        assert!(dom.slot_directory.get().is_some());
+        dom.set_text(label, "changed");
+        assert!(
+            dom.slot_directory.get().is_some(),
+            "kept across a text change"
+        );
+        dom.set_attr(light, "class", "c");
+        dom.set_attr(slot, "class", "c");
+        dom.set_attr(light, "slot", "b");
+        assert!(
+            dom.slot_directory.get().is_some(),
+            "kept across attribute changes"
+        );
+        assert_eq!(dom.assigned_slot(light), None);
+        dom.set_attr(slot, "name", "b");
+        assert!(
+            dom.slot_directory.get().is_none(),
+            "a slot's name changes the directory"
+        );
+        assert_eq!(dom.assigned_slot(light), Some(slot));
+    }
+
     fn manual_host(dom: &mut Dom) -> (NodeId, NodeId) {
         let body = dom.get_by_id("body").unwrap();
         let host = dom.create_element("div");

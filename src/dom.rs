@@ -2805,6 +2805,17 @@ impl Dom {
         }
     }
 
+    /// `mark_dom_revision` for a change that leaves every tree's slots and
+    /// their names as they were: Text and other attribute changes. DOM
+    /// #find-a-slot reads nothing else, so the slot directory stays valid.
+    fn mark_dom_revision_keeping_slots(&mut self) {
+        let slots = self.slot_directory.take();
+        self.mark_dom_revision();
+        if let Some(slots) = slots {
+            let _ = self.slot_directory.set(slots);
+        }
+    }
+
     fn record_geometry_dirty(&mut self, id: NodeId, kind: DirtyKind) {
         // CSS Lists 3 / Content 3: counters and quote depth can affect later
         // sibling subtrees. Until their dependencies have a narrower proof,
@@ -2920,7 +2931,11 @@ impl Dom {
         }
         let impact = self.invalidate_attribute_selectors(id, name, old_class);
         self.invalidate_attribute_style_values(id, name, impact);
-        self.mark_dom_revision();
+        if name.eq_ignore_ascii_case("name") && self.tag_name(id) == Some("slot") {
+            self.mark_dom_revision();
+        } else {
+            self.mark_dom_revision_keeping_slots();
+        }
         self.dirty_nodes.push((id, DirtyKind::Attr));
         self.record_geometry_dirty(id, DirtyKind::Attr);
     }
