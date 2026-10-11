@@ -109,6 +109,9 @@ pub(crate) struct Typed {
     pub(crate) visibility_hidden: Option<bool>,
     /// Whether one of `Dom::CSS_IMAGE_PROPERTIES` names an image.
     pub(crate) css_images: Option<bool>,
+    /// Whether the element's `::before` or `::after` box names an image
+    /// (`http::pseudo_image_sources`).
+    pub(crate) pseudo_images: Option<bool>,
 }
 
 /// Properties whose value is computed per element (unit guards), never shared

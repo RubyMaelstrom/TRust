@@ -10454,37 +10454,29 @@ fn collect_image_urls_for_boxes(
                 eager.push(url);
             }
         }
-        // CSS 2 #content: generated images participate in resource discovery
-        // even before they have natural dimensions (and therefore paint no
-        // pixels). Include pseudo backgrounds through the same cascade.
-        for pseudo in [crate::dom::PseudoEl::Before, crate::dom::PseudoEl::After] {
-            let Some(items) = dom.pseudo_content_items(id, pseudo) else {
+        // Generated content's images, remembered like the element's own:
+        // a pseudo-element's content may need the document's counters,
+        // which every DOM change makes the first such read recompute.
+        let pseudo_sources = if dom.typed_memo(
+            id,
+            |typed| typed.pseudo_images,
+            |typed, names| typed.pseudo_images = Some(names),
+            || !pseudo_image_sources(dom, id).is_empty(),
+        ) {
+            pseudo_image_sources(dom, id)
+        } else {
+            Vec::new()
+        };
+        for source in pseudo_sources {
+            let Some(url) = resolve_css_image_source(style_base(), &source) else {
                 continue;
             };
-            if dom.pseudo_layout_value(id, pseudo, "display").as_deref() == Some("none") {
-                continue;
+            if dom.resource_cookies_restricted(id) {
+                cookie_restricted.insert(url.clone());
             }
-            let mut sources: Vec<_> = items
-                .into_iter()
-                .filter_map(|item| match item {
-                    crate::dom::GeneratedContent::Image(source) => Some(source),
-                    _ => None,
-                })
-                .collect();
-            if let Some(value) = dom.pseudo_layout_value(id, pseudo, "background-image") {
-                sources.extend(css_image_sources(&value));
-            }
-            for source in sources {
-                let Some(url) = resolve_css_image_source(style_base(), &source) else {
-                    continue;
-                };
-                if dom.resource_cookies_restricted(id) {
-                    cookie_restricted.insert(url.clone());
-                }
-                attribute(&url, id, crate::page_images::ImageInitiator::Css);
-                urls.push(url.clone());
-                eager.push(url);
-            }
+            attribute(&url, id, crate::page_images::ImageInitiator::Css);
+            urls.push(url.clone());
+            eager.push(url);
         }
     }
     // A `<video>` whose source is MSE/blob (no `src`/`<source>`/`poster` — every
@@ -10525,6 +10517,31 @@ fn collect_image_urls_for_boxes(
         lazy_nodes,
         sources,
     }
+}
+
+/// The image sources of `id`'s `::before` and `::after` boxes in order. CSS 2
+/// #content: generated images participate in resource discovery even before
+/// they have natural dimensions (and therefore paint no pixels); pseudo
+/// backgrounds come through the same cascade. A pseudo-element without
+/// content, or with `display: none`, generates no box.
+fn pseudo_image_sources(dom: &crate::dom::Dom, id: crate::dom::NodeId) -> Vec<String> {
+    let mut sources = Vec::new();
+    for pseudo in [crate::dom::PseudoEl::Before, crate::dom::PseudoEl::After] {
+        let Some(items) = dom.pseudo_content_items(id, pseudo) else {
+            continue;
+        };
+        if dom.pseudo_layout_value(id, pseudo, "display").as_deref() == Some("none") {
+            continue;
+        }
+        sources.extend(items.into_iter().filter_map(|item| match item {
+            crate::dom::GeneratedContent::Image(source) => Some(source),
+            _ => None,
+        }));
+        if let Some(value) = dom.pseudo_layout_value(id, pseudo, "background-image") {
+            sources.extend(css_image_sources(&value));
+        }
+    }
+    sources
 }
 
 /// Every non-empty `<url>` in a computed image value, with CSS escapes
@@ -23004,6 +23021,51 @@ customElements.define('lit-counter', LitCounter);
                 DisplayCommand::GlyphRun { shaped, .. } if shaped.text.contains("2Z")
             )));
         }
+    }
+
+    #[test]
+    fn generated_content_image_discovery_follows_style_changes() {
+        // Image discovery remembers, beside each element's computed values,
+        // whether its ::before/::after names an image; every change that
+        // reaches the pseudo-element's style must reach that answer too.
+        let base = Url::parse("https://example.test/").unwrap();
+        let mut dom = crate::dom::Dom::parse_document(
+            "<style>.i::before{content:url(a.png)} .n::before{display:none}\
+             .b::after{content:'';background-image:url(b.png)}\
+             .on #c::after{content:url(d.png)}</style>\
+             <div id=x>x</div><div id=p><span id=c>y</span></div>",
+        );
+        dom.set_doc_url(Some(base.clone()));
+        let viewport = crate::layout2::Viewport::new(320., 200.);
+        let found = |dom: &crate::dom::Dom, name: &str| {
+            collect_image_urls(dom, &base, viewport, 1.)
+                .all
+                .contains(&format!("https://example.test/{name}"))
+        };
+        let (x, p, c) = (
+            dom.get_by_id("x").unwrap(),
+            dom.get_by_id("p").unwrap(),
+            dom.get_by_id("c").unwrap(),
+        );
+        assert!(!found(&dom, "a.png"));
+        dom.set_attr(x, "class", "i");
+        assert!(found(&dom, "a.png"));
+        dom.set_attr(x, "class", "i n");
+        assert!(!found(&dom, "a.png"), "display:none generates no box");
+        dom.set_attr(x, "class", "b");
+        assert!(found(&dom, "b.png"));
+        assert!(!found(&dom, "d.png"));
+        dom.set_attr(p, "class", "on");
+        assert!(found(&dom, "d.png"), "an ancestor's class");
+        let style = dom.create_element("style");
+        let css = dom.create_text("#c::before{content:url(s.png)}");
+        dom.append(style, css);
+        let root = dom.document_element().unwrap();
+        dom.append(root, style);
+        assert!(found(&dom, "s.png"), "a new sheet");
+        dom.set_attr(p, "class", "");
+        assert!(!found(&dom, "d.png"));
+        assert!(found(&dom, "s.png"));
     }
 
     #[test]
