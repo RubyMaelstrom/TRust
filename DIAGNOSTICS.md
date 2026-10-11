@@ -1194,12 +1194,19 @@ DOSBOX_JS=dosbox-sync.js.gz DOSBOX_MEM=dosbox-sync.mem.gz GAME_DIR=./doom-c EXIT
 
 `tools/em_dosbox_harness.js` stubs the DOM, canvas and AudioContext, mounts `GAME_DIR` as `C:`
 and prints `graphics ... first seen at t=<s>`: the time until DOOM's first graphics frame
-(its title screen), a fixed amount of guest work (296 emulated frames) and so a repeatable
-measure of emulation speed. With `FRAME_PNG=out.png` it writes the last frame. Pin to one
-core: this host's X925 cores (5-9, 15-19) run the JIT about 1.8 times faster than its A725
-cores, and the host's load varies run to run, so compare engines in concurrent runs. Measured
-on 2026-10-10 at Lumen eb0c9e9: node (V8) 10.1 s, Lumen JIT 106 s (10.5x); in the browser
-the same page needs about 190 s to reach the title screen.
+(its title screen). With `FRAME_PNG=out.png` it writes the last frame.
+
+The emulator's default `cycles=max` (archive.org's setting) sizes each emulated millisecond's
+work to the host's recent speed, so one slow host tick throttles the guest for seconds and the
+guest work before the title differs from run to run: neither that time nor the host's cycles
+to the title measures the engine reliably. For engine comparisons set
+`DOSBOX_CYCLES='fixed 50000'`, which gives every emulated millisecond the same guest work, and
+count the host's user instructions to the title (`perf stat -e instructions:u`). Lumen 1bbc822
+repeated within 0.5% that way (3,008 G and 3,022 G instructions, about 590 s; node 24: 142 G,
+19 s). Pin to one core: this host's X925 cores (5-9, 15-19) run the JIT about 1.8 times
+faster than its A725 cores, and the host's load varies run to run, so compare engines in
+concurrent runs. Measured with `cycles=max` on 2026-10-10 at Lumen eb0c9e9: node (V8) 10.1 s,
+Lumen JIT 106 s; in the browser the same page needs about 190 s to reach the title screen.
 
 Micro-benchmarks of the asm.js patterns (one iteration of a loop, ns): a typed-array element
 access costs 20-40 in Lumen against 1-2 in V8, a JavaScript call 40-56 against 1.4, a closure

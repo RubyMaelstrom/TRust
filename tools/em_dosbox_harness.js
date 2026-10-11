@@ -6,6 +6,12 @@
 //   DOSBOX_JS=dosbox-sync.js DOSBOX_MEM=dosbox-sync.mem GAME_DIR=./c [EXIT_ON_GFX=1] \
 //   [FRAME_PNG=out.png] node tools/em_dosbox_harness.js [seconds] [dosbox args...]
 //
+// DOSBOX_CYCLES sets DOSBox's [cpu] cycles (default `max`). `max` adapts the emulated CPU to
+// host timing, so one slow host tick (a collection, a large compile) can throttle the guest for
+// many seconds and the work to reach a screen varies run to run. For engine A/B comparisons use a
+// fixed count the host cannot keep up with (`fixed 100000`): every tick then runs the same guest
+// work, and the host's user cycles to the title measure the engine.
+//
 // GAME_DIR is mounted as drive C:. The default program is DOOM.EXE; other arguments are passed
 // to DOSBox. The first frame with at least 40 distinct sampled colors (graphics mode) is
 // reported as `graphics ... first seen at t=...`; with EXIT_ON_GFX the run ends 4 s later.
@@ -89,7 +95,7 @@ G.Module = {
         else FS.writeFile(v, new Uint8Array(fs.readFileSync(p)), {encoding: 'binary'});
       });
     })(base, '/emulator/c');
-    FS.writeFile('/emulator/dosbox.conf', '[sdl]\nfullscreen=false\n[cpu]\ncore=auto\ncycles=max\n[mixer]\nnosound=false\n[midi]\nmpu401=none\n');
+    FS.writeFile('/emulator/dosbox.conf', '[sdl]\nfullscreen=false\n[cpu]\ncore=auto\ncycles=' + (process.env.DOSBOX_CYCLES || 'max') + '\n[mixer]\nnosound=false\n[midi]\nmpu401=none\n');
   }]
 };
 var args = ['-conf', '/emulator/dosbox.conf', '-c', 'mount c /emulator/c', '-c', 'c:'];
