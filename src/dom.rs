@@ -2064,9 +2064,18 @@ impl Dom {
                 let inline_cursor = self.cssom_inline.get(&id).map_or_else(
                     || {
                         self.attr(id, "style").is_some_and(|style| {
-                            parse_declaration_block(style, false)
-                                .into_iter()
-                                .any(|(name, _, _)| name == "cursor")
+                            // A `cursor` declaration spells the name, ASCII
+                            // case-insensitively, unless it is escaped (CSS
+                            // Syntax 3 #consume-escaped-code-point): parse
+                            // only a block that could hold one.
+                            (style.contains('\\')
+                                || style
+                                    .as_bytes()
+                                    .windows(6)
+                                    .any(|window| window.eq_ignore_ascii_case(b"cursor")))
+                                && parse_declaration_block(style, false)
+                                    .into_iter()
+                                    .any(|(name, _, _)| name == "cursor")
                         })
                     },
                     |declarations| declarations.iter().any(|(name, _, _)| name == "cursor"),
@@ -4992,6 +5001,21 @@ impl Dom {
         #[cfg(test)]
         crate::layout2::paint_audit_read(id, "attr");
         style_view::NodesRef::new(&self.nodes).attr(id, name)
+    }
+
+    /// Whether `attr` finds any of `names`, in one pass over the element's
+    /// attributes rather than one per name.
+    pub(crate) fn has_any_attr(&self, id: NodeId, names: &[&str]) -> bool {
+        #[cfg(test)]
+        crate::layout2::paint_audit_read(id, "attr");
+        match self.nodes.get(id).map(|node| &node.data) {
+            Some(NodeData::Element { attrs, .. }) => attrs.iter().any(|attribute| {
+                names
+                    .iter()
+                    .any(|name| str::eq_ignore_ascii_case(&attribute.name.local, name))
+            }),
+            _ => false,
+        }
     }
 
     /// DOM getAttribute matches qualified names, folding only on HTML

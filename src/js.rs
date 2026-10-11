@@ -1326,11 +1326,13 @@ fn clickable_set_in(
     let mut candidates: FxHashSet<usize> = walk
         .iter()
         .map(|&(node, _)| node)
-        .filter(|&node| {
-            dom.tag_name(node) == Some("button")
-                || dom.is_details_summary(node)
-                || dom.attr(node, "onclick").is_some()
-                || dom.attr(node, "role") == Some("button")
+        .filter(|&node| match dom.tag_name(node) {
+            None => false,
+            Some("button") => true,
+            Some("summary") if dom.is_details_summary(node) => true,
+            Some(_) => {
+                dom.attr(node, "onclick").is_some() || dom.attr(node, "role") == Some("button")
+            }
         })
         .collect();
     // A hyperlink with its own referrer policy is followed by the page actor,
@@ -1459,11 +1461,7 @@ fn hover_set_in(
     listener_hosts: &std::collections::HashSet<usize>,
 ) -> (std::collections::HashSet<usize>, bool) {
     let mut hosts = listener_hosts.clone();
-    hosts.extend(nodes.filter(|&node| {
-        HOVER_ATTRS
-            .iter()
-            .any(|attribute| dom.attr(node, attribute).is_some())
-    }));
+    hosts.extend(nodes.filter(|&node| dom.has_any_attr(node, HOVER_ATTRS)));
     let complete = !hosts.is_empty();
     let mut marked = if complete {
         hosts
