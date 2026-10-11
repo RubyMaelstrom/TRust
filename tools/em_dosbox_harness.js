@@ -14,7 +14,8 @@
 //
 // GAME_DIR is mounted as drive C:. The default program is DOOM.EXE; other arguments are passed
 // to DOSBox. The first frame with at least 40 distinct sampled colors (graphics mode) is
-// reported as `graphics ... first seen at t=...`; with EXIT_ON_GFX the run ends 4 s later.
+// reported as `graphics ... first seen at t=...`. EXIT_ON_GFX ends the run there, or 4 s later
+// with FRAME_PNG so the frame written is the settled title screen.
 'use strict';
 var G = globalThis; G.require = require;
 var fs = require('fs');
@@ -31,7 +32,11 @@ var frames = 0, lastFrames = 0, lastImg = null, gfxAt = 0;
 function detectGfx(img) {
   var d = new Uint32Array(img.data.buffer, img.data.byteOffset, img.data.length >> 2), seen = {}, n = 0;
   for (var i = 0; i < d.length; i += 997) { var c = d[i]; if (!seen[c]) { seen[c] = 1; n++; } }
-  if (n >= 40) { gfxAt = now(); console.log('[harness] graphics (distinct colors ' + n + ') first seen at t=' + (gfxAt / 1000).toFixed(1) + 's frames=' + frames); }
+  if (n >= 40) {
+    gfxAt = now(); console.log('[harness] graphics (distinct colors ' + n + ') first seen at t=' + (gfxAt / 1000).toFixed(1) + 's frames=' + frames);
+    // End at once, so instruction counts stop at the title rather than include its idle loop.
+    if (process.env.EXIT_ON_GFX && !process.env.FRAME_PNG) { console.log('[harness] done frames=' + frames); process.exit(0); }
+  }
 }
 var evh = function () {};
 function El(tag) {
@@ -44,7 +49,7 @@ function El(tag) {
     if (t !== '2d') return null;
     var self = e;
     return { canvas: self, createImageData: function (w, h) { return { width: w, height: h, data: new Uint8ClampedArray(w * h * 4) }; },
-      putImageData: function (img) { frames++; lastImg = img; if (!gfxAt && (frames & 3) === 0) detectGfx(img); }, drawImage: function () {}, fillRect: function () {}, clearRect: function () {},
+      putImageData: function (img) { frames++; lastImg = img; if (!gfxAt) detectGfx(img); }, drawImage: function () {}, fillRect: function () {}, clearRect: function () {},
       getImageData: function (x, y, w, h) { return { width: w, height: h, data: new Uint8ClampedArray(w * h * 4) }; },
       save: function () {}, restore: function () {}, fillStyle: '', imageSmoothingEnabled: false };
   };
@@ -141,7 +146,6 @@ function dumpPng(file) {
   fs.writeFileSync(file, out);
 }
 var tick = function () {
-  if (gfxAt && process.env.EXIT_ON_GFX) { /* fall through */ }
   var f = frames, now_ = now();
   if (Math.floor(now_ / 5000) !== Math.floor((now_ - 1000) / 5000)) console.log('[harness] t=' + (now_ / 1000).toFixed(1) + 's frames=' + f + ' (+' + (f - lastFrames) + ')');
   lastFrames = f;

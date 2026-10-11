@@ -1201,9 +1201,11 @@ work to the host's recent speed, so one slow host tick throttles the guest for s
 guest work before the title differs from run to run: neither that time nor the host's cycles
 to the title measures the engine reliably. For engine comparisons set
 `DOSBOX_CYCLES='fixed 50000'`, which gives every emulated millisecond the same guest work, and
-count the host's user instructions to the title (`perf stat -e instructions:u`). Lumen 1bbc822
-repeated within 0.5% that way (3,008 G and 3,022 G instructions, about 590 s; node 24: 142 G,
-19 s). Pin to one core: this host's X925 cores (5-9, 15-19) run the JIT about 1.8 times
+count the host's user instructions to the title (`perf stat -e instructions:u`; with
+`EXIT_ON_GFX` and no `FRAME_PNG` the run ends at the title). On 2026-10-11 that repeated
+within 0.5%: Lumen 1bbc822 358-359 G instructions (79-83 s), Lumen 9b1a2cf 267 G (50-52 s),
+node 24 23 G (4.3 s). The title's frame number varies with DOSBox's real-time frame skipping,
+so the harness tests every frame, and frame counts are not comparable. Pin to one core: this host's X925 cores (5-9, 15-19) run the JIT about 1.8 times
 faster than its A725 cores, and the host's load varies run to run, so compare engines in
 concurrent runs. Measured with `cycles=max` on 2026-10-10 at Lumen eb0c9e9: node (V8) 10.1 s,
 Lumen JIT 106 s; in the browser the same page needs about 190 s to reach the title screen.
