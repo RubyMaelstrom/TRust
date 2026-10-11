@@ -72,7 +72,7 @@ pub(crate) struct OofMark<'t> {
 
 /// One placed inline item in CSS pixels. Shaped text is retained so paint does
 /// not repeat font selection or shaping.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Piece {
     pub x: f32,
     pub y: f32,
@@ -179,7 +179,7 @@ impl ReplacedBox {
 }
 
 /// A multiline control's laid-out content.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ControlText {
     /// Shaped text runs at their CSS-pixel offsets from the control's
     /// content (paint) rectangle, with wrapping, alignment and indentation
@@ -211,6 +211,14 @@ struct ControlTextRest {
     align_last: Option<super::style::Align2>,
     indent: f32,
     vp: Vp,
+}
+
+/// Two laid values are the same only when they share this retained state:
+/// comparing its inputs would cost more than re-deriving the prefix.
+impl PartialEq for ControlTextRest {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+    }
 }
 
 impl ControlText {
@@ -265,7 +273,7 @@ fn line_extent(lines: &[LineOut]) -> [f32; 2] {
 }
 
 /// One shaped text run of a multiline control's content.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ControlLine {
     pub x: f32,
     pub y: f32,
@@ -277,7 +285,7 @@ pub(crate) struct ControlLine {
 /// boxes. CSS Backgrounds 3 #box-decoration-break (`slice`): a box's line
 /// fragment has its start edge only where the box begins and its end edge
 /// only where it ends.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct InlineBoxes {
     /// Enclosing inline boxes, outermost first.
     pub chain: std::sync::Arc<[InlineBoxEntry]>,
@@ -293,7 +301,7 @@ pub(crate) struct InlineBoxes {
 
 /// One side of an inline box's line fragment, relative to the piece at
 /// that side of it.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct BoxBound {
     pub key: InlineBoxKey,
     /// The distance between the piece and the box's border edge on this
@@ -310,7 +318,7 @@ pub(crate) type InlineBoxKey = (NodeId, Option<PseudoEl>);
 
 /// One inline box of a piece's chain. Every element box is tracked for
 /// CSSOM View geometry; generated boxes only when they paint.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct InlineBoxEntry {
     pub key: InlineBoxKey,
     /// Whether the box paints a background, border or shadow.
@@ -399,7 +407,7 @@ impl InlineBoxEntry {
 /// inline elements still generate (empty) inline boxes, with margins,
 /// padding, borders and a content area at their place on the line, and a
 /// positioned one establishes a containing block (CSS 2 §10.1).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct EmptyInlineBox {
     pub entry: InlineBoxEntry,
     /// Border-box start and end edges from the line box origin, before the
@@ -535,7 +543,7 @@ fn breaks_between(before: char, after: char) -> bool {
 /// Frontend-neutral inline paint and interaction payload. Canonical fragments
 /// never carry the terminal `Item`'s cell coordinates or dimensions; the
 /// terminal adapter constructs those only while quantizing a piece.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct InlineItem {
     /// Authored/native-control text used by canonical CSS-pixel layout and
     /// graphical paint.

@@ -178,7 +178,7 @@ pub(crate) enum FragKind {
     Fixed(usize),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct LineFrag {
     /// Pieces are in inline/block coordinates; the enclosing fragment is physical.
     pub sideways: bool,
@@ -207,7 +207,7 @@ pub(crate) struct LineFrag {
 }
 
 /// A line box's content as laid out, before ellipsing.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct LaidLine {
     pub pieces: Vec<Piece>,
     pub atom_boxes: Vec<Piece>,
