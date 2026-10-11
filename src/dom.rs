@@ -3370,10 +3370,12 @@ impl Dom {
     /// CSS Grid 2 #subgrid-listing: a row subgrid requires a parent grid and
     /// cannot independently establish a formatting context.
     pub(crate) fn is_row_subgrid_item(&self, id: NodeId) -> bool {
-        if !matches!(
-            self.effective_display(id).as_deref(),
-            Some("grid" | "inline-grid")
-        ) || !self
+        self.is_row_subgrid_item_with(id, self.effective_display(id).as_deref())
+    }
+
+    /// `is_row_subgrid_item` given the element's `effective_display`.
+    fn is_row_subgrid_item_with(&self, id: NodeId, display: Option<&str>) -> bool {
+        if !matches!(display, Some("grid" | "inline-grid")) || !self
             .computed_value_resolved(id, "grid-template-rows")
             .is_some_and(|v| v.split_whitespace().next() == Some("subgrid"))
             || matches!(
@@ -3419,9 +3421,11 @@ impl Dom {
         if self.tag_name(id).is_none() {
             return false; // text/comment/document — not an element box
         }
+        // Every check below reads the element's display; derive it once.
+        let display = self.effective_display(id);
         // CSS Grid 2 #subgrid-items: row subgrid contents participate in
         // their parent's sizing, so they cannot be an incremental boundary.
-        if self.is_row_subgrid_item(id) {
+        if self.is_row_subgrid_item_with(id, display.as_deref()) {
             return false;
         }
         // overflow ≠ visible on EITHER axis → BFC (a scroll/clip viewport),
@@ -3436,40 +3440,39 @@ impl Dom {
         // display values that establish an independent context for their
         // contents (`effective_display` = cascade ELSE the tag's UA default, so a
         // bare `<td>`/`<table>` is caught too).
-        if let Some(d) = self.effective_display(id)
-            && matches!(
-                d.trim().to_ascii_lowercase().as_str(),
-                "flow-root"
-                    | "inline-block"
-                    | "table-cell"
-                    | "table-caption"
-                    | "table"
-                    | "inline-table"
-                    | "flex"
-                    | "inline-flex"
-                    | "grid"
-                    | "inline-grid"
-            )
-        {
+        if display.as_deref().is_some_and(|display| {
+            [
+                "flow-root",
+                "inline-block",
+                "table-cell",
+                "table-caption",
+                "table",
+                "inline-table",
+                "flex",
+                "inline-flex",
+                "grid",
+                "inline-grid",
+            ]
+            .iter()
+            .any(|keyword| display.trim().eq_ignore_ascii_case(keyword))
+        }) {
             return true;
         }
         // A flex/grid ITEM establishes a new formatting context for its contents
         // (CSS Flexbox §3) — detected via the parent's effective display.
         if let Some(p) = self.parent_composed(id)
             && let Some(pd) = self.effective_display(p)
-            && matches!(
-                pd.trim().to_ascii_lowercase().as_str(),
-                "flex" | "inline-flex" | "grid" | "inline-grid"
-            )
+            && ["flex", "inline-flex", "grid", "inline-grid"]
+                .iter()
+                .any(|keyword| pd.trim().eq_ignore_ascii_case(keyword))
         {
             return true;
         }
         // Out-of-flow (absolute/fixed) and floats establish a BFC.
         if let Some(pos) = self.computed_style(id, "position")
-            && matches!(
-                pos.trim().to_ascii_lowercase().as_str(),
-                "absolute" | "fixed"
-            )
+            && ["absolute", "fixed"]
+                .iter()
+                .any(|keyword| pos.trim().eq_ignore_ascii_case(keyword))
         {
             return true;
         }
