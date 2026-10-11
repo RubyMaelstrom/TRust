@@ -12009,7 +12009,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__dom_contains", 2, host_contains),
     ("__dom_set_hover", 1, guarded_set_hover),
     ("__dom_focus", 2, guarded_focus),
-    ("__dom_fragment_target", 1, host_fragment_target),
+    ("__dom_fragment_target", 2, host_fragment_target),
     ("__dom_children", 1, host_children),
     ("__dom_slot_assigned", 1, guarded_slot_assigned),
     ("__dom_assigned_slot", 1, guarded_assigned_slot),
@@ -20234,13 +20234,22 @@ fn host_contains(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, V
     Ok(Value::Bool(contains))
 }
 
+/// HTML #scroll-to-the-fragment-identifier's target element update for the
+/// calling Realm's Document (argument 1; the top-level Document if absent).
 fn host_fragment_target(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let fragment = args
         .first()
         .filter(|v| !matches!(v, Value::Undefined | Value::Null))
         .map(|_| host_arg_string(ctx, args, 0));
+    let document = args
+        .get(1)
+        .and_then(Value::as_num_opt)
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .map_or(DOCUMENT, |value| value as usize);
     let dom = host_dom(ctx);
-    let target = dom.borrow_mut().set_fragment_target(fragment.as_deref());
+    let target = dom
+        .borrow_mut()
+        .set_document_fragment_target(document, fragment.as_deref());
     Ok(target.map_or(Value::Null, |node| Value::Num(node as f64)))
 }
 
@@ -32356,6 +32365,56 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_child_navigables_fragment_navigation_sets_its_own_target() {
+        // HTML #target-element, #navigate-fragid and
+        // #scroll-to-the-fragment-identifier with Selectors 4
+        // #the-target-pseudo: each Document has its own target element. A
+        // child navigable's fragment navigation (here from its load handler,
+        // as felixfever.nekoweb.org's dress-up game does with
+        // `location.replace('#…')`; an about:srcdoc Document resolves that
+        // against its parent's base URL, so this uses the hash setter)
+        // indicates an element
+        // of its Document, which :target then matches, and leaves the
+        // parent's target alone even where the parent has the same id.
+        let child = "<!doctype html><style>section{display:none}section:target{display:block}</style>\
+            <section id=a>A</section><section id=b>B</section><script>\
+            onload = () => { location.hash = 'b'; const t = document.querySelector(':target');\
+            const shown = ['a','b'].map(id => getComputedStyle(document.getElementById(id)).display);\
+            parent.document.getElementById('o').textContent = 'child:' + (t && t.id) + ':' + shown + \
+            ' parent:' + parent.document.querySelector(':target'); };</script>";
+        let html = format!(
+            "<section id=b>parent b</section><output id=o></output><iframe srcdoc=\"{child}\"></iframe>\
+             <script>document.addEventListener('click', () => {{}});</script>"
+        );
+        let mut env = crate::js::PageEnv::bare(DEFAULT_URL);
+        env.terminal_presentation = false;
+        let (_handle, mut events) = spawn_page(html, env);
+        let expected = "child:b:none,block parent:null";
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let mut last = String::new();
+            loop {
+                match events.recv().await {
+                    Some(crate::js::PageEvt::Updated { html, .. }) => {
+                        if let Some(start) = html.find("<output") {
+                            let open = start + html[start..].find('>').unwrap() + 1;
+                            let close = open + html[open..].find("</output>").unwrap();
+                            last = html[open..close].to_owned();
+                            if last == expected {
+                                break;
+                            }
+                        }
+                    }
+                    Some(crate::js::PageEvt::Trouble(errors)) => panic!("{errors:?}"),
+                    Some(_) => {}
+                    None => panic!("actor ended; saw {last:?}"),
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the child never reported its target"));
     }
 
     #[tokio::test]

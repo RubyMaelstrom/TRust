@@ -76,9 +76,7 @@ impl Dom {
         if let Some(&host) = self.shadow_hosts.get(&id) {
             visit(id, host);
         }
-        if id == DOCUMENT
-            && let Some(target) = self.fragment_target
-        {
+        if let Some(&target) = self.fragment_targets.get(&id) {
             visit(id, target);
         }
     }
@@ -241,7 +239,7 @@ impl Dom {
                 .iter()
                 .all(|(id, _, _)| !dead.contains(id))
         );
-        debug_assert!(!self.fragment_target.is_some_and(|id| dead.contains(&id)));
+        debug_assert!(self.fragment_targets.values().all(|id| !dead.contains(id)));
         if self
             .resource_base_element_cache
             .get()
@@ -466,9 +464,8 @@ impl Dom {
                     .shrink_to(generated.list_items.len().saturating_mul(2));
             }
         }
-        if self.fragment_target.is_some_and(|id| !valid(id)) {
-            self.fragment_target = None;
-        }
+        self.fragment_targets
+            .retain(|&document, &mut target| valid(document) && valid(target));
         self.autofocus.retain(valid);
         self.style_load.retain(valid);
         if self

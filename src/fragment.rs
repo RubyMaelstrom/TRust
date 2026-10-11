@@ -54,10 +54,16 @@ pub fn position<T: Copy>(fragment: &str, targets: &HashMap<String, T>, top: T) -
 /// Select before looking up geometry: IDs beat legacy names regardless of
 /// their relative positions, and duplicates use DOM tree order, not paint order.
 pub(crate) fn targets(dom: &Dom) -> HashMap<String, NodeId> {
+    targets_in(dom, DOCUMENT)
+}
+
+/// HTML #find-a-potential-indicated-element in `document`, the top-level
+/// Document or a child navigable's Document in the same arena.
+pub(crate) fn targets_in(dom: &Dom, document: NodeId) -> HashMap<String, NodeId> {
     let mut targets = HashMap::new();
     for attribute in ["id", "name"] {
-        for node in dom.descendants(DOCUMENT) {
-            if dom.owner_document(node) != Some(DOCUMENT) {
+        for node in dom.descendants(document) {
+            if dom.owner_document(node) != Some(document) {
                 continue;
             }
             if attribute == "name" && dom.tag_name(node) != Some("a") {

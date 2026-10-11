@@ -4981,6 +4981,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 });
             } catch (e) {}
             domContentLoaded = true;
+            // HTML #try-to-scroll-to-the-fragment: a fragment in the frame's
+            // URL indicates its target once parsing has finished.
+            const childWindow = internalsOf(frame).contentRealmWindow;
+            if (childWindow) {
+                try { trustOf(childWindow).takeScrollFragment(); } catch (e) {}
+            }
             // HTML #the-end: the load event also waits for eager image
             // fetches (#delay-the-load-event), including script-started ones.
             whenImageLoadsSettle(function () {
@@ -27714,6 +27720,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             // how Astro's ClientRouter #anchor links (`location.href = "#x"`)
             // reach the app to scroll — see PageEvt::ScrollToFragment.
             trust.scrollFragment = locState.hash ? locState.hash.slice(1) : "";
+            // HTML #navigate-fragid runs "scroll to the fragment" within the
+            // navigation. A child navigable's Document (its own Realm, or a
+            // scoped one sharing this Realm) has no frontend scroll to wait
+            // for: apply its target element now.
+            if (realmRootFrame || nodeIds.get(g.document) !== 0) trust.takeScrollFragment();
         } else if (!hashOnly) {
             trust.navigation = p[0];
             const initiator = windowMessageSlots && windowMessageState(incumbent);
@@ -27744,7 +27755,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         try { record.state = entry && entry.url === url ? record.clone(entry.state) : null; }
         catch (_) { record.state = null; }
         updateLoc(url);
-        __dom_fragment_target(url.includes('#') ? locState.hash.slice(1) : null);
+        __dom_fragment_target(url.includes('#') ? locState.hash.slice(1) : null, nodeIds.get(g.document));
         // Already executing the asynchronous traversal task. HTML's update
         // document for history step application fires popstate now, and queues
         // hashchange separately on the DOM manipulation task source.
@@ -28011,7 +28022,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (fragment === undefined || fragment === null) return null;
         // HTML #scroll-to-the-fragment-identifier: update :target, reveal
         // enclosing details/hidden-until-found sections, then focus the target.
-        const id = __dom_fragment_target(fragment), target = id === null ? null : wrap(id);
+        // HTML #target-element: this Realm's own Document.
+        const id = __dom_fragment_target(fragment, nodeIds.get(g.document));
+        const target = id === null ? null : wrap(id);
         if (target) {
             const reveal = [];
             for (let node = target; node; node = node.parentNode || node.host) {

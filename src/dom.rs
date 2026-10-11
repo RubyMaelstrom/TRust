@@ -838,8 +838,11 @@ pub struct Dom {
     /// so the `SPRITE_SHEETS` key matches). `None` = unknown
     /// (sprite refs then count as unrenderable, the conservative answer).
     doc_url: Option<url::Url>,
-    /// HTML #scroll-to-the-fragment-identifier, independent of history URL rewrites.
-    fragment_target: Option<NodeId>,
+    /// HTML #target-element: each Document's target element (keyed by the
+    /// Document node), set by #scroll-to-the-fragment-identifier and
+    /// independent of history URL rewrites. A child navigable's Document in
+    /// this arena has its own.
+    fragment_targets: FxHashMap<NodeId, NodeId>,
     /// HTML focused DOM anchor per Document, shared with the page focus model.
     focused_areas: FxHashMap<NodeId, NodeId>,
     /// Incremental layout (incremental-layout contract): the element nodes mutated
@@ -1259,7 +1262,7 @@ impl Dom {
             scroll_state,
             scroll_changes,
             doc_url,
-            fragment_target: _,
+            fragment_targets: _,
             focused_areas,
             dirty_nodes,
             dirty_attributed,
@@ -1835,7 +1838,7 @@ impl Dom {
             scroll_state: FxHashMap::default(),
             scroll_changes: Vec::new(),
             doc_url: None,
-            fragment_target: None,
+            fragment_targets: FxHashMap::default(),
             focused_areas: FxHashMap::default(),
             dirty_nodes: Vec::new(),
             dirty_attributed: true,
@@ -3621,16 +3624,37 @@ impl Dom {
     }
 
     pub(crate) fn set_fragment_target(&mut self, fragment: Option<&str>) -> Option<NodeId> {
+        self.set_document_fragment_target(DOCUMENT, fragment)
+    }
+
+    /// HTML #scroll-to-the-fragment-identifier for `document` (the top-level
+    /// Document or a child navigable's): set its target element to the
+    /// indicated part of `fragment` in that Document, or to null.
+    pub(crate) fn set_document_fragment_target(
+        &mut self,
+        document: NodeId,
+        fragment: Option<&str>,
+    ) -> Option<NodeId> {
+        if !matches!(
+            self.nodes.get(document).map(|node| &node.data),
+            Some(NodeData::Document)
+        ) {
+            return None;
+        }
         let target = fragment.filter(|f| !f.is_empty()).and_then(|fragment| {
-            let targets = crate::fragment::targets(self);
+            let targets = crate::fragment::targets_in(self, document);
             targets
                 .get(fragment)
                 .or_else(|| targets.get(&crate::fragment::decode(fragment)))
                 .copied()
         });
-        if self.fragment_target != target {
-            let old = std::mem::replace(&mut self.fragment_target, target);
-            self.nodes.remember(DOCUMENT);
+        let old = self.fragment_targets.get(&document).copied();
+        if old != target {
+            match target {
+                Some(target) => self.fragment_targets.insert(document, target),
+                None => self.fragment_targets.remove(&document),
+            };
+            self.nodes.remember(document);
             // HTML #selector-target: only the old and new target elements
             // change state. No style sheet input changes, so the parsed
             // index survives even the complete fallback. A stale index is
@@ -14836,7 +14860,13 @@ impl<'a> StyleView<'a> {
         if c.hover && !self.state.hover_chain.contains(&id) {
             return false;
         }
-        if c.target && self.state.fragment_target != Some(id) {
+        if c.target
+            && self
+                .state
+                .fragment_targets
+                .get(&self.nodes.owner_document(id))
+                != Some(&id)
+        {
             return false;
         }
         // Live `:popover-open`: the element's popover is currently showing.
