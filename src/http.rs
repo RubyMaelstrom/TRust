@@ -10307,30 +10307,46 @@ fn collect_image_urls_for_boxes(
             });
         }
     };
-    for id in dom.flat_descendants(crate::dom::DOCUMENT) {
+    // One flat-tree walk serves both passes below and the media census.
+    let nodes = dom.flat_document_order();
+    let mut has_video = false;
+    let mut has_media = false;
+    for &id in nodes.iter() {
+        let tag = dom.tag_name(id);
+        match tag {
+            Some("video") => {
+                has_video = true;
+                has_media = true;
+            }
+            Some("audio") => {
+                has_media = true;
+                continue;
+            }
+            Some("img" | "svg" | "input") => {}
+            _ => continue,
+        }
         // `<img src>` and `<video poster>` (the poster renders as the video's
         // clickable thumbnail) both feed the decode pipeline.
-        let selected = (dom.tag_name(id) == Some("img"))
+        let selected = (tag == Some("img"))
             .then(|| crate::responsive_image::select(dom, id, base, viewport, device_pixel_ratio))
             .flatten()
             .filter(crate::responsive_image::loadable_source);
         // An inline SVG is not fetched: its image is its own serialization,
         // which only a rendered box paints (CSS Display 3 §2.5 omits the
         // rest), so a laid-out page serializes no unrendered SVG.
-        let svg = (dom.tag_name(id) == Some("svg")
-            && boxes.is_none_or(|boxes| boxes.contains_key(&id)))
-        .then(|| match painted_svgs.and_then(|svgs| svgs.get(&id)) {
-            Some(source) => Some(dom.painted_svg_source(id, source).to_owned()),
-            None => dom.svg_image_data(id, Some(base)).map(|(source, _)| source),
-        })
-        .flatten();
-        let poster = (dom.tag_name(id) == Some("video"))
+        let svg = (tag == Some("svg") && boxes.is_none_or(|boxes| boxes.contains_key(&id)))
+            .then(|| match painted_svgs.and_then(|svgs| svgs.get(&id)) {
+                Some(source) => Some(dom.painted_svg_source(id, source).to_owned()),
+                None => dom.svg_image_data(id, Some(base)).map(|(source, _)| source),
+            })
+            .flatten();
+        let poster = (tag == Some("video"))
             .then(|| dom.attr(id, "poster"))
             .flatten()
             .map(str::trim)
             .filter(|source| !source.is_empty());
         // HTML #image-button-state-(type=image): the button's image.
-        let image_button = (dom.tag_name(id) == Some("input") && dom.input_type(id) == "image")
+        let image_button = (tag == Some("input") && dom.input_type(id) == "image")
             .then(|| dom.attr(id, "src"))
             .flatten()
             .map(str::trim)
@@ -10400,7 +10416,7 @@ fn collect_image_urls_for_boxes(
     // `background-repeat` is `repeat`, so a background image must be available
     // before the first paint rather than waiting for a later display-list
     // rebuild (CSS Backgrounds 3 §§2.1, 2.3).
-    for id in dom.flat_descendants(crate::dom::DOCUMENT) {
+    for &id in nodes.iter() {
         // CSS Backgrounds 3 §2.3 permits deferring invisible images; CSS
         // Display 3 §2.5 excludes display:none subtrees from the box tree.
         // The desktop already has measured boxes: don't cascade thousands
@@ -10415,7 +10431,14 @@ fn collect_image_urls_for_boxes(
         // and style attributes resolve against the frame Document's base.
         let style_base = std::cell::OnceCell::new();
         let style_base = || style_base.get_or_init(|| dom.style_resource_base(id, base));
-        for property in ["background-image", "list-style-image", "cursor", "content"] {
+        // Almost no element names an image: its remembered answer spares the
+        // four computed strings.
+        let properties: &[&str] = if dom.names_css_images(id) {
+            &crate::dom::Dom::CSS_IMAGE_PROPERTIES
+        } else {
+            &[]
+        };
+        for property in properties {
             let Some(value) = dom.computed_value_resolved(id, property) else {
                 continue;
             };
@@ -10473,18 +10496,6 @@ fn collect_image_urls_for_boxes(
     // `flow_page_level_media_fallback`'s gate) — and since a drawn preview IS
     // the mpv link, the frame must reach the decode pipe or the affordance
     // stays a bare text line forever.
-    let mut has_video = false;
-    let mut has_media = false;
-    for id in dom.flat_descendants(crate::dom::DOCUMENT) {
-        match dom.tag_name(id) {
-            Some("video") => {
-                has_video = true;
-                has_media = true;
-            }
-            Some("audio") => has_media = true,
-            _ => {}
-        }
-    }
     // Mirrors the layout gates exactly: a present `<video>` only borrows the
     // page preview when the page IS a video page. Every `<video>` has an mpv
     // activation surface, but a generic page's `og:image` still describes the

@@ -749,8 +749,9 @@ fn graphical_paint_boundaries(
     boxes: &HashMap<NodeId, PxRect>,
 ) -> Vec<GraphicalPaintBoundary> {
     let mut boundaries = dom
-        .flat_descendants(crate::dom::DOCUMENT)
-        .into_iter()
+        .flat_document_order()
+        .iter()
+        .copied()
         .filter(|node| boxes.contains_key(node))
         .filter_map(|node| {
             if dom.render_live() && dom.paint_patch_host(node) {

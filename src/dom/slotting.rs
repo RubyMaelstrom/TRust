@@ -647,6 +647,62 @@ mod tests {
         assert_eq!(dom.assigned_slot(light), Some(slot));
     }
 
+    #[test]
+    fn the_shared_flat_order_follows_every_flat_tree_change() {
+        // `flat_document_order` must equal a fresh flat-tree walk after
+        // each change that can move a node in it: insertion and removal,
+        // shadow attachment, a slottable's `slot` and a slot's `name`
+        // (attribute changes), and manual assignment (HTML #dom-slot-assign).
+        let mut dom = Dom::parse_document(
+            "<body id=body><div id=host><span id=light slot=a>x</span><b>y</b></div></body>",
+        );
+        let check = |dom: &Dom, step: &str| {
+            assert_eq!(
+                &*dom.flat_document_order(),
+                dom.flat_descendants(DOCUMENT).as_slice(),
+                "{step}"
+            );
+            // A second read is served from the cache and still agrees.
+            assert_eq!(
+                &*dom.flat_document_order(),
+                dom.flat_descendants(DOCUMENT).as_slice(),
+                "{step} (cached)"
+            );
+        };
+        let (host, light) = (
+            dom.get_by_id("host").unwrap(),
+            dom.get_by_id("light").unwrap(),
+        );
+        check(&dom, "parsed");
+        let root = dom.attach_shadow(host);
+        check(&dom, "shadow attached");
+        let slot = dom.create_element("slot");
+        dom.set_attr(slot, "name", "a");
+        dom.append(root, slot);
+        check(&dom, "slot inserted");
+        dom.set_attr(light, "slot", "b");
+        check(&dom, "slottable renamed");
+        dom.set_attr(slot, "name", "b");
+        check(&dom, "slot renamed");
+        let text = dom.create_text("z");
+        dom.append(light, text);
+        check(&dom, "text appended");
+        dom.set_text(text, "zz");
+        check(&dom, "text changed");
+        dom.detach(light);
+        check(&dom, "slottable removed");
+        let (manual, manual_root) = manual_host(&mut dom);
+        let first = dom.create_element("slot");
+        dom.append(manual_root, first);
+        let child = dom.create_element("i");
+        dom.append(manual, child);
+        check(&dom, "manual host");
+        dom.assign_slot_manually(first, &[child]);
+        check(&dom, "manually assigned");
+        dom.assign_slot_manually(first, &[]);
+        check(&dom, "manually unassigned");
+    }
+
     fn manual_host(dom: &mut Dom) -> (NodeId, NodeId) {
         let body = dom.get_by_id("body").unwrap();
         let host = dom.create_element("div");

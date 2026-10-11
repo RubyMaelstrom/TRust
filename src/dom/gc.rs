@@ -167,6 +167,7 @@ impl Dom {
             changed_popovers |= self.fullscreen_flags.remove(&id);
             self.started_scripts.remove(&id);
             self.slot_directory.take();
+            self.document_orders.get_mut().clear();
             self.canvases.get_mut().remove(&id);
             self.container_sizes.get_mut().remove(&id);
             self.container_dependencies.get_mut().remove_node(id);

@@ -94,6 +94,39 @@ pub use xml_serialize::NotWellFormed;
 
 pub type NodeId = usize;
 
+/// Whole-document walks shared until the tree changes
+/// (`Dom::flat_document_order`, `Dom::composed_document_order`), each with
+/// the DOM `epoch` it was taken at.
+#[derive(Default)]
+struct DocumentOrders {
+    flat: Option<(u64, std::sync::Arc<[NodeId]>)>,
+    composed: Option<(u64, std::sync::Arc<[NodeId]>)>,
+}
+
+impl DocumentOrders {
+    fn current(
+        order: &Option<(u64, std::sync::Arc<[NodeId]>)>,
+        epoch: u64,
+    ) -> Option<std::sync::Arc<[NodeId]>> {
+        order
+            .as_ref()
+            .filter(|(at, _)| *at == epoch)
+            .map(|(_, order)| order.clone())
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    fn retained_bytes(&self) -> usize {
+        [&self.flat, &self.composed]
+            .into_iter()
+            .flatten()
+            .map(|(_, order)| order.len() * std::mem::size_of::<NodeId>())
+            .sum()
+    }
+}
+
 type SerializationCache = (u64, FxHashMap<(NodeId, u8), String>);
 
 /// The presentation inputs an inline SVG image resource is derived from: the
@@ -655,6 +688,10 @@ pub struct Dom {
     /// DOM #find-a-slot step 6 for every shadow root, built on the first
     /// lookup after a mutation (`mark_dom_revision` resets it).
     slot_directory: std::sync::OnceLock<slotting::SlotDirectory>,
+    /// The Document's flat-tree and shadow-including orders as of DOM
+    /// `epoch`; dropped wherever the slot directory is, since the parser and
+    /// collection change the tree without a DOM revision.
+    document_orders: RefCell<DocumentOrders>,
     /// Whether some node carries an `inert` attribute or a presentation
     /// `data-trust-blocked` marker, as of DOM `epoch` (`may_be_inert`).
     inert_attributes: std::cell::Cell<(u64, bool)>,
@@ -1212,6 +1249,7 @@ impl Dom {
             shadow_data,
             manual_slots: _,
             slot_directory: _,
+            document_orders,
             inert_attributes: _,
             slot_signals: _,
             ce_registries,
@@ -1462,6 +1500,10 @@ impl Dom {
         fixed_map!(external_sheets, (NodeId, cssom::LinkedSheet));
         bytes = bytes.saturating_add(properties.retained_bytes());
         bytes = bytes.saturating_add(pending_style_invalidations.retained_bytes());
+        match document_orders.try_borrow() {
+            Ok(orders) => bytes = bytes.saturating_add(orders.retained_bytes()),
+            Err(_) => unavailable += 1,
+        }
         match paint_cache.try_borrow() {
             Ok(cache) => {
                 bytes =
@@ -1798,6 +1840,7 @@ impl Dom {
             shadow_data: FxHashMap::default(),
             manual_slots: slotting::ManualSlots::default(),
             slot_directory: std::sync::OnceLock::new(),
+            document_orders: RefCell::default(),
             inert_attributes: std::cell::Cell::new((u64::MAX, true)),
             slot_signals: slotting::SlotSignals::default(),
             ce_registries: custom_registry::State::default(),
@@ -2133,7 +2176,12 @@ impl Dom {
             let view = self.style_view();
             let mut ancestors = rule_index::WalkAncestors::new();
             for &root in roots {
-                for id in std::iter::once(root).chain(self.composed_descendants(root)) {
+                let descendants: std::sync::Arc<[NodeId]> = if root == DOCUMENT {
+                    self.composed_document_order()
+                } else {
+                    self.composed_descendants(root).into()
+                };
+                for id in std::iter::once(root).chain(descendants.iter().copied()) {
                     if self.tag_name(id).is_none() {
                         continue;
                     }
@@ -3837,6 +3885,29 @@ impl Dom {
         )
     }
 
+    /// The image-valued properties the rendering update's resource scan
+    /// reads on each rendered element (CSS Backgrounds 3 §2.3, CSS Lists 3
+    /// `list-style-image`, CSS UI 4 `cursor`, CSS Content 3 `content`).
+    pub(crate) const CSS_IMAGE_PROPERTIES: [&'static str; 4] =
+        ["background-image", "list-style-image", "cursor", "content"];
+
+    /// Whether any of `CSS_IMAGE_PROPERTIES` names an image (a non-empty
+    /// `<url>` in its resolved value), remembered beside the computed values
+    /// so the scan reads the four strings only on elements that use one.
+    pub(crate) fn names_css_images(&self, id: NodeId) -> bool {
+        self.typed_memo(
+            id,
+            |typed| typed.css_images,
+            |typed, names| typed.css_images = Some(names),
+            || {
+                Self::CSS_IMAGE_PROPERTIES.iter().any(|property| {
+                    self.computed_value_resolved(id, property)
+                        .is_some_and(|value| css_urls(&value).iter().any(|url| !url.is_empty()))
+                })
+            },
+        )
+    }
+
     /// A horizontal scroll container (`overflow-x: auto|scroll`) — the strip
     /// axis of a carousel.
     pub fn is_hscroll_container(&self, id: NodeId) -> bool {
@@ -4447,6 +4518,7 @@ impl Dom {
     /// invalidate style/layout caches or walk node-document ownership.
     fn parser_detach(&mut self, id: NodeId) {
         self.slot_directory.take();
+        self.document_orders.get_mut().clear();
         let (parent, previous, next) = {
             let node = &self.nodes[id];
             (node.parent, node.prev_sibling, node.next_sibling)
@@ -10903,6 +10975,32 @@ impl Dom {
     /// ancestry) must walk that same tree: a light-DOM walk loses shadow
     /// content, while a composed walk also visits unassigned light children
     /// that generate no boxes.
+    /// `flat_descendants(DOCUMENT)`, shared by the rendering update's
+    /// whole-document scans until the tree changes: every DOM revision
+    /// advances `epoch`, and the parser's and collection's untracked tree
+    /// changes drop it with the slot directory.
+    pub(crate) fn flat_document_order(&self) -> std::sync::Arc<[NodeId]> {
+        if let Some(order) = DocumentOrders::current(&self.document_orders.borrow().flat, self.epoch)
+        {
+            return order;
+        }
+        let order: std::sync::Arc<[NodeId]> = self.flat_descendants(DOCUMENT).into();
+        self.document_orders.borrow_mut().flat = Some((self.epoch, order.clone()));
+        order
+    }
+
+    /// `composed_descendants(DOCUMENT)`, shared like `flat_document_order`.
+    pub(crate) fn composed_document_order(&self) -> std::sync::Arc<[NodeId]> {
+        if let Some(order) =
+            DocumentOrders::current(&self.document_orders.borrow().composed, self.epoch)
+        {
+            return order;
+        }
+        let order: std::sync::Arc<[NodeId]> = self.composed_descendants(DOCUMENT).into();
+        self.document_orders.borrow_mut().composed = Some((self.epoch, order.clone()));
+        order
+    }
+
     pub(crate) fn flat_descendants(&self, root: NodeId) -> Vec<NodeId> {
         let mut out = Vec::new();
         let mut stack = Vec::new();
@@ -13119,7 +13217,7 @@ impl Dom {
     pub(crate) fn external_svg_use_sheet_requests(&self, base: &url::Url) -> Vec<(url::Url, bool)> {
         let mut seen = std::collections::HashMap::<String, usize>::new();
         let mut out: Vec<(url::Url, bool)> = Vec::new();
-        for id in self.flat_descendants(DOCUMENT) {
+        for &id in self.flat_document_order().iter() {
             if self.tag_name(id) != Some("use") {
                 continue;
             }

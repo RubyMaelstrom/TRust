@@ -17,7 +17,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::dom::{DOCUMENT, Dom, NodeId};
+use crate::dom::{Dom, NodeId};
 use crate::layout2::{NO_NODE, PxRect};
 
 use super::flow::{Frag, FragKind, LineFrag, TopFrag};
@@ -435,7 +435,7 @@ fn composed_union(
         .filter(|&(&k, _)| keep(k))
         .map(|(&k, &v)| (k, v))
         .collect();
-    for &id in dom.composed_descendants(DOCUMENT).iter().rev() {
+    for &id in dom.composed_document_order().iter().rev() {
         if !keep(id) {
             continue;
         }

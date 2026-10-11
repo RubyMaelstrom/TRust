@@ -943,4 +943,48 @@ mod typed_memo_tests {
         check(&dom);
         assert!(dom.visibility_hidden(a));
     }
+    #[test]
+    fn the_css_image_memo_follows_classes_inheritance_variables_and_sheets() {
+        // `names_css_images` answers as reading the four image-valued
+        // properties would, through every change that reaches them.
+        let mut dom = Dom::parse_document(
+            "<style>.b{background-image:url(b.png)} .c{cursor:url(c.cur),auto}\
+             .v{--img:url(v.png)} .u{list-style-image:var(--img)}</style>\
+             <div id=p><span id=a>x</span></div>",
+        );
+        let (p, a) = (dom.get_by_id("p").unwrap(), dom.get_by_id("a").unwrap());
+        let check = |dom: &Dom| {
+            for id in [p, a] {
+                let names = Dom::CSS_IMAGE_PROPERTIES.iter().any(|property| {
+                    dom.computed_value_resolved(id, property)
+                        .is_some_and(|value| css_urls(&value).iter().any(|url| !url.is_empty()))
+                });
+                assert_eq!(dom.names_css_images(id), names);
+                assert_eq!(dom.names_css_images(id), names);
+            }
+        };
+        check(&dom);
+        assert!(!dom.names_css_images(a));
+        dom.set_attr(a, "class", "b");
+        check(&dom);
+        assert!(dom.names_css_images(a));
+        dom.set_attr(a, "class", "");
+        dom.set_attr(p, "class", "c");
+        check(&dom);
+        assert!(dom.names_css_images(a), "cursor is inherited");
+        dom.set_attr(p, "class", "v");
+        dom.set_attr(a, "class", "u");
+        check(&dom);
+        assert!(dom.names_css_images(a), "through an inherited variable");
+        dom.set_attr(p, "class", "");
+        check(&dom);
+        assert!(!dom.names_css_images(a), "the variable is gone");
+        let style = dom.create_element("style");
+        let css = dom.create_text("span{content:url(s.png)}");
+        dom.append(style, css);
+        let head = dom.document_element().unwrap();
+        dom.append(head, style);
+        check(&dom);
+        assert!(dom.names_css_images(a));
+    }
 }

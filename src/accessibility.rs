@@ -126,7 +126,7 @@ impl SemanticTree {
             focused: focused == Some(DOCUMENT),
             checked: None,
         });
-        for node in dom.flat_descendants(DOCUMENT) {
+        for &node in dom.flat_document_order().iter() {
             let Some(bounds) = boxes.get(&node).copied() else {
                 continue;
             };

@@ -107,6 +107,8 @@ struct NodeRows {
 pub(crate) struct Typed {
     pub(crate) overflow: Option<[crate::layout2::Overflow; 2]>,
     pub(crate) visibility_hidden: Option<bool>,
+    /// Whether one of `Dom::CSS_IMAGE_PROPERTIES` names an image.
+    pub(crate) css_images: Option<bool>,
 }
 
 /// Properties whose value is computed per element (unit guards), never shared
