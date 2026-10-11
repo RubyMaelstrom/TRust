@@ -1767,8 +1767,9 @@ impl Dom {
     fn forget_animated_value(&self, id: NodeId, property: usize) {
         let name = PROPS[property].name;
         let inherited = PROPS[property].inherited;
-        let mut computed = self.computed_cache.borrow_mut();
-        computed.1.forget(id, property);
+        // `cascaded` may compute a style row, which borrows the same cache:
+        // hold it only for each eviction.
+        self.computed_cache.borrow_mut().1.forget(id, property);
         let mut stack = Vec::new();
         self.push_composed_children(id, &mut stack);
         if self.tag_name(id) == Some("slot") {
@@ -1793,7 +1794,7 @@ impl Dom {
             if !inherits {
                 continue;
             }
-            computed.1.forget(node, property);
+            self.computed_cache.borrow_mut().1.forget(node, property);
             self.push_composed_children(node, &mut stack);
             if self.tag_name(node) == Some("slot") {
                 stack.extend(self.flat_slot_nodes(node));
