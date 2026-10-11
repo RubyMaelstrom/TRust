@@ -97,6 +97,16 @@ struct NodeRows {
     contextual: Row,
     inline: Option<Box<InlineRecord>>,
     display: Option<DisplayRecord>,
+    typed: Typed,
+}
+
+/// Typed results of a node's most-read computed values (`Dom::typed_memo`),
+/// each filled on its first read. They live beside the node's values, so
+/// every eviction of those drops them as well.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Typed {
+    pub(crate) overflow: Option<[crate::layout2::Overflow; 2]>,
+    pub(crate) visibility_hidden: Option<bool>,
 }
 
 /// Properties whose value is computed per element (unit guards), never shared
@@ -415,7 +425,21 @@ impl Values {
     }
 
     pub(super) fn share_row(&mut self, node: NodeId, shared: SharedRow) {
-        self.rows.get_mut(node).expect("prepared node row").common = Some(shared);
+        let row = self.rows.get_mut(node).expect("prepared node row");
+        row.common = Some(shared);
+        row.typed = Typed::default();
+    }
+
+    /// The typed results memoized for `node`, while it has computed values.
+    pub(super) fn typed(&self, node: NodeId) -> Option<Typed> {
+        self.rows.get(node).map(|row| row.typed)
+    }
+
+    /// Record a typed result for `node`; nothing without its computed values.
+    pub(super) fn update_typed(&mut self, node: NodeId, update: impl FnOnce(&mut Typed)) {
+        if let Some(row) = self.rows.get_mut(node) {
+            update(&mut row.typed);
+        }
     }
 
     pub(super) fn insert(&mut self, (node, property): (NodeId, usize), value: Option<String>) {
@@ -525,6 +549,7 @@ impl Values {
         let Some(row) = self.rows.get_mut(node) else {
             return;
         };
+        row.typed = Typed::default();
         if contextual(property) {
             row.contextual.forget(property);
         } else if let Some(common) = &row.common {
@@ -618,6 +643,27 @@ mod tests {
         );
         values.retain_nodes(|_| false);
         assert!(values.is_empty());
+    }
+
+    #[test]
+    fn typed_results_leave_with_their_values() {
+        let mut values = Values::default();
+        let typed = |values: &Values| values.typed(1).and_then(|typed| typed.visibility_hidden);
+        values.update_typed(1, |typed| typed.visibility_hidden = Some(true));
+        assert_eq!(typed(&values), None, "no values, no typed results");
+        values.insert((1, 0), Some("hidden".into()));
+        values.update_typed(1, |typed| typed.visibility_hidden = Some(true));
+        assert_eq!(typed(&values), Some(true));
+        // An animation-origin eviction of any property drops them.
+        values.forget(1, 0);
+        assert_eq!(typed(&values), None);
+        values.update_typed(1, |typed| typed.visibility_hidden = Some(true));
+        let row = values.row(1).unwrap();
+        values.share_row(1, row);
+        assert_eq!(typed(&values), None, "a re-shared row starts over");
+        values.update_typed(1, |typed| typed.visibility_hidden = Some(true));
+        values.clear_node(1);
+        assert_eq!(typed(&values), None);
     }
 
     #[test]

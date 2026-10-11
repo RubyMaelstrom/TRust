@@ -620,7 +620,50 @@ impl Dom {
     }
     #[inline]
     pub fn visibility_hidden(&self, id: NodeId) -> bool {
-        ComputeView(self).visibility_hidden(id)
+        self.typed_memo(
+            id,
+            |typed| typed.visibility_hidden,
+            |typed, hidden| typed.visibility_hidden = Some(hidden),
+            || ComputeView(self).visibility_hidden(id),
+        )
+    }
+
+    /// A typed result derived from `id`'s computed values, memoized beside
+    /// them in the computed cache (`computed_cache::Typed`): stamped like
+    /// them and dropped by each of their evictions, so the paint, geometry
+    /// and accessibility passes of every rendering update stop re-reading
+    /// and re-parsing the same strings. `computed_value` answers from
+    /// transition- and animation-origin values before its cache, so the memo
+    /// is bypassed while any transition or animation supplies one.
+    pub(crate) fn typed_memo<T: Copy>(
+        &self,
+        id: NodeId,
+        read: impl FnOnce(&computed_cache::Typed) -> Option<T>,
+        write: impl FnOnce(&mut computed_cache::Typed, T),
+        compute: impl FnOnce() -> T,
+    ) -> T {
+        self.flush_style_invalidations();
+        if !self.transitions.idle() || !self.animations.supplies_no_values() {
+            return compute();
+        }
+        let stamp = (
+            self.style_value_epoch,
+            crate::font_system::page_font_epoch(),
+        );
+        {
+            let cache = self.computed_cache.borrow();
+            if cache.0 == stamp
+                && let Some(value) = cache.1.typed(id).as_ref().and_then(read)
+            {
+                return value;
+            }
+        }
+        let value = compute();
+        let mut cache = self.computed_cache.borrow_mut();
+        if cache.0 == stamp {
+            cache.1.update_typed(id, |typed| write(typed, value));
+        }
+        value
     }
     #[inline]
     pub fn effective_opacity(&self, id: NodeId) -> f32 {
@@ -849,5 +892,55 @@ impl Dom {
     #[inline]
     pub(in crate::dom) fn property_base(&self, id: NodeId) -> Option<&url::Url> {
         ComputeView(self).property_base(id)
+    }
+}
+
+#[cfg(test)]
+mod typed_memo_tests {
+    use super::*;
+
+    #[test]
+    fn typed_memo_follows_class_inheritance_and_sheet_changes() {
+        // The memo answers exactly as the string path does after every
+        // change that reaches an element's computed values.
+        let mut dom = Dom::parse_document(
+            "<style>.h{overflow:hidden} .s{overflow-x:scroll} .v{visibility:hidden}\
+             .c{visibility:collapse}</style><div id=p><span id=a class=h>x</span></div>",
+        );
+        let (p, a) = (dom.get_by_id("p").unwrap(), dom.get_by_id("a").unwrap());
+        let check = |dom: &Dom| {
+            for id in [p, a] {
+                let axes = crate::layout2::Overflow::axes_from_longhands(
+                    dom.computed_value_resolved(id, "overflow-x"),
+                    dom.computed_value_resolved(id, "overflow-y"),
+                );
+                assert_eq!(dom.overflow_axes(id), axes);
+                // The typed answer is read twice: the second comes from the memo.
+                assert_eq!(dom.overflow_axes(id), axes);
+                let hidden = matches!(
+                    dom.computed_value(id, "visibility").as_deref(),
+                    Some("hidden" | "force-hidden" | "collapse")
+                );
+                assert_eq!(dom.visibility_hidden(id), hidden);
+                assert_eq!(dom.visibility_hidden(id), hidden);
+            }
+        };
+        check(&dom);
+        dom.set_attr(a, "class", "s");
+        check(&dom);
+        dom.set_attr(p, "class", "v");
+        check(&dom);
+        assert!(dom.visibility_hidden(a), "inherited from the parent");
+        dom.set_attr(p, "class", "");
+        check(&dom);
+        dom.set_attr(a, "style", "visibility:collapse;overflow:clip auto");
+        check(&dom);
+        let style = dom.create_element("style");
+        let css = dom.create_text("span{visibility:hidden!important}");
+        dom.append(style, css);
+        let head = dom.document_element().unwrap();
+        dom.append(head, style);
+        check(&dom);
+        assert!(dom.visibility_hidden(a));
     }
 }

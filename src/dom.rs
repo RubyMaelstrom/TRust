@@ -3729,9 +3729,16 @@ impl Dom {
     /// The element's resolved overflow axes (`Overflow::axes` over its
     /// resolved values), reading each longhand once.
     pub(crate) fn overflow_axes(&self, id: NodeId) -> [crate::layout2::Overflow; 2] {
-        crate::layout2::Overflow::axes_from_longhands(
-            self.computed_value_resolved(id, "overflow-x"),
-            self.computed_value_resolved(id, "overflow-y"),
+        self.typed_memo(
+            id,
+            |typed| typed.overflow,
+            |typed, axes| typed.overflow = Some(axes),
+            || {
+                crate::layout2::Overflow::axes_from_longhands(
+                    self.computed_value_resolved(id, "overflow-x"),
+                    self.computed_value_resolved(id, "overflow-y"),
+                )
+            },
         )
     }
 

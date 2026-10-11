@@ -484,6 +484,11 @@ impl State {
         self.invalid.borrow_mut().clear();
     }
 
+    /// No animation supplies an animation-origin value.
+    pub(super) fn supplies_no_values(&self) -> bool {
+        self.values.is_empty()
+    }
+
     /// The animation-origin value of `name` on `id`, if any.
     pub(super) fn value(&self, id: NodeId, name: &str) -> Option<String> {
         self.target_value((id, None), name)
