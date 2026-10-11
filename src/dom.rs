@@ -653,6 +653,9 @@ pub struct Dom {
     /// DOM #find-a-slot step 6 for every shadow root, built on the first
     /// lookup after a mutation (`mark_dom_revision` resets it).
     slot_directory: std::sync::OnceLock<slotting::SlotDirectory>,
+    /// Whether some node carries an `inert` attribute or a presentation
+    /// `data-trust-blocked` marker, as of DOM `epoch` (`may_be_inert`).
+    inert_attributes: std::cell::Cell<(u64, bool)>,
     /// DOM #signal-slot-list and each slot's last signalled assignment.
     slot_signals: slotting::SlotSignals,
     /// Custom element registry associations (see `custom_registry`).
@@ -1198,6 +1201,7 @@ impl Dom {
             shadow_data,
             manual_slots: _,
             slot_directory: _,
+            inert_attributes: _,
             slot_signals: _,
             ce_registries,
             media_tracks,
@@ -1773,6 +1777,7 @@ impl Dom {
             shadow_data: FxHashMap::default(),
             manual_slots: slotting::ManualSlots::default(),
             slot_directory: std::sync::OnceLock::new(),
+            inert_attributes: std::cell::Cell::new((u64::MAX, true)),
             slot_signals: slotting::SlotSignals::default(),
             ce_registries: custom_registry::State::default(),
             media_tracks: media_tracks::State::default(),
@@ -2342,7 +2347,31 @@ impl Dom {
     /// the inertness of its ancestors; content of an inert navigable
     /// container is inert too, as its container is not hit-testable.
     pub fn is_inert(&self, id: NodeId) -> bool {
-        self.style_view().is_inert(id)
+        self.may_be_inert() && self.style_view().is_inert(id)
+    }
+
+    /// Whether any node can be inert (`StyleView::is_inert`): only an
+    /// `inert` attribute, a blocking modal dialog or a presentation arena's
+    /// `data-trust-blocked` marker makes one so. Paint and hit testing ask
+    /// for every box, and the answer otherwise walks all flat-tree
+    /// ancestors; the attribute scan runs once per DOM revision.
+    fn may_be_inert(&self) -> bool {
+        if !self.modal_dialogs.is_empty() {
+            return true;
+        }
+        let (epoch, found) = self.inert_attributes.get();
+        if epoch == self.epoch {
+            return found;
+        }
+        let found = self.nodes.iter().any(|node| {
+            matches!(&node.data, NodeData::Element { attrs, .. }
+            if attrs.iter().any(|attr| {
+                let name = &*attr.name.local;
+                name == "inert" || name == "data-trust-blocked"
+            }))
+        });
+        self.inert_attributes.set((self.epoch, found));
+        found
     }
 
     /// Whether any document in this arena is blocked by a modal dialog
@@ -33048,6 +33077,33 @@ mod tests {
             (reparsed.effective_opacity(reparsed_backdrop) - 0.6).abs() < f32::EPSILON,
             "the native frontend receives the same compositing alpha: {html}"
         );
+    }
+
+    #[test]
+    fn inert_attributes_are_seen_after_every_change() {
+        // HTML #the-inert-attribute: the per-revision scan behind
+        // `may_be_inert` follows attribute writes, removals and insertions.
+        let mut dom =
+            Dom::parse_document("<body id=body><div id=a><button id=b>x</button></div></body>");
+        let (body, a, b) = (
+            dom.get_by_id("body").unwrap(),
+            dom.get_by_id("a").unwrap(),
+            dom.get_by_id("b").unwrap(),
+        );
+        assert!(!dom.is_inert(b));
+        dom.set_attr(a, "inert", "");
+        assert!(dom.is_inert(b) && dom.is_inert(a) && !dom.is_inert(body));
+        dom.remove_attr(a, "inert");
+        assert!(!dom.is_inert(b));
+        let section = dom.create_element("section");
+        dom.set_attr(section, "inert", "");
+        let inside = dom.create_element("span");
+        dom.append(section, inside);
+        dom.append(body, section);
+        assert!(dom.is_inert(inside) && !dom.is_inert(b));
+        let parsed = Dom::parse_document("<div inert><p id=q>t</p></div><p id=r>u</p>");
+        assert!(parsed.is_inert(parsed.get_by_id("q").unwrap()));
+        assert!(!parsed.is_inert(parsed.get_by_id("r").unwrap()));
     }
 
     #[test]
