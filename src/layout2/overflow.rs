@@ -85,20 +85,13 @@ impl Overflow {
     }
 }
 
-pub(super) fn overflow_axes(dom: &Dom, node: NodeId) -> [String; 2] {
+/// The element's resolved overflow axes (`Dom::overflow_axes`); `visible`
+/// for the anonymous boxes no element owns.
+pub(super) fn overflow_axes(dom: &Dom, node: NodeId) -> [Overflow; 2] {
     if node == NO_NODE {
-        return ["visible".into(), "visible".into()];
+        return [Overflow::Visible; 2];
     }
-    dom.overflow_axes(node).map(|v| {
-        match v {
-            Overflow::Visible => "visible",
-            Overflow::Clip => "clip",
-            Overflow::Hidden => "hidden",
-            Overflow::Auto => "auto",
-            Overflow::Scroll => "scroll",
-        }
-        .into()
-    })
+    dom.overflow_axes(node)
 }
 
 pub(super) fn viewport_overflow_source(dom: &Dom) -> Option<NodeId> {
@@ -118,7 +111,7 @@ pub(super) fn viewport_overflow_source_for(dom: &Dom, root: NodeId) -> Option<No
     };
     if dom.tag_name(root) == Some("html")
         && !contained(root)
-        && overflow_axes(dom, root) == ["visible", "visible"]
+        && overflow_axes(dom, root) == [Overflow::Visible; 2]
         && let Some(body) = dom
             .children(root)
             .into_iter()
@@ -134,13 +127,22 @@ pub(super) fn viewport_overflow_source_for(dom: &Dom, root: NodeId) -> Option<No
 /// CSS Overflow 3 #overflow-propagation, including the HTML body fallback.
 pub(super) fn viewport_overflow_disabled(dom: &Dom) -> [bool; 2] {
     viewport_overflow_source(dom).map_or([false; 2], |node| {
-        overflow_axes(dom, node).map(|v| matches!(v.as_str(), "hidden" | "clip"))
+        overflow_axes(dom, node).map(|v| matches!(v, Overflow::Hidden | Overflow::Clip))
     })
 }
 
 /// CSSOM View #scrolling-area and CSS Overflow 3 #scrolling: the origin is
 /// block-start/inline-start, or main-start/cross-start for a flex container.
 pub(crate) fn scroll_reverse(dom: &Dom, node: NodeId) -> [bool; 2] {
+    dom.typed_memo(
+        node,
+        |typed| typed.scroll_reverse,
+        |typed, reverse| typed.scroll_reverse = Some(reverse),
+        || scroll_reverse_uncached(dom, node),
+    )
+}
+
+fn scroll_reverse_uncached(dom: &Dom, node: NodeId) -> [bool; 2] {
     let rtl = dom.computed_value_resolved(node, "direction").as_deref() == Some("rtl");
     let writing = dom
         .computed_value_resolved(node, "writing-mode")
@@ -338,18 +340,12 @@ impl ScrollAreas {
         }
         if !root && Some(f.node) != viewport_source {
             let axes = overflow_axes(dom, f.node);
-            let paint_containment = f.node != NO_NODE
-                && dom
-                    .computed_value_resolved(f.node, "contain")
-                    .is_some_and(|v| {
-                        v.split_whitespace()
-                            .any(|v| matches!(v, "paint" | "content" | "strict"))
-                    });
-            if frame || paint_containment || axes[0] != "visible" {
+            let paint_containment = f.node != NO_NODE && dom.paint_contained(f.node);
+            if frame || paint_containment || axes[0] != Overflow::Visible {
                 area.0 = end.0;
                 area.2 = end.2;
             }
-            if frame || paint_containment || axes[1] != "visible" {
+            if frame || paint_containment || axes[1] != Overflow::Visible {
                 area.1 = end.1;
                 area.3 = end.3;
             }
@@ -368,15 +364,15 @@ impl ScrollAreas {
             area.union(Edge::rect(r.x, r.y, r.x + r.width, r.y + r.height));
         }
         if !root && f.node != NO_NODE {
-            match dom.computed_value_resolved(f.node, "position").as_deref() {
+            match dom.position_scheme(f.node) {
                 // Its containing block is an inline box of the parent's
                 // formatting context, so it joins the parent's area.
-                Some("absolute") if f.flow.inline_cb => {}
-                Some("absolute") => {
+                super::style::Pos::Absolute if f.flow.inline_cb => {}
+                super::style::Pos::Absolute => {
                     escaping.push((false, area));
                     return Edge::point(0., 0.);
                 }
-                Some("fixed") => {
+                super::style::Pos::Fixed => {
                     escaping.push((true, area));
                     return Edge::point(0., 0.);
                 }

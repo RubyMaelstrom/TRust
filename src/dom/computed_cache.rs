@@ -112,6 +112,13 @@ pub(crate) struct Typed {
     /// Whether the element's `::before` or `::after` box names an image
     /// (`http::pseudo_image_sources`).
     pub(crate) pseudo_images: Option<bool>,
+    /// `layout2::overflow::scroll_reverse`: which scroll axes start at the
+    /// end edge.
+    pub(crate) scroll_reverse: Option<[bool; 2]>,
+    /// Whether `contain` includes paint containment (`Dom::paint_contained`).
+    pub(crate) paint_contained: Option<bool>,
+    /// The positioning scheme (`Dom::position_scheme`).
+    pub(crate) position: Option<crate::layout2::Pos>,
 }
 
 /// Properties whose value is computed per element (unit guards), never shared

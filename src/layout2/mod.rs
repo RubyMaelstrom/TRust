@@ -114,7 +114,7 @@ pub(crate) use memo::box_style_bytes;
 /// <to-list>)`. Author style sheets cannot declare it: `<transform-list>`
 /// has no such function.
 pub(crate) const DEFERRED_TRANSFORM_INTERPOLATION: &str = "-trust-interpolate-matrix";
-pub(crate) use style::{BoxStyle, InlineStyle, StyleSource, pseudo_units};
+pub(crate) use style::{BoxStyle, InlineStyle, Pos, StyleSource, pseudo_units};
 pub(crate) use transform::serialize_list as serialize_transform_list;
 pub(crate) use tree_cache::BoxTreeCache;
 

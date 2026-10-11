@@ -944,6 +944,53 @@ mod typed_memo_tests {
         assert!(dom.visibility_hidden(a));
     }
     #[test]
+    fn layout_memos_follow_position_containment_and_direction_changes() {
+        // `position_scheme`, `paint_contained` and `scroll_reverse` answer
+        // from the memo exactly as from the computed strings, through class,
+        // inherited-direction and sheet changes.
+        use crate::layout2::Pos;
+        let mut dom = Dom::parse_document(
+            "<style>.a{position:absolute} .s{position:-webkit-sticky} .c{contain:content}\
+             .r{direction:rtl} .f{display:flex;flex-direction:row-reverse}</style>\
+             <div id=p><div id=x>x</div></div>",
+        );
+        let (p, x) = (dom.get_by_id("p").unwrap(), dom.get_by_id("x").unwrap());
+        let read = |dom: &Dom| {
+            let first = (
+                dom.position_scheme(x),
+                dom.paint_contained(x),
+                crate::layout2::scroll_reverse(dom, x),
+            );
+            assert_eq!(first.0, Pos::of(dom, x));
+            assert_eq!(
+                first,
+                (
+                    dom.position_scheme(x),
+                    dom.paint_contained(x),
+                    crate::layout2::scroll_reverse(dom, x),
+                ),
+                "the memo repeats the answer"
+            );
+            first
+        };
+        assert_eq!(read(&dom), (Pos::Static, false, [false, false]));
+        dom.set_attr(x, "class", "a c");
+        assert_eq!(read(&dom), (Pos::Absolute, true, [false, false]));
+        dom.set_attr(x, "class", "s");
+        assert_eq!(read(&dom), (Pos::Sticky, false, [false, false]));
+        dom.set_attr(p, "class", "r");
+        assert_eq!(read(&dom), (Pos::Sticky, false, [true, false]), "inherited rtl");
+        dom.set_attr(x, "class", "f");
+        assert_eq!(read(&dom), (Pos::Static, false, [false, false]), "row-reverse in rtl");
+        let style = dom.create_element("style");
+        let css = dom.create_text("#x{position:fixed;contain:strict}");
+        dom.append(style, css);
+        let root = dom.document_element().unwrap();
+        dom.append(root, style);
+        assert_eq!(read(&dom), (Pos::Fixed, true, [false, false]));
+    }
+
+    #[test]
     fn the_css_image_memo_follows_classes_inheritance_variables_and_sheets() {
         // `names_css_images` answers as reading the four image-valued
         // properties would, through every change that reaches them.

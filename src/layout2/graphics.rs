@@ -805,12 +805,7 @@ impl<'a> Builder<'a> {
 
     fn collect_sticky_in<'f>(&mut self, fragment: &'f Frag, ancestors: &mut Vec<&'f Frag>) {
         if fragment.node != NO_NODE
-            && matches!(
-                self.dom
-                    .computed_value_resolved(fragment.node, "position")
-                    .as_deref(),
-                Some("sticky" | "-webkit-sticky")
-            )
+            && self.dom.position_scheme(fragment.node) == super::Pos::Sticky
         {
             let mut parent = self.dom.parent_flat(fragment.node);
             let mut container = None;
@@ -2656,12 +2651,7 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
 /// positioned element's border box; `auto` leaves that edge at the border
 /// edge. Percentages are not part of the legacy grammar.
 fn legacy_clip_rect(dom: &Dom, node: NodeId, border_box: CssRect) -> Option<CssRect> {
-    if !matches!(
-        dom.computed_value_resolved(node, "position")
-            .as_deref()
-            .map(str::trim),
-        Some("absolute" | "fixed")
-    ) {
+    if !dom.position_scheme(node).out_of_flow() {
         return None;
     }
     let value = dom.computed_value_resolved(node, "clip")?;
@@ -6752,7 +6742,12 @@ fn rectangular_overflow_clip(dom: &Dom, fragment: &Frag) -> Option<Clip> {
         return None;
     }
     let [x, y] =
-        overflow_axes(dom, fragment.node).map(|value| matches!(value.as_str(), "hidden" | "clip"));
+        overflow_axes(dom, fragment.node).map(|value| {
+            matches!(
+                value,
+                super::overflow::Overflow::Hidden | super::overflow::Overflow::Clip
+            )
+        });
     // CSS Containment 2 #containment-paint: the used overflow of a paint
     // containment box clips a `visible` axis.
     let used = fragment.paint.overflow.map(|axis| {
@@ -6783,30 +6778,21 @@ fn rectangular_overflow_clip(dom: &Dom, fragment: &Frag) -> Option<Clip> {
 }
 
 fn rounded_overflow_clip(dom: &Dom, fragment: &Frag) -> Option<PaintShape> {
+    use super::overflow::Overflow;
     let style = PaintStyle::Element(fragment.node);
-    let shorthand = style.value(dom, "overflow").unwrap_or_default();
-    let mut parts = shorthand.split_whitespace();
-    let sx = parts.next().unwrap_or("visible");
-    let sy = parts.next().unwrap_or(sx);
-    let x = style.value(dom, "overflow-x");
-    let y = style.value(dom, "overflow-y");
-    let mut x = x.as_deref().unwrap_or(sx).trim();
-    let mut y = y.as_deref().unwrap_or(sy).trim();
-    let scrollable = |value| matches!(value, "hidden" | "auto" | "scroll" | "overlay");
     // CSS Overflow 3 §3.1: visible computes to auto opposite a scrollable
-    // axis. clip/visible, in contrast, explicitly has no rounded clip.
-    if x == "visible" && scrollable(y) {
-        x = "auto";
-    }
-    if y == "visible" && scrollable(x) {
-        y = "auto";
-    }
+    // axis (the resolved axes). clip/visible, in contrast, explicitly has
+    // no rounded clip.
+    let axes = overflow_axes(dom, fragment.node);
     let contained = fragment
         .paint
         .overflow
         .iter()
-        .all(|axis| *axis == super::overflow::Overflow::Clip);
-    if !(scrollable(x) && scrollable(y) || x == "clip" && y == "clip" || contained) {
+        .all(|axis| *axis == Overflow::Clip);
+    if !(axes.iter().all(|axis| axis.scrollable())
+        || axes == [Overflow::Clip; 2]
+        || contained)
+    {
         return None;
     }
     let border = CssRect::new(fragment.x, fragment.y, fragment.w, fragment.h);

@@ -3424,18 +3424,14 @@ impl Dom {
         if self.is_row_subgrid_item(id) {
             return false;
         }
-        // overflow ≠ visible on EITHER axis → BFC (a scroll/clip viewport).
-        for prop in ["overflow", "overflow-x", "overflow-y"] {
-            if let Some(v) = self.computed_style(id, prop)
-                && v.split_whitespace().any(|t| {
-                    matches!(
-                        t.to_ascii_lowercase().as_str(),
-                        "hidden" | "clip" | "scroll" | "auto"
-                    )
-                })
-            {
-                return true;
-            }
+        // overflow ≠ visible on EITHER axis → BFC (a scroll/clip viewport),
+        // from the resolved axes layout itself uses (`overflow_axes`).
+        if self
+            .overflow_axes(id)
+            .iter()
+            .any(|axis| *axis != crate::layout2::Overflow::Visible)
+        {
+            return true;
         }
         // display values that establish an independent context for their
         // contents (`effective_display` = cascade ELSE the tag's UA default, so a
@@ -3891,6 +3887,34 @@ impl Dom {
                     self.computed_value_resolved(id, "overflow-y"),
                 )
             },
+        )
+    }
+
+    /// CSS Containment 2 #containment-paint: whether `contain` includes paint
+    /// containment (`paint`, or the `content` and `strict` shorthands).
+    pub(crate) fn paint_contained(&self, id: NodeId) -> bool {
+        self.typed_memo(
+            id,
+            |typed| typed.paint_contained,
+            |typed, contained| typed.paint_contained = Some(contained),
+            || {
+                self.computed_value_resolved(id, "contain")
+                    .is_some_and(|value| {
+                        value
+                            .split_whitespace()
+                            .any(|value| matches!(value, "paint" | "content" | "strict"))
+                    })
+            },
+        )
+    }
+
+    /// The element's positioning scheme (CSS 2 §9.3.1, `layout2::Pos::of`).
+    pub(crate) fn position_scheme(&self, id: NodeId) -> crate::layout2::Pos {
+        self.typed_memo(
+            id,
+            |typed| typed.position,
+            |typed, position| typed.position = Some(position),
+            || crate::layout2::Pos::of(self, id),
         )
     }
 
