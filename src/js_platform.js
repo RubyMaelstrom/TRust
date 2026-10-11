@@ -5748,6 +5748,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         }
         return false;
     }
+    // UI Events #handle-native-mouse-click: whether the primary release just
+    // handled generates a click (a common ancestor of its press and release
+    // targets), which the actor then runs in the same task (`trust.click`).
+    trust.pointerClickPending = function () {
+        return !!pointerInput.click;
+    };
     trust.click = function (id) {
         const pending = pointerInput.click;
         if (pending) {
@@ -6248,7 +6254,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // select page text with it (Selection API §2 "User Interactions");
     // `bypassMenu` is the user's bypass of #maybe-show-context-menu.
     trust.pointerButton = function (id, pressed, x, y, screenX, screenY, button = 0, modifiers = 0, routed = false,
-        textId = null, textOffset = 0, selects = false, bypassMenu = false) {
+        textId = null, textOffset = 0, selects = false, bypassMenu = false, hitTest = false) {
         if (currentPointerLock()) { pointerInput.modifiers = modifiers; return trust.lockedPointerButton(button, pressed); }
         x = +x || 0; y = +y || 0;
         screenX = screenX === undefined ? x : +screenX || 0;
@@ -6262,6 +6268,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             pointerInput.buttons = pressed ? pointerInput.buttons | mask : pointerInput.buttons & ~mask;
             processPointerCapture();
         }
+        // UI Events #handle-native-mouse-down and #handle-native-mouse-up:
+        // the target of a native button (`hitTest`) is the hit test at the
+        // event's viewport coordinates, CSSOM View's elementFromPoint on the
+        // current layout. A frontend's id names only the regions it found
+        // interactive.
+        if (hitTest && !pointerInput.capture) id = pointerHitTest(x, y, id);
         if (!pointerInput.capture) id = nativeFrameContentHit(id, x, y);
         const hit = id;
         if (pointerInput.capture && (!routed || id != null)) id = elementIdentity(pointerInput.capture.target);
@@ -6270,7 +6282,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             const rect = frameContentClientRect(childFrame);
             const canceled = trustOf(internalsOf(childFrame).contentRealmWindow).pointerButton(id, pressed,
                 x - rect.left, y - rect.top, screenX, screenY, button, modifiers, true,
-                textId, textOffset, selects, bypassMenu);
+                textId, textOffset, selects, bypassMenu, hitTest);
             if (pressed && !canceled) trust.focusPage(id);
             if (!pressed && !pointerInput.buttons) trust.hover(hit,x,y,screenX,screenY,modifiers,false,false);
             return canceled;
@@ -19297,6 +19309,20 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const root = doc.documentElement;
         if (root && result[result.length - 1] !== root) result.push(root);
         return result;
+    }
+    // UI Events #hit-test for a native pointer button in this Realm's
+    // Document: the arena id of the frontmost hit-testable element at the
+    // viewport point, before any retargeting (dispatch retargets), or
+    // `fallback` outside any box. Ids of a child navigable's nodes stay
+    // unwrapped; native input routing descends into their Realm.
+    function pointerHitTest(x, y, fallback) {
+        const doc = g.document;
+        const frame = doc && internalsOf(doc).frame || null;
+        if (!doc || (!frame && nodeIds.get(doc) !== 0)) return fallback;
+        const ids = __dom_elements_from_point(
+            frame ? nodeIds.get(frame) : 0, x, y, +(g.scrollX || 0), +(g.scrollY || 0)
+        );
+        return ids && ids.length ? ids[0] : fallback;
     }
     function documentElementFromPoint(doc, x, y, argumentCount) {
         const elements = documentElementsFromPoint(doc, x, y, argumentCount);

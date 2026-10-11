@@ -7539,6 +7539,51 @@ impl DesktopApp {
         }
     }
 
+    /// The frontend's part of a primary click on a live page, whose actor
+    /// dispatches the click itself: number spin buttons, the native editor's
+    /// focus and caret, a select's drop-down box, and external media. Every
+    /// other activation behavior (links, checkboxes, buttons, submission,
+    /// reset, file prompts) is the actor's.
+    fn native_pointer_activation(&mut self, target: PageHit) {
+        if matches!(target.link, Some(Link::Media(_))) {
+            if let Some(link) = target.link {
+                self.activate_link(link);
+            }
+            return;
+        }
+        if self.step_number_from_pointer(&target) {
+            return;
+        }
+        let Some((form, field)) = self.form_target_for_hit(&target) else {
+            return;
+        };
+        let Some(kind) = self
+            .page_layout
+            .as_ref()
+            .and_then(|page| page.document.forms.get(form))
+            .and_then(|form| form.fields.get(field))
+            .map(|control| control.kind.clone())
+        else {
+            return;
+        };
+        match kind {
+            FieldKind::Text | FieldKind::Number | FieldKind::Password | FieldKind::Textarea => {
+                self.focus_form(form, field);
+                self.position_form_caret(form, field);
+            }
+            FieldKind::Select(_) => {
+                self.form_editor = None;
+                self.set_focus(FocusTarget::Form { form, field });
+                self.open_select_popup(form, field);
+            }
+            FieldKind::Hidden => {}
+            _ => {
+                self.form_editor = None;
+                self.set_focus(FocusTarget::Form { form, field });
+            }
+        }
+    }
+
     fn step_number_from_pointer(&mut self, target: &PageHit) -> bool {
         let Some((form, field)) = self.form_target_for_hit(target) else {
             return false;
@@ -7576,10 +7621,11 @@ impl DesktopApp {
                 .and_then(|f| f.fields.get(field))
                 .and_then(|f| f.live_node)
         {
+            // The actor dispatched this pointer click itself.
             self.dispatch(UserAction::StepNumber {
                 node,
                 direction,
-                click: true,
+                click: false,
             });
         } else {
             self.step_number_control(form, field, direction);
@@ -8405,7 +8451,6 @@ impl DesktopApp {
                             self.pressed_hit
                         );
                     }
-                    let actor_fallback = self.pressed_hit.as_ref().and_then(|hit| hit.actor);
                     let click_target =
                         self.pressed_hit
                             .take()
@@ -8418,19 +8463,17 @@ impl DesktopApp {
                     if std::env::var_os("TRUST_DESKTOP_TRACE").is_some() {
                         eprintln!("desktop: primary click target={click_target:?}");
                     }
+                    // UI Events #handle-native-mouse-click: a live page's
+                    // actor decides from its own hit tests whether the release
+                    // generates a click and runs it with its activation
+                    // behavior. The frontend keeps only its native control
+                    // duties; a static page has no actor, so it activates here.
                     if let Some(target) = click_target {
-                        if !self.step_number_from_pointer(&target) {
+                        if self.browser.page_is_live() {
+                            self.native_pointer_activation(target);
+                        } else if !self.step_number_from_pointer(&target) {
                             self.activate_page_hit(target);
                         }
-                    } else if self.browser.page_is_live()
-                        && let Some(node) = actor_fallback
-                    {
-                        // The actor's up target may be captured even though the
-                        // release has no presentation hit (e.g. over chrome).
-                        self.dispatch(UserAction::Activate(Link::JsClick {
-                            node,
-                            href: String::new(),
-                        }));
                     }
                 }
                 _ => {}

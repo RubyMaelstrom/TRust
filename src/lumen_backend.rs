@@ -3267,12 +3267,11 @@ mod desktop {
                 Wake::Maintenance => {}
                 // UI Events #handle-native-mouse-click: the platform calls it
                 // "immediately after handle native mouse up for mouseups that
-                // generate clicks". The frontend queues the click it decided on
-                // in the same native event as the release, so once pointerup
-                // and mouseup have run the click is ordinarily waiting: run it
-                // in this task, with one rendering update. Anything else keeps
-                // its turn at the head of the interaction queue; a click not
-                // yet queued runs as the next task, as before.
+                // generate clicks". The actor decides that from its own hit
+                // tests of the press and release and runs the click in this
+                // task, with one rendering update. The frontend's own focus of
+                // the pressed control, sent with the release, rides along;
+                // anything else keeps its turn at the head of the queue.
                 Wake::Interaction(Some(PageCmd::PointerButton {
                     node,
                     pressed: false,
@@ -3284,21 +3283,13 @@ mod desktop {
                     prepare_interaction(&mut page, &interrupt);
                     run_pointer_button(&mut page, node, false, x, y, 0, metadata);
                     checkpoint(&mut page, "pointer button");
-                    // The frontend's own focus of the activated control rides
-                    // with the gesture too.
                     let mut next = next_interaction(&mut interaction_lookahead, &mut interactions);
                     while let Some(PageCmd::Focus(focus)) = next {
                         run_focus(&mut page, focus);
                         next = next_interaction(&mut interaction_lookahead, &mut interactions);
                     }
-                    let released = match next {
-                        Some(PageCmd::Click(click)) => run_click(&mut page, &events, click),
-                        other => {
-                            interaction_lookahead = other;
-                            finish_task_with_ack(&mut page, &events, false)
-                        }
-                    };
-                    if !released {
+                    interaction_lookahead = next;
+                    if !finish_pointer_release(&mut page, &events) {
                         break;
                     }
                     prefer_command = false;
@@ -6087,7 +6078,11 @@ mod desktop {
                 prepare_interaction(page, interrupt);
                 run_pointer_button(page, node, pressed, x, y, button, metadata);
                 checkpoint(page, "pointer button");
-                finish_task_with_ack(page, events, false)
+                if !pressed && button == 0 {
+                    finish_pointer_release(page, events)
+                } else {
+                    finish_task_with_ack(page, events, false)
+                }
             }
             PageCmd::Focus(node) | PageCmd::KeyboardFocus(node) => {
                 prepare_interaction(page, interrupt);
@@ -6635,14 +6630,33 @@ mod desktop {
                 text_offset,
                 Value::Bool(metadata.selection.is_some()),
                 Value::Bool(metadata.bypass_context_menu),
+                // A native button: the actor hit-tests its target.
+                Value::Bool(true),
             ],
             "pointer button",
         );
     }
 
-    /// UI Events #send-click-event for the frontend's native click on
-    /// `node` (the pending pointer click target replaces it in the prelude),
-    /// then the activation's navigation or form submission, ending the task.
+    /// End the task of a primary release: UI Events #handle-native-mouse-click
+    /// when the release generated a click (its press and release targets
+    /// share an ancestor), with the click's activation, else the release's
+    /// own rendering update.
+    fn finish_pointer_release(
+        page: &mut LumenPage,
+        events: &tokio::sync::mpsc::Sender<PageEvt>,
+    ) -> bool {
+        let pending = call_trust(page, "pointerClickPending", &[], "pointer click")
+            .is_some_and(|value| page.engine.ctx().to_boolean(&value));
+        if pending {
+            run_click(page, events, DOCUMENT)
+        } else {
+            finish_task_with_ack(page, events, false)
+        }
+    }
+
+    /// UI Events #send-click-event for a native click on `node` (a pending
+    /// pointer click target replaces it in the prelude), then the
+    /// activation's navigation or form submission, ending the task.
     fn run_click(
         page: &mut LumenPage,
         events: &tokio::sync::mpsc::Sender<PageEvt>,
@@ -32242,10 +32256,11 @@ mod tests {
         // UI Events #handle-native-mouse-click: the platform calls it
         // "immediately after handle native mouse up" for a mouseup that
         // generates a click, so no rendering update shows the mouseup without
-        // its click; the frontend's focus of the activated control, which it
-        // sends between them, rides along (d, u, f, c below). The slow
-        // mousedown holds the actor until the frontend's release and click are
-        // both queued, as one native event queues them.
+        // its click. The actor decides the click from its own hit tests; the
+        // frontend's focus of the pressed control, sent with the release,
+        // rides along (d, u, f, c below), and any other command runs after the
+        // click. The slow mousedown holds the actor until the release and
+        // what follows it are queued, as one native event queues them.
         let html = "<button id=b>go</button><input id=i><input id=j><output id=o></output><script>\
             const o = document.getElementById('o'), b = document.getElementById('b');\
             const log = (s) => { o.textContent += s; };\
@@ -32262,11 +32277,12 @@ mod tests {
         let mut env = crate::js::PageEnv::bare(DEFAULT_URL);
         env.terminal_presentation = false;
         let (handle, mut events) = spawn_page(html.into(), env);
+        // Inside the button, past the body's 8px margin.
         let pointer = |pressed| crate::js::PageCmd::PointerButton {
             node: Some(button),
             pressed,
-            x: 5.0,
-            y: 5.0,
+            x: 12.0,
+            y: 12.0,
             button: 0,
             metadata: Default::default(),
         };
@@ -32283,24 +32299,15 @@ mod tests {
             ) {}
             let mut seen = Vec::new();
             for (gesture, expected) in [
-                (
-                    vec![
-                        pointer(true),
-                        pointer(false),
-                        crate::js::PageCmd::Click(button),
-                    ],
-                    "duc",
-                ),
+                (vec![pointer(true), pointer(false)], "duc"),
                 (
                     vec![
                         pointer(true),
                         pointer(false),
                         crate::js::PageCmd::Focus(Some(input)),
-                        crate::js::PageCmd::Click(button),
                     ],
                     "ducdufc",
                 ),
-                // Any other command keeps its place ahead of the click.
                 (
                     vec![
                         pointer(true),
@@ -32311,9 +32318,8 @@ mod tests {
                             checked: None,
                             commit: false,
                         },
-                        crate::js::PageCmd::Click(button),
                     ],
-                    "ducdufcdugc",
+                    "ducdufcducg",
                 ),
             ] {
                 for command in gesture {
@@ -32344,9 +32350,77 @@ mod tests {
             );
             assert_eq!(
                 seen.last().map(String::as_str),
-                Some("ducdufcdugc"),
+                Some("ducdufcducg"),
                 "{seen:?}"
             );
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_click_on_plain_content_reaches_the_element_under_the_pointer() {
+        // UI Events #handle-native-mouse-down, -up and -click with CSSOM View
+        // elementFromPoint as the hit test: a press and release over text with
+        // no listener of its own target that text's element, and the click
+        // they generate bubbles to a document listener ("click outside").
+        // The frontend names no node for such content.
+        let html = "<style>body{margin:0}p{margin:0;height:40px}</style><body id=body>\
+            <p id=first>first</p><p id=plain>plain text</p><output id=o></output><script>\
+            const o = document.getElementById('o');\
+            for (const type of ['mousedown', 'mouseup', 'click'])\
+                document.addEventListener(type, (e) => { o.textContent += type[5] || type[0]; \
+                    o.textContent += ':' + e.target.id + ' '; });</script>";
+        let mut env = crate::js::PageEnv::bare(DEFAULT_URL);
+        env.terminal_presentation = false;
+        let (handle, mut events) = spawn_page(html.into(), env);
+        let pointer = |pressed, y| crate::js::PageCmd::PointerButton {
+            node: None,
+            pressed,
+            x: 20.0,
+            y,
+            button: 0,
+            metadata: Default::default(),
+        };
+        let output = |html: &str| {
+            let start = html.find("<output")?;
+            let open = start + html[start..].find('>')? + 1;
+            let close = open + html[open..].find("</output>")?;
+            Some(html[open..close].to_owned())
+        };
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !matches!(
+                events.recv().await,
+                Some(crate::js::PageEvt::Updated { .. })
+            ) {}
+            // A press on one paragraph and a release on the other generate a
+            // click at their nearest common ancestor, the body (Pointer Events
+            // #the-click-auxclick-and-contextmenu-events).
+            for command in [
+                pointer(true, 60.0),
+                pointer(false, 60.0),
+                pointer(true, 20.0),
+                pointer(false, 60.0),
+            ] {
+                handle.try_send_user(command).unwrap();
+            }
+            let expected = "d:plain u:plain c:plain d:first u:plain c:body ";
+            let mut last = String::new();
+            loop {
+                match events.recv().await {
+                    Some(crate::js::PageEvt::Updated { html, .. }) => {
+                        if let Some(text) = output(&html) {
+                            last = text;
+                            if last == expected {
+                                break;
+                            }
+                        }
+                    }
+                    Some(crate::js::PageEvt::Trouble(errors)) => panic!("{errors:?}"),
+                    Some(_) => {}
+                    None => panic!("actor ended; saw {last:?}"),
+                }
+            }
         })
         .await
         .unwrap();
@@ -32359,7 +32433,8 @@ mod tests {
         // release select the page's text, and the page answers the gesture
         // with what its selection selects (user-select:none text left out);
         // a secondary click asks whether the frontend shows its menu.
-        let html = "<p id=p>Hello brave world</p><p id=n style='user-select:none'>skip</p>\
+        let html = "<style>body{margin:0}p{margin:0;height:20px}</style>\
+            <p id=p>Hello brave world</p><p id=n style='user-select:none'>skip</p>\
             <p id=q>more text</p><script>document.getElementById('p').addEventListener('click',()=>{});\
             document.getElementById('n').addEventListener('contextmenu',(e)=>e.preventDefault());</script>";
         let dom = Dom::parse_document(html);
@@ -32376,11 +32451,18 @@ mod tests {
             )),
             ..Default::default()
         };
+        // The actor hit-tests each button: the paragraphs are 20px rows.
+        let row = |node| {
+            [element("p"), element("n"), element("q")]
+                .iter()
+                .position(|&id| id == node)
+                .unwrap() as f64
+        };
         let button = |node, pressed, button, metadata| crate::js::PageCmd::PointerButton {
             node: Some(node),
             pressed,
             x: 10.0,
-            y: 10.0,
+            y: 10.0 + 20.0 * row(node),
             button,
             metadata,
         };
@@ -32392,7 +32474,7 @@ mod tests {
             handle
                 .try_send_user(button(element("p"), true, 0, metadata(p, 2, 1)))
                 .unwrap();
-            handle.send_hover_with_metadata(Some(element("q")), 10.0, 40.0, metadata(q, 4, 2));
+            handle.send_hover_with_metadata(Some(element("q")), 10.0, 50.0, metadata(q, 4, 2));
             handle
                 .try_send_user(button(element("q"), false, 0, metadata(q, 4, 3)))
                 .unwrap();

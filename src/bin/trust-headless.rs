@@ -397,22 +397,20 @@ fn replay_click(controller: &mut BrowserController, options: &Options, point: Cs
             },
         });
     }
-    let Some(hit) = hit else {
-        return String::from("nothing activatable");
-    };
-    // The desktop's page_hit_activation: a live page receives a script click
-    // on the hit actor, carrying the link's href for its default action.
+    // UI Events #handle-native-mouse-click: a live page's actor dispatched
+    // the click of that release itself, with its activation behavior, as in
+    // trust-desktop. A static page has no actor: activate the hit here.
     let live = controller.page_is_live();
+    let Some(hit) = hit else {
+        return String::from(if live {
+            "no activatable region (the page dispatched its own click)"
+        } else {
+            "nothing activatable"
+        });
+    };
     let activation = match (&hit.link, hit.actor) {
         (Some(Link::Media(_)), _) => hit.link.clone(),
-        (link, Some(node)) if live => Some(Link::JsClick {
-            node,
-            href: match link {
-                Some(Link::JsClick { href, .. }) => href.clone(),
-                Some(Link::Form { .. }) | None => String::new(),
-                Some(link) => link.to_string(),
-            },
-        }),
+        _ if live => None,
         (link, actor) => link.clone().or_else(|| {
             actor.map(|node| Link::JsClick {
                 node,

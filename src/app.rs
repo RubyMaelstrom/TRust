@@ -642,8 +642,6 @@ pub struct App {
     /// nothing ever sent — the two are equivalent: a clear is only worth
     /// sending after a `Some`). Reset with the live page.
     hover_sent: Option<usize>,
-    /// A native primary press on a live JS target activates only on release.
-    pressed_js_link: Option<Link>,
     /// A pointer-target change awaiting the dwell: `(actor node or None =
     /// clear, viewport CSS px of the hovered cell)`. The run loop arms a
     /// `HOVER_DWELL` one-shot when this changes (the resize-at-rest pattern)
@@ -1016,7 +1014,6 @@ impl App {
             session_history_sent: None,
             page_history_updates: 0,
             hover_sent: None,
-            pressed_js_link: None,
             hover_want: None,
             scroll_intent: 0,
             region_geom_sent: std::collections::HashMap::new(),
@@ -1630,7 +1627,6 @@ impl App {
         // hover/click grab so a drag begun on the bar never also follows a link.
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                self.pressed_js_link = None;
                 if let Some(d) = self.scrollbar_at(mouse.column, mouse.row) {
                     self.scroll_drag = Some(d);
                     self.seek_scroll_drag(mouse.column, mouse.row);
@@ -1661,12 +1657,12 @@ impl App {
             let actor = self.page_focus_actor(link.as_ref(), mouse.column, mouse.row);
             self.finish_form_edit();
             self.dispatch_primary_pointer(actor, true, mouse.column, mouse.row);
-            if let Some(link) = link {
-                if self.live_page.is_some() && matches!(link, Link::JsClick { .. }) {
-                    self.pressed_js_link = Some(link);
-                } else {
-                    self.browser_follow_link(link);
-                }
+            // A live page's script targets activate through the actor's
+            // own click of the press and release.
+            if let Some(link) = link
+                && !(self.live_page.is_some() && matches!(link, Link::JsClick { .. }))
+            {
+                self.browser_follow_link(link);
             }
             return;
         }
@@ -1697,12 +1693,12 @@ impl App {
                 let link = on_link.then(|| self.selected_link()).flatten();
                 let actor = self.page_focus_actor(link.as_ref(), mouse.column, mouse.row);
                 self.dispatch_primary_pointer(actor, true, mouse.column, mouse.row);
-                if let Some(link) = link {
-                    if self.live_page.is_some() && matches!(link, Link::JsClick { .. }) {
-                        self.pressed_js_link = Some(link);
-                    } else {
-                        self.browser_follow_link(link);
-                    }
+                // A live page's script targets activate through the actor's
+                // own click of the press and release.
+                if let Some(link) = link
+                    && !(self.live_page.is_some() && matches!(link, Link::JsClick { .. }))
+                {
+                    self.browser_follow_link(link);
                 }
             }
             (MouseEventKind::Up(MouseButton::Left), true)
@@ -1710,14 +1706,13 @@ impl App {
                     || (self.mode == Mode::Search
                         && matches!(self.search_target, Some(Link::Form { .. }))) =>
             {
-                let pressed = self.pressed_js_link.take();
+                // UI Events #handle-native-mouse-click: the live page's actor
+                // decides from its own hit tests whether this release
+                // generates a click, and runs it with its activation behavior.
                 let on_link = self.browser_mouse_hover(mouse.column, mouse.row);
                 let link = on_link.then(|| self.selected_link()).flatten();
                 let actor = self.page_focus_actor(link.as_ref(), mouse.column, mouse.row);
                 self.dispatch_primary_pointer(actor, false, mouse.column, mouse.row);
-                if let Some(pressed) = pressed.filter(|pressed| Some(pressed) == link.as_ref()) {
-                    self.browser_follow_link(pressed);
-                }
             }
             _ => {}
         }
@@ -5588,7 +5583,6 @@ impl App {
             self.page_history_updates = 0;
             // A fresh engine holds no hover chain; start the app's view clean.
             self.hover_sent = None;
-            self.pressed_js_link = None;
             self.hover_want = None;
             self.page_js_errors = response
                 .js
@@ -5637,7 +5631,6 @@ impl App {
         self.session_history_sent = None;
         self.page_history_updates = 0;
         self.hover_sent = None;
-        self.pressed_js_link = None;
         self.hover_want = None;
         self.region_geom_sent.clear();
         self.picker_open_sent = None;
@@ -12514,7 +12507,10 @@ mod tests {
     }
 
     #[test]
-    fn live_mouse_press_release_precedes_click_and_drag_out_does_not_activate() {
+    fn live_mouse_press_and_release_leave_the_click_to_the_page_actor() {
+        // UI Events #handle-native-mouse-click: the page actor hit-tests the
+        // press and release itself and dispatches the click they generate;
+        // the terminal sends the native button transitions only.
         use crate::js::{PageCmd, PageHandle};
         use crossterm::event::{MouseButton, MouseEventKind};
         let mut app = super::App::new(None, 23);
@@ -12554,14 +12550,11 @@ mod tests {
         app.on_mouse_event(mouse(MouseEventKind::Up(MouseButton::Left), x, y));
         assert!(matches!(
             drain(&mut rx).as_slice(),
-            [
-                PageCmd::PointerButton {
-                    node: Some(42),
-                    pressed: false,
-                    ..
-                },
-                PageCmd::Click(42)
-            ]
+            [PageCmd::PointerButton {
+                node: Some(42),
+                pressed: false,
+                ..
+            }]
         ));
         app.on_mouse_event(mouse(MouseEventKind::Down(MouseButton::Left), x, y));
         drain(&mut rx);
@@ -12570,7 +12563,6 @@ mod tests {
             drain(&mut rx).as_slice(),
             [PageCmd::PointerButton { pressed: false, .. }]
         ));
-        assert!(app.pressed_js_link.is_none());
     }
 
     #[test]
@@ -16195,9 +16187,14 @@ mod tests {
             x,
             y,
         ));
-        assert!(app.page_busy);
-        drain_page_event(&mut app).await;
-        assert!(app.browser.as_ref().unwrap().doc.fixed.is_empty());
+        // The page actor hit-tests the press and release and runs the click.
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !app.browser.as_ref().unwrap().doc.fixed.is_empty() {
+                drain_page_event(&mut app).await;
+            }
+        })
+        .await
+        .expect("the click removed the overlay");
     }
 
     #[tokio::test]
@@ -16244,9 +16241,14 @@ mod tests {
             col + width.max(1) / 2,
             r as u16,
         ));
-        assert!(app.page_busy);
-        drain_page_event(&mut app).await;
-        assert!(app.browser.as_ref().unwrap().doc.fixed.is_empty());
+        // The page actor hit-tests the press and release and runs the click.
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !app.browser.as_ref().unwrap().doc.fixed.is_empty() {
+                drain_page_event(&mut app).await;
+            }
+        })
+        .await
+        .expect("the click hid the dialog");
     }
 
     async fn drain_page_event(app: &mut super::App) {
