@@ -804,8 +804,7 @@ impl<'a> Builder<'a> {
     }
 
     fn collect_sticky_in<'f>(&mut self, fragment: &'f Frag, ancestors: &mut Vec<&'f Frag>) {
-        if fragment.node != NO_NODE
-            && self.dom.position_scheme(fragment.node) == super::Pos::Sticky
+        if fragment.node != NO_NODE && self.dom.position_scheme(fragment.node) == super::Pos::Sticky
         {
             let mut parent = self.dom.parent_flat(fragment.node);
             let mut container = None;
@@ -6741,13 +6740,12 @@ fn rectangular_overflow_clip(dom: &Dom, fragment: &Frag) -> Option<Clip> {
     if matches!(dom.tag_name(fragment.node), Some("iframe" | "frame")) {
         return None;
     }
-    let [x, y] =
-        overflow_axes(dom, fragment.node).map(|value| {
-            matches!(
-                value,
-                super::overflow::Overflow::Hidden | super::overflow::Overflow::Clip
-            )
-        });
+    let [x, y] = overflow_axes(dom, fragment.node).map(|value| {
+        matches!(
+            value,
+            super::overflow::Overflow::Hidden | super::overflow::Overflow::Clip
+        )
+    });
     // CSS Containment 2 #containment-paint: the used overflow of a paint
     // containment box clips a `visible` axis.
     let used = fragment.paint.overflow.map(|axis| {
@@ -6789,10 +6787,7 @@ fn rounded_overflow_clip(dom: &Dom, fragment: &Frag) -> Option<PaintShape> {
         .overflow
         .iter()
         .all(|axis| *axis == Overflow::Clip);
-    if !(axes.iter().all(|axis| axis.scrollable())
-        || axes == [Overflow::Clip; 2]
-        || contained)
-    {
+    if !(axes.iter().all(|axis| axis.scrollable()) || axes == [Overflow::Clip; 2] || contained) {
         return None;
     }
     let border = CssRect::new(fragment.x, fragment.y, fragment.w, fragment.h);

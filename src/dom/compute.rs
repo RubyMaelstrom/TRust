@@ -979,9 +979,17 @@ mod typed_memo_tests {
         dom.set_attr(x, "class", "s");
         assert_eq!(read(&dom), (Pos::Sticky, false, [false, false]));
         dom.set_attr(p, "class", "r");
-        assert_eq!(read(&dom), (Pos::Sticky, false, [true, false]), "inherited rtl");
+        assert_eq!(
+            read(&dom),
+            (Pos::Sticky, false, [true, false]),
+            "inherited rtl"
+        );
         dom.set_attr(x, "class", "f");
-        assert_eq!(read(&dom), (Pos::Static, false, [false, false]), "row-reverse in rtl");
+        assert_eq!(
+            read(&dom),
+            (Pos::Static, false, [false, false]),
+            "row-reverse in rtl"
+        );
         let style = dom.create_element("style");
         let css = dom.create_text("#x{position:fixed;contain:strict}");
         dom.append(style, css);

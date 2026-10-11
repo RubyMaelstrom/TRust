@@ -23042,11 +23042,7 @@ customElements.define('lit-counter', LitCounter);
                 .all
                 .contains(&format!("https://example.test/{name}"))
         };
-        let (x, p, c) = (
-            dom.get_by_id("x").unwrap(),
-            dom.get_by_id("p").unwrap(),
-            dom.get_by_id("c").unwrap(),
-        );
+        let (x, p) = (dom.get_by_id("x").unwrap(), dom.get_by_id("p").unwrap());
         assert!(!found(&dom, "a.png"));
         dom.set_attr(x, "class", "i");
         assert!(found(&dom, "a.png"));

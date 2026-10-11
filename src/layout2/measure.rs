@@ -484,7 +484,10 @@ fn composed_union(
         }
         let mut acc = content.get(&id).copied();
         // `composed_children` order (light, then shadow) without a list.
-        let shadow = dom.shadow_root(id).into_iter().flat_map(|root| dom.child_iter(root));
+        let shadow = dom
+            .shadow_root(id)
+            .into_iter()
+            .flat_map(|root| dom.child_iter(root));
         for child in dom.child_iter(id).chain(shadow) {
             if !keep(child) {
                 continue;
@@ -753,7 +756,13 @@ fn project(
     if !fx.own.is_empty() {
         let fixed_nodes = std::mem::take(&mut fx.nodes);
         let fx_content = composed_union(dom, &fx.own, |id| fixed_nodes.contains(&id));
-        select_into(dom, &fx_content, &fx, &mut out, wanted.then_some(&mut scroll));
+        select_into(
+            dom,
+            &fx_content,
+            &fx,
+            &mut out,
+            wanted.then_some(&mut scroll),
+        );
     }
     // Scroll overflow follows containing blocks and local overflow clipping;
     // the composed union above remains solely the inline border-box fallback.

@@ -3375,9 +3375,10 @@ impl Dom {
 
     /// `is_row_subgrid_item` given the element's `effective_display`.
     fn is_row_subgrid_item_with(&self, id: NodeId, display: Option<&str>) -> bool {
-        if !matches!(display, Some("grid" | "inline-grid")) || !self
-            .computed_value_resolved(id, "grid-template-rows")
-            .is_some_and(|v| v.split_whitespace().next() == Some("subgrid"))
+        if !matches!(display, Some("grid" | "inline-grid"))
+            || !self
+                .computed_value_resolved(id, "grid-template-rows")
+                .is_some_and(|v| v.split_whitespace().next() == Some("subgrid"))
             || matches!(
                 self.computed_value_resolved(id, "position").as_deref(),
                 Some("absolute" | "fixed")
@@ -11031,7 +11032,8 @@ impl Dom {
     /// advances `epoch`, and the parser's and collection's untracked tree
     /// changes drop it with the slot directory.
     pub(crate) fn flat_document_order(&self) -> std::sync::Arc<[NodeId]> {
-        if let Some(order) = DocumentOrders::current(&self.document_orders.borrow().flat, self.epoch)
+        if let Some(order) =
+            DocumentOrders::current(&self.document_orders.borrow().flat, self.epoch)
         {
             return order;
         }

@@ -1333,7 +1333,16 @@ pub(crate) fn measure_retained_layout_for_box(
     images: &ImageSizes,
     requested_box: Option<NodeId>,
 ) -> RetainedMeasurement {
-    measure_retained(dom, base, viewport, forms, controls, images, requested_box, true)
+    measure_retained(
+        dom,
+        base,
+        viewport,
+        forms,
+        controls,
+        images,
+        requested_box,
+        true,
+    )
 }
 
 /// `measure_retained_layout_for_box` whose complete projection leaves the
@@ -1348,7 +1357,16 @@ pub(crate) fn measure_retained_border_boxes(
     images: &ImageSizes,
     requested_box: Option<NodeId>,
 ) -> RetainedMeasurement {
-    measure_retained(dom, base, viewport, forms, controls, images, requested_box, false)
+    measure_retained(
+        dom,
+        base,
+        viewport,
+        forms,
+        controls,
+        images,
+        requested_box,
+        false,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
