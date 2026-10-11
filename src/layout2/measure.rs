@@ -15,7 +15,8 @@
 //! as the old engine's cell union did—but without replacing the border box that
 //! `getBoundingClientRect()` must report.
 
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::HashMap;
 
 use crate::dom::{Dom, NodeId};
 use crate::layout2::{NO_NODE, PxRect};
@@ -50,6 +51,9 @@ pub(super) struct SingleBoxIndex {
     /// Most pages have few transformed boxes. Only those boxes need a second
     /// rectangle; don't double retained geometry for every ordinary element.
     untransformed: rustc_hash::FxHashMap<NodeId, PxRect>,
+    /// Every node a fragment, line piece or inline box names: a superset of
+    /// the nodes the complete projection attributes geometry to (`walk`).
+    owners: rustc_hash::FxHashSet<NodeId>,
     #[cfg(test)]
     pub(super) visited: usize,
 }
@@ -73,6 +77,12 @@ impl SingleBoxIndex {
                 #[cfg(test)]
                 {
                     index.visited += 1;
+                }
+                if frag.node != NO_NODE {
+                    index.owners.insert(frag.node);
+                }
+                if let FragKind::Line(line) = &frag.kind {
+                    index.note_line(line);
                 }
                 if frag.node != NO_NODE
                     && matches!(frag.kind, FragKind::Block | FragKind::TableCell(_))
@@ -106,8 +116,40 @@ impl SingleBoxIndex {
         index
     }
 
+    /// The nodes a line's pieces and inline boxes name, laid and painted.
+    fn note_line(&mut self, line: &LineFrag) {
+        let laid = line.laid.as_deref();
+        let pieces = line.pieces.iter().chain(&line.atom_boxes).chain(
+            laid.into_iter()
+                .flat_map(|laid| laid.pieces.iter().chain(&laid.atom_boxes)),
+        );
+        for piece in pieces {
+            self.owners.insert(piece.item.node);
+            if let Some(boxes) = &piece.boxes {
+                self.owners
+                    .extend(boxes.chain.iter().map(|entry| entry.key.0));
+            }
+        }
+        self.owners
+            .extend(line.empty_boxes.iter().map(|empty| empty.entry.key.0));
+    }
+
     pub(super) fn get(&self, node: NodeId) -> Option<PxRect> {
         self.boxes.get(&node).copied().flatten()
+    }
+
+    /// Whether the complete projection can give `node` a border box. It
+    /// unions the geometry of each element's shadow-including inclusive
+    /// descendants (`composed_union`), so an element none of whose
+    /// descendants owns geometry (one in a `display: none` subtree, say) has
+    /// no box (CSSOM View #dom-element-getboundingclientrect), and a read of
+    /// it needs no projection.
+    pub(super) fn may_have_box(&self, dom: &Dom, node: NodeId) -> bool {
+        self.owners.contains(&node)
+            || dom
+                .composed_descendants(node)
+                .iter()
+                .any(|descendant| self.owners.contains(descendant))
     }
 
     pub(super) fn get_layout(&self, node: NodeId) -> Option<PxRect> {
@@ -119,6 +161,7 @@ impl SingleBoxIndex {
         // Requested-storage lower bound, matching the host inventory contract.
         self.boxes.capacity() * std::mem::size_of::<(NodeId, Option<PxRect>)>()
             + self.untransformed.capacity() * std::mem::size_of::<(NodeId, PxRect)>()
+            + self.owners.capacity() * std::mem::size_of::<NodeId>()
     }
 }
 
@@ -268,7 +311,7 @@ fn piece_rect(f: &Frag, line: &LineFrag, p: &super::inline::Piece) -> Rect {
 
 /// Fold a rectangle into a `NodeId → Rect` map (union on collision — an
 /// element that generates several fragments reports their bounding box).
-fn add(map: &mut HashMap<NodeId, Rect>, node: NodeId, r: Rect) {
+fn add(map: &mut FxHashMap<NodeId, Rect>, node: NodeId, r: Rect) {
     map.entry(node)
         .and_modify(|c| *c = Rect::union(*c, r))
         .or_insert(r);
@@ -282,11 +325,11 @@ fn add(map: &mut HashMap<NodeId, Rect>, node: NodeId, r: Rect) {
 /// collects every element id touched (fixed-subtree membership).
 #[derive(Default)]
 struct Own {
-    own: HashMap<NodeId, Rect>,
-    block: HashMap<NodeId, Rect>,
-    inline: HashMap<NodeId, Rect>,
-    css_size: HashMap<NodeId, [f32; 2]>,
-    nodes: HashSet<NodeId>,
+    own: FxHashMap<NodeId, Rect>,
+    block: FxHashMap<NodeId, Rect>,
+    inline: FxHashMap<NodeId, Rect>,
+    css_size: FxHashMap<NodeId, [f32; 2]>,
+    nodes: FxHashSet<NodeId>,
     frame_viewports: HashMap<NodeId, crate::render::CssRect>,
 }
 
@@ -388,8 +431,8 @@ fn inline_box_fragments(f: &Frag, line: &LineFrag) -> Vec<(NodeId, Rect)> {
 /// that block too. Union each such block into its inline ancestors (up to the
 /// enclosing block container), never an atomic inline, float or positioned
 /// box, whose geometry stays outside the inline box.
-fn blocks_in_inlines(dom: &Dom, own: &Own) -> HashMap<NodeId, Rect> {
-    let mut out = HashMap::new();
+fn blocks_in_inlines(dom: &Dom, own: &Own) -> FxHashMap<NodeId, Rect> {
+    let mut out = FxHashMap::default();
     for (&node, &rect) in &own.block {
         let Some(parent) = dom
             .parent_composed(node)
@@ -427,10 +470,10 @@ fn blocks_in_inlines(dom: &Dom, own: &Own) -> HashMap<NodeId, Rect> {
 /// scrollable document (fixed boxes do not contribute to scroll overflow).
 fn composed_union(
     dom: &Dom,
-    base: &HashMap<NodeId, Rect>,
+    base: &FxHashMap<NodeId, Rect>,
     keep: impl Fn(NodeId) -> bool,
-) -> HashMap<NodeId, Rect> {
-    let mut content: HashMap<NodeId, Rect> = base
+) -> FxHashMap<NodeId, Rect> {
+    let mut content: FxHashMap<NodeId, Rect> = base
         .iter()
         .filter(|&(&k, _)| keep(k))
         .map(|(&k, &v)| (k, v))
@@ -440,7 +483,9 @@ fn composed_union(
             continue;
         }
         let mut acc = content.get(&id).copied();
-        for child in dom.composed_children(id) {
+        // `composed_children` order (light, then shadow) without a list.
+        let shadow = dom.shadow_root(id).into_iter().flat_map(|root| dom.child_iter(root));
+        for child in dom.child_iter(id).chain(shadow) {
             if !keep(child) {
                 continue;
             }
@@ -460,10 +505,10 @@ fn composed_union(
 /// box while `scrollWidth`/`scrollHeight` return the size of its scrolling area.
 fn select_into(
     dom: &Dom,
-    content: &HashMap<NodeId, Rect>,
+    content: &FxHashMap<NodeId, Rect>,
     own: &Own,
     out: &mut HashMap<NodeId, PxRect>,
-    scroll: &mut HashMap<NodeId, PxRect>,
+    mut scroll: Option<&mut HashMap<NodeId, PxRect>>,
 ) {
     let block = &own.block;
     let css_size = &own.css_size;
@@ -499,9 +544,10 @@ fn select_into(
                 css_height: css_size.get(&node).map(|size| f64::from(size[1])),
             },
         );
-        if dom.is_scroll_container(node)
-            || dom.is_hscroll_container(node)
-            || matches!(dom.tag_name(node), Some("html" | "body"))
+        if let Some(scroll) = scroll.as_deref_mut()
+            && (dom.is_scroll_container(node)
+                || dom.is_hscroll_container(node)
+                || matches!(dom.tag_name(node), Some("html" | "body")))
         {
             scroll.insert(
                 node,
@@ -531,7 +577,24 @@ pub(super) fn boxes(
     HashMap<NodeId, PxRect>,
     HashMap<NodeId, crate::render::CssRect>,
 ) {
-    project(dom, root, fixed, top_layer, true, true)
+    project(dom, root, fixed, top_layer, true, true, true)
+}
+
+/// [`boxes`] without the scrolling areas: the border boxes and child
+/// Document viewports a rendering update needs. Only CSSOM View's
+/// `scrollWidth`/`scrollHeight` and scroll clamping read scrolling areas.
+#[allow(clippy::type_complexity)]
+pub(super) fn border_boxes(
+    dom: &Dom,
+    root: &Frag,
+    fixed: &[Frag],
+    top_layer: &[TopFrag],
+) -> (
+    HashMap<NodeId, PxRect>,
+    HashMap<NodeId, crate::render::CssRect>,
+) {
+    let (boxes, _, frame_viewports) = project(dom, root, fixed, top_layer, true, true, false);
+    (boxes, frame_viewports)
 }
 
 /// [`boxes`] for graphical layout, which keeps only the border boxes. Its
@@ -543,7 +606,7 @@ pub(super) fn painted_boxes(
     fixed: &[Frag],
     top_layer: &[TopFrag],
 ) -> HashMap<NodeId, PxRect> {
-    project(dom, root, fixed, top_layer, true, false).0
+    project(dom, root, fixed, top_layer, true, false, true).0
 }
 
 pub(super) fn layout_boxes(
@@ -552,7 +615,7 @@ pub(super) fn layout_boxes(
     fixed: &[Frag],
     top_layer: &[TopFrag],
 ) -> HashMap<NodeId, PxRect> {
-    project(dom, root, fixed, top_layer, false, false).0
+    project(dom, root, fixed, top_layer, false, false, true).0
 }
 
 /// Each element's first box fragment's `UsedBasis` (CSSOM #resolved-values).
@@ -653,6 +716,7 @@ fn project(
     top_layer: &[TopFrag],
     visual: bool,
     text_controls: bool,
+    scrolling_areas: bool,
 ) -> (
     HashMap<NodeId, PxRect>,
     HashMap<NodeId, PxRect>,
@@ -678,15 +742,26 @@ fn project(
     let mut out: HashMap<NodeId, PxRect> = HashMap::new();
     let mut scroll: HashMap<NodeId, PxRect> = HashMap::new();
     let flow_content = composed_union(dom, &flow.own, |_| true);
-    select_into(dom, &flow_content, &flow, &mut out, &mut scroll);
+    let wanted = visual && scrolling_areas;
+    select_into(
+        dom,
+        &flow_content,
+        &flow,
+        &mut out,
+        wanted.then_some(&mut scroll),
+    );
     if !fx.own.is_empty() {
         let fixed_nodes = std::mem::take(&mut fx.nodes);
         let fx_content = composed_union(dom, &fx.own, |id| fixed_nodes.contains(&id));
-        select_into(dom, &fx_content, &fx, &mut out, &mut scroll);
+        select_into(dom, &fx_content, &fx, &mut out, wanted.then_some(&mut scroll));
     }
     // Scroll overflow follows containing blocks and local overflow clipping;
     // the composed union above remains solely the inline border-box fallback.
     if !visual {
+        return (out, HashMap::new(), flow.frame_viewports);
+    }
+    if !scrolling_areas {
+        flow.frame_viewports.extend(fx.frame_viewports);
         return (out, HashMap::new(), flow.frame_viewports);
     }
     let mut areas = if text_controls {

@@ -72,6 +72,10 @@ struct LumenGeomCache {
     boxes: std::collections::HashMap<crate::dom::NodeId, crate::layout2::PxRect>,
     tracks: std::collections::HashMap<crate::dom::NodeId, (Vec<f32>, Vec<f32>)>,
     scrolling_areas: std::collections::HashMap<crate::dom::NodeId, crate::layout2::PxRect>,
+    /// Whether `scrolling_areas` is complete for `fragments`. Rendering and
+    /// rectangle reads need only border boxes; the first scroll-extent read
+    /// or scroll clamp of a layout projects the areas (`scrolling_areas`).
+    scrolling_areas_current: bool,
     frame_viewports: std::collections::HashMap<crate::dom::NodeId, crate::render::CssRect>,
     paint: Option<crate::render::PagePaint>,
     hit_index: Option<crate::render::PageHitIndex>,
@@ -98,6 +102,7 @@ impl LumenGeomCache {
             boxes: Default::default(),
             tracks: Default::default(),
             scrolling_areas: Default::default(),
+            scrolling_areas_current: false,
             frame_viewports: Default::default(),
             paint: None,
             hit_index: None,
@@ -22659,26 +22664,15 @@ fn ensure_host_geometry(
             .is_some()
             .then(Instant::now);
         let (forms, controls) = crate::http::extract_forms_arena(&dom, &base, None);
-        let measured = if requested_box.is_some() {
-            crate::layout2::measure_retained_layout_for_box(
-                &dom,
-                &base,
-                viewport,
-                &forms,
-                &controls,
-                &images.borrow(),
-                requested_box,
-            )
-        } else {
-            crate::layout2::measure_retained_layout(
-                &dom,
-                &base,
-                viewport,
-                &forms,
-                &controls,
-                &images.borrow(),
-            )
-        };
+        let measured = crate::layout2::measure_retained_border_boxes(
+            &dom,
+            &base,
+            viewport,
+            &forms,
+            &controls,
+            &images.borrow(),
+            requested_box,
+        );
         if let Some(measure_started) = measure_started {
             let cascade = crate::dom::take_casc_diag();
             eprintln!(
@@ -22710,6 +22704,7 @@ fn ensure_host_geometry(
         cached.boxes = measured.boxes;
         cached.tracks = measured.tracks;
         cached.scrolling_areas = measured.scrolling_areas;
+        cached.scrolling_areas_current = measured.scrolling_areas_measured;
         cached.frame_viewports = measured.frame_viewports;
         cached.fragments = measured.fragments;
         // The superseded paint stays available to top-level hit testing
@@ -22740,10 +22735,20 @@ fn ensure_host_geometry(
         if let Some((node, rect, frame)) = single {
             cached.boxes.insert(node, rect);
             cached.frame_viewports.extend(frame);
+        } else if requested_box.is_some_and(|node| !fragments.may_have_box(&dom, node)) {
+            // No box: the read finds no entry, as after a complete projection.
         } else {
-            let (boxes, scrolling_areas, frame_viewports) = fragments.measure_boxes(&dom);
+            // Which read needed every box (a node the single-box index cannot
+            // answer: inline, fragmented, a table part, or no box at all).
+            if std::env::var_os("TRUST_DIAG_FRAME").is_some() {
+                eprintln!(
+                    "DIAGGEOM projection reason={reason} node={requested_box:?} tag={:?} display={:?}",
+                    requested_box.and_then(|node| dom.tag_name(node)),
+                    requested_box.and_then(|node| dom.computed_value(node, "display")),
+                );
+            }
+            let (boxes, frame_viewports) = fragments.measure_border_boxes(&dom);
             cached.boxes = boxes;
-            cached.scrolling_areas = scrolling_areas;
             cached.frame_viewports = frame_viewports;
             cached.complete_geometry = true;
         }
@@ -22756,6 +22761,19 @@ fn ensure_host_geometry(
         let _ = dom_handle.borrow_mut().take_geometry_dirty_targets();
     }
     cache
+}
+
+/// CSSOM View #scrolling-area for every scroll container of the cached
+/// layout, projected from its fragments on the first read that needs one.
+fn project_scrolling_areas(cache: &Rc<RefCell<LumenGeomCache>>, dom: &Dom) {
+    let mut cached = cache.borrow_mut();
+    if cached.scrolling_areas_current {
+        return;
+    }
+    if let Some(fragments) = cached.fragments.clone() {
+        cached.scrolling_areas = fragments.measure_boxes(dom).1;
+    }
+    cached.scrolling_areas_current = true;
 }
 
 fn ensure_host_hit_test_cache(ctx: &mut Ctx) -> Rc<RefCell<LumenGeomCache>> {
@@ -23080,6 +23098,15 @@ fn host_rect(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value
     let (id, epoch, presentation_epoch, top_level_frame, requested_box) = {
         let dom = dom_handle.borrow();
         let id = host_arg_node(&dom, args, 0);
+        // CSSOM View #dom-element-getboundingclientrect and Resize Observer
+        // #calculate-box-size: an element without an associated box has no
+        // geometry. A node outside the shadow-including tree of every
+        // rendered Document (a child navigable's Document hangs from its
+        // container in this arena) has none however the page is laid out,
+        // so answer without bringing layout up to date or projecting boxes.
+        if id.is_none_or(|id| !dom.is_connected(id)) {
+            return Ok(Value::Null);
+        }
         let top_level_frame = id.is_some_and(|id| {
             matches!(dom.tag_name(id), Some("iframe" | "frame")) && dom.frame_owner(id).is_none()
         });
@@ -23289,6 +23316,7 @@ fn host_scroll_get(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
         let id = {
             let dom = host_dom(ctx);
             let dom = dom.borrow();
+            project_scrolling_areas(&cache, &dom);
             host_arg_node(&dom, args, 0)
         };
         id.and_then(|id| cache.borrow().scrolling_areas.get(&id).copied())
@@ -23314,6 +23342,7 @@ fn host_scroll_set(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
     let cache = ensure_host_geom_cache(ctx, "scroll-position");
     let dom_handle = host_dom(ctx);
     let dom = dom_handle.borrow();
+    project_scrolling_areas(&cache, &dom);
     let Some(id) = host_arg_node(&dom, args, 0) else {
         return Ok(Value::Bool(false));
     };
@@ -26348,6 +26377,131 @@ mod tests {
         })()"#
             ),
             "ok"
+        );
+    }
+
+    #[test]
+    fn scrolling_areas_wait_for_a_read_that_needs_them() {
+        // CSSOM View #dom-element-scrollwidth and #dom-element-scrolltop read
+        // an element's scrolling area; border boxes and rendering do not. A
+        // complete projection leaves the areas until a scroll extent or a
+        // scroll clamp needs them, which then answers for the same layout.
+        let dom = Rc::new(RefCell::new(Dom::parse_document(
+            "<style>body{margin:0} #s{width:100px;height:50px;overflow:hidden}\
+             #w{width:300px;height:200px}</style><div id=s><div id=w></div></div>\
+             <span id=i>inline text</span>",
+        )));
+        let mut engine =
+            configured_engine(HostState::new(dom, Rc::new(RealmClock::new())), DEFAULT_URL);
+        let cache = engine
+            .ctx()
+            .host_mut::<HostState>()
+            .unwrap()
+            .geom_cache
+            .clone();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "String(document.getElementById('i').getBoundingClientRect().width>0)"
+            ),
+            "true"
+        );
+        assert!(cache.borrow().complete_geometry);
+        assert!(!cache.borrow().scrolling_areas_current);
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "var s=document.getElementById('s'); JSON.stringify([s.scrollWidth,s.scrollHeight])"
+            ),
+            "[300,200]"
+        );
+        assert!(cache.borrow().scrolling_areas_current);
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "document.getElementById('w').style.height='120px';\
+                 s.scrollTop=1000; s.scrollLeft=1000; JSON.stringify([s.scrollTop,s.scrollLeft])"
+            ),
+            "[70,200]"
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "document.getElementById('w').style.width='400px'; String(s.scrollWidth)"
+            ),
+            "400"
+        );
+    }
+
+    #[test]
+    fn a_detached_elements_rectangle_needs_no_layout() {
+        // CSSOM View #dom-element-getboundingclientrect: an element without
+        // an associated box reports an empty rectangle. A node outside the
+        // document has none, so reading it neither lays the changed page out
+        // again nor projects every box; connected nodes, shadow ones
+        // included, still see the change.
+        let dom = Rc::new(RefCell::new(Dom::parse_document(
+            "<style>body{margin:0}</style><div id=box style='width:40px;height:10px'></div>",
+        )));
+        let mut engine =
+            configured_engine(HostState::new(dom, Rc::new(RealmClock::new())), DEFAULT_URL);
+        let start = crate::layout2::layout_pass_count();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "var box=document.getElementById('box'); String(box.getBoundingClientRect().width)"
+            ),
+            "40"
+        );
+        assert_eq!(crate::layout2::layout_pass_count(), start + 1);
+        let cache = engine
+            .ctx()
+            .host_mut::<HostState>()
+            .unwrap()
+            .geom_cache
+            .clone();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"
+                box.style.width='50px';
+                var detached=document.createElement('div');
+                detached.style.width='30px';
+                var inner=document.createElement('span');
+                detached.append(inner);
+                var removed=document.createElement('p');
+                document.body.append(removed);
+                removed.remove();
+                var lone=document.createElement('span').attachShadow({mode:'open'});
+                var shadowed=document.createElement('b');
+                lone.append(shadowed);
+                JSON.stringify([detached,inner,removed,shadowed].map(e=>{
+                    var r=e.getBoundingClientRect(); return [r.x,r.y,r.width,r.height];
+                }))
+            "#
+            ),
+            "[[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0]]"
+        );
+        assert_eq!(
+            crate::layout2::layout_pass_count(),
+            start + 1,
+            "detached nodes need no layout"
+        );
+        assert!(!cache.borrow().complete_geometry);
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"
+                var host=document.createElement('div');
+                document.body.append(host);
+                var inside=document.createElement('div');
+                inside.style.cssText='width:20px;height:5px';
+                host.attachShadow({mode:'open'}).append(inside);
+                JSON.stringify([box.getBoundingClientRect().width,
+                    inside.getBoundingClientRect().width])
+            "#
+            ),
+            "[50,20]"
         );
     }
 

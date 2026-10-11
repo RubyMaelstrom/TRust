@@ -1294,6 +1294,9 @@ pub fn measure_boxes_css(
 #[derive(Default)]
 pub(crate) struct RetainedMeasurement {
     pub complete_geometry: bool,
+    /// Whether `scrolling_areas` holds every scrolling area of the layout
+    /// (`measure_retained_border_boxes` leaves them to a later projection).
+    pub scrolling_areas_measured: bool,
     pub viewport_fixed_roots: Vec<NodeId>,
     pub boxes: HashMap<NodeId, PxRect>,
     pub tracks: HashMap<NodeId, (Vec<f32>, Vec<f32>)>,
@@ -1306,6 +1309,7 @@ pub(crate) struct RetainedMeasurement {
 /// Measure once and keep the fragment tree for the next paint/hit-test
 /// consumer. Unretainable trees still return complete geometry; painting
 /// takes the ordinary borrowed full-layout fallback in that exceptional case.
+#[cfg(test)]
 pub(crate) fn measure_retained_layout(
     dom: &Dom,
     base: &Url,
@@ -1319,6 +1323,7 @@ pub(crate) fn measure_retained_layout(
 
 /// Keep the same complete layout, while allowing a rectangle-only consumer
 /// to defer projecting unrelated boxes and scrolling areas from its fragments.
+#[cfg(test)]
 pub(crate) fn measure_retained_layout_for_box(
     dom: &Dom,
     base: &Url,
@@ -1328,10 +1333,40 @@ pub(crate) fn measure_retained_layout_for_box(
     images: &ImageSizes,
     requested_box: Option<NodeId>,
 ) -> RetainedMeasurement {
+    measure_retained(dom, base, viewport, forms, controls, images, requested_box, true)
+}
+
+/// `measure_retained_layout_for_box` whose complete projection leaves the
+/// scrolling areas, which only CSSOM View's scroll extents and scroll
+/// clamping read, to the retained fragments (`LayoutFragments::measure_boxes`).
+pub(crate) fn measure_retained_border_boxes(
+    dom: &Dom,
+    base: &Url,
+    viewport: Viewport,
+    forms: &[Form],
+    controls: &ControlMap,
+    images: &ImageSizes,
+    requested_box: Option<NodeId>,
+) -> RetainedMeasurement {
+    measure_retained(dom, base, viewport, forms, controls, images, requested_box, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn measure_retained(
+    dom: &Dom,
+    base: &Url,
+    viewport: Viewport,
+    forms: &[Form],
+    controls: &ControlMap,
+    images: &ImageSizes,
+    requested_box: Option<NodeId>,
+    scrolling_areas: bool,
+) -> RetainedMeasurement {
     session::with_layout(dom, base, viewport, forms, controls, images, |layout| {
         let Some(layout) = layout else {
             return RetainedMeasurement {
                 complete_geometry: true,
+                scrolling_areas_measured: true,
                 ..Default::default()
             };
         };
@@ -1364,16 +1399,32 @@ pub(crate) fn measure_retained_layout_for_box(
             };
             Some((node, rect, frame))
         });
-        let (boxes, scrolling_areas, frame_viewports) = match single_box {
+        // An unretainable tree keeps no fragments to project them from later.
+        let scrolling_areas = scrolling_areas
+            || !(flow::positioned_complete(&layout.root)
+                && layout.fixed.iter().all(flow::positioned_complete)
+                && layout
+                    .top_layer
+                    .iter()
+                    .all(|top| flow::positioned_complete(&top.fragment)));
+        let (boxes, areas, frame_viewports) = match single_box {
             Some((node, rect, frame)) => (
                 HashMap::from([(node, rect)]),
                 HashMap::new(),
                 frame.into_iter().collect(),
             ),
-            None => measure::boxes(dom, &layout.root, &layout.fixed, &layout.top_layer),
+            None if scrolling_areas => {
+                measure::boxes(dom, &layout.root, &layout.fixed, &layout.top_layer)
+            }
+            None => {
+                let (boxes, frame_viewports) =
+                    measure::border_boxes(dom, &layout.root, &layout.fixed, &layout.top_layer);
+                (boxes, HashMap::new(), frame_viewports)
+            }
         };
         RetainedMeasurement {
             complete_geometry: single_box.is_none(),
+            scrolling_areas_measured: single_box.is_none() && scrolling_areas,
             viewport_fixed_roots: layout
                 .fixed
                 .iter()
@@ -1388,7 +1439,7 @@ pub(crate) fn measure_retained_layout_for_box(
                 .collect(),
             boxes,
             tracks: layout.tracks,
-            scrolling_areas,
+            scrolling_areas: areas,
             frame_viewports,
             fragments: LayoutFragments::from_owned(
                 layout.root,

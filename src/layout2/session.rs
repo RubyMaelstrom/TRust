@@ -89,6 +89,14 @@ impl LayoutFragments {
             .get(node)
     }
 
+    /// Whether the complete projection can give `node` a border box
+    /// (`SingleBoxIndex::may_have_box`).
+    pub(crate) fn may_have_box(&self, dom: &crate::dom::Dom, node: NodeId) -> bool {
+        self.single_boxes
+            .get_or_init(|| measure::SingleBoxIndex::new(&self.root, &self.fixed, &self.top_layer))
+            .may_have_box(dom, node)
+    }
+
     /// The viewport of the child Document `frame` contains, as the complete
     /// projection's `frame_viewports` records it.
     pub(crate) fn frame_viewport(
@@ -166,6 +174,18 @@ impl LayoutFragments {
         HashMap<NodeId, crate::render::CssRect>,
     ) {
         measure::boxes(dom, &self.root, &self.fixed, &self.top_layer)
+    }
+
+    /// `measure_boxes` without the scrolling areas (`measure::border_boxes`).
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn measure_border_boxes(
+        &self,
+        dom: &Dom,
+    ) -> (
+        HashMap<NodeId, PxRect>,
+        HashMap<NodeId, crate::render::CssRect>,
+    ) {
+        measure::border_boxes(dom, &self.root, &self.fixed, &self.top_layer)
     }
 
     pub(super) fn retain(
