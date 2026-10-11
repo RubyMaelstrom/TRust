@@ -75,7 +75,9 @@ impl ScopedSheets {
 impl Pending {
     pub(super) fn retain_nodes(&mut self, live: impl Fn(NodeId) -> bool) {
         self.roots.get_mut().retain(|&node, _| live(node));
-        self.dirty.set(!self.roots.get_mut().is_empty());
+        // Scoped sheet changes still owe their flush its proof.
+        self.dirty
+            .set(!self.roots.get_mut().is_empty() || self.scoped_sheets.get_mut().is_some());
     }
 
     pub(super) fn retained_bytes(&self) -> usize {
@@ -1194,18 +1196,14 @@ impl Dom {
             self.selector_epoch = self.selector_epoch.wrapping_add(1);
             return None;
         }
-        let subjects = {
-            let cache = self.style_cache.borrow();
-            match cache.as_ref() {
-                Some((epoch, index)) if *epoch == self.style_epoch => index
-                    .selector_dependencies
-                    .for_node(self, node)
-                    .attributes
-                    .subjects(self, node, name, old_class),
-                // No current rule index: no proof of independence.
-                _ => None,
-            }
-        };
+        // No rule index to prove against: no proof of independence.
+        let subjects = self.proof_style_index().and_then(|index| {
+            index
+                .selector_dependencies
+                .for_node(self, node)
+                .attributes
+                .subjects(self, node, name, old_class)
+        });
         // Selector matching never crosses into another tree, and inserting a
         // detached tree restyles all of it. Frameworks set attributes on nodes
         // before inserting them; with a broad dependency (`dir`, `lang`, …)
@@ -1400,6 +1398,22 @@ impl Dom {
         let cache = self.style_cache.borrow();
         let (epoch, index) = cache.as_ref()?;
         (*epoch == self.style_epoch).then(|| index.clone())
+    }
+
+    /// The rule index a mutation's local invalidation is proved against: the
+    /// current one, or while only scoped sheet changes await their flush, the
+    /// index from before them (a component adopts its sheets and then renders
+    /// into its shadow root before anything reads style). The changed scopes'
+    /// rules select only inside their hosts' subtrees, which are already
+    /// queued for a full restyle, and every other scope's rules are the same
+    /// in both indexes (the flush proves it, or restyles the document). Any
+    /// other sheet change since then expired every style (`Dom::mark`), so no
+    /// proof made until the next read can leave a stale style behind.
+    fn proof_style_index(&self) -> Option<std::rc::Rc<StyleIndex>> {
+        self.current_style_index().or_else(|| {
+            let pending = self.pending_style_invalidations.scoped_sheets.borrow();
+            pending.as_ref().map(|scoped| scoped.old.clone())
+        })
     }
 
     #[track_caller]
@@ -1706,41 +1720,33 @@ impl Dom {
         // Detached construction uses the same dependency proof. Recursively
         // invalidating its entire growing root on each append would make a
         // fragment-building loop quadratic even without structural selectors.
-        // Without a current rule index there is no proof of independence, so
-        // slot assignment need not be asked about.
-        let index_current = self
-            .style_cache
-            .borrow()
-            .as_ref()
-            .is_some_and(|(epoch, _)| *epoch == self.style_epoch);
-        let local = (index_current && !self.child_list_may_reassign_slots(parent, changed))
-            .then(|| {
-                let index = self.style_cache.borrow();
-                index.as_ref().and_then(|(epoch, index)| {
-                    let dependencies = index.selector_dependencies.for_node(self, parent);
-                    let relational_root = dependencies.relational_root(self, parent);
-                    (*epoch == self.style_epoch
-                        && !dependencies.structure_global
-                        // Selectors 4 #the-dir-pseudo / HTML directionality:
-                        // only an automatic-direction ancestor can acquire a
-                        // different direction when its descendants change.
-                        && !(dependencies.text_direction
-                            && self.text_may_change_direction(parent))
-                        && !(dependencies.indeterminate
-                            && (changed.is_empty()
-                                || changed.iter().any(|&node| self.subtree_has_radio_group_member(node))))
-                        && !(dependencies.text_placeholder
-                            && self.tag_name(parent) == Some("textarea"))
-                        && !(dependencies.form_state
-                            && self.structure_may_change_validity(parent, changed)))
-                    .then(|| {
-                        let (empty_siblings, restyle_children) =
-                            dependencies.structure_impact(self, parent);
-                        (empty_siblings, restyle_children, relational_root)
-                    })
+        // Without a rule index there is no proof of independence, so slot
+        // assignment need not be asked about.
+        let local = self
+            .proof_style_index()
+            .filter(|_| !self.child_list_may_reassign_slots(parent, changed))
+            .and_then(|index| {
+                let dependencies = index.selector_dependencies.for_node(self, parent);
+                let relational_root = dependencies.relational_root(self, parent);
+                (!dependencies.structure_global
+                    // Selectors 4 #the-dir-pseudo / HTML directionality:
+                    // only an automatic-direction ancestor can acquire a
+                    // different direction when its descendants change.
+                    && !(dependencies.text_direction
+                        && self.text_may_change_direction(parent))
+                    && !(dependencies.indeterminate
+                        && (changed.is_empty()
+                            || changed.iter().any(|&node| self.subtree_has_radio_group_member(node))))
+                    && !(dependencies.text_placeholder
+                        && self.tag_name(parent) == Some("textarea"))
+                    && !(dependencies.form_state
+                        && self.structure_may_change_validity(parent, changed)))
+                .then(|| {
+                    let (empty_siblings, restyle_children) =
+                        dependencies.structure_impact(self, parent);
+                    (empty_siblings, restyle_children, relational_root)
                 })
-            })
-            .flatten();
+            });
         let Some((empty_siblings, restyle_children, relational_root)) = local else {
             // Selector matching never leaves a tree and a detached tree has
             // no rendered style: without a local proof, restyle the detached
@@ -1828,18 +1834,13 @@ impl Dom {
         // but do not discard unrelated trees merely to reshape control text.
         let independent = !self.shadow_style_dependencies(node)
             && !self.text_may_change_direction(node)
-            && self
-                .style_cache
-                .borrow()
-                .as_ref()
-                .is_some_and(|(epoch, index)| {
-                    let dependencies = index.selector_dependencies.for_node(self, node);
-                    *epoch == self.style_epoch
-                        && !dependencies.text_placeholder
-                        // HTML #constraints: the value feeds the validity
-                        // states of the control and of its form owner.
-                        && !dependencies.form_state
-                });
+            && self.proof_style_index().is_some_and(|index| {
+                let dependencies = index.selector_dependencies.for_node(self, node);
+                !dependencies.text_placeholder
+                    // HTML #constraints: the value feeds the validity
+                    // states of the control and of its form owner.
+                    && !dependencies.form_state
+            });
         if !independent {
             // Placeholder state must invalidate its selector subjects, even
             // when the value transition leaves the element tree unchanged.
@@ -1871,19 +1872,16 @@ impl Dom {
         }
         let stable_shadow_text = character_data.is_some() && !empty_changed && !direction_changed;
         // A shadow host's Text children are slottables (DOM #find-slotables).
-        let independent = (self.shadow_root(parent).is_none() || stable_shadow_text) && {
-            let index = self.style_cache.borrow();
-            index.as_ref().is_some_and(|(epoch, index)| {
+        let independent = (self.shadow_root(parent).is_none() || stable_shadow_text)
+            && self.proof_style_index().is_some_and(|index| {
                 let dependencies = index.selector_dependencies.for_node(self, parent);
-                *epoch == self.style_epoch
-                    && !(direction_changed
-                        && dependencies.text_direction
-                        && self.text_may_change_direction(parent))
+                !(direction_changed
+                    && dependencies.text_direction
+                    && self.text_may_change_direction(parent))
                     && !(dependencies.text_placeholder && self.tag_name(parent) == Some("textarea"))
                     && !(dependencies.form_state && self.text_may_change_validity(parent))
                     && !(empty_changed && dependencies.empty)
-            })
-        };
+            });
         if !independent {
             // Character data moves no elements; only the text node changed.
             self.touch_content(Some(parent), character_data.as_slice());
@@ -3259,6 +3257,33 @@ mod tests {
     }
 
     #[test]
+    fn a_component_rendering_after_adopting_its_sheets_restyles_only_itself() {
+        // A component adopts its sheets and renders its template into its
+        // shadow root before anything reads style, while light-tree code
+        // mutates beside it. Those mutations are proved local against the
+        // index from before the adoption; nothing expires every style.
+        let (mut dom, _, [outer_root, _], stable) = adopted_sheet_document();
+        assert_style_values_match_cold(&mut dom);
+        let kept = dom.cascaded_maps(stable);
+        let values = dom.style_value_epoch;
+        dom.set_adopted_styles(outer_root, ADOPTED_SHEETS[0]);
+        let item = dom.create_element("b");
+        dom.set_attr(item, "class", "x");
+        dom.append(outer_root, item);
+        let text = dom.create_text("rendered");
+        dom.append(item, text);
+        dom.set_attr(item, "class", "y");
+        let beside = dom.create_element("i");
+        dom.append(stable, beside);
+        assert_eq!(
+            dom.style_value_epoch, values,
+            "a mutation after the adoption restyled the document"
+        );
+        assert!(std::rc::Rc::ptr_eq(&kept, &dom.cascaded_maps(stable)));
+        assert_style_values_match_cold(&mut dom);
+    }
+
+    #[test]
     fn adopted_sheet_changes_match_full_recascade() {
         for seed in [7, 0x5eed, 0xadd0] {
             let (mut dom, elements, roots, _) = adopted_sheet_document();
@@ -3282,6 +3307,78 @@ mod tests {
                 }
                 assert_style_values_match_cold(&mut dom);
             }
+        }
+    }
+
+    #[test]
+    fn mutations_while_adopted_sheet_changes_are_pending_match_full_recascade() {
+        // A component adopts its sheets and then renders into its shadow
+        // root before anything reads style; light-tree code mutates beside
+        // it. Insertions, removals and attribute writes made while scoped
+        // sheet changes await their flush, including under structural rules
+        // in the changed and unchanged scopes, must agree with a full
+        // recascade at the next read.
+        let structural = [
+            ".x:first-child{margin-left:2px} .y + .x{border-left-width:3px}",
+            ":empty{min-width:1px} .x:last-child .y{width:9px} :host(.a){color:rgb(4, 4, 4)}",
+        ];
+        let sheets: Vec<&str> = ADOPTED_SHEETS.iter().chain(&structural).copied().collect();
+        for seed in [11, 0xfeed, 0xc0de] {
+            let (mut dom, mut elements, roots, stable) = adopted_sheet_document();
+            let light = dom.create_element("style");
+            let css =
+                dom.create_text(".y:nth-child(2){padding-top:5px} div:has(> .x){min-height:4px}");
+            dom.append(light, css);
+            dom.append(stable, light);
+            assert_style_values_match_cold(&mut dom);
+            let mut state: u64 = seed;
+            let mut next = |bound: usize| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state % bound as u64) as usize
+            };
+            let classes = ["a", "b", "x", "y"];
+            let mut inserted = Vec::new();
+            for _ in 0..160 {
+                match next(5) {
+                    0 => {
+                        let node = elements[next(elements.len())];
+                        let tokens: Vec<_> =
+                            classes.iter().filter(|_| next(3) == 0).copied().collect();
+                        dom.set_attr(node, "class", &tokens.join(" "));
+                    }
+                    1 | 2 => {
+                        let root = roots[next(roots.len())];
+                        dom.set_adopted_styles(root, sheets[next(sheets.len())]);
+                    }
+                    3 => {
+                        let parent = elements[next(elements.len())];
+                        let child = dom.create_element(["b", "i", "div"][next(3)]);
+                        dom.set_attr(child, "class", classes[next(classes.len())]);
+                        let first = dom.child_iter(parent).next();
+                        match first {
+                            Some(first) if next(2) == 0 => {
+                                dom.insert_before(parent, child, Some(first));
+                            }
+                            _ => dom.append(parent, child),
+                        }
+                        inserted.push(child);
+                        elements.push(child);
+                    }
+                    _ => {
+                        if !inserted.is_empty() {
+                            let node = inserted.swap_remove(next(inserted.len()));
+                            dom.detach(node);
+                            elements.retain(|&element| element != node);
+                        }
+                    }
+                }
+                if next(4) == 0 {
+                    assert_style_values_match_cold(&mut dom);
+                }
+            }
+            assert_style_values_match_cold(&mut dom);
         }
     }
 
