@@ -542,8 +542,16 @@ current behavior and limits; consult the governing standards before changing it.
   with a space (`LineStart`). The terminal frontend has no page selection.
 - trust-desktop's context menu (`src/render/context_menu.rs`,
   `src/bin/trust-desktop/context_menu.rs`) is browser chrome like COMMAND:
-  Copy (with a selection), Reload, Open COMMAND, Kill Page (live pages) and
-  Add/Remove Bookmark (`bookmarks::Operation::Lookup`/`RemoveUrl`). Pointer
+  Open in mpv (over a media element), Open in New Tab and Copy Link (over a
+  hyperlink), Copy (with a selection), Reload, Open COMMAND, Kill Page (live
+  pages) and Add/Remove Bookmark (`bookmarks::Operation::Lookup`/
+  `RemoveUrl`). HTML #attr-media-controls puts such media features in "the
+  media element's context menu", so they do not interfere with the page's
+  rendering: graphical paint names each hit-testable media element's
+  external playback target (`PagePaint::media_targets`, from
+  `layout2::media_target`), and the menu takes the topmost one among every
+  box under the pointer (`Scene::media_target_at`), so a player's overlays
+  do not hide its video. Nothing over the page opens mpv. Pointer
   Events #maybe-show-context-menu decides: a secondary release (or the menu
   key / Shift+F10, as the key's default) fires `contextmenu`, and the menu
   shows when the page's answer (`PageEvt::ContextMenu`) is uncanceled;
@@ -743,24 +751,28 @@ current behavior and limits; consult the governing standards before changing it.
 - Audio and video (HTML #media-elements) play inline in the graphical
   frontends; the terminal plays nothing inline (`canPlayType()` answers "",
   there is no `MediaSource`) and keeps opening media and YouTube players in
-  mpv. The prelude runs the media element algorithms; `media_host` owns
-  each element's `media::player::Player` (a control thread that demuxes and
-  decodes audio, a video decode thread and a presenter publishing frames to
-  a `VideoSurface` that paint reads by surface id), whose reports come back
-  as `LumenHostTask::Media`. Audio goes to PulseAudio/PipeWire (the
-  pure-Rust `pulseaudio` crate) or dlopen'd ALSA, silently in
-  trust-headless (`media::audio::disable_device_output`); the clock follows
-  the heard audio. Bundled decoders: rav1d (AV1) and Symphonia (MP3, FLAC,
-  Vorbis, PCM). H.264, HEVC, AAC, VP8, VP9 and Opus come from the system's
-  FFmpeg, libavcodec 59–63 dlopen'd at run time (`media::decode::ffmpeg`);
-  Windows has no system decoder module yet. One registry
-  (`media::decode::Registry`, bundled first) answers `canPlayType()`,
-  `MediaSource.isTypeSupported()` and Media Capabilities, so they never
-  claim what cannot decode. Containers are TRust's own ISO BMFF, Matroska/
-  WebM and ADTS parsers plus Symphonia's Ogg/MP3/FLAC/WAV readers; HTTP
-  media streams through Range requests (CORS-safelisted single ranges) into
-  a bounded sparse cache. A top-level navigation to playable audio/video is
-  a media document (HTML #read-media) on the desktop, not a download.
+  mpv. Graphical layouts, static ones included (`render_html_for_environment`
+  and the CSS-only render set `Dom::set_inline_media`), present media
+  elements as players (a replaced box from the start, with its hit region),
+  never as links to the external player; trust-desktop offers mpv only in
+  the media element's context menu. The prelude runs the media element
+  algorithms; `media_host` owns each element's `media::player::Player` (a
+  control thread that demuxes and decodes audio, a video decode thread and a
+  presenter publishing frames to a `VideoSurface` that paint reads by surface
+  id), whose reports come back as `LumenHostTask::Media`. Audio goes to
+  PulseAudio/PipeWire (the pure-Rust `pulseaudio` crate) or dlopen'd ALSA,
+  silently in trust-headless (`media::audio::disable_device_output`); the
+  clock follows the heard audio. Bundled decoders: rav1d (AV1) and Symphonia
+  (MP3, FLAC, Vorbis, PCM). H.264, HEVC, AAC, VP8, VP9 and Opus come from the
+  system's FFmpeg, libavcodec 59–63 dlopen'd at run time
+  (`media::decode::ffmpeg`); Windows has no system decoder module yet. One
+  registry (`media::decode::Registry`, bundled first) answers `canPlayType()`,
+  `MediaSource.isTypeSupported()` and Media Capabilities, so they never claim
+  what cannot decode. Containers are TRust's own ISO BMFF, Matroska/WebM and
+  ADTS parsers plus Symphonia's Ogg/MP3/FLAC/WAV readers; HTTP media streams
+  through Range requests (CORS-safelisted single ranges) into a bounded sparse
+  cache. A top-level navigation to playable audio/video is a media document
+  (HTML #read-media) on the desktop, not a download.
 - Media Source Extensions (w3c/media-source): `media::mse` runs the segment
   parser loop for ISO BMFF and WebM byte streams, coded frame processing
   (segments and sequence modes, timestampOffset, append windows, overlap

@@ -161,7 +161,8 @@ pub(super) struct Recording {
     /// Every image the chunk requested, in call order (first occurrence).
     pub images: Vec<(ImageHandle, String)>,
     pub replaced: Vec<NodeId>,
-    pub media_controls: bool,
+    /// The chunk painted a media element's hit region (`note_media_hit`).
+    pub media_hits: bool,
 }
 
 impl Recording {
@@ -248,7 +249,7 @@ struct Chunk {
     lines: Box<[PaintLine]>,
     images: Box<[(ImageHandle, String)]>,
     replaced: Box<[NodeId]>,
-    media_controls: bool,
+    media_hits: bool,
     /// The last paint that validated or built this chunk.
     frame: u64,
 }
@@ -854,7 +855,7 @@ pub(super) fn paint_leaf(fragment: &Frag, builder: &mut Builder<'_>) {
         lines: builder.lines[before.lines..].into(),
         images: recording.images.into_boxed_slice(),
         replaced: recording.replaced.into_boxed_slice(),
-        media_controls: recording.media_controls,
+        media_hits: recording.media_hits,
         frame: session.frame,
     };
     if let Some(index) = hit {
@@ -1032,7 +1033,7 @@ fn replay(
     builder
         .replaced_images
         .extend(chunk.replaced.iter().copied());
-    builder.has_media_controls |= chunk.media_controls;
+    builder.has_media_hits |= chunk.media_hits;
     session.stats.replayed_commands += chunk.commands.len() as u32;
     if let Some(spans) = session.spans.as_mut() {
         spans.push(Span {
@@ -1049,7 +1050,7 @@ fn chunk_output_eq(a: &Chunk, b: &Chunk) -> bool {
         && a.lines == b.lines
         && a.images == b.images
         && a.replaced == b.replaced
-        && a.media_controls == b.media_controls
+        && a.media_hits == b.media_hits
 }
 
 /// Re-evaluate the lookups a chunk recorded.

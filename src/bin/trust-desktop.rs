@@ -7731,16 +7731,10 @@ impl DesktopApp {
 
     /// The frontend's part of a primary click on a live page, whose actor
     /// dispatches the click itself: number spin buttons, the native editor's
-    /// focus and caret, a select's drop-down box, and external media. Every
-    /// other activation behavior (links, checkboxes, buttons, submission,
-    /// reset, file prompts) is the actor's.
+    /// focus and caret, and a select's drop-down box. Every other activation
+    /// behavior (links, checkboxes, buttons, submission, reset, file
+    /// prompts, media controls) is the actor's.
     fn native_pointer_activation(&mut self, target: PageHit) {
-        if matches!(target.link, Some(Link::Media(_))) {
-            if let Some(link) = target.link {
-                self.activate_link(link);
-            }
-            return;
-        }
         if self.step_number_from_pointer(&target) {
             return;
         }
@@ -10102,11 +10096,6 @@ fn build_accessibility_update(frame: AccessibilityFrame<'_>, initial: bool) -> T
 }
 
 fn same_page_target(left: &PageHit, right: &PageHit) -> bool {
-    if matches!(left.link, Some(Link::Media(_))) && matches!(right.link, Some(Link::Media(_))) {
-        // Native subwidgets retain the media DOM anchor when keyboard focus
-        // supplies its live actor; pointer activation remains a browser action.
-        return left.node == right.node && left.link == right.link;
-    }
     match (left.actor, right.actor) {
         (Some(left), Some(right)) => left == right,
         (Some(_), None) | (None, Some(_)) => false,
@@ -10125,13 +10114,6 @@ fn same_page_target(left: &PageHit, right: &PageHit) -> bool {
 /// retained solely as the dead-actor fallback used by the controller's
 /// navigation-priority lane.
 fn page_hit_activation(hit: &PageHit, page_live: bool) -> Option<Link> {
-    // HTML §4.8.8 allows a video to represent an external playback control.
-    // Preserve that browser action even when the underlying player has a JS
-    // actor, so activation reaches mpv with the originating page's referrer.
-    // https://html.spec.whatwg.org/multipage/media.html#the-video-element
-    if matches!(hit.link, Some(Link::Media(_))) {
-        return hit.link.clone();
-    }
     if page_live && let Some(node) = hit.actor {
         let href = match hit.link.as_ref() {
             Some(Link::JsClick { href, .. }) => href.clone(),
@@ -10962,6 +10944,52 @@ mod tests {
         pages_open_tabs_for_new_targets(&event_loop).await;
         pages_that_ask_keep_their_tab_or_the_browser_open(&event_loop).await;
         popups_are_tabs_of_their_openers_group(&event_loop).await;
+        media_offers_the_external_player_in_its_context_menu(&event_loop);
+    }
+
+    fn media_offers_the_external_player_in_its_context_menu(event_loop: &EventLoop<DesktopEvent>) {
+        // HTML #attr-media-controls: user agent features such as playing
+        // the media elsewhere go in "the media element's context menu", and
+        // "should not interfere with the page's normal rendering". Nothing
+        // paints over the player, and the menu finds the video under the
+        // poster copy its player layers over it.
+        let mut app = static_page_app(
+            event_loop,
+            "<body style='margin:0'><div style='position:relative;width:320px;height:180px'>\
+             <video src='clip.mp4' poster='poster.jpg' style='position:absolute;inset:0;\
+             width:100%;height:100%'></video><img src='poster.jpg' style='position:absolute;\
+             inset:0;width:100%;height:100%'></div><p style='margin:40px 0'>Text</p></body>",
+        );
+        recompose(&mut app);
+        let scene = app.scene.as_ref().unwrap();
+        assert!(
+            !scene.primitives.iter().any(|command| matches!(command,
+                DisplayCommand::GlyphRun { shaped, .. } if shaped.text.contains("mpv"))),
+            "no button over the page"
+        );
+        let content = scene.content_viewport;
+        click(
+            &mut app,
+            CssPoint::new(content.x + 160.0, content.y + 90.0),
+            MouseButton::Right,
+        );
+        let menu = app.context_menu.as_ref().expect("a context menu");
+        assert_eq!(menu.items[0].label, "Open in mpv");
+        assert!(
+            menu.items[1].separated && menu.items[1].label == "Reload",
+            "the page's own items follow, apart"
+        );
+        assert_eq!(
+            menu.media.as_ref().map(url::Url::as_str),
+            Some("https://example.test/clip.mp4")
+        );
+        app.close_context_menu();
+        let text = text_at(&app, "Text", 1);
+        click(&mut app, text, MouseButton::Right);
+        let menu = app.context_menu.as_ref().expect("a context menu");
+        assert!(menu.media.is_none());
+        assert!(menu.items.iter().all(|item| item.label != "Open in mpv"));
+        app.close_context_menu();
     }
 
     async fn popups_are_tabs_of_their_openers_group(event_loop: &EventLoop<DesktopEvent>) {
@@ -11719,6 +11747,7 @@ mod tests {
             pressed: None,
             title: "HTTPS  /  example.test".into(),
             link: None,
+            media: None,
         };
         let update = build_accessibility_update(
             AccessibilityFrame {
@@ -11972,29 +12001,6 @@ mod tests {
             })
         );
         assert_eq!(page_hit_activation(&target, false), target.link);
-    }
-
-    #[test]
-    fn media_hit_preserves_external_playback_on_live_and_static_pages() {
-        let target = PageHit {
-            rect: CssRect::new(0.0, 0.0, 320.0, 180.0),
-            node: 9,
-            actor: Some(42),
-            link: Some(Link::Media(
-                url::Url::parse("https://media.example.test/video.mp4").unwrap(),
-            )),
-            cursor: None,
-        };
-        for page_live in [true, false] {
-            assert_eq!(
-                page_hit_activation(&target, page_live),
-                target.link,
-                "the browser's external playback control must retain its media action"
-            );
-        }
-        let mut native = target.clone();
-        native.actor = None;
-        assert!(same_page_target(&native, &target));
     }
 
     #[test]

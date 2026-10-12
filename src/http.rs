@@ -945,6 +945,10 @@ pub fn render_html_for_environment(
     let base = base_with_doc_base(&html, &response.url);
     let mut dom = crate::dom::Dom::parse_document(&html);
     close_static_dialogs(&mut dom, seed);
+    // Graphical frontends present media elements as players (HTML
+    // Rendering #embedded-content-rendering-rules), even where no page
+    // actor plays them; their context menu offers the external player.
+    dom.set_inline_media(true);
     dom.set_doc_url(Some(base.clone()));
     dom.set_fragment_target(response.url.fragment());
     dom.set_viewport_px(viewport.width, viewport.height);
@@ -8737,6 +8741,9 @@ fn css_only_render(
     let mut dom = crate::js::css_prepare(html, viewport, cell_px);
     let document = dom.document();
     dom.set_document_encoding(document, document_encoding);
+    // As in a graphical page actor: media elements are players there, an
+    // external player's link only in the terminal.
+    dom.set_inline_media(!terminal_presentation);
     if !frames.is_empty() {
         install_page_frames(&mut dom, page_url, frames);
     }

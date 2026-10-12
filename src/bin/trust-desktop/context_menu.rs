@@ -2,7 +2,9 @@
 //! menu key opens over the page, as COMMAND is. The page decides only
 //! whether it shows, through `contextmenu` (Pointer Events
 //! #maybe-show-context-menu); Shift+secondary button bypasses the page.
-//! Its items act on the browser, never on the DOM.
+//! Its items act on the browser, never on the DOM. Over a media element it
+//! offers the external player (mpv), where HTML #attr-media-controls places
+//! such user agent features ("the media element's context menu").
 //!
 //! Opening, highlighting and closing it repaint only the menu: the
 //! composed page stays as it is (`DesktopApp::draw_partial`).
@@ -13,6 +15,8 @@ use trust::render::{ContextMenuGeometry, ContextMenuIcon, ContextMenuItem, paint
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum MenuAction {
+    /// Play the media element the menu was opened on in mpv.
+    OpenInMpv,
     /// Open the menu's link in a new background tab.
     OpenLinkInNewTab,
     /// Copy the menu's link address.
@@ -36,6 +40,8 @@ pub(super) struct PageContextMenu {
     pub(super) title: String,
     /// The hyperlink the menu was opened on, and its address.
     pub(super) link: Option<(Link, String)>,
+    /// The external playback target of the media element it was opened on.
+    pub(super) media: Option<url::Url>,
 }
 
 /// COMMAND's name for the page: its scheme and host.
@@ -145,7 +151,19 @@ impl DesktopApp {
         Some((link, address))
     }
 
-    fn context_menu_entries(&self, link: bool) -> Vec<(MenuAction, ContextMenuItem)> {
+    /// The media element at `at` (the keyboard's target when the menu key
+    /// opened the menu): its external playback target. The pointer finds
+    /// it under whatever its player layers over it.
+    pub(super) fn media_at(&self, at: CssPoint, from_keyboard: bool) -> Option<url::Url> {
+        let page = &self.tab.page_layout.as_ref()?.layout.paint;
+        if from_keyboard {
+            let node = self.tab.keyboard_target.as_ref()?.node;
+            return page.media_targets.get(&node).cloned();
+        }
+        self.scene.as_ref()?.media_target_at(page, at)
+    }
+
+    fn context_menu_entries(&self, link: bool, media: bool) -> Vec<(MenuAction, ContextMenuItem)> {
         let item = |label: &str, shortcut, icon, enabled, separated, caution| ContextMenuItem {
             label: label.to_string(),
             shortcut,
@@ -155,6 +173,19 @@ impl DesktopApp {
             caution,
         };
         let mut entries = Vec::new();
+        if media {
+            entries.push((
+                MenuAction::OpenInMpv,
+                item(
+                    "Open in mpv",
+                    None,
+                    ContextMenuIcon::ExternalPlayer,
+                    true,
+                    false,
+                    false,
+                ),
+            ));
+        }
         if link {
             entries.push((
                 MenuAction::OpenLinkInNewTab,
@@ -163,7 +194,7 @@ impl DesktopApp {
                     None,
                     ContextMenuIcon::NewTab,
                     true,
-                    false,
+                    media,
                     false,
                 ),
             ));
@@ -188,7 +219,7 @@ impl DesktopApp {
                     Some("Ctrl+C"),
                     ContextMenuIcon::Copy,
                     true,
-                    link,
+                    link || media,
                     false,
                 ),
             ));
@@ -200,7 +231,7 @@ impl DesktopApp {
                 Some("Ctrl+R"),
                 ContextMenuIcon::Reload,
                 true,
-                copy || link,
+                copy || link || media,
                 false,
             ),
         ));
@@ -313,8 +344,9 @@ impl DesktopApp {
         };
         self.close_select_popup();
         let link = self.hyperlink_at(at, from_keyboard);
+        let media = self.media_at(at, from_keyboard);
         let (actions, items): (Vec<_>, Vec<_>) = self
-            .context_menu_entries(link.is_some())
+            .context_menu_entries(link.is_some(), media.is_some())
             .into_iter()
             .unzip();
         let geometry = ContextMenuGeometry::new(at, bounds, &items);
@@ -333,6 +365,7 @@ impl DesktopApp {
             pressed: None,
             title: endpoint_title(&self.tab.browser.snapshot().address),
             link,
+            media,
         });
         self.refresh_page_bookmark();
         self.apply_cursor_icon(CursorIcon::Default);
@@ -342,12 +375,11 @@ impl DesktopApp {
 
     /// Rebuild the open menu's items in place (the bookmark store answered).
     fn update_context_menu_items(&mut self) {
-        let link = self
-            .context_menu
-            .as_ref()
-            .is_some_and(|menu| menu.link.is_some());
+        let (link, media) = self.context_menu.as_ref().map_or((false, false), |menu| {
+            (menu.link.is_some(), menu.media.is_some())
+        });
         let (actions, items): (Vec<_>, Vec<_>) =
-            self.context_menu_entries(link).into_iter().unzip();
+            self.context_menu_entries(link, media).into_iter().unzip();
         let Some(menu) = &mut self.context_menu else {
             return;
         };
@@ -502,20 +534,26 @@ impl DesktopApp {
     }
 
     pub(super) fn activate_context_menu_item(&mut self, index: usize) {
-        let Some((action, link)) = self
+        let Some((action, link, media)) = self
             .context_menu
             .as_ref()
             .filter(|menu| menu.items.get(index).is_some_and(|item| item.enabled))
             .and_then(|menu| {
                 menu.actions
                     .get(index)
-                    .map(|&action| (action, menu.link.clone()))
+                    .map(|&action| (action, menu.link.clone(), menu.media.clone()))
             })
         else {
             return;
         };
         self.close_context_menu();
         match action {
+            MenuAction::OpenInMpv => {
+                if let Some(url) = media {
+                    self.tab.browser.open_in_external_player(url);
+                    self.launch_external_media_requests();
+                }
+            }
             MenuAction::OpenLinkInNewTab => {
                 if let Some((link, _)) = link {
                     self.open_link_in_new_tab(link, false);

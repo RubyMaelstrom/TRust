@@ -4415,7 +4415,10 @@ impl Flow<'_> {
             style_node: node,
             pseudo: None,
             node,
+            // Where media is a link to the external player (see
+            // `Ifc::image`); inline players are not.
             link: url
+                .filter(|_| !self.dom.inline_media())
                 .and_then(|u| super::inline::poster_media_target(self.dom, self.base, node, u))
                 .map(crate::doc::Link::Media)
                 .or_else(|| inl.link.clone()),

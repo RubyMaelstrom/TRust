@@ -32,6 +32,8 @@ pub enum ContextMenuIcon {
     NewTab,
     /// Two chain links: copy the link's address.
     Link,
+    /// A screen playing: open the media in the external player.
+    ExternalPlayer,
     Copy,
     Reload,
     Command,
@@ -458,6 +460,25 @@ fn paint_icon(
             }
             stroke(sign);
         }
+        ContextMenuIcon::ExternalPlayer => {
+            stroke(vec![
+                PathElement::MoveTo(at(1.0, 2.5)),
+                PathElement::LineTo(at(13.0, 2.5)),
+                PathElement::LineTo(at(13.0, 11.0)),
+                PathElement::LineTo(at(1.0, 11.0)),
+                PathElement::Close,
+            ]);
+            stroke(vec![
+                PathElement::MoveTo(at(5.75, 4.75)),
+                PathElement::LineTo(at(9.25, 6.75)),
+                PathElement::LineTo(at(5.75, 8.75)),
+                PathElement::Close,
+            ]);
+            stroke(vec![
+                PathElement::MoveTo(at(4.5, 13.5)),
+                PathElement::LineTo(at(9.5, 13.5)),
+            ]);
+        }
     }
 }
 
@@ -614,11 +635,19 @@ mod tests {
             );
             let items = vec![
                 ContextMenuItem {
+                    label: "Open in mpv".into(),
+                    shortcut: None,
+                    icon: ContextMenuIcon::ExternalPlayer,
+                    enabled: true,
+                    separated: false,
+                    caution: false,
+                },
+                ContextMenuItem {
                     label: "Copy".into(),
                     shortcut: Some("Ctrl+C"),
                     icon: ContextMenuIcon::Copy,
                     enabled: true,
-                    separated: false,
+                    separated: true,
                     caution: false,
                 },
                 ContextMenuItem {

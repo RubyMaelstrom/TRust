@@ -2961,6 +2961,13 @@ impl BrowserController {
         }));
     }
 
+    /// Play `url` in the external media player (mpv) at the user's
+    /// request, as a media element's context menu offers it; the frontend
+    /// launches what `take_external_media` returns.
+    pub fn open_in_external_player(&mut self, url: url::Url) {
+        self.queue_external_media(url);
+    }
+
     fn queue_external_media(&mut self, url: url::Url) {
         // RFC 9110 §10.1.3: the referrer identifies the resource from which
         // the target URI was obtained. Capture the source with the media

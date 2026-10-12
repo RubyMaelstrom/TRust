@@ -1,23 +1,22 @@
-//! HTML #the-video-element permits an external playback utility when the UA
-//! cannot render video. This is browser UI, not a CSS z-index or a document
-//! top-layer entry. Keep only its anchor's spatial scopes: author paint and
-//! compositing effects cannot cover the button. Clips still prevent controls
-//! leaking from an offscreen/closed player. HTML #focusable-area identifies the
-//! media element as the DOM anchor of its native subwidgets.
+//! The user agent's playback controls of inline media elements (HTML
+//! #expose-a-user-interface-to-the-user). They are browser UI, not a CSS
+//! z-index or a document top-layer entry. Keep only their anchor's spatial
+//! scopes: author paint and compositing effects cannot cover the controls.
+//! Clips still prevent controls leaking from an offscreen/closed player. HTML
+//! #focusable-area identifies the media element as the DOM anchor of its
+//! native subwidgets. The external player (mpv) is offered by the media
+//! element's context menu (`PagePaint::media_targets`), never over the page.
 //!
 //! Local HTML snapshot e5071a20c8569d8a3ec02ed27dd01b948773f850.
 
 use super::*;
 use crate::dom::media::MediaControlsState;
 
-/// What browser UI a media element's anchor gets.
-pub(crate) enum MediaAnchor {
-    /// The external-player button (the terminal's representation of media
-    /// that cannot play inline, and players that were removed).
-    External(CssRect, Link),
-    /// The user agent's playback controls of an inline media element (HTML
-    /// #expose-a-user-interface-to-the-user), in its border box.
-    Controls(CssRect, MediaControlsState, bool),
+/// An inline media element's playback controls, in its border box.
+pub(crate) struct MediaControlsAnchor {
+    pub rect: CssRect,
+    pub state: MediaControlsState,
+    pub video: bool,
 }
 
 impl PagePaint {
@@ -25,7 +24,7 @@ impl PagePaint {
     /// `anchor` filters eligible media and supplies its actual replaced box.
     pub(crate) fn collect_browser_media(
         &mut self,
-        mut anchor: impl FnMut(&HitRegion) -> Option<MediaAnchor>,
+        mut anchor: impl FnMut(&HitRegion) -> Option<MediaControlsAnchor>,
     ) {
         let mut result = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -69,24 +68,11 @@ impl PagePaint {
                 let Some(media) = anchor(hit) else {
                     continue;
                 };
-                match media {
-                    MediaAnchor::External(rect, link) => {
-                        if rect.width <= 0. || rect.height <= 0. {
-                            continue;
-                        }
-                        seen.insert(hit.node);
-                        let mut hit = hit.clone();
-                        hit.link = Some(link);
-                        append_button(&mut result, &hit, rect);
-                    }
-                    MediaAnchor::Controls(rect, state, video) => {
-                        if rect.width <= 0. || rect.height <= 0. {
-                            continue;
-                        }
-                        seen.insert(hit.node);
-                        append_media_controls(&mut result, hit, rect, &state, video);
-                    }
+                if media.rect.width <= 0. || media.rect.height <= 0. {
+                    continue;
                 }
+                seen.insert(hit.node);
+                append_media_controls(&mut result, hit, media.rect, &media.state, media.video);
             }
             if fixed {
                 result.push(Primitive::EndFixed);
@@ -115,61 +101,6 @@ impl PagePaint {
             })
             .collect()
     }
-}
-
-fn append_button(commands: &mut Vec<Primitive>, hit: &HitRegion, anchor: CssRect) {
-    let style = crate::text::TextStyle {
-        size: 13.,
-        weight: 600.,
-        ..Default::default()
-    };
-    let mut shaped = crate::text::shape("▶ Open in mpv", &style);
-    if anchor.width < shaped.advance + 12. {
-        shaped = crate::text::shape("▶", &style);
-    }
-    let inset = if anchor.width > shaped.advance + 20. && anchor.height > shaped.line_height + 16. {
-        4.
-    } else {
-        0.
-    };
-    let rect = CssRect::new(
-        anchor.x + inset,
-        anchor.y + inset,
-        (shaped.advance + 12.).min(anchor.width - inset),
-        (shaped.line_height + 8.).min(anchor.height - inset),
-    );
-    commands.push(Primitive::PushClip(PaintShape::Rect(rect)));
-    commands.push(Primitive::FillRect {
-        rect,
-        color: PaintColor::Rgba(24, 28, 34, 255),
-    });
-    commands.push(Primitive::GlyphRun {
-        origin: CssPoint::new(
-            rect.x + ((rect.width - shaped.advance) * 0.5).max(0.),
-            rect.y + ((rect.height - shaped.line_height) * 0.5).max(0.),
-        ),
-        shaped,
-        color: PaintColor::Rgba(255, 255, 255, 255),
-        decoration: TextDecorationPaint {
-            color: PaintColor::Rgba(255, 255, 255, 255),
-            style: DecorationStyle::Solid,
-            thickness: None,
-            underline_offset: None,
-        },
-        shadows: Vec::new(),
-        clip: None,
-        node: hit.node,
-        link: None,
-        selection: Default::default(),
-    });
-    commands.push(Primitive::HitRegion(HitRegion {
-        rect,
-        node: hit.node,
-        actor: None,
-        link: hit.link.clone(),
-        cursor: Some("pointer".into()),
-    }));
-    commands.push(Primitive::PopClip);
 }
 
 /// The parts of a media element's control bar, in CSS px. The page actor's
@@ -474,6 +405,7 @@ impl Scene {
 mod tests {
     use super::*;
     use crate::dom::Dom;
+    use crate::dom::media::MediaPresentation;
     use crate::layout2::{GraphicalLayout, Viewport};
 
     fn layout(dom: &Dom) -> GraphicalLayout {
@@ -485,6 +417,33 @@ mod tests {
             &Default::default(),
             &Default::default(),
         )
+    }
+
+    /// A document whose media elements are inline players, as a graphical
+    /// page actor's (and a graphical static render's) are.
+    fn inline_dom(html: &str) -> Dom {
+        let mut dom = Dom::parse_document(html);
+        dom.set_inline_media(true);
+        dom
+    }
+
+    /// Give media element `node` a player presentation showing its controls.
+    fn show_controls(dom: &mut Dom, node: usize) {
+        dom.set_media_presentation(
+            node,
+            Some(MediaPresentation {
+                surface: 0,
+                natural: None,
+                show_poster: true,
+                controls: Some(MediaControlsState {
+                    paused: true,
+                    muted: false,
+                    time: 0.,
+                    duration: 10.,
+                    visible: true,
+                }),
+            }),
+        );
     }
 
     fn scene(page: &PagePaint, scroll: CssPoint) -> Scene {
@@ -510,8 +469,18 @@ mod tests {
         CssPoint::new(rect.x + rect.width / 2., rect.y + rect.height / 2.)
     }
 
+    fn media_links(page: &PagePaint) -> usize {
+        [&page.primitives, &page.browser_media]
+            .into_iter()
+            .flatten()
+            .filter(|command| {
+                matches!(command, Primitive::HitRegion(hit) if matches!(hit.link, Some(Link::Media(_))))
+            })
+            .count()
+    }
+
     #[test]
-    fn media_controls_survive_error_ui_replacement_and_retire_with_the_container() {
+    fn a_failed_players_target_stays_with_the_terminal_never_over_the_graphical_page() {
         let mut dom = Dom::parse_document(
             r#"<body style="margin:0"><section id=player style="width:320px;height:180px;position:relative">
                 <div id=inner><video id=v src="/clip.mp4"></video></div></section>"#,
@@ -526,17 +495,14 @@ mod tests {
             "existing media owns its control"
         );
         dom.set_text(player, "Unable to play inline");
+        assert_eq!(dom.retained_media_controls().len(), 1);
+        // HTML #attr-media-controls: features beyond the controls "should
+        // not interfere with the page's normal rendering". The graphical
+        // page paints no button over the page's own error UI.
         let layout = layout(&dom);
-        assert_eq!(layout.paint.browser_media_nodes(), [player].into());
-        let scene = scene(&layout.paint, CssPoint::default());
-        let target = scene.ordered_focus_hits(&[player]).pop().unwrap();
-        assert!(
-            matches!(&target.link, Some(Link::Media(url)) if url.as_str() == "https://example.test/clip.mp4")
-        );
-        assert_eq!(
-            scene.page_hit_at(center(target.rect)).unwrap().link,
-            target.link
-        );
+        assert!(layout.paint.browser_media.is_empty());
+        assert_eq!(media_links(&layout.paint), 0);
+        assert!(layout.paint.media_targets.is_empty());
         assert_eq!(
             layout.boxes[&player].height, 180.,
             "native UI does not change CSS geometry"
@@ -545,6 +511,7 @@ mod tests {
             !dom.serialize_js(crate::dom::DOCUMENT).contains("mpv"),
             "no synthetic author DOM"
         );
+        // The terminal, which plays nothing inline, still offers it.
         let terminal = crate::layout2::lay_out_document(
             &dom,
             &base,
@@ -607,31 +574,48 @@ mod tests {
     }
 
     #[test]
-    fn media_controls_remember_an_offered_frame_player_before_author_failure() {
-        let mut dom =
-            Dom::parse_document(r#"<body><iframe id=frame width=320 height=180></iframe>"#);
+    fn a_frames_player_is_offered_from_its_own_document() {
+        let mut dom = inline_dom(r#"<body><iframe id=frame width=320 height=180></iframe>"#);
         let frame = dom.get_by_id("frame").unwrap();
         dom.install_frame_document(
             frame,
-            "<body><div><video width=320 height=180></video></div>",
+            "<body style=margin:0><div><video id=video width=320 height=180></video></div>",
             "https://player.example.test/embed/123",
         )
         .unwrap();
+        let video = dom
+            .descendants(frame)
+            .find(|&id| dom.attr(id, "id") == Some("video"))
+            .unwrap();
         let body = dom
             .descendants(frame)
             .find(|&id| dom.tag_name(id) == Some("body"))
             .unwrap();
-        assert!(!layout(&dom).paint.browser_media.is_empty());
-        // Player libraries can reject their source before assigning video.src
-        // and replace the Document body without firing a native media error.
+        let painted = layout(&dom);
+        assert_eq!(
+            painted
+                .paint
+                .media_targets
+                .get(&video)
+                .map(url::Url::as_str),
+            Some("https://player.example.test/embed/123"),
+            "a sourceless player plays its frame's page"
+        );
+        assert!(painted.paint.browser_media.is_empty());
+        assert_eq!(media_links(&painted.paint), 0);
+        let scene = scene(&painted.paint, CssPoint::default());
+        let rect = scene.ordered_focus_hits(&[video]).pop().unwrap().rect;
+        assert_eq!(
+            scene
+                .media_target_at(&painted.paint, center(rect))
+                .map(|url| url.to_string()),
+            Some(String::from("https://player.example.test/embed/123"))
+        );
+        // Player libraries can replace a failed player with their own UI.
         dom.set_text(body, "Network error");
         let painted = layout(&dom);
-        assert_eq!(painted.paint.browser_media_nodes(), [body].into());
-        let scene = scene(&painted.paint, CssPoint::default());
-        let target = scene.ordered_focus_hits(&[body]).pop().unwrap();
-        assert!(
-            matches!(&target.link, Some(Link::Media(url)) if url.as_str() == "https://player.example.test/embed/123")
-        );
+        assert!(painted.paint.media_targets.is_empty());
+        assert!(painted.paint.browser_media.is_empty());
     }
 
     #[test]
@@ -680,51 +664,74 @@ mod tests {
     }
 
     #[test]
-    fn media_controls_override_author_layers_without_changing_cssom_or_layout() {
-        let dom = Dom::parse_document(
+    fn media_under_a_players_layers_is_found_beneath_them_and_nothing_paints_over_the_page() {
+        // A custom player: the video under its poster copy and a page-wide
+        // link (X- and erome-style players position both over the video).
+        let dom = inline_dom(
             r#"<body style="margin:0">
           <div style="position:relative;width:320px;height:180px">
-            <video id=v src="clip.mp4" style="position:absolute;inset:0;width:100%;height:100%"></video>
-            <div id=poster style="position:absolute;inset:0;background:red">Poster</div>
+            <video id=v src="clip.mp4" poster="poster.jpg" style="position:absolute;inset:0;width:100%;height:100%"></video>
+            <img id=poster src="poster.jpg" style="position:absolute;inset:0;width:100%;height:100%">
           </div>
           <a id=cover href=/page style="position:fixed;inset:0;z-index:2147483647;background:blue">Page</a>"#,
         );
         let layout = layout(&dom);
         let v = dom.get_by_id("v").unwrap();
         let cover = dom.get_by_id("cover").unwrap();
-        assert!(layout.boxes.contains_key(&dom.get_by_id("poster").unwrap()));
-        assert_eq!(layout.paint.browser_media_nodes(), [v].into());
-        let scene = scene(&layout.paint, CssPoint::default());
-        let target = scene.ordered_focus_hits(&[v]).pop().unwrap();
-        assert!(matches!(&target.link, Some(Link::Media(url)) if url.path() == "/clip.mp4"));
+        assert_eq!(layout.boxes[&v].width, 320.);
+        assert!(layout.paint.browser_media.is_empty());
         assert_eq!(
-            scene.page_hit_at(center(target.rect)).unwrap().link,
-            target.link
+            media_links(&layout.paint),
+            0,
+            "neither the video nor its poster copy becomes a link to mpv"
         );
+        assert_eq!(
+            layout.paint.media_targets.get(&v).map(|url| url.path()),
+            Some("/clip.mp4")
+        );
+        let scene = scene(&layout.paint, CssPoint::default());
+        let point = CssPoint::new(160., 90.);
         assert_eq!(
             page_element_hits_at(
                 &layout.paint,
                 CssSize::new(640., 480.),
                 CssPoint::default(),
-                center(target.rect)
+                point
             )[0]
             .node,
-            cover
+            cover,
+            "the page's own layers stay on top for its events"
+        );
+        assert!(
+            scene
+                .page_hit_at(point)
+                .is_none_or(|hit| !matches!(hit.link, Some(Link::Media(_))))
+        );
+        assert_eq!(
+            scene
+                .media_target_at(&layout.paint, point)
+                .map(|url| url.path().to_string()),
+            Some(String::from("/clip.mp4")),
+            "the context menu finds the video beneath the layers"
+        );
+        assert_eq!(
+            scene.media_target_at(&layout.paint, CssPoint::new(500., 400.)),
+            None
         );
         let frame = vello_cpu::VelloCpuRenderer::new()
             .render_rgba(&scene)
             .unwrap();
-        let at = ((target.rect.y as usize + 1) * 640 + target.rect.x as usize + 1) * 4;
+        let at = (400 * 640 + 600) * 4;
         assert_eq!(
             &frame.pixels[at..at + 4],
-            &[24, 28, 34, 255],
-            "native background covers page blue"
+            &[0, 0, 255, 255],
+            "the page's own top layer stays on top"
         );
     }
 
     #[test]
     fn media_controls_follow_nested_scroll_transform_and_viewport_scroll() {
-        let dom = Dom::parse_document(
+        let mut dom = inline_dom(
             r#"<body style="margin:0">
           <div id=scroller style="margin:40px;width:320px;height:200px;overflow:auto">
             <div style="height:70px"></div>
@@ -733,10 +740,21 @@ mod tests {
             </div><div style="height:400px"></div>
           </div>"#,
         );
-        let mut layout = layout(&dom);
         let v = dom.get_by_id("v").unwrap();
+        show_controls(&mut dom, v);
+        let mut layout = layout(&dom);
         let scroller = dom.get_by_id("scroller").unwrap();
-        let before = scene(&layout.paint, CssPoint::default()).ordered_focus_hits(&[v])[0].rect;
+        let bar = |scene: &Scene| {
+            let rect = scene.ordered_focus_hits(&[v])[0].rect;
+            media_controls_layout(rect, true).bar
+        };
+        let before = bar(&scene(&layout.paint, CssPoint::default()));
+        assert_eq!(
+            scene(&layout.paint, CssPoint::default())
+                .page_hit_at(center(before))
+                .map(|hit| hit.node),
+            Some(v)
+        );
         layout
             .paint
             .scroll_containers
@@ -746,13 +764,14 @@ mod tests {
             .offset
             .y = 30.;
         let scene = scene(&layout.paint, CssPoint::new(0., 10.));
-        let after = scene.ordered_focus_hits(&[v])[0].rect;
+        let after = bar(&scene);
         assert_eq!((after.x, after.y), (before.x, before.y - 40.));
-        assert!(matches!(
-            scene.page_hit_at(center(after)).unwrap().link,
-            Some(Link::Media(_))
-        ));
-        // A control clipped outside its scrollport must not become a screen-fixed button.
+        assert_eq!(
+            scene.page_hit_at(center(after)).map(|hit| hit.node),
+            Some(v)
+        );
+        // Controls clipped outside their scrollport must not become a
+        // screen-fixed bar.
         layout
             .paint
             .scroll_containers
@@ -760,48 +779,70 @@ mod tests {
             .find(|c| c.node == scroller)
             .unwrap()
             .offset
-            .y = 170.;
+            .y = 250.;
         let clipped = self::scene(&layout.paint, CssPoint::default());
-        let rect = clipped.ordered_focus_hits(&[v])[0].rect;
+        let rect = bar(&clipped);
         assert!(
-            !clipped
+            clipped
                 .page_hit_at(center(rect))
-                .is_some_and(|hit| matches!(hit.link, Some(Link::Media(_))))
+                .is_none_or(|hit| hit.node != v)
         );
     }
 
     #[test]
-    fn media_controls_respect_suppression_inertness_and_source_changes() {
-        let mut dom = Dom::parse_document(
+    fn media_targets_follow_hit_testing_and_sources() {
+        let mut dom = inline_dom(
             r#"<body style="margin:0">
           <video id=v src=first.mp4></video>
-          <video src=hidden.mp4 style="display:none"></video>
-          <video src=transparent.mp4 style="opacity:0"></video>
-          <video src=invisible.mp4 style="visibility:hidden"></video>
-          <div inert><video src=inert.mp4></video></div>
-          <audio></audio>"#,
+          <video id=hidden src=hidden.mp4 style="display:none"></video>
+          <video id=transparent src=transparent.mp4 style="opacity:0"></video>
+          <video id=invisible src=invisible.mp4 style="visibility:hidden"></video>
+          <div inert><video id=inert src=inert.mp4></video></div>
+          <a href=/watch/1><video id=stream></video></a>
+          <audio id=silent src=a.mp3></audio>
+          <audio id=player controls src=b.mp3></audio>
+          <audio id=sourceless controls></audio>"#,
         );
-        let v = dom.get_by_id("v").unwrap();
-        assert_eq!(layout(&dom).paint.browser_media_nodes(), [v].into());
+        let id = |name: &str| dom.get_by_id(name).unwrap();
+        let targets = |dom: &Dom| {
+            let mut targets: Vec<(usize, String)> = layout(dom)
+                .paint
+                .media_targets
+                .into_iter()
+                .map(|(node, url)| (node, url.path().to_string()))
+                .collect();
+            targets.sort();
+            targets
+        };
+        let mut expected = vec![
+            (id("v"), String::from("/first.mp4")),
+            // Transparent content is still hit, as CSS hit testing has it.
+            (id("transparent"), String::from("/transparent.mp4")),
+            // A sourceless (MSE) player plays the page its link names.
+            (id("stream"), String::from("/watch/1")),
+            (id("player"), String::from("/b.mp3")),
+        ];
+        expected.sort();
+        assert_eq!(targets(&dom), expected);
+        let v = id("v");
         dom.set_attr(v, "src", "second.mp4");
-        let paint = layout(&dom).paint;
-        let target = scene(&paint, CssPoint::default())
-            .ordered_focus_hits(&[v])
-            .pop()
-            .unwrap();
-        assert!(matches!(target.link, Some(Link::Media(url)) if url.path() == "/second.mp4"));
+        assert!(targets(&dom).contains(&(v, String::from("/second.mp4"))));
         dom.set_attr(v, "style", "display:none");
-        assert!(layout(&dom).paint.browser_media.is_empty());
+        assert!(!targets(&dom).iter().any(|(node, _)| *node == v));
     }
 
     #[test]
     fn media_controls_keyboard_order_uses_dom_anchors_not_paint_order() {
-        let dom = Dom::parse_document(
+        let mut dom = inline_dom(
             r#"<button id=before>Before</button>
           <video id=normal></video><video id=early tabindex=2></video>
           <video id=skip tabindex=-1></video><div inert><video id=inert></video></div>
           <a id=after href=/next>After</a>"#,
         );
+        for name in ["normal", "early", "skip", "inert"] {
+            let node = dom.get_by_id(name).unwrap();
+            show_controls(&mut dom, node);
+        }
         let layout = layout(&dom);
         let order = dom.sequential_focus_order_with_subwidgets(
             &layout.boxes,
@@ -820,8 +861,6 @@ mod tests {
             targets.iter().map(|hit| hit.node).collect::<Vec<_>>(),
             order
         );
-        assert!(matches!(targets[0].link, Some(Link::Media(_))));
-        assert!(matches!(targets[2].link, Some(Link::Media(_))));
     }
 
     #[test]
@@ -836,19 +875,33 @@ mod tests {
                     node: 7,
                     actor: None,
                     cursor: None,
-                    link: Some(Link::Media(
-                        url::Url::parse("https://example.test/v.mp4").unwrap(),
-                    )),
+                    link: None,
                 }),
                 Primitive::PopClip,
             ],
             ..Default::default()
         };
-        page.collect_browser_media(|hit| Some(MediaAnchor::External(hit.rect, hit.link.clone()?)));
+        page.collect_browser_media(|hit| {
+            Some(MediaControlsAnchor {
+                rect: hit.rect,
+                state: MediaControlsState {
+                    paused: true,
+                    muted: false,
+                    time: 0.,
+                    duration: 1.,
+                    visible: true,
+                },
+                video: true,
+            })
+        });
         let scene = scene(&page, CssPoint::default());
-        assert!(matches!(
-            scene.page_hit_at(CssPoint::new(110., 10.)).unwrap().link,
-            Some(Link::Media(_))
-        ));
+        // The bar spans the bottom of the video, inside the clip only as
+        // the transform placed it.
+        assert_eq!(
+            scene
+                .page_hit_at(CssPoint::new(110., 90.))
+                .map(|hit| hit.node),
+            Some(7)
+        );
     }
 }

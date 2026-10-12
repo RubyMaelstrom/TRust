@@ -106,7 +106,8 @@ struct Builder<'a> {
     /// Blockified replaced elements have a principal border box separate
     /// from their anonymous content line. Keep its used geometry for radii.
     replaced_border_boxes: rustc_hash::FxHashMap<NodeId, CssRect>,
-    has_media_controls: bool,
+    /// Some hit region belongs to a media element (`note_media_hit`).
+    has_media_hits: bool,
     /// Overflow clips round the padding edge, independently of whether the
     /// box exposes a user scrolling mechanism (hidden/clip do not).
     rounded_overflow_clips: rustc_hash::FxHashMap<NodeId, PaintShape>,
@@ -248,13 +249,14 @@ impl<'a> Builder<'a> {
         self.replaced_images.insert(node);
     }
 
-    /// A hit region of a media link was painted.
-    fn note_media_controls(&mut self, media: bool) {
-        if media {
+    /// A hit region of `node`: when it is a media element, the paint names
+    /// its external playback target (`PagePaint::media_targets`).
+    fn note_media_hit(&mut self, node: NodeId) {
+        if node != NO_NODE && matches!(self.dom.tag_name(node), Some("video" | "audio")) {
             if let Some(recording) = self.recording.get_mut().as_mut() {
-                recording.media_controls = true;
+                recording.media_hits = true;
             }
-            self.has_media_controls = true;
+            self.has_media_hits = true;
         }
     }
 
@@ -298,7 +300,7 @@ impl<'a> Builder<'a> {
             marquee_scopes: Default::default(),
             legacy_clips: Default::default(),
             replaced_border_boxes: Default::default(),
-            has_media_controls: false,
+            has_media_hits: false,
             rounded_overflow_clips: Default::default(),
             overflow_clips: Default::default(),
             scroll_tree: scroll_tree.map_or_else(
@@ -1269,6 +1271,7 @@ fn paint_once(
         fixed_interleaved: true,
         top_layer: top_layer_entries,
         browser_media: Vec::new(),
+        media_targets: Default::default(),
         image_requests: builder.image_requests,
         canvas_images: builder.canvas_images,
         scroll_containers: builder.scroll_containers,
@@ -1276,55 +1279,62 @@ fn paint_once(
         timeline_origin_ms: dom.document_timeline_origin(),
         replaced_images: std::mem::take(&mut builder.replaced_images),
     };
-    let media_fallbacks = dom.retained_media_controls();
-    let inline_controls = dom.inline_media() && dom.has_media_controls();
-    if builder.has_media_controls || !media_fallbacks.is_empty() || inline_controls {
-        use crate::render::media_controls::MediaAnchor;
+    if builder.has_media_hits {
+        paint.media_targets = media_targets(dom, base, &paint);
+    }
+    if dom.inline_media() && dom.has_media_controls() {
+        use crate::render::media_controls::MediaControlsAnchor;
+        // HTML #expose-a-user-interface-to-the-user: an inline media
+        // element's controls overlay its box (HTML Rendering: "overlaid
+        // above the page content without causing any layout changes").
         paint.collect_browser_media(|hit| {
-            if let Some(target) = media_fallbacks.get(&hit.node) {
-                return Some(MediaAnchor::External(
-                    hit.rect,
-                    crate::doc::Link::Media(target.clone()),
-                ));
+            let state = dom.media_presentation(hit.node)?.controls?;
+            if dom.paint_suppressed(hit.node) || dom.visibility_hidden(hit.node) {
+                return None;
             }
-            // HTML #expose-a-user-interface-to-the-user: an inline media
-            // element's controls overlay its box (HTML Rendering: "overlaid
-            // above the page content without causing any layout changes").
-            if let Some(controls) = dom.media_presentation(hit.node).and_then(|p| p.controls) {
-                if dom.paint_suppressed(hit.node) || dom.visibility_hidden(hit.node) {
-                    return None;
-                }
-                let rect = builder
+            Some(MediaControlsAnchor {
+                rect: builder
                     .replaced_border_boxes
                     .get(&hit.node)
                     .copied()
-                    .unwrap_or(hit.rect);
-                let video = dom.tag_name(hit.node) == Some("video");
-                return Some(MediaAnchor::Controls(rect, controls, video));
-            }
-            let Some(link @ crate::doc::Link::Media(_)) = &hit.link else {
-                return None;
-            };
-            (matches!(dom.tag_name(hit.node), Some("video" | "audio"))
-                && !dom.paint_suppressed(hit.node)
-                && !dom.visibility_hidden(hit.node))
-            .then(|| {
-                if let crate::doc::Link::Media(target) = link {
-                    dom.remember_media_target(hit.node, target);
-                }
-                MediaAnchor::External(
-                    builder
-                        .replaced_border_boxes
-                        .get(&hit.node)
-                        .copied()
-                        .unwrap_or(hit.rect),
-                    link.clone(),
-                )
+                    .unwrap_or(hit.rect),
+                state,
+                video: dom.tag_name(hit.node) == Some("video"),
             })
         });
     }
     let session = builder.retained.take();
     ((paint, patch_boundaries, boundaries), session)
+}
+
+/// The external playback target (`layout2::media_target`) of each media
+/// element with a hit region in `paint`: what its context menu offers to open
+/// in mpv. HTML #the-video-element lets a user agent represent video as "a
+/// link to an external video playback utility", and the media elements'
+/// User interface section (#attr-media-controls) puts such features in "the
+/// media element's context menu", as they "should not interfere with the
+/// page's normal rendering".
+fn media_targets(dom: &Dom, base: &Url, paint: &PagePaint) -> HashMap<NodeId, Url> {
+    let mut targets = HashMap::new();
+    let lists = [
+        &paint.fixed_under_primitives,
+        &paint.primitives,
+        &paint.fixed_primitives,
+    ]
+    .into_iter()
+    .chain(paint.top_layer.iter().map(|entry| &entry.primitives));
+    for commands in lists {
+        for command in commands {
+            if let DisplayCommand::HitRegion(hit) = command
+                && !targets.contains_key(&hit.node)
+                && matches!(dom.tag_name(hit.node), Some("video" | "audio"))
+                && let Some(target) = crate::layout2::media_target(dom, base, hit.node)
+            {
+                targets.insert(hit.node, target);
+            }
+        }
+    }
+    targets
 }
 
 /// CSS 2.2 Appendix E order for one real stacking context. Opacity and
@@ -2064,6 +2074,7 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
             } else {
                 None
             };
+            builder.note_media_hit(node);
             builder.commands.push(DisplayCommand::HitRegion(HitRegion {
                 rect,
                 node,
@@ -2463,7 +2474,12 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
             } else if piece.item.graphical_image.is_some()
                 || piece.item.image.is_some()
                 || (node != NO_NODE && builder.dom.canvas_size(node).is_some())
-                || (node != NO_NODE && builder.dom.media_presentation(node).is_some())
+                // HTML Rendering #embedded-content-rendering-rules: an inline
+                // player is a replaced element, with its box, background and
+                // hit region, before it has a frame or poster to show.
+                || (node != NO_NODE
+                    && builder.dom.inline_media()
+                    && matches!(builder.dom.tag_name(node), Some("video" | "audio")))
             {
                 if node != NO_NODE
                     && (builder.dom.canvas_size(node).is_some()
@@ -2609,10 +2625,7 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
                 // Hit testing follows the element's box, not the object.
                 let rect = if piece.item.crop { content } else { rect };
                 if style_node == NO_NODE || builder.dom.point_hit_testable(style_node) {
-                    builder.note_media_controls(matches!(
-                        piece.item.link,
-                        Some(crate::doc::Link::Media(_))
-                    ));
+                    builder.note_media_hit(node);
                     builder.push_marquee_content(
                         node,
                         DisplayCommand::HitRegion(HitRegion {
@@ -6134,7 +6147,7 @@ fn push_label_hit_region(
         rect.width <= 0.0 || rect.height <= 0.0
     };
     if !clipped_away && (style_node == NO_NODE || builder.dom.point_hit_testable(style_node)) {
-        builder.note_media_controls(matches!(piece.item.link, Some(crate::doc::Link::Media(_))));
+        builder.note_media_hit(node);
         builder.push_marquee_content(
             node,
             DisplayCommand::HitRegion(HitRegion {

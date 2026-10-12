@@ -721,6 +721,7 @@ impl PagePaint {
             fixed_interleaved,
             top_layer,
             browser_media,
+            media_targets,
             image_requests,
             canvas_images,
             scroll_containers,
@@ -784,6 +785,12 @@ impl PagePaint {
                 replaced_images
                     .capacity()
                     .saturating_mul(std::mem::size_of::<usize>() * 2),
+            )
+            .saturating_add(
+                media_targets
+                    .values()
+                    .map(|url| std::mem::size_of::<(usize, url::Url)>() + url.as_str().len())
+                    .sum::<usize>(),
             );
         let mut opaque = false;
         bytes = bytes.saturating_add(browser_media.capacity() * std::mem::size_of::<Primitive>());
@@ -2001,10 +2008,15 @@ pub struct PagePaint {
     /// Absolute entries retain document scrolling; fixed entries are viewport-
     /// pinned. Every entry paints after the root stacking context.
     pub top_layer: Vec<TopLayerEntry>,
-    /// Browser-owned external playback controls. These never participate in
-    /// document painting or CSSOM hit testing. Frontends compose them above
-    /// page content, below browser chrome, with retained spatial scopes.
+    /// The user agent's playback controls of inline media elements. These
+    /// never participate in document painting or CSSOM hit testing.
+    /// Frontends compose them above page content, below browser chrome,
+    /// with retained spatial scopes.
     pub browser_media: Vec<Primitive>,
+    /// The external playback target (mpv) of each media element with a hit
+    /// region, by node: what its context menu offers
+    /// (`Scene::media_target_at`).
+    pub media_targets: HashMap<usize, url::Url>,
     pub image_requests: Vec<ImageRequest>,
     /// Node-associated canvas snapshots. No URLs, fetches, or intrinsic-size
     /// round trip is needed; retained old paint keeps its own complete pixels.
@@ -2761,6 +2773,19 @@ impl Scene {
         hit
     }
 
+    /// The external playback target (`PagePaint::media_targets`) of the
+    /// topmost media element among every box at `point` of `page`, so that
+    /// a player's own layers over its video (a poster copy, a click
+    /// catcher, controls) do not hide it.
+    pub fn media_target_at(&self, page: &PagePaint, point: CssPoint) -> Option<url::Url> {
+        if page.media_targets.is_empty() {
+            return None;
+        }
+        self.page_element_hits_at(point)
+            .into_iter()
+            .find_map(|hit| page.media_targets.get(&hit.node).cloned())
+    }
+
     /// Every CSS box at `point`, in topmost-first paint order, for CSSOM View's
     /// `elementsFromPoint()` algorithm. Unlike the UI's activation hit test,
     /// ordinary non-interactive elements remain candidates. Multiple fragments
@@ -2830,20 +2855,13 @@ impl Scene {
         let mut hits = std::collections::HashMap::new();
         for (index, primitive) in self.primitives.iter().enumerate() {
             if let DisplayCommand::HitRegion(region) = primitive {
-                let hit = PageHit {
+                hits.entry(region.node).or_insert_with(|| PageHit {
                     rect: transformed_bounds(region.rect, states[index].transform),
                     node: region.node,
                     actor: region.actor,
                     link: region.link.clone(),
                     cursor: region.cursor.clone(),
-                };
-                // A native playback subwidget follows its DOM anchor's focus
-                // order, but uses the button's geometry and activation target.
-                if matches!(region.link, Some(Link::Media(_))) {
-                    hits.insert(region.node, hit);
-                } else {
-                    hits.entry(region.node).or_insert(hit);
-                }
+                });
             }
         }
         order.iter().filter_map(|node| hits.remove(node)).collect()

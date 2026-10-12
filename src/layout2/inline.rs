@@ -2864,15 +2864,18 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
     ) {
         // A player often paints its `<video poster>` again as an absolutely
         // positioned sibling `<img>` so custom controls can cover the native
-        // element. That later image wins CSS painting order; carry the media
+        // element. That later image wins CSS painting order; where media is
+        // represented as a link to the external player, carry the media
         // target onto the pixels the user actually sees, or the real media
         // representation underneath becomes an unreachable link (X-style
         // players). Association is by the standardized poster URL and nearest
-        // containing band, never by a class or host name.
+        // containing band, never by a class or host name. Inline players are
+        // not links: their context menu offers the external player.
         let link = control
             .map(|(form, field)| Link::Form { form, field })
             .or_else(|| {
-                url.and_then(|u| poster_media_target(self.dom, self.base, node, u))
+                url.filter(|_| !self.dom.inline_media())
+                    .and_then(|u| poster_media_target(self.dom, self.base, node, u))
                     .map(Link::Media)
             })
             .or_else(|| ctx.link.clone());
