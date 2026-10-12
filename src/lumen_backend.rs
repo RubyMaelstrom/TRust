@@ -6672,17 +6672,23 @@ mod desktop {
                     .map(String::from),
             );
         }
-        // HTML #notify-about-rejected-promises: the platform queues a task that
-        // fires unhandledrejection and reports each event that is not canceled.
-        let rejections = page.engine.take_unhandled_rejections_full();
-        if !rejections.is_empty() {
-            let pairs: Vec<Value> = rejections
-                .iter()
-                .flat_map(|(promise, reason)| [promise.clone(), reason.clone()])
-                .collect();
-            let list = page.engine.ctx().make_array(pairs);
-            if engine_call_trust(&mut page.engine, "notifyRejectedPromises", &[list]).is_err() {
-                for (_, reason) in rejections {
+        // HTML #notify-about-rejected-promises: each global with a non-empty
+        // about-to-be-notified rejected promises list queues a task that fires
+        // unhandledrejection and reports each event that is not canceled. The
+        // list is that of the settings object whose script rejected the promise
+        // (HostPromiseRejectionTracker), so a frame's rejection is its own
+        // Window's, never the top-level Document's.
+        let rejections = page.engine.take_unhandled_rejections_in_contexts();
+        for (context, list) in rejections_by_context(rejections) {
+            let reasons: Vec<Value> = list.iter().map(|(_, reason)| reason.clone()).collect();
+            if !notify_rejections_in_context(
+                &mut page.engine,
+                context,
+                "notifyRejectedPromises",
+                list,
+            ) && is_page_context(&mut page.engine, context)
+            {
+                for reason in reasons {
                     let message = value_string(&mut page.engine, &reason);
                     page.outcome
                         .console
@@ -6690,16 +6696,12 @@ mod desktop {
                 }
             }
         }
-        // HTML HostPromiseRejectionTracker "handle": a handler attached to a promise of the
-        // outstanding rejected promises weak set queues a task to fire rejectionhandled.
-        let handled = page.engine.take_handled_rejections();
-        if !handled.is_empty() {
-            let pairs: Vec<Value> = handled
-                .into_iter()
-                .flat_map(|(promise, reason)| [promise, reason])
-                .collect();
-            let list = page.engine.ctx().make_array(pairs);
-            let _ = engine_call_trust(&mut page.engine, "notifyHandledPromises", &[list]);
+        // HTML HostPromiseRejectionTracker "handle": a handler attached to a promise of a
+        // global's outstanding rejected promises weak set queues a task to fire
+        // rejectionhandled at that global.
+        let handled = page.engine.take_handled_rejections_in_contexts();
+        for (context, list) in rejections_by_context(handled) {
+            notify_rejections_in_context(&mut page.engine, context, "notifyHandledPromises", list);
         }
         if std::env::var_os("TRUST_LUMEN_TRACE").is_some() {
             for error in &page.outcome.errors[error_start..] {
@@ -20102,6 +20104,62 @@ fn lumen_worker_internal_call(
         .member_get(&worker, name)
         .map_err(EvalError::Throw)?;
     engine.call_function_interruptible(&function, worker, args)
+}
+
+/// Rejection records grouped by the host settings context of their global, each group in
+/// rejection order (HTML #notify-about-rejected-promises runs per global).
+fn rejections_by_context(records: Vec<(u64, Value, Value)>) -> Vec<(u64, Vec<(Value, Value)>)> {
+    let mut groups: Vec<(u64, Vec<(Value, Value)>)> = Vec::new();
+    for (context, promise, reason) in records {
+        match groups.iter_mut().find(|(group, _)| *group == context) {
+            Some((_, list)) => list.push((promise, reason)),
+            None => groups.push((context, vec![(promise, reason)])),
+        }
+    }
+    groups
+}
+
+/// Whether `context` is the engine's active settings context or a live Window's.
+fn is_page_context(engine: &mut lumen::Engine, context: u64) -> bool {
+    let ctx = engine.ctx();
+    context == ctx.host_job_context()
+        || ctx
+            .host_mut::<HostState>()
+            .is_some_and(|state| state.window_realm(context).is_some())
+}
+
+/// Hand `list` to the platform-control operation `method` (`notifyRejectedPromises` or
+/// `notifyHandledPromises`) of Window `context`'s Realm, which queues its global task. A
+/// Window that is gone has no event loop task to queue (its Document is not fully active), so
+/// its records are dropped. False when the operation could not run.
+fn notify_rejections_in_context(
+    engine: &mut lumen::Engine,
+    context: u64,
+    method: &str,
+    list: Vec<(Value, Value)>,
+) -> bool {
+    let pairs: Vec<Value> = list
+        .into_iter()
+        .flat_map(|(promise, reason)| [promise, reason])
+        .collect();
+    if context == engine.ctx().host_job_context() {
+        let list = engine.ctx().make_array(pairs);
+        return engine_call_trust_method(engine, method, &[list]).is_ok();
+    }
+    let Some(realm) = engine
+        .ctx()
+        .host_mut::<HostState>()
+        .and_then(|state| state.window_realm(context))
+    else {
+        return false;
+    };
+    engine
+        .ctx()
+        .with_embed_realm(&realm, |realm_ctx| {
+            let list = realm_ctx.make_array(pairs);
+            host_call_trust(realm_ctx, method, &[list]).is_ok()
+        })
+        .unwrap_or(false)
 }
 
 fn lumen_worker_report_buffered_errors(
@@ -45290,6 +45348,38 @@ mod tests {
             check(Object.prototype.toString.call(e) === "[object DOMException]", "class string");
             throws(() => new DOMException(Symbol()), "TypeError", "DOMString conversion");
             "#,
+        );
+    }
+
+    #[test]
+    fn unhandled_rejections_fire_at_the_rejecting_scripts_global() {
+        // HTML #the-hostpromiserejectiontracker-implementation: a rejection goes on the
+        // about-to-be-notified list of the running script's settings object's global, so a
+        // frame's unhandled rejection (also one the top-level page triggers by calling a frame
+        // function) fires unhandledrejection at the frame's Window, never at the top-level
+        // one. Twitch's page reported Kasada's cross-origin challenge frame's rejections as its
+        // own errors.
+        let html = r#"<!doctype html><body><pre id="o">pending</pre>
+            <iframe srcdoc="<script>parent.frameEvents = []; addEventListener('unhandledrejection', e => parent.frameEvents.push('frame:' + e.reason)); window.rejectHere = reason => { Promise.reject(reason); }; Promise.reject('in-frame');</script>"></iframe>
+            <script>
+            const events = [];
+            addEventListener('unhandledrejection', e => events.push('top:' + e.reason));
+            onload = () => {
+                frames[0].rejectHere('called-from-top');
+                Promise.reject('in-top');
+                setTimeout(() => { document.getElementById('o').textContent =
+                    events.concat(window.frameEvents || ['no frame']).join(','); }, 50);
+            };
+            </script>"#;
+        let (output, _) = crate::js::transform(html, &crate::js::PageEnv::bare(DEFAULT_URL));
+        let result = output
+            .split("<pre id=\"o\">")
+            .nth(1)
+            .and_then(|rest| rest.split("</pre>").next())
+            .unwrap_or_default();
+        assert_eq!(
+            result, "top:in-top,frame:in-frame,frame:called-from-top",
+            "{output}"
         );
     }
 
