@@ -96,7 +96,7 @@ impl Flow<'_> {
         }
 
         let min_sum: f32 = col_min.iter().sum();
-        let max_sum: f32 = col_max.iter().sum();
+        let max_sum = percent_expanded_max(&col_max, &col_w);
         // Used table content width (§17.5.2.2): auto uses MAX when it fits the
         // band, else the band; a definite width fills the band (which already
         // equals `width − spacing`); never below MIN.
@@ -1248,6 +1248,48 @@ fn distribute_widths(
         grow_by_weight(&mut widths, &all, excess, |_| 1.0, ncols as f32);
     }
     widths.iter().map(|w| w.max(1.0)).collect()
+}
+
+/// The max-content width (less border spacing) an auto-width table asks of
+/// its containing block. CSS Tables 3 #computing-column-measures: a column's
+/// intrinsic percentage width is "the percentage of the table width the
+/// column desires to get, and could end up overriding its max-content
+/// width". A column wanting `p` of the table with max-content `m` needs a
+/// table of `m / p`, and the columns without a percentage need their
+/// max-content sum to be the remaining `1 − Σp` of it; when the percentages
+/// leave nothing for columns with content, the table wants all the room it
+/// can get. Gecko (`BasicTableLayoutStrategy`'s percentage-expanded
+/// preferred width) and Blink widen only the table's own used width this
+/// way, never its max-content contribution to its ancestors, which
+/// `table_intrinsic` reports. Bootstrap 3's input groups rely on it: their
+/// `width: 1%` addon cells stretch the table to the containing block.
+fn percent_expanded_max(max: &[f32], specs: &[Option<ColSpec>]) -> f32 {
+    let mut percent_total = 0.0f32;
+    let mut small_percent = 0.0f32;
+    let mut other_max = 0.0f32;
+    for (c, &width) in max.iter().enumerate() {
+        // #intrinsic-percentage-width-of-a-column: at most 100% less the
+        // columns before it.
+        let percent = match specs.get(c).copied().flatten() {
+            Some(ColSpec::Pct(p)) => p.min(1.0 - percent_total),
+            _ => 0.0,
+        };
+        if percent > 0.0 {
+            small_percent = small_percent.max(width / percent);
+            percent_total += percent;
+        } else {
+            other_max += width;
+        }
+    }
+    let mut expanded = max.iter().sum::<f32>().max(small_percent);
+    if percent_total >= 1.0 - f32::EPSILON {
+        if other_max > 0.0 {
+            expanded = f32::INFINITY;
+        }
+    } else {
+        expanded = expanded.max(other_max / (1.0 - percent_total));
+    }
+    expanded
 }
 
 /// Fixed table layout column widths (§17.5.2.1): declared column widths are

@@ -4715,6 +4715,39 @@ mod tests {
     }
 
     #[test]
+    fn generated_block_boxes_align_their_lines_by_their_own_text_properties() {
+        // CSS Pseudo 4 #generated-content: ::before/::after are fully
+        // styleable, so their block containers' lines follow the
+        // pseudo-element's text-align, text-indent and direction (CSS Text 3
+        // #text-align-property), not the originating element's. Video.js
+        // centers its big play glyph this way: an absolutely positioned
+        // ::before inside a static inline placeholder.
+        let width = 160.0;
+        let layout = lay_graphical(
+            r#"<style>
+              div { position:relative; height:20px; margin:0 }
+              #abs::before { content:"mid"; position:absolute; top:0; left:0; width:100%; text-align:center }
+              #ins > span::before { content:"ins"; position:absolute; top:0; left:0; width:100%; text-align:right }
+              #blk::before { content:"blk"; display:block; text-indent:10px }
+              #rtl::before { content:"rtl"; display:block; direction:rtl }
+            </style><body style="margin:0">
+            <div id=abs></div><div id=ins><span></span></div><div id=blk></div><div id=rtl></div></body>"#,
+            width,
+            &HashMap::new(),
+        );
+        let style = crate::text::TextStyle::default();
+        let w = |s: &str| crate::text::shape(s, &style).advance;
+        let (mx, _, _) = graphical_text(&layout, "mid");
+        assert!((mx - (width - w("mid")) / 2.0).abs() < 0.25, "mid x={mx}");
+        let (ix, _, _) = graphical_text(&layout, "ins");
+        assert!((ix - (width - w("ins"))).abs() < 0.25, "ins x={ix}");
+        let (bx, _, _) = graphical_text(&layout, "blk");
+        assert!((bx - 10.0).abs() < 0.25, "blk x={bx}");
+        let (rx, _, _) = graphical_text(&layout, "rtl");
+        assert!((rx - (width - w("rtl"))).abs() < 0.25, "rtl x={rx}");
+    }
+
+    #[test]
     fn legacy_center_aligns_overconstrained_descendant_blocks() {
         // WHATWG HTML Rendering §15.2/15.3.3: this is not merely inherited
         // text-align. A qualifying fixed-width descendant has its forced used
@@ -6140,6 +6173,61 @@ mod tests {
             assert!((width(id) - 158.0).abs() < 2.5, "{id}: {}", width(id));
         }
         assert!((width("y") - 318.0).abs() < 2.5, "{}", width("y"));
+    }
+
+    #[test]
+    fn percentage_columns_widen_auto_width_tables() {
+        // CSS Tables 3 #computing-column-measures: a column's intrinsic
+        // percentage width can override its max-content width, so an auto
+        // table widens until each percentage column gets its share (as
+        // Gecko and Blink do), never beyond its containing block.
+        // `half`: the 50% column's 100px max-content asks for a 200px table.
+        // `rest`: the 25% column leaves 75% to a 150px column, so 200px.
+        // `full`: Bootstrap 3's input group, whose 1% addon stretches the
+        // table to the 400px band, and whose floated `display:table-cell`
+        // field is blockified (CSS Display 3 #transformations) into an
+        // anonymous cell that takes the rest.
+        let html = r#"<!doctype html><body style="margin:0;width:400px">
+            <div id=half style="display:table"><div style="display:table-cell;width:50%"><div style="width:100px;height:1px"></div></div><div style="display:table-cell"></div></div>
+            <div id=rest style="display:table"><div style="display:table-cell;width:25%"></div><div style="display:table-cell"><div style="width:150px;height:1px"></div></div></div>
+            <div id=full style="display:table"><span id=addon style="display:table-cell;width:1%;padding:0 10px;white-space:nowrap">S</span><input id=field style="display:table-cell;float:left;width:100%;box-sizing:border-box"><span style="display:none">x</span></div>
+            <div id=shrink style="float:left"><div id=inner style="display:table"><div style="display:table-cell;width:50%"><div style="width:30px;height:1px"></div></div></div></div>
+            </body>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 800.0, &HashMap::new());
+        let rect = |id: &str| layout.boxes[&dom.get_by_id(id).unwrap()];
+        assert!(
+            (rect("half").width - 200.0).abs() < 0.5,
+            "{}",
+            rect("half").width
+        );
+        assert!(
+            (rect("rest").width - 200.0).abs() < 0.5,
+            "{}",
+            rect("rest").width
+        );
+        assert!(
+            (rect("full").width - 400.0).abs() < 0.5,
+            "{}",
+            rect("full").width
+        );
+        let addon = rect("addon");
+        let field = rect("field");
+        assert!(addon.width < 40.0, "{}", addon.width);
+        assert!((field.left - (addon.left + addon.width)).abs() < 0.5);
+        assert!((field.left + field.width - 400.0).abs() < 0.5, "{field:?}");
+        // A table's max-content contribution to a shrink-to-fit ancestor is
+        // not widened; it then fills the width that ancestor got.
+        assert!(
+            (rect("shrink").width - 30.0).abs() < 0.5,
+            "{}",
+            rect("shrink").width
+        );
+        assert!(
+            (rect("inner").width - 30.0).abs() < 0.5,
+            "{}",
+            rect("inner").width
+        );
     }
 
     #[test]

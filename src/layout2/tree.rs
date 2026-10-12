@@ -1844,9 +1844,7 @@ impl Builder<'_> {
         let mut top_captions = Vec::new();
         let mut bottom_captions = Vec::new();
         for c in self.dom.flat_children(id) {
-            if self.dom.effective_display(c).as_deref() != Some("table-caption")
-                || Pos::of(self.dom, c).out_of_flow()
-            {
+            if self.table_child_display(c).as_deref() != Some("table-caption") {
                 continue;
             }
             let bottom = self
@@ -1995,8 +1993,18 @@ impl Builder<'_> {
         header
     }
 
+    /// The display type `node` has as a child of a table box. CSS Display 3
+    /// #transformations: absolute positioning or floating blockifies a box,
+    /// so it is never a proper table child; it joins an anonymous cell (CSS
+    /// 2 §17.2.1). Bootstrap 3's input groups float their `display:
+    /// table-cell` text field.
     fn table_child_display(&self, node: NodeId) -> Option<String> {
-        if Pos::of(self.dom, node).out_of_flow() {
+        let floats = || {
+            self.dom
+                .computed_value(node, "float")
+                .is_some_and(|float| !float.trim().eq_ignore_ascii_case("none"))
+        };
+        if Pos::of(self.dom, node).out_of_flow() || floats() {
             None
         } else {
             self.dom.effective_display(node)

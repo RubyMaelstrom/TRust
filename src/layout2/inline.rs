@@ -4339,7 +4339,8 @@ pub(super) fn block_ellipsis(
     line.width = end + ellipsis.box_width - line.band[0];
     line.pieces.push(ellipsis);
     let free = (line.band[1] - line.band[0] - line.width).max(0.0);
-    line.alignment_offset = match super::style::block_align(dom, root.node) {
+    let text = super::style::TextSource::of(root);
+    line.alignment_offset = match super::style::block_align(dom, text) {
         Align2::Center => free / 2.0,
         Align2::Right => free,
         _ => 0.0,

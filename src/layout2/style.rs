@@ -1247,24 +1247,82 @@ pub(crate) enum Align2 {
     Justify,
 }
 
+/// Whose computed text properties (`text-align`, `text-align-last`,
+/// `text-indent`, `direction`) govern a block container's line boxes. An
+/// anonymous box inherits its parent element's (CSS 2 §9.2.1.1). A generated
+/// `::before`/`::after` box is a fully styleable pseudo-element (CSS Pseudo
+/// 4 #generated-content) without a node identity of its own, so its lines
+/// follow the pseudo-element's computed values, not its originating
+/// element's.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TextSource {
+    node: NodeId,
+    pseudo: Option<PseudoEl>,
+}
+
+impl TextSource {
+    /// The source of the lines a box with inline context `inl` lays out.
+    pub(crate) fn of(inl: &InlineStyle) -> Self {
+        match inl.pseudo {
+            Some((node, which)) => Self {
+                node,
+                pseudo: Some(which),
+            },
+            None => inl.node.into(),
+        }
+    }
+
+    fn value(self, dom: &Dom, prop: &str) -> Option<String> {
+        if self.node == NO_NODE {
+            return None;
+        }
+        match self.pseudo {
+            Some(which) => dom.pseudo_layout_value(self.node, which, prop),
+            None => dom.computed_value_resolved(self.node, prop),
+        }
+    }
+
+    /// The font-relative units its lengths resolve against.
+    pub(crate) fn units(self, dom: &Dom) -> Units {
+        match self.pseudo {
+            Some(which) => pseudo_units(dom, self.node, which),
+            None => Units::of(dom, self.node),
+        }
+    }
+
+    /// Its computed `text-indent`.
+    pub(crate) fn text_indent(self, dom: &Dom) -> Option<String> {
+        self.value(dom, "text-indent")
+    }
+}
+
+impl From<NodeId> for TextSource {
+    fn from(node: NodeId) -> Self {
+        Self { node, pseudo: None }
+    }
+}
+
 /// The alignment governing `id`'s line boxes: its computed `text-align`,
 /// which includes HTML's `align` and `<center>` presentational hints.
-pub(crate) fn block_align(dom: &Dom, id: NodeId) -> Align2 {
-    if id == NO_NODE {
+pub(crate) fn block_align(dom: &Dom, id: impl Into<TextSource>) -> Align2 {
+    let source = id.into();
+    if source.node == NO_NODE {
         return Align2::Left;
     }
-    if let Some(v) = dom.computed_value_resolved(id, "text-align")
-        && let Some(a) = align_from_css_in(&v, right_to_left(dom, id))
+    if let Some(v) = source.value(dom, "text-align")
+        && let Some(a) = align_from_css_in(&v, right_to_left(dom, source))
     {
         return a;
     }
     // UA sheet: `caption { text-align: center }` (CSS 2.1 §17.4 / Appendix D)
     // when the cascade resolved no author alignment.
-    if dom.effective_display(id).as_deref() == Some("table-caption") {
+    if source.pseudo.is_none()
+        && dom.effective_display(source.node).as_deref() == Some("table-caption")
+    {
         return Align2::Center;
     }
     // The initial value, `start`.
-    if right_to_left(dom, id) {
+    if right_to_left(dom, source) {
         Align2::Right
     } else {
         Align2::Left
@@ -1345,15 +1403,13 @@ pub(crate) fn legacy_descendant_align(dom: &Dom, id: NodeId) -> Option<Align2> {
 
 /// CSS Text 3 #text-align-last-property: the used alignment of `id`'s last
 /// line, or `None` for `auto` (which follows `text-align`).
-pub(crate) fn block_align_last(dom: &Dom, id: NodeId) -> Option<Align2> {
-    if id == NO_NODE {
-        return None;
-    }
-    let value = dom.computed_value_resolved(id, "text-align-last")?;
+pub(crate) fn block_align_last(dom: &Dom, id: impl Into<TextSource>) -> Option<Align2> {
+    let source = id.into();
+    let value = source.value(dom, "text-align-last")?;
     if value.trim().eq_ignore_ascii_case("auto") {
         return None;
     }
-    align_from_css_in(&value, right_to_left(dom, id))
+    align_from_css_in(&value, right_to_left(dom, source))
 }
 
 /// CSS Box Alignment 3 #distribution-block: a block container's
@@ -1415,11 +1471,10 @@ pub(super) fn block_content_align(dom: &Dom, id: NodeId) -> Option<BlockContentA
 
 /// CSS Writing Modes 4 #direction: whether `id`'s inline base direction is
 /// right-to-left.
-pub(super) fn right_to_left(dom: &Dom, id: NodeId) -> bool {
-    id != NO_NODE
-        && dom
-            .computed_value_resolved(id, "direction")
-            .is_some_and(|direction| direction.trim().eq_ignore_ascii_case("rtl"))
+pub(super) fn right_to_left(dom: &Dom, id: impl Into<TextSource>) -> bool {
+    id.into()
+        .value(dom, "direction")
+        .is_some_and(|direction| direction.trim().eq_ignore_ascii_case("rtl"))
 }
 
 fn align_from_css(value: &str) -> Option<Align2> {

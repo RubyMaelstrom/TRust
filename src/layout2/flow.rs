@@ -30,7 +30,7 @@ use super::float::{FloatBox, FloatCtx, Side};
 use super::inline::{AtomBoxSize, FloatEnv, Ifc, InlineItem, LineOut, OofMark, Piece};
 use super::intrinsic::IMode;
 use super::style::{
-    BOTTOM, BoxStyle, InlineStyle, LEFT, Outline, Pos, RIGHT, TOP, block_align,
+    BOTTOM, BoxStyle, InlineStyle, LEFT, Outline, Pos, RIGHT, TOP, TextSource, block_align,
     legacy_descendant_align,
 };
 use super::tree::{Atom, AtomKind, BoxNode, Content, Inline, SharedBox};
@@ -887,8 +887,10 @@ impl Flow<'_> {
         let a0 = cur.anchors.len();
         let inl = InlineStyle::for_box(self.dom, b.node, s, parent_inl, self.base);
         // Anonymous boxes inherit the text properties of their parent
-        // element (§9.2.1.1) — alignment/indent read from it.
+        // element (§9.2.1.1) — alignment/indent read from it; a generated
+        // box's are its pseudo-element's own.
         let style_node = if b.node == NO_NODE { inl.node } else { b.node };
+        let text = TextSource::of(&inl);
         // `h`/`x_border` are mutable because a table box shrinks to fit
         // (§17.5.2) and repositions within its band (§17.4 auto margins /
         // align) — its used content width and border-box left are known only
@@ -1194,8 +1196,8 @@ impl Flow<'_> {
                             content_top_y,
                             h.content_w,
                             child_cb_h,
-                            block_align(self.dom, style_node),
-                            self.indent_px(style_node, h.content_w),
+                            block_align(self.dom, text),
+                            self.indent_px(text, h.content_w),
                             marker,
                             marker_image,
                             &inl,
@@ -1406,7 +1408,7 @@ impl Flow<'_> {
                             self.vp,
                             h.content_w,
                             ifc_cb_h,
-                            block_align(self.dom, style_node),
+                            block_align(self.dom, text),
                             0.0,
                             None,
                             &[],
@@ -1519,7 +1521,7 @@ impl Flow<'_> {
             cur.neg = 0.0;
         }
         if super::text_overflow::applies(s) {
-            let rtl = super::style::right_to_left(self.dom, inl.node);
+            let rtl = super::style::right_to_left(self.dom, text);
             let scroll = self.ellipsis_scroll(b.node, s);
             super::text_overflow::apply(&mut children, &inl, rtl, scroll);
         }
@@ -1996,7 +1998,7 @@ impl Flow<'_> {
                 width,
                 None,
                 align,
-                self.indent_px(inl.node, width),
+                self.indent_px(TextSource::of(inl), width),
                 None,
                 &[],
             );
@@ -2005,11 +2007,11 @@ impl Flow<'_> {
             ifc.finish().0
         };
         let lines = if height.is_some() {
-            probe(cap, block_align(self.dom, inl.node))
+            probe(cap, block_align(self.dom, TextSource::of(inl)))
         } else {
             let max_lines = probe(10_000_000., super::style::Align2::Left);
             let max = max_lines.iter().map(|line| line.width).fold(0., f32::max);
-            probe(max.min(cap), block_align(self.dom, inl.node))
+            probe(max.min(cap), block_align(self.dom, TextSource::of(inl)))
         };
         let block = lines.iter().map(|line| line.gap_before + line.height).sum();
         let inline =
@@ -2678,14 +2680,10 @@ impl Flow<'_> {
 
     /// `text-indent` in px for a box's IFC (inherited; percentages against
     /// the box's own content width — CSS Text §6.2).
-    pub(crate) fn indent_px(&self, node: NodeId, content_w: f32) -> f32 {
-        if node == NO_NODE {
-            return 0.0;
-        }
-        let u = crate::layout2::Units::of(self.dom, node);
-        self.dom
-            .computed_value_resolved(node, "text-indent")
-            .and_then(|v| Len::parse(&v, u, self.vp))
+    pub(crate) fn indent_px(&self, source: super::style::TextSource, content_w: f32) -> f32 {
+        source
+            .text_indent(self.dom)
+            .and_then(|v| Len::parse(&v, source.units(self.dom), self.vp))
             .and_then(|l| l.resolve(Some(content_w)))
             .unwrap_or(0.0)
     }
@@ -3971,7 +3969,7 @@ impl Flow<'_> {
         let _profile = super::diagnostics::enter(super::diagnostics::Op::ItemCompute);
         let s = &b.style;
         let inl = InlineStyle::for_box(self.dom, b.node, s, parent_inl, self.base);
-        let style_node = if b.node == NO_NODE { inl.node } else { b.node };
+        let text = TextSource::of(&inl);
         let bp_l = s.border[LEFT] + self.pad(s, LEFT, pct_basis);
         let bp_r = s.border[RIGHT] + self.pad(s, RIGHT, pct_basis);
         let bt = s.border[TOP] + self.pad(s, TOP, pct_basis);
@@ -4069,8 +4067,8 @@ impl Flow<'_> {
                     bt,
                     content_w,
                     def_h,
-                    block_align(self.dom, style_node),
-                    self.indent_px(style_node, content_w),
+                    block_align(self.dom, text),
+                    self.indent_px(text, content_w),
                     (b.marker_inside).then_some(b.marker.as_deref()).flatten(),
                     (b.marker_inside)
                         .then_some(b.marker_image.as_deref())
@@ -4154,7 +4152,7 @@ impl Flow<'_> {
                         self.vp,
                         content_w,
                         def_h,
-                        block_align(self.dom, style_node),
+                        block_align(self.dom, text),
                         0.0,
                         None,
                         &[],
@@ -4261,7 +4259,7 @@ impl Flow<'_> {
             cur.neg = 0.0;
         }
         if super::text_overflow::applies(s) {
-            let rtl = super::style::right_to_left(self.dom, inl.node);
+            let rtl = super::style::right_to_left(self.dom, text);
             let scroll = self.ellipsis_scroll(b.node, s);
             super::text_overflow::apply(&mut children, &inl, rtl, scroll);
         }
@@ -5583,12 +5581,12 @@ impl Flow<'_> {
         }
         // CSS Text 3 #valdef-text-align-last-auto: justified text's last line
         // is start-aligned, which is the right edge in right-to-left text.
-        let align_last = super::style::block_align_last(self.dom, inl.node).or_else(|| {
-            (align == super::style::Align2::Justify
-                && super::style::right_to_left(self.dom, inl.node))
-            .then_some(super::style::Align2::Right)
+        let text = TextSource::of(inl);
+        let align_last = super::style::block_align_last(self.dom, text).or_else(|| {
+            (align == super::style::Align2::Justify && super::style::right_to_left(self.dom, text))
+                .then_some(super::style::Align2::Right)
         });
-        let rtl = super::style::right_to_left(self.dom, inl.node);
+        let rtl = super::style::right_to_left(self.dom, text);
         // One line layout of this content; `inset` narrows line breaking
         // from line `from` on (CSS Text 4 #text-wrap-style).
         let lay = |fc: &mut FloatCtx, inset: f32, from: usize| {
@@ -5801,8 +5799,8 @@ impl Flow<'_> {
                     content_top,
                     col_w,
                     cb_h,
-                    block_align(self.dom, b.node),
-                    self.indent_px(b.node, col_w),
+                    block_align(self.dom, TextSource::of(inl)),
+                    self.indent_px(TextSource::of(inl), col_w),
                     (b.marker_inside).then_some(b.marker.as_deref()).flatten(),
                     (b.marker_inside)
                         .then_some(b.marker_image.as_deref())

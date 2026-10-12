@@ -247,7 +247,7 @@ impl Flow<'_> {
                     Align2::Left,
                     // text-indent participates in intrinsic widths;
                     // percentages resolve against a zero basis here.
-                    self.indent_px(if b.node == NO_NODE { inl.node } else { b.node }, 0.0),
+                    self.indent_px(super::style::TextSource::of(&here), 0.0),
                     None,
                     &atom_sizes,
                 );
