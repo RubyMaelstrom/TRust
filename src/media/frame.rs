@@ -178,6 +178,101 @@ impl VideoFrame {
         first_row: usize,
         out: &mut [u8],
     ) {
+        if factor == 1 && self.convert_rows_8bit(k, out_w, first_row, out) {
+            return;
+        }
+        self.convert_rows_by_sample(k, factor, out_w, first_row, out);
+    }
+
+    /// [`Self::convert_rows`] at full size for 8-bit samples, the common
+    /// case and one run for every presented frame: each row's luma and
+    /// chroma are read as slices rather than one clamped, bounds-checked
+    /// sample at a time, and a chroma pair's terms are computed once for the
+    /// pixels sharing it. The pixels are those of the general path. False
+    /// (writing nothing) for other depths, subsamplings or the identity
+    /// matrix.
+    fn convert_rows_8bit(
+        &self,
+        k: &Coefficients,
+        out_w: usize,
+        first_row: usize,
+        out: &mut [u8],
+    ) -> bool {
+        let plane = |index: usize| match self.planes.get(index) {
+            Some(Plane {
+                data: PlaneData::U8(data),
+                stride,
+                ..
+            }) if self.bit_depth == 8 => Some((data.as_slice(), *stride)),
+            _ => None,
+        };
+        let Some((luma, luma_stride)) = plane(0) else {
+            return false;
+        };
+        if k.identity {
+            return false;
+        }
+        let chroma = match self.layout {
+            Layout::Monochrome => None,
+            Layout::Planar {
+                chroma_shift: (sx @ (0 | 1), sy),
+            } => match (plane(1), plane(2)) {
+                (Some(u), Some(v)) => Some((u, Some(v), sx, sy)),
+                _ => return false,
+            },
+            Layout::Planar { .. } => return false,
+            // Interleaved Cb/Cr pairs, 4:2:0.
+            Layout::SemiPlanar => match plane(1) {
+                Some(uv) => Some((uv, None, 1, 1)),
+                None => return false,
+            },
+        };
+        for (row, line) in out.chunks_exact_mut(out_w * 4).enumerate() {
+            let y = first_row + row;
+            let lumas = &luma[y * luma_stride..][..out_w];
+            let pixels = line.as_chunks_mut::<4>().0;
+            match chroma {
+                None => {
+                    let terms = k.terms(128, 128);
+                    for (pixel, &luma) in pixels.iter_mut().zip(lumas) {
+                        *pixel = k.pixel(i32::from(luma), terms);
+                    }
+                }
+                Some(((u, u_stride), Some((v, v_stride)), sx, sy)) => {
+                    let cy = y >> sy;
+                    let pairs = u[cy * u_stride..]
+                        .iter()
+                        .copied()
+                        .zip(v[cy * v_stride..].iter().copied());
+                    if sx == 0 {
+                        for ((pixel, &luma), (cb, cr)) in pixels.iter_mut().zip(lumas).zip(pairs) {
+                            *pixel = k.pixel(i32::from(luma), k.terms(cb.into(), cr.into()));
+                        }
+                    } else {
+                        convert_pixel_pairs(k, pixels, lumas, pairs);
+                    }
+                }
+                Some(((uv, uv_stride), None, _, sy)) => {
+                    let pairs = uv[(y >> sy) * uv_stride..]
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|&[u, v]| (u, v));
+                    convert_pixel_pairs(k, pixels, lumas, pairs);
+                }
+            }
+        }
+        true
+    }
+
+    fn convert_rows_by_sample(
+        &self,
+        k: &Coefficients,
+        factor: usize,
+        out_w: usize,
+        first_row: usize,
+        out: &mut [u8],
+    ) {
         let rows = out.len() / (out_w * 4);
         let shift = self.bit_depth.saturating_sub(8);
         let area = (factor * factor) as u32;
@@ -247,6 +342,33 @@ impl VideoFrame {
     }
 }
 
+/// One row of 8-bit samples with horizontally halved chroma: each (Cb, Cr)
+/// of `chroma` serves two pixels, and the next one a last odd pixel. Fixed
+/// size pairs let the compiler vectorize the row (several times faster than
+/// pixel-at-a-time chunks).
+#[inline]
+fn convert_pixel_pairs(
+    k: &Coefficients,
+    pixels: &mut [[u8; 4]],
+    lumas: &[u8],
+    mut chroma: impl Iterator<Item = (u8, u8)>,
+) {
+    let (pixel_pairs, pixel_tail) = pixels.as_chunks_mut::<2>();
+    let (luma_pairs, luma_tail) = lumas.as_chunks::<2>();
+    for ((pixels, &[left, right]), (cb, cr)) in
+        pixel_pairs.iter_mut().zip(luma_pairs).zip(&mut chroma)
+    {
+        let terms = k.terms(cb.into(), cr.into());
+        *pixels = [
+            k.pixel(i32::from(left), terms),
+            k.pixel(i32::from(right), terms),
+        ];
+    }
+    if let ([pixel], [luma], Some((cb, cr))) = (pixel_tail, luma_tail, chroma.next()) {
+        *pixel = k.pixel(i32::from(*luma), k.terms(cb.into(), cr.into()));
+    }
+}
+
 #[inline]
 fn read(plane: &Plane, index: usize) -> u32 {
     match &plane.data {
@@ -305,18 +427,29 @@ impl Coefficients {
             // GBR: Y'=G, Cb=B, Cr=R.
             return (v.min(255) as u8, y.min(255) as u8, u.min(255) as u8);
         }
-        let y = (y as i32 - self.y_offset) * self.y_scale;
-        let cb = u as i32 - 128;
-        let cr = v as i32 - 128;
+        let [r, g, b, _] = self.pixel(y as i32, self.terms(u as i32, v as i32));
+        (r, g, b)
+    }
+
+    /// The chroma contributions (with rounding) to R', G' and B' of the
+    /// pixels sharing one (Cb, Cr) sample.
+    #[inline]
+    fn terms(&self, cb: i32, cr: i32) -> [i32; 3] {
+        let (cb, cr) = (cb - 128, cr - 128);
         let round = 1 << 13;
-        let r = (y + self.cr_r * cr + round) >> 14;
-        let g = (y - self.cb_g * cb - self.cr_g * cr + round) >> 14;
-        let b = (y + self.cb_b * cb + round) >> 14;
-        (
-            r.clamp(0, 255) as u8,
-            g.clamp(0, 255) as u8,
-            b.clamp(0, 255) as u8,
-        )
+        [
+            self.cr_r * cr + round,
+            round - self.cb_g * cb - self.cr_g * cr,
+            self.cb_b * cb + round,
+        ]
+    }
+
+    /// One opaque pixel from its luma and its chroma `terms`.
+    #[inline]
+    fn pixel(&self, y: i32, [r, g, b]: [i32; 3]) -> [u8; 4] {
+        let y = (y - self.y_offset) * self.y_scale;
+        let channel = |term: i32| ((y + term) >> 14).clamp(0, 255) as u8;
+        [channel(r), channel(g), channel(b), 255]
     }
 }
 
@@ -484,6 +617,84 @@ mod tests {
         };
         let (pixels, ..) = high.to_rgba(1).unwrap();
         assert_eq!(&pixels[..4], &[255, 255, 255, 255]);
+    }
+
+    /// The 8-bit full-size row path converts exactly as the per-sample path
+    /// does, for every layout and odd sizes (chroma rounded up, the last
+    /// pixel of a pair-wise row on its own).
+    #[test]
+    fn row_conversion_matches_sample_conversion() {
+        let (w, h) = (7usize, 5usize);
+        let ramp = |len: usize, seed: usize| -> Vec<u8> {
+            (0..len)
+                .map(|i| ((i * 37 + seed * 101) % 256) as u8)
+                .collect()
+        };
+        let layouts = [
+            Layout::Planar {
+                chroma_shift: (1, 1),
+            },
+            Layout::Planar {
+                chroma_shift: (1, 0),
+            },
+            Layout::Planar {
+                chroma_shift: (0, 0),
+            },
+            Layout::SemiPlanar,
+            Layout::Monochrome,
+        ];
+        for (index, layout) in layouts.into_iter().enumerate() {
+            let (cw, ch, planes) = match layout {
+                Layout::Planar {
+                    chroma_shift: (sx, sy),
+                } => {
+                    let cw = (w + (1 << sx) - 1) >> sx;
+                    let ch = (h + (1 << sy) - 1) >> sy;
+                    (cw, ch, 2)
+                }
+                Layout::SemiPlanar => (w.div_ceil(2), h.div_ceil(2), 1),
+                Layout::Monochrome => (0, 0, 0),
+            };
+            let mut planes_out = vec![Plane::u8(ramp(9 * h, index), 9, w, h)];
+            for plane in 0..planes {
+                let width = if matches!(layout, Layout::SemiPlanar) {
+                    cw * 2
+                } else {
+                    cw
+                };
+                planes_out.push(Plane::u8(
+                    ramp((width + 3) * ch, plane + 7),
+                    width + 3,
+                    cw,
+                    ch,
+                ));
+            }
+            for (matrix, full_range) in [(1, false), (6, true), (0, true)] {
+                let frame = VideoFrame {
+                    width: w as u32,
+                    height: h as u32,
+                    layout,
+                    planes: planes_out.clone(),
+                    ..frame(0, 0, 0, full_range, matrix)
+                };
+                assert!(frame.valid(), "{layout:?}");
+                let k = Coefficients::new(frame.color, 8);
+                let mut rows = vec![0u8; w * h * 4];
+                // The identity (GBR) matrix keeps to the general path.
+                let converted = frame.convert_rows_8bit(&k, w, 0, &mut rows);
+                assert_eq!(converted, matrix != 0, "{layout:?}");
+                if !converted {
+                    continue;
+                }
+                let mut samples = vec![0u8; w * h * 4];
+                frame.convert_rows_by_sample(&k, 1, w, 0, &mut samples);
+                assert_eq!(rows, samples, "{layout:?} matrix {matrix}");
+                // A band of rows starting part way down, as the threads run.
+                let mut band = vec![0u8; w * 2 * 4];
+                assert!(frame.convert_rows_8bit(&k, w, 3, &mut band));
+                assert_eq!(band, samples[w * 3 * 4..w * 5 * 4]);
+            }
+        }
     }
 
     #[test]
