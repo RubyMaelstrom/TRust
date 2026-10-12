@@ -576,13 +576,14 @@ current behavior and limits; consult the governing standards before changing it.
 - Tabs (trust-desktop): a strip in place of the title bar (window moves,
   minimize/maximize/close, scroll arrows on overflow), Ctrl+T, Ctrl+W,
   Ctrl+Tab/Ctrl+Shift+Tab (not for a Telnet session in character mode),
-  Ctrl+Shift+T (this session's closed tabs), Ctrl+Q. A background tab unseen
-  for 10 minutes sleeps (Page Lifecycle discard: freeze, then its engine
-  goes; its history wakes it), except a Telnet session, an audible page, one
-  with unsubmitted form edits, a loading one, one being asked whether to
-  leave, and one sharing its browsing context group. Pages unload (pagehide,
-  unload, keepalive beacons outliving them) when their tab closes or
-  navigates; beforeunload asks the user through `UnloadPrompt`.
+  Ctrl+Shift+T (this session's closed tabs), Ctrl+Q. Tabs fill the strip's
+  height; the empty strip beside them moves the window. A background tab
+  unseen for 10 minutes sleeps (Page Lifecycle discard: freeze, then its
+  engine goes; its history wakes it), except a Telnet session, an audible
+  page, one with unsubmitted form edits, a loading one, one being asked
+  whether to leave, and one sharing its browsing context group. Pages unload
+  (pagehide, unload, keepalive beacons outliving them) when their tab closes
+  or navigates; beforeunload asks the user through `UnloadPrompt`.
 - HTML's rules for choosing a navigable in trust-desktop: `_blank`
   hyperlinks, Ctrl/middle clicks and `noopener` requests open a tab in a new
   browsing context group (`PageEvt::OpenTraversable`); `window.open` and

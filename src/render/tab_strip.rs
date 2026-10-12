@@ -36,8 +36,6 @@ const ARROW_WIDTH: f32 = 20.0;
 /// Empty strip that always remains for moving the window.
 const DRAG_RESERVE: f32 = 40.0;
 const LEFT_PAD: f32 = 4.0;
-/// Tabs start below this margin; the rest of the strip's top moves the window.
-const TAB_TOP: f32 = 3.0;
 const TITLE_SIZE: f32 = 11.5;
 /// From this width every tab shows its close button; narrower inactive tabs
 /// show it while hovered.
@@ -94,8 +92,9 @@ pub struct TabStripGeometry {
 impl TabStripGeometry {
     /// Lay out `count` tabs: as wide as fits up to their maximum, then at
     /// their minimum width scrolled by `scroll`, with the scroll arrows at
-    /// the far right. The window buttons stay at the right edge and some
-    /// empty strip always remains to move the window by.
+    /// the far right. Tabs fill the strip's height. The window buttons stay
+    /// at the right edge and some empty strip always remains to move the
+    /// window by.
     pub fn new(width: f32, count: usize, scroll: f32) -> Self {
         let height = TAB_STRIP_HEIGHT;
         let width = width.max(0.0);
@@ -122,7 +121,7 @@ impl TabStripGeometry {
         } else {
             (TAB_MAX_WIDTH, 0.0, false)
         };
-        let viewport = CssRect::new(LEFT_PAD, TAB_TOP, viewport_width, height - TAB_TOP);
+        let viewport = CssRect::new(LEFT_PAD, 0.0, viewport_width, height);
         let max_scroll = if overflow {
             (tab_width * count_f - viewport_width).max(0.0)
         } else {
@@ -137,9 +136,9 @@ impl TabStripGeometry {
             .map(|index| {
                 CssRect::new(
                     viewport.x + index as f32 * tab_width - scroll,
-                    TAB_TOP,
+                    0.0,
                     tab_width,
-                    height - TAB_TOP,
+                    height,
                 )
             })
             .collect();
@@ -1020,9 +1019,16 @@ mod tests {
             Some(TabStripPart::Empty)
         );
         assert_eq!(
-            geometry.part_at(CssPoint::new(geometry.tabs[0].x + 30.0, 1.0)),
-            Some(TabStripPart::Empty),
-            "the margin above the tabs moves the window"
+            geometry.part_at(CssPoint::new(geometry.tabs[0].x + 30.0, 0.0)),
+            Some(TabStripPart::Tab(0)),
+            "tabs fill the strip's height"
+        );
+        assert_eq!(
+            geometry.part_at(CssPoint::new(
+                geometry.tabs[2].x + 30.0,
+                TAB_STRIP_HEIGHT - 0.5
+            )),
+            Some(TabStripPart::Tab(2))
         );
         assert_eq!(
             geometry.part_at(CssPoint::new(10.0, TAB_STRIP_HEIGHT + 1.0)),

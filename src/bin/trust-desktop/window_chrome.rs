@@ -13,6 +13,9 @@ use winit::window::ResizeDirection;
 /// The band along the window's edges that resizes it while it is neither
 /// maximized nor fullscreen.
 const RESIZE_BORDER: f32 = 5.0;
+/// Along the top, between its corners, only this much of the band resizes:
+/// the tabs fill the strip below it and must be easy to hit.
+const TOP_RESIZE_BORDER: f32 = 2.0;
 /// A second press on the empty strip within this time maximizes the window.
 const DOUBLE_CLICK: Duration = Duration::from_millis(450);
 /// How far a pressed tab moves before the press becomes a drag.
@@ -131,7 +134,7 @@ impl DesktopApp {
         let size = self.metrics.css;
         let west = point.x < RESIZE_BORDER;
         let east = point.x >= size.width - RESIZE_BORDER;
-        let north = point.y < RESIZE_BORDER;
+        let north = point.y < TOP_RESIZE_BORDER || (point.y < RESIZE_BORDER && (west || east));
         let south = point.y >= size.height - RESIZE_BORDER;
         match (north, south, west, east) {
             (true, _, true, _) => Some(ResizeDirection::NorthWest),
