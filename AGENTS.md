@@ -494,8 +494,8 @@ current behavior and limits; consult the governing standards before changing it.
   navigation request's final `Referer`.
 - IndexedDB and Cache Storage are shared blocks (`/*__INDEXEDDB_BEGIN__*/`,
   `/*__CACHE_STORAGE_BEGIN__*/`) in Windows and workers over the storage shed's
-  per-origin bottles, so every agent of an origin sees the same databases and
-  caches. Commits use `__storage_cas` compare-and-set retries (a read/write
+  per-storage-key bottles, so every agent of an origin (within one storage
+  partition) sees the same databases and caches. Commits use `__storage_cas` compare-and-set retries (a read/write
   transaction replaces only its scope's object stores). `indexed_db_host.rs` is
   the shed's coordinator for connection queues, connections, the
   versionchange/blocked handshake and cross-agent transaction scheduling; it
@@ -1024,12 +1024,22 @@ current behavior and limits; consult the governing standards before changing it.
   HTTP may use the exception, and SameSite still applies: cross-site responses
   store them only as `Secure; SameSite=None`, and cross-site requests receive
   only those. Every other cookie (including `__cf_bm`) stays blocked cross-site.
-  Third-party frames still
-  cannot access document cookies or localStorage, even for bookmarked sites.
-  Main navigation follows SameSite rules. `set cookies off` disables cookie access/capture
+  Third-party frames still cannot access document cookies.
+  Main navigation follows SameSite rules.
+- Storage is partitioned like LibreWolf's (Firefox dFPI) and Chrome's
+  (Client-Side Storage Partitioning, Privacy CG): a frame or worker with a
+  cross-site ancestor keys localStorage, sessionStorage, IndexedDB, Cache
+  Storage, BroadcastChannel and shared workers by its top-level site as well
+  as its origin (`CookieContext::storage_partition`, `__trust_cfg.
+  storagePartition`, `storageKeyFor` in the prelude; buckets are
+  `<kind>:<origin>^<top-level site>`). An embed's state under one site is
+  invisible under every other and to its own first-party pages; an A-B-A frame
+  is partitioned too. Partitions stay in memory for the session, even under
+  bookmarked sites; there is no Storage Access API or storage-access heuristic. `set cookies off` disables cookie access/capture
   without clearing saved cookies or localStorage; cookie deletion does not
   itself delete localStorage.
-- localStorage quotas are 5 MiB per origin and 64 MiB total. Saved files have
+- localStorage quotas are 5 MiB per origin (per partition for embeds) and
+  64 MiB total. Saved files have
   private permissions but are unencrypted. Writes are atomic, off the UI thread,
   and coordinated with bookmark edits across instances; surface storage errors.
 - Windows defaults: config/bookmarks/site data in `%APPDATA%\trust`, state/cache

@@ -37,11 +37,22 @@ enum StorageKind<'a> {
     Local(&'a str),
     Temporary,
 }
+/// A first-party `local:<origin>` bucket. A partitioned storage key
+/// (`<origin>^<top-level site>`, `CookieContext::storage_partition`; `^` is a
+/// forbidden host code point, so no origin contains it) belongs to an embed
+/// and lives only for the session, whatever the user has bookmarked.
 fn storage_kind(bucket: &str) -> StorageKind<'_> {
     match bucket.strip_prefix("local:") {
-        Some(origin) => StorageKind::Local(origin),
-        None => StorageKind::Temporary,
+        Some(origin) if !origin.contains('^') => StorageKind::Local(origin),
+        _ => StorageKind::Temporary,
     }
+}
+/// The web site of a first-party localStorage bucket's origin.
+fn local_bucket_site(bucket: &str) -> Option<String> {
+    let StorageKind::Local(origin) = storage_kind(bucket) else {
+        return None;
+    };
+    Url::parse(origin).ok().and_then(|url| site(&url))
 }
 
 /// Scheme-independent permission key. Cookie same-site checks add the scheme.
@@ -460,12 +471,7 @@ pub(crate) fn after_bookmarks_write(
     crate::http::persist_cookie_snapshot(&added);
     let storage = s.storage.lock().unwrap();
     for (bucket, values) in storage.iter() {
-        if bucket
-            .strip_prefix("local:")
-            .and_then(|o| Url::parse(o).ok())
-            .and_then(|u| site(&u))
-            .is_some_and(|site| added.contains(&site))
-        {
+        if local_bucket_site(bucket).is_some_and(|site| added.contains(&site)) {
             for (key, value) in values {
                 local_mutation(bucket, key, Some(value));
             }
@@ -565,12 +571,7 @@ impl Service {
         {
             crate::http::persist_cookie_snapshot(&added);
             for (bucket, entries) in self.storage.lock().unwrap().iter() {
-                if bucket
-                    .strip_prefix("local:")
-                    .and_then(|o| Url::parse(o).ok())
-                    .and_then(|u| site(&u))
-                    .is_some_and(|s| added.contains(&s))
-                {
+                if local_bucket_site(bucket).is_some_and(|s| added.contains(&s)) {
                     for (key, value) in entries {
                         local_mutation(bucket, key, Some(value));
                     }
@@ -803,6 +804,29 @@ mod tests {
         assert_eq!(storage["local:https://a.example.com:8443"]["key"], "port");
         assert_eq!(storage.len(), 3);
         assert!(!file_for(&f.service.bookmarks, "elsewhere.test").exists());
+    }
+
+    #[test]
+    fn partitioned_local_storage_never_crosses_the_persistence_boundary() {
+        // An embed's partitioned bucket (`CookieContext::storage_partition`) stays in memory
+        // even when its origin's site, or the site it is embedded in, is bookmarked.
+        assert!(matches!(
+            storage_kind("local:https://a.example.com"),
+            StorageKind::Local("https://a.example.com")
+        ));
+        assert!(matches!(
+            storage_kind("local:https://a.example.com^https://example.com"),
+            StorageKind::Temporary
+        ));
+        assert_eq!(
+            local_bucket_site("local:https://a.example.com"),
+            Some("example.com".into())
+        );
+        assert_eq!(
+            local_bucket_site("local:https://a.example.com^https://example.com"),
+            None
+        );
+        assert_eq!(local_bucket_site("session:0:https://a.example.com"), None);
     }
 
     #[test]

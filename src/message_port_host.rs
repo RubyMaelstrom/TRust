@@ -92,6 +92,19 @@ impl Drop for Agent {
 }
 
 impl Agent {
+    /// The storage key and name of every open BroadcastChannel, for tests.
+    #[cfg(test)]
+    pub fn broadcast_channels(&self) -> Vec<String> {
+        let registry = self.registry.lock().unwrap();
+        let mut channels: Vec<_> = registry
+            .ports
+            .values()
+            .filter_map(|port| port.broadcast.clone())
+            .collect();
+        channels.sort();
+        channels
+    }
+
     pub fn release(&self, realm: Option<u64>) {
         let mut registry = self.registry.lock().unwrap();
         let ids: Vec<_> = registry

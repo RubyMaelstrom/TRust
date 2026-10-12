@@ -549,6 +549,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         add(target, type, callback) { addListener.call(target, type, callback); },
         remove(target, type, callback) { removeListener.call(target, type, callback); },
         origin() { return lp[8] || "null"; },
+        storageKey: workerStorageKey,
         // #eligible-for-messaging: a WorkerGlobalScope whose closing flag is false.
         eligible() { return !workerClosing; },
         deliver(target, type, init) { dispatchScopeEvent(trustedScopeEvent(MessageEvent, type, init), true, target); }
@@ -686,6 +687,15 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
 
     // --- location (WorkerLocation) ---
     var lp = __url_parse(cfg.url, null) || [cfg.url, "", "", "", "", "/", "", "", "", "", ""];
+    // The worker's storage key: its origin, partitioned by the top-level site
+    // when its owner had a cross-site ancestor (the Window prelude's
+    // `storageKeyFor`; Client-Side Storage Partitioning). "null" has none.
+    var storagePartition = typeof cfg.storagePartition === "string" ? cfg.storagePartition : "";
+    function workerStorageKey() {
+        var origin = lp[8] || "null";
+        if (origin === "null" || storagePartition === "null") return "null";
+        return storagePartition === "" ? origin : origin + "^" + storagePartition;
+    }
     // HTML #worker-locations: WorkerGlobalScope's [SameObject] location is a
     // WorkerLocation whose members reflect the worker's URL; none is writable.
     const workerLocationToken = {};
@@ -715,9 +725,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // The shared Indexed Database and Cache Storage blocks' view of this
     // worker: its storage key (the origin, opaque for a data: URL), its events
     // with IndexedDB's event parents and its storage codec; its database
-    // tasks alternate with the platform task queue. The databases and caches are the origin's, shared with Windows.
+    // tasks alternate with the platform task queue. The databases and caches are the storage key's, shared with Windows.
     g.__indexeddb_adapter = {
-        origin: lp[8] || "null", EventTarget: g.EventTarget, Event,
+        origin: workerStorageKey(), EventTarget: g.EventTarget, Event,
         setParent(target, parent) { scopeEventParents.set(target, parent); },
         fire(target, C, type, init) {
             var event = trustedScopeEvent(C, type, init);
@@ -732,7 +742,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         deserialize(wire) { return WK.messageCodec.deserialize(wire); },
         register(api) { indexedDBTasks = api; },
     };
-    g.__cache_storage_adapter = { origin: lp[8] || "null", secure: !!cfg.secureContext };
+    g.__cache_storage_adapter = { origin: workerStorageKey(), secure: !!cfg.secureContext };
     // Secure Contexts §1.3: a dedicated worker inherits the owner's secure
     // context when its script URL is potentially trustworthy. Rust computes
     // that relationship, including Blob URL inheritance, at construction.
@@ -794,6 +804,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         queue(fn) { platformTasks.push(fn); },
         report(error) { reportException(error); },
         origin() { return lp[8] || "null"; },
+        storageKey: workerStorageKey,
         baseURL() { return lp[0]; },
         secure: !!cfg.secureContext,
         context: 0,

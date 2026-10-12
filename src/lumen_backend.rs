@@ -17754,6 +17754,8 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
     // cannot be swept before the new global is published.
     ctx.suspend_gc();
     let realm = ctx.create_embed_realm();
+    // The new environment's storage partition (`CookieContext::storage_partition`).
+    let mut storage_partition = String::new();
     // Root the new Window Realm before running its platform bootstrap. The
     // bootstrap allocates a complete set of intrinsics and may cross an
     // allocation/GC safepoint; the host owns the nascent environment from the
@@ -17805,6 +17807,7 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
             .dom
             .borrow_mut()
             .set_frame_cookie_restriction(frame_id, cookie_context.cross_site_ancestor);
+        storage_partition = cookie_context.storage_partition().to_owned();
         // HTML #hostloadimportedmodule for this Window too: its import()s
         // start their fetches as they run (`begin_dynamic_module_fetch`),
         // with the settings `queue_dynamic_module_load` will use.
@@ -17895,6 +17898,11 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
             }
         }
         realm_ctx.member_set(&config, "cookieOpaque", Value::Bool(cookie_opaque))?;
+        realm_ctx.member_set(
+            &config,
+            "storagePartition",
+            Value::from_string(storage_partition.clone()),
+        )?;
         realm_ctx.member_set(&config, "url", Value::from_string(url.clone()))?;
         realm_ctx.member_set(&config, "referrer", Value::from_string(referrer.clone()))?;
         realm_ctx.member_set(&config, "navigationTiming", navigation_timing.clone())?;
@@ -19411,10 +19419,13 @@ fn host_worker_spawn(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
     // HTML #dom-sharedworker: match an existing shared worker global scope by constructor
     // storage key, constructor URL and name. A type or secure-context mismatch is reported
     // to the constructor as -1, after which it fires error without connecting.
+    // The storage key includes the constructor's storage partition, so an embed shares
+    // its shared workers only with the same embed under the same top-level site.
     let shared_key = shared.then(|| {
         format!(
-            "{}\0{}\0{}",
+            "{}\0{}\0{}\0{}",
             owner_page.origin().ascii_serialization(),
+            cookie_context.storage_partition(),
             script_url.as_str(),
             name
         )
@@ -20330,7 +20341,7 @@ fn run_lumen_worker(
         "classic"
     };
     let config = format!(
-        "globalThis.__worker_cfg = {{ id: {}, name: {}, type: {}, url: {}, ua: {}, navigatorMode: {}, platform: {}, language: {}, languages: [{}, {}], hwc: {}, globalPrivacyControl: {}, secureContext: {}, timeOrigin: {}, shared: {} }};",
+        "globalThis.__worker_cfg = {{ id: {}, name: {}, type: {}, url: {}, ua: {}, navigatorMode: {}, platform: {}, language: {}, languages: [{}, {}], hwc: {}, globalPrivacyControl: {}, secureContext: {}, timeOrigin: {}, shared: {}, storagePartition: {} }};",
         launch.id,
         serde_json::to_string(&launch.name).unwrap_or_else(|_| String::from("\"\"")),
         serde_json::to_string(worker_type).expect("static worker type serializes"),
@@ -20350,6 +20361,8 @@ fn run_lumen_worker(
         launch.secure_context,
         clock.origin_ms,
         launch.shared,
+        serde_json::to_string(launch.cookie_context.storage_partition())
+            .expect("storage partition serializes"),
     );
     for platform in [false, true] {
         let setup = if platform {
@@ -26214,14 +26227,12 @@ fn host_storage_allowed(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
         .first()
         .and_then(Value::as_num_opt)
         .map_or(u64::MAX, |v| v as u64);
+    // A cross-site environment's localStorage is partitioned by its storage key
+    // (`CookieContext::storage_partition`), not refused; only a non-web client has none.
     let context = cookie_context_for_id(ctx, id);
-    Ok(Value::Bool(
-        !context.cross_site_ancestor
-            && context
-                .client
-                .as_ref()
-                .is_some_and(|url| crate::site_storage::site(url).is_some()),
-    ))
+    Ok(Value::Bool(context.client.as_ref().is_some_and(|url| {
+        crate::site_storage::site(url).is_some()
+    })))
 }
 
 fn host_storage_bucket(ctx: &mut Ctx, args: &[Value]) -> (crate::js::WebStorage, String) {
@@ -26631,17 +26642,19 @@ fn host_file_list(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
 const INDEXED_DATABASE_QUOTA: usize = 64 * 1024 * 1024;
 const CACHE_STORAGE_QUOTA: usize = 64 * 1024 * 1024;
 
-/// Storage #storage-usage and #storage-quota of an origin's local storage shelf (Storage
-/// #dom-storagemanager-estimate). The shelf's bottles are this origin's localStorage, Indexed
+/// Storage #storage-usage and #storage-quota of a storage key's local storage shelf (Storage
+/// #dom-storagemanager-estimate). The shelf's bottles are the key's localStorage, Indexed
 /// Database and Cache Storage buckets in the shared storage shed; sessionStorage belongs to a
-/// session shelf. Each bottle is measured as its endpoint enforces its quota, and the quota is
-/// the sum of those endpoint quotas, independent of the device's free space.
+/// session shelf. The key is an origin, or an embed's partitioned key (`storageKeyFor` in the
+/// platform prelude), whose shelf is separate from the origin's own. Each bottle is measured as
+/// its endpoint enforces its quota, and the quota is the sum of those endpoint quotas,
+/// independent of the device's free space.
 fn host_storage_manager(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     if host_arg_usv(ctx, args, 0) != "estimate" {
         return Ok(Value::Undefined);
     }
-    let origin = host_arg_usv(ctx, args, 1);
-    if origin == "null" {
+    let key = host_arg_usv(ctx, args, 1);
+    if key == "null" {
         return Ok(Value::Undefined);
     }
     let Some(storage) = ctx
@@ -26657,7 +26670,7 @@ fn host_storage_manager(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
             .iter()
             .filter_map(|(bucket, entries)| {
                 let (kind, owner) = bucket.split_once(':')?;
-                if owner != origin {
+                if owner != key {
                     return None;
                 }
                 Some(match kind {
@@ -31921,6 +31934,11 @@ mod tests {
     }
 
     fn worker_platform_engine_with(test_internals: bool) -> lumen::Engine {
+        worker_platform_engine_configured(test_internals, "")
+    }
+
+    /// `extra` adds `__worker_cfg` members (`, name: value`), as `run_lumen_worker` does.
+    fn worker_platform_engine_configured(test_internals: bool, extra: &str) -> lumen::Engine {
         let clock = Rc::new(RealmClock::new());
         let mut state = HostState::new(Rc::new(RefCell::new(Dom::new())), clock.clone());
         state.test_hooks.internals = test_internals;
@@ -31944,12 +31962,50 @@ mod tests {
         install_lumen_worker_boundary(&mut engine);
         eval(
             &mut engine,
-            &format!("globalThis.__worker_cfg={{url:'https://example.org/worker.js',timeOrigin:{origin}}}"),
+            &format!("globalThis.__worker_cfg={{url:'https://example.org/worker.js',timeOrigin:{origin}{extra}}}"),
             "worker config",
         )
         .unwrap();
         assert!(eval_lumen_worker_platform_setup(&mut engine).unwrap());
         engine
+    }
+
+    #[test]
+    fn worker_storage_takes_its_owners_partition() {
+        // `run_lumen_worker` passes the owner's `CookieContext::storage_partition` as
+        // `__worker_cfg.storagePartition`: a worker an embed creates keys its storage blocks
+        // (here BroadcastChannel; Indexed Database and Cache Storage use the same key) by the
+        // owner's top-level site, and one without a storage key reaches only itself.
+        for (partition, expected) in [
+            ("", "https://example.org\nids"),
+            (
+                "https://partition.example",
+                "https://example.org^https://partition.example\nids",
+            ),
+            ("null", "opaque:"),
+        ] {
+            let mut worker = worker_platform_engine_configured(
+                true,
+                &format!(", storagePartition: {partition:?}"),
+            );
+            eval(
+                &mut worker,
+                "new BroadcastChannel('ids');",
+                "worker channel",
+            )
+            .unwrap();
+            let channels = worker
+                .ctx()
+                .host_mut::<HostState>()
+                .unwrap()
+                .message_ports
+                .broadcast_channels();
+            assert_eq!(channels.len(), 1, "{partition}");
+            assert!(
+                channels[0].starts_with(expected),
+                "{partition}: {channels:?}"
+            );
+        }
     }
 
     #[test]
@@ -49640,7 +49696,10 @@ mod tests {
     }
 
     #[test]
-    fn bookmark_storage_policy_blocks_third_party_frames_and_hides_host_capabilities() {
+    fn bookmark_storage_policy_partitions_third_party_frames_and_hides_host_capabilities() {
+        // A cross-site frame (and an http frame of an https site: schemeful sites differ)
+        // gets partitioned localStorage rather than a SecurityError
+        // (`embedded_storage_is_partitioned_by_the_top_level_site`); its cookies stay blocked.
         let _guard = crate::http::COOKIE_TEST_LOCK.lock().unwrap();
         crate::http::set_cookies_enabled(true);
         let mut engine = configured_engine(
@@ -49680,7 +49739,7 @@ mod tests {
         "#, "bookmark storage policy").unwrap();
         assert_eq!(
             string_value(&mut engine, "bookmarkStoragePolicyResult"),
-            "SecurityError|true||undefined|undefined|undefined|undefined|undefined|sibling:child=visible|SecurityError|storagePolicy=top"
+            "exposed||undefined|undefined|undefined|undefined|undefined|sibling:child=visible|exposed|storagePolicy=top"
         );
         assert_eq!(string_value(&mut engine, "fakeCookieDocument"), "");
     }
@@ -49721,9 +49780,10 @@ mod tests {
             "challenge cookie context inheritance",
         )
         .unwrap();
+        // The nested cross-site frame's localStorage is its partition's.
         assert_eq!(
             string_value(&mut engine, "challengeCookieVisibility"),
-            "SecurityError"
+            "exposed"
         );
         let contexts: Vec<_> = engine
             .ctx()
@@ -49878,9 +49938,10 @@ mod tests {
             blank.eval(`document.cookie = 'ignored=1'; globalThis.result = document.cookie;`);
             globalThis.ancestorCookieResult = [third.result, opaque.result.join(','), blank.result, document.cookie].join('|');
         "#, "nested site for cookies").unwrap();
+        // The A-B-A frame has no cookies but its own localStorage partition.
         assert_eq!(
             string_value(&mut engine, "ancestorCookieResult"),
-            "SecurityError|SecurityError,SecurityError||ancestor=top"
+            "exposed|SecurityError,SecurityError||ancestor=top"
         );
     }
 
@@ -50105,6 +50166,203 @@ mod tests {
         assert!(!storage.contains_key("cache-storage-names"));
         assert!(!storage.contains_key("cache-storage-data"));
         assert!(!storage.contains_key("indexed-database"));
+    }
+
+    #[test]
+    fn embedded_storage_is_partitioned_by_the_top_level_site() {
+        // Client-Side Storage Partitioning (Privacy CG work item) with the top-level site of
+        // Fetch #determine-the-network-partition-key and HTML's has cross-site ancestor: the
+        // same embed under two sites, and the embed's own first-party pages, never share
+        // localStorage or sessionStorage, and an A-B-A frame is partitioned too. Previously
+        // every API but localStorage (which threw) was keyed by origin alone, so an embed
+        // could carry an identifier from one site to the next.
+        let _guard = crate::http::COOKIE_TEST_LOCK.lock().unwrap();
+        crate::http::set_cookies_enabled(true);
+        let storage = crate::js::WebStorage::default();
+        let mut results = Vec::new();
+        let mut channels = Vec::new();
+        for top in [
+            "https://news.partition.example/",
+            "https://shop.partition.example.org/",
+            "https://tracker.partition.example.net/",
+        ] {
+            let mut state = HostState::new(
+                Rc::new(RefCell::new(Dom::new())),
+                Rc::new(RealmClock::new()),
+            );
+            state.storage = storage.clone();
+            let mut engine = configured_engine(state, top);
+            eval(&mut engine, &format!(r#"
+                const html = document.createElement('html'), body = document.createElement('body');
+                document.appendChild(html); html.appendChild(body);
+                function frameRealm(owner, url) {{
+                    const frame = owner.document.createElement('iframe');
+                    (owner.document.body || owner.document.documentElement).appendChild(frame);
+                    owner.__dom_load_frame(frame.__id, '<body></body>', url);
+                    frame.__contentDoc = undefined;
+                    return owner.__dom_create_window_realm(owner.__dom_allocate_job_context(),
+                        frame.__id, url, owner.__trust_cfg, owner, window, frame, 0, '');
+                }}
+                // The tracker's own pages use the top-level Window itself.
+                const tracker = {top:?} === 'https://tracker.partition.example.net/' ? window
+                    : frameRealm(window, 'https://tracker.partition.example.net/frame');
+                tracker.eval(`
+                    globalThis.seen = [localStorage.getItem('id'), sessionStorage.getItem('id')].map(String).join('|');
+                    localStorage.setItem('id', {top:?}); sessionStorage.setItem('id', {top:?});
+                `);
+                globalThis.result = tracker.seen;
+                if (tracker !== window) {{
+                    // A frame of the top-level site inside the cross-site embed.
+                    const aba = frameRealm(tracker, {top:?} + 'aba');
+                    aba.eval(`localStorage.setItem('aba', 'nested'); new BroadcastChannel('ids');`);
+                }}
+            "#), "partitioned storage").unwrap();
+            results.push(string_value(&mut engine, "result"));
+            channels.extend(
+                engine
+                    .ctx()
+                    .host_mut::<HostState>()
+                    .unwrap()
+                    .message_ports
+                    .broadcast_channels(),
+            );
+        }
+        // Every embed and the tracker's own page start empty: nothing crossed sites.
+        assert_eq!(results, ["null|null"; 3]);
+        assert_eq!(
+            channels,
+            [
+                "https://news.partition.example^https://partition.example\nids",
+                "https://shop.partition.example.org^https://example.org\nids",
+            ]
+        );
+        let storage = storage.lock().unwrap();
+        let tracker = "https://tracker.partition.example.net";
+        for (bucket, key, value) in [
+            (
+                format!("local:{tracker}^https://partition.example"),
+                "id",
+                "https://news.partition.example/",
+            ),
+            (
+                format!("session:0:{tracker}^https://partition.example"),
+                "id",
+                "https://news.partition.example/",
+            ),
+            (
+                format!("local:{tracker}^https://example.org"),
+                "id",
+                "https://shop.partition.example.org/",
+            ),
+            (
+                format!("local:{tracker}"),
+                "id",
+                "https://tracker.partition.example.net/",
+            ),
+            (
+                // The A-B-A frame's key is partitioned, not the top-level site's own.
+                String::from("local:https://news.partition.example^https://partition.example"),
+                "aba",
+                "nested",
+            ),
+        ] {
+            let entries = storage.get(&bucket).unwrap_or_else(|| {
+                panic!("{bucket} missing: {:?}", storage.keys().collect::<Vec<_>>())
+            });
+            assert_eq!(
+                entries.get(key).map(String::as_str),
+                Some(value),
+                "{bucket}"
+            );
+        }
+        assert!(!storage.contains_key("local:https://news.partition.example"));
+    }
+
+    #[test]
+    fn partitioned_environments_key_caches_databases_and_estimates() {
+        // The Indexed Database, Cache Storage and StorageManager blocks take the environment's
+        // storage key: an embed's partition (`__trust_cfg.storagePartition`, as Rust sets it
+        // for a frame with a cross-site ancestor) is separate from the origin's own shelf and
+        // from the same origin's partition under another site. "null" has no storage key.
+        let storage = crate::js::WebStorage::default();
+        let mut results = Vec::new();
+        for partition in [
+            "https://partition.example",
+            "",
+            "https://example.org",
+            "null",
+        ] {
+            let mut state = HostState::new(
+                Rc::new(RefCell::new(Dom::new())),
+                Rc::new(RealmClock::new()),
+            );
+            state.storage = storage.clone();
+            let mut engine =
+                configured_engine_before_prelude(state, "https://tracker.partition.example.net/");
+            eval(
+                &mut engine,
+                &format!("__trust_cfg.storagePartition = {partition:?};"),
+                "storage partition",
+            )
+            .unwrap();
+            eval_platform_prelude(&mut engine).unwrap();
+            eval(
+                &mut engine,
+                r#"
+                globalThis.result = 'pending';
+                (async () => {
+                    const seen = [(await caches.keys()).join(',') || 'none',
+                        (await indexedDB.databases()).map(database => database.name).join(',') || 'none'];
+                    const cache = await caches.open('ids');
+                    await cache.put('https://tracker.partition.example.net/id', new Response('id'));
+                    await new Promise((resolve, reject) => {
+                        const request = indexedDB.open('ids');
+                        request.onsuccess = () => { request.result.close(); resolve(); };
+                        request.onerror = () => reject(request.error);
+                    });
+                    seen.push((await navigator.storage.estimate()).usage > 0);
+                    return seen.join('|');
+                })().then(value => { result = value; }, e => { result = e.name; });
+            "#,
+                "partitioned caches and databases",
+            )
+            .unwrap();
+            for _ in 0..64 {
+                run_microtask_checkpoint(&mut engine);
+                if !engine_call_trust_method(&mut engine, "hasPlatformTask", &[])
+                    .is_ok_and(|value| engine.ctx().to_boolean(&value))
+                {
+                    break;
+                }
+                assert!(engine_call_trust_method(&mut engine, "runPlatformTask", &[]).is_ok());
+            }
+            run_microtask_checkpoint(&mut engine);
+            results.push(string_value(&mut engine, "result"));
+        }
+        assert_eq!(
+            results,
+            [
+                "none|none|true",
+                "none|none|true",
+                "none|none|true",
+                "SecurityError"
+            ]
+        );
+        let storage = storage.lock().unwrap();
+        let tracker = "https://tracker.partition.example.net";
+        for key in [
+            format!("{tracker}^https://partition.example"),
+            tracker.to_owned(),
+            format!("{tracker}^https://example.org"),
+        ] {
+            for kind in ["cache-storage-names", "indexed-database"] {
+                assert!(
+                    storage.contains_key(&format!("{kind}:{key}")),
+                    "{kind}:{key} missing: {:?}",
+                    storage.keys().collect::<Vec<_>>()
+                );
+            }
+        }
     }
 
     #[test]

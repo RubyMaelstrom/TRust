@@ -371,6 +371,24 @@ impl CookieContext {
             cross_site_redirect: false,
         }
     }
+    /// Client-Side Storage Partitioning (Privacy CG work item; the top-level
+    /// site of Fetch #determine-the-network-partition-key and HTML
+    /// #concept-settings-object-has-cross-site-ancestor, local whatwg/fetch
+    /// and whatwg/html 2026-09-06): an environment with a cross-site ancestor
+    /// keys its storage by its top-level site as well as its origin, so an
+    /// embed's state under one site is invisible under every other. "" is a
+    /// first-party environment, whose storage key is its origin alone (WHATWG
+    /// Storage #storage-keys); "null" is one without a web top-level site,
+    /// which gets no storage key (Storage #obtain-a-storage-key's "the user
+    /// has disabled storage").
+    pub(crate) fn storage_partition(&self) -> &str {
+        if !self.cross_site_ancestor {
+            ""
+        } else {
+            self.top_level_site.as_deref().unwrap_or("null")
+        }
+    }
+
     fn same_site(&self, target: &Url) -> bool {
         !self.cross_site_ancestor
             && !self.cross_site_redirect

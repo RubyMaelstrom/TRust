@@ -43,6 +43,17 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     const storageContextId = Number(cfg.hostSettingsContext) || 0;
     const storageShed = Number(cfg.storageShed) || 0;
     const storageOpaque = !!cfg.cookieOpaque;
+    // Client-Side Storage Partitioning (Privacy CG; `CookieContext::
+    // storage_partition`): an environment with a cross-site ancestor keys
+    // every storage API (localStorage, sessionStorage, Indexed Database,
+    // Cache Storage, BroadcastChannel, shared workers) by its top-level site
+    // as well as its origin. "" is first party (the key is the origin, WHATWG
+    // Storage #storage-keys); "null" has no storage key, like an opaque origin.
+    const storagePartition = typeof cfg.storagePartition === "string" ? cfg.storagePartition : "";
+    function storageKeyFor(origin) {
+        if (origin === "null" || storagePartition === "null") return "null";
+        return storagePartition === "" ? origin : origin + "^" + storagePartition;
+    }
     const documentReferrers = new WeakMap(), frameReferrers = new WeakMap();
     // A frame's navigation response `Referrer-Policy` (HTML #creating-a-policy-
     // container-from-a-fetch-response), for the Document the response creates.
@@ -29133,6 +29144,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         queue(fn) { __queue_dom_task(fn); },
         report(error) { reportException(error, "callback"); },
         origin() { return messageWindowState.origin; },
+        storageKey() { return storageKeyFor(messageWindowState.origin); },
         baseURL() { return messageWindowState.apiBaseURL(); },
         secure: secureContext,
         context: storageContextId,
@@ -37428,8 +37440,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         setResourceTimingBufferSize() {},
     };
 
-    // Storage maps retain origin boundaries; only localStorage has bookmark-
-    // controlled persistence. Third-party localStorage is blocked independently.
+    // Storage maps retain storage-key boundaries (`storageKeyFor`): an embed
+    // under a cross-site ancestor gets its own partition. Only first-party
+    // localStorage has bookmark-controlled persistence.
     function setStorageValue(bucket, key, value) {
         if (__storage_set(bucket, key, value) === false) throw new QuotaExceededError("The localStorage quota was exceeded.");
     }
@@ -37468,14 +37481,14 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     for (const key of ["getItem", "setItem", "removeItem", "clear", "key", "length"])
         Object.defineProperty(Storage.prototype, key, {...Object.getOwnPropertyDescriptor(Storage.prototype, key), enumerable: true});
     g.Storage = Storage;
-    function makeStorage(kind, origin) {
+    function makeStorage(kind, key) {
         // Storage #storage-keys / HTML #the-localstorage-attribute: the
-        // object's map belongs to its creating environment's checked origin,
+        // object's map belongs to its creating environment's storage key,
         // not the caller, a mutable <base> URL, or a later host settings token.
         // Keep this private key with the API object even after frame removal.
         // sessionStorage belongs to this top-level traversable's storage shed
         // (Storage #traversable-storage-shed).
-        const bucket = kind === "session" ? "session:" + storageShed + ":" + origin : kind + ":" + origin;
+        const bucket = kind === "session" ? "session:" + storageShed + ":" + key : kind + ":" + key;
         const target = Object.create(Storage.prototype);
         // HTML #the-storage-interface and Web IDL #js-legacy-platform-objects:
         // named access and the methods share ONE map. Prototype members mask
@@ -37527,22 +37540,23 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     const documentStorageHolders = new WeakMap();
     function windowStorage(kind) {
-        if (kind === "local" && (storageOpaque || !__storage_allowed(storageContextId))) throw new DOMException("Third-party localStorage is unavailable.", "SecurityError");
+        if (kind === "local" && (storageOpaque || !__storage_allowed(storageContextId))) throw new DOMException("localStorage is unavailable for this document.", "SecurityError");
         const doc = g.document;
         let holders = documentStorageHolders.get(doc);
         if (holders && holders[kind]) return holders[kind];
         // HTML's getter obtains a storage bottle map before creating its
-        // holder. A URL's "null" serialization must not become a shared
-        // opaque-origin bucket. Use the environment origin, which already
-        // preserves initial about:blank/about:srcdoc inheritance.
-        const origin = messageWindowState.origin;
-        if (origin === "null")
+        // holder (Storage #obtain-a-storage-key). A URL's "null"
+        // serialization must not become a shared opaque-origin bucket. Use
+        // the environment origin, which already preserves initial
+        // about:blank/about:srcdoc inheritance, keyed by its partition.
+        const key = storageKeyFor(messageWindowState.origin);
+        if (key === "null")
             throw new DOMException("Storage is unavailable for an opaque origin.", "SecurityError");
         if (!holders) {
             holders = { local: null, session: null };
             documentStorageHolders.set(doc, holders);
         }
-        return holders[kind] = makeStorage(kind, origin);
+        return holders[kind] = makeStorage(kind, key);
     }
     Object.defineProperties(g, {
         localStorage: { configurable: true, enumerable: true, get() { return windowStorage("local"); } },
@@ -45893,7 +45907,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // The Window's view for the shared Cache Storage block: its storage key.
     // Cache objects retain their creating environment's map, including when
     // called from another Realm or after a document base/settings change.
-    const __persistentStorageOrigin = messageWindowState.origin;
+    // The environment's storage key (`storageKeyFor`): its origin, or for an
+    // embed under a cross-site ancestor that origin and its top-level site.
+    const __persistentStorageOrigin = storageKeyFor(messageWindowState.origin);
     g.__cache_storage_adapter = { origin: __persistentStorageOrigin, secure: secureContext };
     /*__CACHE_STORAGE_BEGIN__*/
     // Service Workers §5 (local w3c/ServiceWorker@92aba3b) exposes Cache and
@@ -47807,6 +47823,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // A Window Realm stays eligible for messaging while its Document is
         // fully active; the host releases its channels when it is not.
         origin() { return messageWindowState.origin; },
+        storageKey() { return storageKeyFor(messageWindowState.origin); },
         eligible() { return true; },
         deliver(target, type, init) {
             runInFrame(realmRootFrame, () => dispatch(target, createTrustedEvent(MessageEvent, type, init), false));
@@ -48148,11 +48165,15 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (!slot) throw new TypeError("Illegal BroadcastChannel invocation");
             return slot;
         }
-        // Storage keys of opaque origins are unique: such a Realm only reaches itself.
+        // HTML #broadcasting-to-other-browsing-contexts: channels connect
+        // environments with equal storage keys (Storage #obtain-a-storage-key-
+        // for-non-storage-purposes), so an embed's channels stay within its
+        // partition. Storage keys of opaque origins are unique: such a Realm
+        // only reaches itself.
         let opaqueKey = null;
         function storageKey() {
-            const origin = adapter.origin();
-            if (origin !== "null") return origin;
+            const key = adapter.storageKey();
+            if (key !== "null") return key;
             if (opaqueKey === null) {
                 const bytes = __crypto_random_bytes(16);
                 opaqueKey = "opaque:";
@@ -50015,10 +50036,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // Database and Cache Storage only for the browsing session.
         function storageShelf() {
             // #obtain-a-local-storage-shelf -> #obtain-a-storage-key: an
-            // opaque origin has no storage key.
-            const origin = adapter.origin();
-            if (origin === "null") throw new TypeErrorCtor("Storage is unavailable for an opaque origin");
-            return origin;
+            // opaque origin has no storage key; an embed's is partitioned.
+            const key = adapter.storageKey();
+            if (key === "null") throw new TypeErrorCtor("Storage is unavailable for an opaque origin");
+            return key;
         }
         class StorageManager {
             constructor() { throw new TypeErrorCtor("Illegal constructor"); }
@@ -50032,15 +50053,15 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 return new PromiseCtor(resolve => adapter.queue(() => resolve(false)));
             }
             estimate() {
-                let origin;
+                let key;
                 try {
                     brand(this, "storage-manager", "StorageManager");
-                    origin = storageShelf();
+                    key = storageShelf();
                 } catch (error) { return rejected(error); }
                 return new PromiseCtor((resolve, reject) => {
                     // #dom-storagemanager-estimate: storage usage and quota of
                     // the shelf, measured as each endpoint enforces its quota.
-                    const measured = __storage_manager("estimate", origin);
+                    const measured = __storage_manager("estimate", key);
                     adapter.queue(() => {
                         if (!measured) reject(new TypeErrorCtor("Storage estimate is unavailable"));
                         else resolve({usage: measured[0], quota: measured[1]});
