@@ -819,6 +819,9 @@ struct HostState {
     media: media_host::MediaHost,
     /// Web Audio contexts' engines and shared data (`webaudio_host`).
     webaudio: webaudio_host::WebAudioHost,
+    /// The group's top-level traversables the user muted
+    /// (`TraversableState::audio_muted`, `apply_audio_mutes`).
+    muted_traversables: std::collections::HashSet<TraversableId>,
     pending_resources: usize,
     /// HTML #link-type-preload fetches in flight. They never delay the load
     /// event, but the document is not quiescent until they settle.
@@ -1152,6 +1155,7 @@ impl HostState {
             task_events: None,
             media: media_host::MediaHost::default(),
             webaudio: webaudio_host::WebAudioHost::default(),
+            muted_traversables: std::collections::HashSet::new(),
             pending_resources: 0,
             pending_preloads: 0,
             pending_module_evaluations: 0,
@@ -1321,6 +1325,7 @@ impl HostState {
             return;
         };
         let (_, slot) = self.traversables.parked.swap_remove(index);
+        self.muted_traversables.remove(&traversable);
         {
             let dom = slot.dom.borrow();
             self.media.release_elements(|node| dom.is_valid(node));
@@ -1381,6 +1386,44 @@ impl HostState {
             .get(&context)
             .copied()
             .unwrap_or_default()
+    }
+
+    /// Whether media element `node` (of Window `context`) plays in a
+    /// traversable the user muted: the one whose Document it is in, which
+    /// it follows when it moves between the group's arenas.
+    fn audio_muted_at(&self, node: usize, context: u64) -> bool {
+        if self.muted_traversables.is_empty() {
+            return false;
+        }
+        let traversable = self
+            .traversable_of_node(node)
+            .unwrap_or_else(|| self.traversable_of_context(context));
+        self.muted_traversables.contains(&traversable)
+    }
+
+    /// The user muted or unmuted `traversable` (HTML #effective-media-volume:
+    /// the user overrides its media's volume).
+    fn set_traversable_muted(&mut self, traversable: TraversableId, muted: bool) {
+        let changed = if muted {
+            self.muted_traversables.insert(traversable)
+        } else {
+            self.muted_traversables.remove(&traversable)
+        };
+        if changed {
+            self.apply_audio_mutes();
+        }
+    }
+
+    /// Give every player and audio context the mute of the traversable it
+    /// is heard from. Neither the media elements nor the contexts change:
+    /// the mute is the user agent's, and pages cannot observe it.
+    fn apply_audio_mutes(&self) {
+        self.media
+            .apply_mutes(|node, context| self.audio_muted_at(node, context));
+        self.webaudio.apply_mutes(|realm| {
+            self.muted_traversables
+                .contains(&self.traversable_of_context(realm))
+        });
     }
 
     fn forget_realm_origin(&mut self, context: u64) {
@@ -1648,6 +1691,7 @@ impl RetainedMemory for HostState {
             task_events,
             media,
             webaudio,
+            muted_traversables: _,
             pending_resources,
             pending_preloads: _,
             pending_module_evaluations: _,
@@ -3793,6 +3837,10 @@ mod desktop {
             checkpoint(page, "unload");
         }
         destroy_active_document(page, false);
+        // The traversable's mute carries over to its new Document.
+        if let Some(state) = page.engine.ctx().host_mut::<HostState>() {
+            state.set_traversable_muted(id, env.traversable.audio_muted);
+        }
 
         // HTML #initialise-the-document-object, in the group's arena family.
         let ids = page.dom.borrow_mut().share_identities();
@@ -5347,6 +5395,10 @@ mod desktop {
         state.viewport.set(viewport);
         state.device_pixel_ratio.set(env.device_pixel_ratio);
         state.screen_position.set(env.screen_position);
+        // A muted tab's next Document is heard as silence from the start.
+        if env.traversable.audio_muted {
+            state.muted_traversables.insert(TraversableId::default());
+        }
         // Inline and data-backed module scripts use the HTML task queue even when this document
         // has no network runtime. Keep that local task source independent of `enable_network`.
         state.task_events = Some(LumenTaskSender::Page(host_tasks.clone()));
@@ -8172,6 +8224,30 @@ mod desktop {
                 if !hidden {
                     page.render_pending = true;
                 }
+                finish_internal_task(page, events)
+            }
+            PageCmd::AudioMuted(muted) => {
+                let changed = page
+                    .engine
+                    .ctx()
+                    .host_mut::<HostState>()
+                    .is_some_and(|state| {
+                        let traversable = state.traversables.selected;
+                        let changed = state.muted_traversables.contains(&traversable) != muted;
+                        state.set_traversable_muted(traversable, muted);
+                        changed
+                    });
+                if !changed {
+                    return true;
+                }
+                // A muted traversable is heard as silence, so its sound no
+                // longer keeps its timers unthrottled while it is hidden.
+                let _ = call_trust(
+                    page,
+                    "audioMutedChanged",
+                    &[Value::Bool(muted)],
+                    "audio mute",
+                );
                 finish_internal_task(page, events)
             }
             PageCmd::SystemFocus(focused) => {
@@ -17398,7 +17474,7 @@ fn main_window_config(
     traversable: crate::js::TraversableState,
 ) -> String {
     format!(
-        "globalThis.__trust_cfg = {{ url: {}, referrer: {}, ua: {}, navigatorMode: {}, platform: {}, language: {}, languages: [{}, {}], width: {}, height: {}, devicePixelRatio: {}, hardwareConcurrency: {}, globalPrivacyControl: {}, secureContext: {}, frameTrace: {}, challengeMessageTrace: {}, navigationTiming: {}, lastModified: {}, fullscreenSupported: {}, inlineMedia: {}, hidden: {}, systemFocus: {}, wasDiscarded: {}, newTraversables: {}, storageShed: {} }};",
+        "globalThis.__trust_cfg = {{ url: {}, referrer: {}, ua: {}, navigatorMode: {}, platform: {}, language: {}, languages: [{}, {}], width: {}, height: {}, devicePixelRatio: {}, hardwareConcurrency: {}, globalPrivacyControl: {}, secureContext: {}, frameTrace: {}, challengeMessageTrace: {}, navigationTiming: {}, lastModified: {}, fullscreenSupported: {}, inlineMedia: {}, hidden: {}, systemFocus: {}, wasDiscarded: {}, newTraversables: {}, storageShed: {}, audioMuted: {} }};",
         json_string(response_url.as_str()),
         json_string(referrer),
         json_string(crate::http::user_agent()),
@@ -17426,6 +17502,7 @@ fn main_window_config(
         traversable.was_discarded,
         traversable.new_traversables,
         traversable.storage_shed,
+        traversable.audio_muted,
     )
 }
 
@@ -22476,8 +22553,19 @@ fn adopt_foreign_insertion(
     Ok(source.transplant_subtree(node, dom, document))
 }
 
+/// Media elements that moved to another traversable's Document of the
+/// group play on there, heard as that traversable's mute says.
+fn follow_moved_media(ctx: &mut Ctx) {
+    if let Some(state) = ctx.host_mut::<HostState>()
+        && !state.muted_traversables.is_empty()
+    {
+        state.apply_audio_mutes();
+    }
+}
+
 fn host_append(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let foreign = foreign_node_argument(ctx, args, 1);
+    let moved = foreign.is_some();
     let dom = host_dom(ctx);
     let mut dom = dom.borrow_mut();
     let Some(parent) = host_arg_node(&dom, args, 0) else {
@@ -22503,6 +22591,10 @@ fn host_append(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Val
         }
     };
     dom.append(parent, child);
+    drop(dom);
+    if moved {
+        follow_moved_media(ctx);
+    }
     Ok(Value::Bool(true))
 }
 
@@ -22529,6 +22621,7 @@ fn host_insert_before(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Val
     let mode = args.get(3).and_then(Value::as_num_opt).unwrap_or(0.0);
     let excluded = reference.filter(|_| mode == 1.0 || mode == 3.0);
     let exclude = |c| mode == 4.0 || Some(c) == excluded;
+    let moved = foreign.is_some() && mode < 2.0;
     let node = match foreign {
         Some((node, source)) => {
             match adopt_foreign_insertion(
@@ -22559,6 +22652,10 @@ fn host_insert_before(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Val
         return Ok(Value::Bool(true));
     }
     dom.insert_before(parent, node, reference);
+    drop(dom);
+    if moved {
+        follow_moved_media(ctx);
+    }
     Ok(Value::Bool(true))
 }
 
@@ -22595,6 +22692,7 @@ fn host_owner_document(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
 /// the prelude, which exposes the required Web IDL exceptions and custom-element reactions.
 fn host_adopt(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let foreign = foreign_node_argument(ctx, args, 1);
+    let moved = foreign.is_some();
     let dom = host_dom(ctx);
     let mut dom = dom.borrow_mut();
     let Some(document) = host_arg_node(&dom, args, 0) else {
@@ -22623,6 +22721,10 @@ fn host_adopt(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Valu
         Err(AdoptError::ShadowRoot) => -5.0,
         Err(AdoptError::HostedFragment) => -6.0,
     };
+    drop(dom);
+    if moved && result >= 0.0 {
+        follow_moved_media(ctx);
+    }
     Ok(Value::Num(result))
 }
 
@@ -29706,6 +29808,40 @@ mod tests {
             }
         }
         assert_eq!(string_value(&mut engine, "fired.join()"), "soon,late");
+    }
+
+    #[test]
+    fn a_muted_hidden_page_is_throttled_as_a_quiet_one() {
+        // The user muted the traversable (`PageCmd::AudioMuted`): its sound
+        // is not heard, so it no longer keeps a hidden page's timers on time.
+        let mut engine = platform_engine();
+        let number = |engine: &mut lumen::Engine, source: &str| {
+            eval_value(engine, source, "timer probe")
+                .unwrap()
+                .as_num_opt()
+                .unwrap()
+        };
+        eval(
+            &mut engine,
+            "globalThis.base = __trust.now(); setTimeout(() => {}, 12500);\
+             __trust.noteAudible({}, true); __trust.systemVisibilityChanged(true);",
+            "audible hidden page",
+        )
+        .unwrap();
+        let base = number(&mut engine, "base");
+        let due = number(&mut engine, "__trust.nextDeadline()");
+        assert!(
+            (due - (base + 12500.0)).abs() < 50.0,
+            "due={due} base={base}"
+        );
+        // Muted: throttled from ten seconds on, so the timer, due after
+        // them, waits for a whole second.
+        eval(&mut engine, "__trust.audioMutedChanged(true)", "mute").unwrap();
+        let aligned = number(&mut engine, "__trust.nextDeadline()");
+        assert_eq!(aligned % 1000.0, 0.0, "aligned={aligned}");
+        assert!(aligned >= due && aligned - due < 1000.0);
+        eval(&mut engine, "__trust.audioMutedChanged(false)", "unmute").unwrap();
+        assert_eq!(number(&mut engine, "__trust.nextDeadline()"), due);
     }
 
     fn platform_engine() -> lumen::Engine {

@@ -16,9 +16,12 @@
 //! backend's thread and reports which frames have become audible
 //! ([`Position`]); the media clock is derived from that report (HTML
 //! #media-timeline: the audio clock is the reference, as in every browser).
+//! A [`Mute`] silences the streams the user muted (a muted tab) without
+//! stopping them.
 
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 #[cfg(target_os = "linux")]
@@ -62,6 +65,51 @@ pub trait Render: Send + Sync {
     /// Fill `out` with interleaved frames and return how many frames it
     /// produced; the remainder of `out` is left as silence.
     fn render(&self, out: &mut [f32]) -> usize;
+}
+
+/// The user's mute of the streams given it (a muted tab; HTML
+/// #effective-media-volume: "the user has indicated that the user agent is
+/// to override the volume"). A muted stream renders and consumes its audio
+/// in real time, so media clocks and audio contexts go on exactly as
+/// before, but is heard as silence. Clones share one switch.
+#[derive(Clone, Debug, Default)]
+pub struct Mute(Arc<AtomicBool>);
+
+impl Mute {
+    pub fn new(muted: bool) -> Self {
+        Self(Arc::new(AtomicBool::new(muted)))
+    }
+
+    pub fn set(&self, muted: bool) {
+        self.0.store(muted, Ordering::Relaxed);
+    }
+
+    pub fn is_muted(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    /// `render`, heard as silence while this is muted.
+    pub fn gate(&self, render: Arc<dyn Render>) -> Arc<dyn Render> {
+        Arc::new(Gated {
+            render,
+            mute: self.clone(),
+        })
+    }
+}
+
+struct Gated {
+    render: Arc<dyn Render>,
+    mute: Mute,
+}
+
+impl Render for Gated {
+    fn render(&self, out: &mut [f32]) -> usize {
+        let produced = self.render.render(out);
+        if self.mute.is_muted() {
+            out.fill(0.0);
+        }
+        produced
+    }
 }
 
 /// How much of a stream has been heard: `frames` frames had left the
@@ -283,6 +331,32 @@ mod tests {
             later.frames_at(Instant::now(), format.rate)
                 <= paused.frames_at(Instant::now(), format.rate) + u64::from(format.rate) / 20
         );
+    }
+
+    /// A muted stream still pulls its audio, so whatever it renders keeps
+    /// time, but writes silence; unmuting brings the sound back at once.
+    #[test]
+    fn a_muted_stream_consumes_its_audio_as_silence() {
+        struct Tone(AtomicU64);
+        impl Render for Tone {
+            fn render(&self, out: &mut [f32]) -> usize {
+                out.fill(0.5);
+                self.0.fetch_add(out.len() as u64, Ordering::Relaxed);
+                out.len()
+            }
+        }
+        let tone = Arc::new(Tone(AtomicU64::new(0)));
+        let mute = Mute::new(true);
+        let gated = mute.gate(tone.clone());
+        let mut out = [1.0f32; 8];
+        assert_eq!(gated.render(&mut out), 8);
+        assert_eq!(out, [0.0; 8]);
+        assert_eq!(tone.0.load(Ordering::Relaxed), 8, "consumed while muted");
+        mute.clone().set(false);
+        assert!(!mute.is_muted(), "clones share the switch");
+        gated.render(&mut out);
+        assert_eq!(out, [0.5; 8]);
+        assert_eq!(tone.0.load(Ordering::Relaxed), 16);
     }
 
     #[test]

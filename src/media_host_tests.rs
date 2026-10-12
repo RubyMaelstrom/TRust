@@ -354,6 +354,57 @@ fn audible_autoplay_needs_activation_and_muted_autoplay_plays() {
     assert_eq!(string_value(&mut engine, "quiet.paused"), "false");
 }
 
+/// A muted tab (HTML #effective-media-volume: the user overrides the
+/// volume) silences its players and audio contexts, those it has and those
+/// it creates, and unmuting brings them back; the page observes none of it.
+#[test]
+fn a_muted_traversable_silences_its_players_and_audio_contexts_unobserved() {
+    let runtime = runtime();
+    let base = serve(&runtime);
+    let (mut engine, mut tasks) = page(&runtime, &format!("{base}/page.html"));
+    eval(
+        &mut engine,
+        &format!(
+            "globalThis.v = document.createElement('video'); v.src = '{base}/av1_mp3.mp4'; \
+             document.body.appendChild(v); globalThis.context = new AudioContext();"
+        ),
+        "media",
+    )
+    .unwrap();
+    run_until(&runtime, &mut engine, &mut tasks, "v.readyState >= 1");
+    let mutes = |engine: &mut lumen::Engine| {
+        let state = engine.ctx().host_mut::<HostState>().unwrap();
+        (state.media.player_mutes(), state.webaudio.context_mutes())
+    };
+    let set_muted = |engine: &mut lumen::Engine, muted: bool| {
+        let state = engine.ctx().host_mut::<HostState>().unwrap();
+        let traversable = state.traversables.selected;
+        state.set_traversable_muted(traversable, muted);
+    };
+    assert_eq!(mutes(&mut engine), (vec![false], vec![false]));
+    set_muted(&mut engine, true);
+    assert_eq!(mutes(&mut engine), (vec![true], vec![true]));
+    // New players and contexts of a muted traversable start muted.
+    eval(
+        &mut engine,
+        &format!(
+            "globalThis.w = document.createElement('video'); w.src = '{base}/av1_mp3.mp4'; \
+             document.body.appendChild(w); globalThis.later = new AudioContext();"
+        ),
+        "more media",
+    )
+    .unwrap();
+    run_until(&runtime, &mut engine, &mut tasks, "w.readyState >= 1");
+    assert_eq!(mutes(&mut engine), (vec![true, true], vec![true, true]));
+    assert_eq!(
+        string_value(&mut engine, "[v.muted, v.volume, w.muted, w.volume].join()"),
+        "false,1,false,1",
+        "the user agent's mute is not the element's"
+    );
+    set_muted(&mut engine, false);
+    assert_eq!(mutes(&mut engine), (vec![false, false], vec![false, false]));
+}
+
 /// The video element is a 96×64 replaced box (its video's natural size)
 /// whose paint is the player's current frame: rendering the live document
 /// through the desktop's display list and CPU rasterizer shows the frame.

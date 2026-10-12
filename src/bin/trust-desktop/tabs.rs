@@ -164,6 +164,8 @@ pub(super) struct SleepingTab {
     pub(super) title: String,
     pub(super) history: trust::core::SessionHistory,
     pub(super) opened_from: Option<TabId>,
+    /// The user muted it; it wakes muted.
+    pub(super) muted: bool,
 }
 
 /// A closed tab Ctrl+Shift+T can reopen where it was, with its history.
@@ -770,18 +772,20 @@ impl DesktopApp {
         tab.opened_from = sleeping.opened_from;
         tab.focus = FocusTarget::Page;
         self.presentation(tab.focus, true).apply(&mut tab.browser);
+        tab.browser.set_audio_muted(sleeping.muted);
         tab.browser.restore_session_history(sleeping.history, true);
         tab
     }
 
     /// Whether a background tab must stay in memory however long it goes
-    /// unseen: a Telnet session, a page making sound or holding the user's
-    /// unsubmitted edits, a form's POST result (loading it again would
-    /// resubmit), a download offer, or a page still loading.
+    /// unseen: a Telnet session, a page making sound the user hears (a
+    /// muted tab's is not) or holding the user's unsubmitted edits, a form's
+    /// POST result (loading it again would resubmit), a download offer, or
+    /// a page still loading.
     fn keeps_awake(tab: &Tab) -> bool {
         tab.terminal.is_some()
             || tab.bookmark_terminal.is_some()
-            || tab.browser.is_audible()
+            || (tab.browser.is_audible() && !tab.browser.is_audio_muted())
             || tab.browser.has_user_edits()
             || tab.browser.is_post_result()
             || tab.browser.download_offer().is_some()
@@ -839,6 +843,7 @@ impl DesktopApp {
             title: tab_title(&tab),
             history: tab.browser.session_history(),
             opened_from: tab.opened_from,
+            muted: tab.browser.is_audio_muted(),
         };
         // Decoded pixels only this tab showed go with it.
         for handle in &tab.image_loads.completed {
@@ -1002,6 +1007,44 @@ impl DesktopApp {
         self.schedule_strip_tick();
     }
 
+    /// Whether tab `id` shows its sound indicator (`TabStripTab::shows_sound`),
+    /// without building its strip entry.
+    pub(super) fn tab_shows_sound(&self, id: TabId) -> bool {
+        let browser = if id == self.tab.id {
+            &self.tab.browser
+        } else {
+            match self.tabs.hidden(id) {
+                Some(Hidden::Awake(tab)) => &tab.browser,
+                Some(Hidden::Asleep(sleeping)) => return sleeping.muted,
+                None => return false,
+            }
+        };
+        browser.is_audible() || browser.is_audio_muted()
+    }
+
+    /// The user pressed tab `id`'s sound indicator: mute the tab, or unmute
+    /// it. The tab keeps its mute as it navigates and sleeps.
+    pub(super) fn toggle_tab_muted(&mut self, id: TabId) {
+        let browser = if id == self.tab.id {
+            &mut self.tab.browser
+        } else {
+            match self.tabs.hidden.get_mut(&id) {
+                Some(Hidden::Awake(tab)) => &mut tab.browser,
+                Some(Hidden::Asleep(sleeping)) => {
+                    sleeping.muted = !sleeping.muted;
+                    self.request_strip_redraw();
+                    self.update_accessibility(false);
+                    return;
+                }
+                None => return,
+            }
+        };
+        let muted = !browser.is_audio_muted();
+        browser.set_audio_muted(muted);
+        self.request_strip_redraw();
+        self.update_accessibility(false);
+    }
+
     /// The strip's view of every tab, in strip order.
     pub(super) fn strip_tabs(&self) -> Vec<TabStripTab> {
         self.tabs
@@ -1015,6 +1058,7 @@ impl DesktopApp {
                     Some(Hidden::Awake(tab)) => strip_entry(tab),
                     Some(Hidden::Asleep(sleeping)) => TabStripTab {
                         title: sleeping.title.clone(),
+                        muted: sleeping.muted,
                         asleep: true,
                         ..Default::default()
                     },
@@ -1031,6 +1075,7 @@ fn strip_entry(tab: &Tab) -> TabStripTab {
         terminal: tab.terminal.is_some(),
         loading: tab.browser.is_loading(),
         audible: tab.browser.is_audible(),
+        muted: tab.browser.is_audio_muted(),
         asleep: false,
     }
 }

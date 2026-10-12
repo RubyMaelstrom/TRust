@@ -10945,6 +10945,8 @@ mod tests {
         pages_that_ask_keep_their_tab_or_the_browser_open(&event_loop).await;
         popups_are_tabs_of_their_openers_group(&event_loop).await;
         media_offers_the_external_player_in_its_context_menu(&event_loop);
+        // Last: it plays the rest of the process's audio silently.
+        the_sound_indicator_mutes_its_tab_in_place(&event_loop).await;
     }
 
     fn media_offers_the_external_player_in_its_context_menu(event_loop: &EventLoop<DesktopEvent>) {
@@ -10990,6 +10992,105 @@ mod tests {
         assert!(menu.media.is_none());
         assert!(menu.items.iter().all(|item| item.label != "Open in mpv"));
         app.close_context_menu();
+    }
+
+    async fn the_sound_indicator_mutes_its_tab_in_place(event_loop: &EventLoop<DesktopEvent>) {
+        // A live page's player offers mpv in its context menu, as a static
+        // page's does. A tab playing sound shows its indicator in the strip;
+        // pressing it mutes the tab (HTML #effective-media-volume: the user
+        // overrides its volume) without showing it, and again unmutes it.
+        trust::media::audio::disable_device_output();
+        const PAGE: &str = "<body style='margin:0'><video src='/clip.mp4' \
+             style='display:block;width:320px;height:180px'></video>\
+             <p style='height:200px'>Sound</p><script>\
+             addEventListener('click', () => { const context = new AudioContext();\
+             const tone = context.createOscillator(); tone.connect(context.destination);\
+             tone.start(); }, {once: true}); setInterval(() => {}, 1000);</script>";
+        static PAGES: [(&str, &str); 1] = [("/page", PAGE)];
+        let (base, _log) = serve_pages(&PAGES).await;
+        let browser = tabs::new_controller(
+            &Handle::current(),
+            &event_loop.create_proxy(),
+            tabs::TabId(950),
+        );
+        let mut app = DesktopApp::for_test(
+            browser,
+            Handle::current(),
+            event_loop.create_proxy(),
+            RendererPreference::Cpu,
+            None,
+        );
+        app.clipboard = None;
+        app.metrics =
+            ViewportMetrics::from_physical(PhysicalSize::new(640, 480), ScaleFactor::new(1.0));
+        app.set_focus(FocusTarget::Page);
+        let playing = app.tab.id;
+        app.navigate(format!("{base}/page"));
+        wait_for_app(&mut app, "the live page", |app| {
+            app.tab.browser.page_is_live()
+                && app
+                    .tab
+                    .browser
+                    .current_page()
+                    .is_some_and(|page| page.rendered_page().is_some())
+        })
+        .await;
+        app.ensure_page_layout(app.viewport_for(FocusTarget::Page));
+        recompose(&mut app);
+        let content = app.scene.as_ref().unwrap().content_viewport;
+        // The page decides whether the menu shows (`contextmenu`); it does.
+        click(
+            &mut app,
+            CssPoint::new(content.x + 160.0, content.y + 90.0),
+            MouseButton::Right,
+        );
+        wait_for_app(&mut app, "the context menu", |app| {
+            app.context_menu.is_some()
+        })
+        .await;
+        let menu = app.context_menu.as_ref().unwrap();
+        assert_eq!(menu.items[0].label, "Open in mpv");
+        assert_eq!(
+            menu.media.as_ref().map(url::Url::to_string),
+            Some(format!("{base}/clip.mp4"))
+        );
+        app.close_context_menu();
+        for pressed in [true, false] {
+            app.dispatch(UserAction::PagePointerButton {
+                actor: None,
+                position: CssPoint::new(10.0, 300.0),
+                pressed,
+                button: 0,
+                metadata: Default::default(),
+            });
+        }
+        wait_for_app(&mut app, "the sound", |app| app.tab.browser.is_audible()).await;
+        app.open_blank_tab();
+        let shown = app.tab.id;
+        let index = app.tabs.index_of(playing).unwrap();
+        let geometry = app.strip_geometry();
+        assert!(geometry.sound[index], "the indicator shows");
+        let indicator = center(geometry.sound_button(index).unwrap());
+        app.pointer_moved(None, indicator);
+        assert_eq!(
+            app.strip.hovered,
+            Some(trust::render::TabStripPart::Sound(index))
+        );
+        let muted = |app: &DesktopApp| match app.tabs.hidden(playing) {
+            Some(tabs::Hidden::Awake(tab)) => tab.browser.is_audio_muted(),
+            _ => panic!("the playing tab stays awake"),
+        };
+        click(&mut app, indicator, MouseButton::Left);
+        assert!(muted(&app));
+        assert_eq!(app.tab.id, shown, "muting does not show the tab");
+        assert!(app.strip_tabs()[index].muted);
+        assert!(
+            app.strip_geometry().sound[index],
+            "a muted tab keeps its indicator to unmute it"
+        );
+        click(&mut app, indicator, MouseButton::Left);
+        assert!(!muted(&app));
+        assert_eq!(app.tab.id, shown);
     }
 
     async fn popups_are_tabs_of_their_openers_group(event_loop: &EventLoop<DesktopEvent>) {

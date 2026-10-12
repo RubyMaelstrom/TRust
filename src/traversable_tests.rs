@@ -123,6 +123,7 @@ async fn a_page_loaded_in_the_background_starts_hidden_without_an_event() {
             was_discarded: true,
             new_traversables: true,
             storage_shed: 0,
+            audio_muted: false,
         },
         vec![],
         |html| !output(html).is_empty(),

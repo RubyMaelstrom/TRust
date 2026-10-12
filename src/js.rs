@@ -261,6 +261,11 @@ pub struct TraversableState {
     /// The traversable's storage shed (`new_storage_shed`), which holds its
     /// sessionStorage across its Documents.
     pub storage_shed: u64,
+    /// The user muted the traversable (a muted tab): HTML
+    /// #effective-media-volume's override by the user, which makes its
+    /// media elements and audio contexts heard as silence while they play
+    /// on unchanged. Pages cannot observe it.
+    pub audio_muted: bool,
 }
 
 impl TraversableState {
@@ -272,6 +277,7 @@ impl TraversableState {
         was_discarded: false,
         new_traversables: false,
         storage_shed: 0,
+        audio_muted: false,
     };
 }
 
@@ -617,6 +623,9 @@ pub enum PageCmd {
     /// HTML #system-focus: the traversable gained or lost system focus. The
     /// actor runs the focus update steps for its current focus chain.
     SystemFocus(bool),
+    /// The user muted (`true`) or unmuted the traversable
+    /// (`TraversableState::audio_muted`).
+    AudioMuted(bool),
 }
 
 impl PageCmd {

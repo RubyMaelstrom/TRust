@@ -2083,9 +2083,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         }
         pauseMediaForFreeze(g.document);
     }
-    // A hidden page that makes no sound has its timers aligned to whole
-    // seconds of the agent clock once it has been hidden for ten seconds, so
-    // a background tab wakes at most once a second. Alignment is monotone:
+    // A hidden page that makes no sound, or whose sound is not heard because
+    // the user muted it, has its timers aligned to whole seconds of the
+    // agent clock once it has been hidden for ten seconds, so a background
+    // tab wakes at most once a second. Alignment is monotone:
     // timers still complete in the order HTML #run-steps-after-a-timeout's
     // step 2 requires, and selection keeps their nominal order.
     function timerDue(t) {
@@ -2095,7 +2096,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         return Math.ceil(agentAt / 1000) * 1000 - agentTimeOffset;
     }
     function updateTimerThrottle() {
-        const throttled = cfg.hidden === true && !audibleSources.size;
+        const throttled = cfg.hidden === true && (!audibleSources.size || cfg.audioMuted === true);
         if (throttled === (timerThrottleFrom !== null)) return;
         trust.setTimerThrottleFrom(throttled ? currentTime() + agentTimeOffset + 10000 : null);
     }
@@ -2116,6 +2117,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (audible) audibleSources.add(source);
         else audibleSources.delete(source);
         if (before !== audibleSources.size > 0) updateTimerThrottle();
+    };
+    // The user muted or unmuted the traversable (`PageCmd::AudioMuted`).
+    // Its pages cannot observe it; only the timer throttling above can.
+    trust.audioMutedChanged = function (muted) {
+        cfg.audioMuted = !!muted;
+        updateTimerThrottle();
     };
     trust.noteUserEdits = function (edits) { userEdits = !!edits; };
     function noteUserEdits(edits) { topTrust().noteUserEdits(edits); }

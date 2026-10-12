@@ -51,6 +51,7 @@ impl DesktopApp {
             self.tabs.order.len(),
             self.strip.scroll,
         )
+        .with_sound(self.tabs.order.iter().map(|&id| self.tab_shows_sound(id)))
     }
 
     fn window_maximized(&self) -> bool {
@@ -324,10 +325,21 @@ impl DesktopApp {
             return true;
         }
         match (part, button) {
-            (TabStripPart::CloseTab(index) | TabStripPart::Tab(index), MouseButton::Middle)
+            (
+                TabStripPart::CloseTab(index)
+                | TabStripPart::Tab(index)
+                | TabStripPart::Sound(index),
+                MouseButton::Middle,
+            )
             | (TabStripPart::CloseTab(index), MouseButton::Left) => {
                 if let Some(&id) = self.tabs.order.get(index) {
                     self.close_tab(id);
+                }
+            }
+            // The indicator mutes its tab without showing it.
+            (TabStripPart::Sound(index), MouseButton::Left) => {
+                if let Some(&id) = self.tabs.order.get(index) {
+                    self.toggle_tab_muted(id);
                 }
             }
             (TabStripPart::NewTab, MouseButton::Left) => self.open_blank_tab(),
@@ -413,14 +425,18 @@ const ACCESS_SCROLL_FORWARD: AccessNodeId = AccessNodeId((1 << 40) + 3);
 const ACCESS_MINIMIZE: AccessNodeId = AccessNodeId((1 << 40) + 4);
 const ACCESS_MAXIMIZE: AccessNodeId = AccessNodeId((1 << 40) + 5);
 const ACCESS_CLOSE_WINDOW: AccessNodeId = AccessNodeId((1 << 40) + 6);
-/// A tab's node is this plus its id; its close button's is the next range.
+/// A tab's node is this plus its id; its close button's is the next range,
+/// and its sound indicator's the range after the unload prompt's.
 const ACCESS_TABS: u64 = 1 << 41;
 const ACCESS_TAB_CLOSE: u64 = 1 << 42;
+const ACCESS_TAB_SOUND: u64 = 1 << 44;
 
 /// What accessibility needs of the strip.
 pub(super) struct AccessTabStrip {
     geometry: TabStripGeometry,
-    tabs: Vec<(TabId, String)>,
+    /// Each tab's id, title, and whether it is muted when it shows its
+    /// sound indicator.
+    tabs: Vec<(TabId, String, Option<bool>)>,
     active: usize,
     maximized: bool,
 }
@@ -435,7 +451,10 @@ impl DesktopApp {
                 .iter()
                 .copied()
                 .zip(self.strip_tabs())
-                .map(|(id, tab)| (id, tab.title))
+                .map(|(id, tab)| {
+                    let sound = tab.shows_sound().then_some(tab.muted);
+                    (id, tab.title, sound)
+                })
                 .collect(),
             active: self.tabs.index_of(self.tab.id).unwrap_or(0),
             maximized: self.window_maximized(),
@@ -456,6 +475,12 @@ impl DesktopApp {
         if (ACCESS_TAB_CLOSE..ACCESS_TAB_CLOSE * 2).contains(&node) {
             if clicked {
                 self.close_tab(TabId(node - ACCESS_TAB_CLOSE));
+            }
+            return true;
+        }
+        if (ACCESS_TAB_SOUND..ACCESS_TAB_SOUND * 2).contains(&node) {
+            if clicked {
+                self.toggle_tab_muted(TabId(node - ACCESS_TAB_SOUND));
             }
             return true;
         }
@@ -492,7 +517,8 @@ impl DesktopApp {
 }
 
 /// The strip as accessibility nodes: a tab list of tabs (ARIA's tabs
-/// pattern), each with its close button, and the strip's buttons.
+/// pattern), each with its close button and, while it plays sound or is
+/// muted, a Mute toggle button; and the strip's buttons.
 pub(super) fn tab_strip_access_nodes(
     strip: &AccessTabStrip,
     nodes: &mut Vec<(AccessNodeId, AccessNode)>,
@@ -511,7 +537,7 @@ pub(super) fn tab_strip_access_nodes(
     list.set_label("Tabs");
     list.set_bounds(rect(geometry.viewport));
     let mut tabs = Vec::new();
-    for (index, (id, title)) in strip.tabs.iter().enumerate() {
+    for (index, (id, title, sound)) in strip.tabs.iter().enumerate() {
         let tab_id = AccessNodeId(ACCESS_TABS + id.0);
         let close_id = AccessNodeId(ACCESS_TAB_CLOSE + id.0);
         let mut tab = AccessNode::new(AccessRole::Tab);
@@ -532,7 +558,24 @@ pub(super) fn tab_strip_access_nodes(
             close.set_bounds(rect(bounds));
         }
         close.add_action(AccessAction::Click);
-        tab.set_children(vec![close_id]);
+        let mut children = vec![close_id];
+        if let Some(muted) = *sound {
+            let sound_id = AccessNodeId(ACCESS_TAB_SOUND + id.0);
+            let mut mute = AccessNode::new(AccessRole::Button);
+            mute.set_label(format!("Mute {title}"));
+            mute.set_toggled(if muted {
+                accesskit::Toggled::True
+            } else {
+                accesskit::Toggled::False
+            });
+            if let Some(bounds) = geometry.sound_button(index) {
+                mute.set_bounds(rect(bounds));
+            }
+            mute.add_action(AccessAction::Click);
+            nodes.push((sound_id, mute));
+            children.insert(0, sound_id);
+        }
+        tab.set_children(children);
         nodes.push((close_id, close));
         nodes.push((tab_id, tab));
         tabs.push(tab_id);

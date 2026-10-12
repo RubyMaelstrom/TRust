@@ -764,6 +764,9 @@ pub struct BrowserController {
     occluded: bool,
     /// The frontend keeps this traversable out of view (a background tab).
     tab_hidden: bool,
+    /// The user muted this traversable (`TraversableState::audio_muted`);
+    /// it stays muted across its navigations.
+    audio_muted: bool,
     /// The traversable's presentation as the live page last heard of it,
     /// starting from the one it was created with (`None`: no live page
     /// attached); `sync_traversable` sends what changed.
@@ -947,6 +950,7 @@ impl BrowserController {
             animation_frames_only: false,
             occluded: false,
             tab_hidden: false,
+            audio_muted: false,
             live_traversable: None,
             restore_discarded: false,
             restore_scroll: None,
@@ -1422,6 +1426,7 @@ impl BrowserController {
             was_discarded: false,
             new_traversables: self.new_traversables_available,
             storage_shed: self.storage_shed,
+            audio_muted: self.audio_muted,
         }
     }
 
@@ -1431,10 +1436,12 @@ impl BrowserController {
     fn sync_traversable(&mut self) {
         let state = self.traversable_state();
         self.window_environment.send_if_modified(|env| {
-            let changed =
-                env.traversable.hidden != state.hidden || env.traversable.focused != state.focused;
+            let changed = env.traversable.hidden != state.hidden
+                || env.traversable.focused != state.focused
+                || env.traversable.audio_muted != state.audio_muted;
             env.traversable.hidden = state.hidden;
             env.traversable.focused = state.focused;
+            env.traversable.audio_muted = state.audio_muted;
             changed
         });
         // The live page knows the presentation it was created with
@@ -1458,8 +1465,19 @@ impl BrowserController {
         {
             sent.focused = state.focused;
         }
+        if sent.audio_muted != state.audio_muted
+            && page
+                .cmds
+                .try_send(crate::js::PageCmd::AudioMuted(state.audio_muted))
+                .is_ok()
+        {
+            sent.audio_muted = state.audio_muted;
+        }
         self.live_traversable = Some(sent);
-        if sent.hidden != state.hidden || sent.focused != state.focused {
+        if sent.hidden != state.hidden
+            || sent.focused != state.focused
+            || sent.audio_muted != state.audio_muted
+        {
             // Retry once the actor drains its channel.
             self.invalidation.request_redraw();
         }
@@ -1482,6 +1500,24 @@ impl BrowserController {
     /// audio context renders sound).
     pub fn is_audible(&self) -> bool {
         self.page_audible
+    }
+
+    /// Whether the user muted this traversable.
+    pub fn is_audio_muted(&self) -> bool {
+        self.audio_muted
+    }
+
+    /// Mute or unmute this traversable at the user's request (HTML
+    /// #effective-media-volume: the user overrides its media's volume).
+    /// The live page silences its players and audio contexts at once;
+    /// pages it navigates to start muted.
+    pub fn set_audio_muted(&mut self, muted: bool) {
+        if self.audio_muted == muted {
+            return;
+        }
+        self.audio_muted = muted;
+        self.sync_traversable();
+        self.invalidation.request_redraw();
     }
 
     /// The user has edits in the live page that were not submitted.
@@ -6202,6 +6238,43 @@ mod tests {
             "report.pdf"
         );
         assert!(browser.pending.is_none());
+    }
+
+    #[test]
+    fn a_tabs_mute_reaches_its_live_page_once_and_its_next_documents() {
+        // HTML #effective-media-volume: the user overrides the volume of the
+        // traversable's media. The live page hears of each change once; new
+        // Documents start from the window environment.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let mut browser =
+            BrowserController::new(runtime.handle().clone(), || {}, CssSize::new(640., 480.));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        browser.live_page = Some(crate::js::PageHandle::from_test_sender(tx));
+        browser.live_traversable = Some(browser.traversable_state());
+        assert!(!browser.is_audio_muted());
+        browser.set_audio_muted(true);
+        assert!(browser.is_audio_muted());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(crate::js::PageCmd::AudioMuted(true))
+        ));
+        assert!(browser.window_environment.borrow().traversable.audio_muted);
+        browser.set_audio_muted(true);
+        browser.sync_traversable();
+        assert!(
+            rx.try_recv().is_err(),
+            "an unchanged mute is not sent again"
+        );
+        browser.set_audio_muted(false);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(crate::js::PageCmd::AudioMuted(false))
+        ));
+        assert!(!browser.window_environment.borrow().traversable.audio_muted);
     }
 
     #[test]

@@ -115,8 +115,9 @@ pub enum Input {
 
 #[derive(Clone)]
 pub enum AudioMode {
-    /// The platform's audio device (falling back to silent output).
-    Device,
+    /// The platform's audio device (falling back to silent output), heard
+    /// as silence while the user mutes it.
+    Device(crate::media::audio::Mute),
     /// Silent real-time output (headless use, tests).
     Silent,
     /// Rerouted into a Web Audio graph (MediaElementAudioSourceNode).
@@ -1061,7 +1062,7 @@ impl Control {
                 sink.set_volume(volume.0, volume.1);
                 sink.set_rate(rate.0, rate.1);
                 let output = match &options.audio {
-                    AudioMode::Device => Output::open(format, sink.clone())
+                    AudioMode::Device(mute) => Output::open(format, mute.gate(sink.clone()))
                         .unwrap_or_else(|_| Output::null(format, sink.clone())),
                     AudioMode::Silent => Output::null(format, sink.clone()),
                     AudioMode::Tap(tap) => Output::tap(format, sink.clone(), tap, 0),

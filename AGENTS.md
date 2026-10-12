@@ -133,10 +133,10 @@ The project favors:
 - `src/core/`: shared browser controller and event delivery for desktop and
   headless clients.
 - `src/bin/trust-desktop.rs`: winit window, native input, and presentation loop.
-  Its modules: `tabs.rs` (tabs, their sleep and the pages' requests for new
-  ones), `window_chrome.rs` (the tab strip replacing the title bar and its
-  partial repaints), `unload_prompt.rs` (the "leave this page?" question),
-  `context_menu.rs` and `text_selection.rs`.
+  Its modules: `tabs.rs` (tabs, their sleep and mute and the pages' requests
+  for new ones), `window_chrome.rs` (the tab strip replacing the title bar
+  and its partial repaints), `unload_prompt.rs` (the "leave this page?"
+  question), `context_menu.rs` and `text_selection.rs`.
 - `src/render/`: renderer-neutral display list, Parley-shaped text, Vello CPU
   reference renderer, Hybrid wgpu backend (Vello GPU), and windowless
   `trust::render::headless` pipeline. See module comments for backend limits.
@@ -585,13 +585,23 @@ current behavior and limits; consult the governing standards before changing it.
   minimize/maximize/close, scroll arrows on overflow), Ctrl+T, Ctrl+W,
   Ctrl+Tab/Ctrl+Shift+Tab (not for a Telnet session in character mode),
   Ctrl+Shift+T (this session's closed tabs), Ctrl+Q. Tabs fill the strip's
-  height; the empty strip beside them moves the window. A background tab
-  unseen for 10 minutes sleeps (Page Lifecycle discard: freeze, then its
-  engine goes; its history wakes it), except a Telnet session, an audible
-  page, one with unsubmitted form edits, a loading one, one being asked
-  whether to leave, and one sharing its browsing context group. Pages unload
-  (pagehide, unload, keepalive beacons outliving them) when their tab closes
-  or navigates; beforeunload asks the user through `UnloadPrompt`.
+  height; the empty strip beside them moves the window. A tab playing sound,
+  or muted, shows a speaker that mutes or unmutes it in place (HTML
+  #effective-media-volume: the user overrides the volume): the controller's
+  `TraversableState::audio_muted` (`PageCmd::AudioMuted`, carried to the
+  tab's next Documents and through its sleep) gives every player and audio
+  context of the traversable a `media::audio::Mute`, which turns its device
+  output to silence while it renders and its clock runs on. Pages cannot
+  observe it (their elements' `muted` and `volume` are unchanged); a moved
+  media element takes its new traversable's mute. A background tab unseen
+  for 10 minutes sleeps (Page Lifecycle discard: freeze, then its engine
+  goes; its history wakes it), except a Telnet session, an audible page the
+  user has not muted, one with unsubmitted form edits, a loading one, one
+  being asked whether to leave, and one sharing its browsing context group;
+  a muted page's timers are throttled while hidden as a silent one's are.
+  Pages unload (pagehide, unload, keepalive beacons outliving them) when
+  their tab closes or navigates; beforeunload asks the user through
+  `UnloadPrompt`.
 - HTML's rules for choosing a navigable in trust-desktop: `_blank`
   hyperlinks, Ctrl/middle clicks and `noopener` requests open a tab in a new
   browsing context group (`PageEvt::OpenTraversable`); `window.open` and

@@ -47,6 +47,9 @@ struct Entry {
     /// The attached MediaSource, for a Media Source Extensions player.
     source: Option<u64>,
     taint: Taint,
+    /// The user's mute of the traversable the element plays in
+    /// (`HostState::apply_audio_mutes`).
+    mute: crate::media::audio::Mute,
 }
 
 /// Whether a player's resource is CORS-cross-origin (Fetch: an opaque
@@ -152,6 +155,28 @@ impl MediaHost {
         {
             tap.set_opaque(opaque);
         }
+    }
+
+    /// Silence each player whose element plays in a traversable the user
+    /// muted: `muted(node, context)` for its element and Window. Players
+    /// rerouted into a Web Audio graph are heard through its context,
+    /// which its own traversable's mute silences.
+    pub(super) fn apply_mutes(&self, muted: impl Fn(usize, u64) -> bool) {
+        for entry in self.players.values() {
+            entry.mute.set(muted(entry.node, entry.context));
+        }
+    }
+
+    /// Each player's mute, in player order.
+    #[cfg(test)]
+    pub(super) fn player_mutes(&self) -> Vec<bool> {
+        let mut mutes: Vec<(u64, bool)> = self
+            .players
+            .iter()
+            .map(|(&id, entry)| (id, entry.mute.is_muted()))
+            .collect();
+        mutes.sort_unstable();
+        mutes.into_iter().map(|(_, muted)| muted).collect()
     }
 
     /// The media elements that have players.
@@ -833,9 +858,22 @@ fn start(
     taint: Taint,
 ) -> f64 {
     let player_sender = std::sync::Mutex::new(sender);
-    let (silent, tap) = ctx.host_mut::<HostState>().map_or((false, None), |state| {
-        (state.media.silent, state.media.taps.get(&node).cloned())
-    });
+    let context = {
+        let dom = host_dom(ctx);
+        let dom = dom.borrow();
+        ctx.host_mut::<HostState>()
+            .and_then(|state| super::node_window_context(state, &dom, node))
+            .unwrap_or(calling)
+    };
+    let (silent, tap, mute) =
+        ctx.host_mut::<HostState>()
+            .map_or((false, None, Default::default()), |state| {
+                (
+                    state.media.silent,
+                    state.media.taps.get(&node).cloned(),
+                    crate::media::audio::Mute::new(state.audio_muted_at(node, context)),
+                )
+            });
     if let (Some(tap), Some(opaque)) = (&tap, taint.opaque()) {
         tap.set_opaque(opaque);
     }
@@ -845,7 +883,7 @@ fn start(
             audio: match tap {
                 Some(tap) => AudioMode::Tap(tap),
                 None if silent => AudioMode::Silent,
-                None => AudioMode::Device,
+                None => AudioMode::Device(mute.clone()),
             },
         },
         move |event| {
@@ -858,13 +896,6 @@ fn start(
         },
     );
     let surface = player.surface().id();
-    let context = {
-        let dom = host_dom(ctx);
-        let dom = dom.borrow();
-        ctx.host_mut::<HostState>()
-            .and_then(|state| super::node_window_context(state, &dom, node))
-            .unwrap_or(calling)
-    };
     {
         let dom = host_dom(ctx);
         dom.borrow_mut().set_media_presentation(
@@ -889,6 +920,7 @@ fn start(
                 context,
                 source: None,
                 taint,
+                mute,
             },
         );
     }

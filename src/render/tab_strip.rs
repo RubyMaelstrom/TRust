@@ -19,6 +19,8 @@ const STRIP: PaintColor = PaintColor::Rgba(7, 6, 18, 255);
 const SURFACE: PaintColor = PaintColor::Rgba(12, 9, 28, 255);
 const HOVER: PaintColor = PaintColor::Rgba(20, 16, 40, 255);
 const PRESSED: PaintColor = PaintColor::Rgba(5, 8, 19, 255);
+/// A tab's sound indicator under the pointer, over the tab's own surface.
+const SOUND_HOVER: PaintColor = PaintColor::Rgba(38, 32, 66, 255);
 const EDGE: PaintColor = PaintColor::Rgba(44, 67, 80, 255);
 const RULE: PaintColor = PaintColor::Rgba(36, 48, 66, 255);
 const MUTED: PaintColor = PaintColor::Rgba(147, 156, 179, 255);
@@ -36,6 +38,8 @@ const ARROW_WIDTH: f32 = 20.0;
 /// Empty strip that always remains for moving the window.
 const DRAG_RESERVE: f32 = 40.0;
 const LEFT_PAD: f32 = 4.0;
+/// A tab's close button and sound indicator are squares this wide.
+const TAB_BUTTON: f32 = 16.0;
 const TITLE_SIZE: f32 = 11.5;
 /// From this width every tab shows its close button; narrower inactive tabs
 /// show it while hovered.
@@ -51,8 +55,19 @@ pub struct TabStripTab {
     pub loading: bool,
     /// Its page is playing sound.
     pub audible: bool,
+    /// The user muted it: its pages are heard as silence (HTML
+    /// #effective-media-volume: the user overrides their volume).
+    pub muted: bool,
     /// Released from memory until shown again (Page Lifecycle "discarded").
     pub asleep: bool,
+}
+
+impl TabStripTab {
+    /// Whether the tab shows its sound indicator, which mutes or unmutes
+    /// it: while it plays sound, and while it is muted.
+    pub fn shows_sound(&self) -> bool {
+        self.audible || self.muted
+    }
 }
 
 /// One interactive part of the strip.
@@ -60,6 +75,8 @@ pub struct TabStripTab {
 pub enum TabStripPart {
     Tab(usize),
     CloseTab(usize),
+    /// A tab's sound indicator: pressing it mutes or unmutes the tab.
+    Sound(usize),
     NewTab,
     ScrollBack,
     ScrollForward,
@@ -78,6 +95,8 @@ pub struct TabStripGeometry {
     pub viewport: CssRect,
     /// One rectangle per tab, in strip order, at the current scroll.
     pub tabs: Vec<CssRect>,
+    /// Which tabs show their sound indicator (`TabStripTab::shows_sound`).
+    pub sound: Vec<bool>,
     pub new_tab: CssRect,
     /// Only while the tabs overflow their viewport.
     pub scroll_back: Option<CssRect>,
@@ -154,6 +173,7 @@ impl TabStripGeometry {
             strip,
             viewport,
             tabs,
+            sound: vec![false; count],
             new_tab,
             scroll_back,
             scroll_forward,
@@ -163,6 +183,17 @@ impl TabStripGeometry {
             scroll,
             max_scroll,
         }
+    }
+
+    /// Note which tabs show their sound indicator, in strip order.
+    pub fn with_sound(mut self, sound: impl IntoIterator<Item = bool>) -> Self {
+        let count = self.tabs.len();
+        self.sound = sound
+            .into_iter()
+            .chain(std::iter::repeat(false))
+            .take(count)
+            .collect();
+        self
     }
 
     /// Whether the tabs are wider than their viewport (the arrows show).
@@ -181,12 +212,24 @@ impl TabStripGeometry {
     /// Tab `index`'s close button.
     pub fn close_button(&self, index: usize) -> Option<CssRect> {
         let tab = *self.tabs.get(index)?;
-        let size = 16.0;
         Some(CssRect::new(
-            tab.x + tab.width - size - 6.0,
-            tab.y + ((tab.height - size) / 2.0).round(),
-            size,
-            size,
+            tab.x + tab.width - TAB_BUTTON - 6.0,
+            tab.y + ((tab.height - TAB_BUTTON) / 2.0).round(),
+            TAB_BUTTON,
+            TAB_BUTTON,
+        ))
+    }
+
+    /// Tab `index`'s sound indicator, beside its close button's place. It
+    /// stays there while the close button hides, so hovering the tab never
+    /// moves it from under the pointer.
+    pub fn sound_button(&self, index: usize) -> Option<CssRect> {
+        let close = self.close_button(index)?;
+        Some(CssRect::new(
+            close.x - 2.0 - TAB_BUTTON,
+            close.y,
+            TAB_BUTTON,
+            TAB_BUTTON,
         ))
     }
 
@@ -215,6 +258,13 @@ impl TabStripGeometry {
                     .is_some_and(|close| close.contains(point))
                 {
                     return Some(TabStripPart::CloseTab(index));
+                }
+                if self.sound.get(index) == Some(&true)
+                    && self
+                        .sound_button(index)
+                        .is_some_and(|sound| sound.contains(point))
+                {
+                    return Some(TabStripPart::Sound(index));
                 }
                 return Some(TabStripPart::Tab(index));
             }
@@ -333,7 +383,8 @@ pub fn paint_tab_strip(
         }
         let hovered = matches!(
             state.hovered,
-            Some(TabStripPart::Tab(i) | TabStripPart::CloseTab(i)) if i == index
+            Some(TabStripPart::Tab(i) | TabStripPart::CloseTab(i) | TabStripPart::Sound(i))
+                if i == index
         );
         if hovered {
             fill_tab_shape(primitives, rect, HOVER);
@@ -388,7 +439,8 @@ pub fn paint_tab_strip(
         }
         let hovered = matches!(
             state.hovered,
-            Some(TabStripPart::Tab(i) | TabStripPart::CloseTab(i)) if i == index
+            Some(TabStripPart::Tab(i) | TabStripPart::CloseTab(i) | TabStripPart::Sound(i))
+                if i == index
         );
         paint_tab_contents(
             primitives, geometry, index, rect, tab, state, active, hovered,
@@ -644,14 +696,16 @@ fn paint_tab_contents(
     }
 
     let show_close = active || hovered || rect.width >= CLOSE_ALWAYS_WIDTH;
-    let close = geometry.close_button(index).map(|close| {
+    // A dragged tab's buttons move with it.
+    let shift = |button: CssRect| {
         CssRect::new(
-            close.x + (rect.x - geometry.tabs[index].x),
-            close.y,
-            close.width,
-            close.height,
+            button.x + (rect.x - geometry.tabs[index].x),
+            button.y,
+            button.width,
+            button.height,
         )
-    });
+    };
+    let close = geometry.close_button(index).map(shift);
     let mut title_right = rect.x + rect.width - 8.0;
     if show_close && let Some(close) = close {
         title_right = close.x - 3.0;
@@ -674,15 +728,39 @@ fn paint_tab_contents(
             1.25,
         );
     }
-    if tab.audible {
-        let size = 12.0;
-        let x = title_right - size;
-        speaker(
-            primitives,
-            CssRect::new(x, (center_y - size / 2.0).round(), size, size),
-            if focused { UI_CYAN } else { UI_DIM },
-        );
-        title_right = x - 4.0;
+    if tab.shows_sound()
+        && let Some(button) = geometry.sound_button(index).map(shift)
+    {
+        let sound_hovered = state.hovered == Some(TabStripPart::Sound(index));
+        let pressed = state.pressed == Some(TabStripPart::Sound(index));
+        if sound_hovered || pressed {
+            fill(
+                primitives,
+                button,
+                if pressed { PRESSED } else { SOUND_HOVER },
+            );
+        }
+        let icon = CssRect::new(button.x + 2.0, button.y + 2.0, 12.0, 12.0);
+        if tab.muted {
+            speaker(
+                primitives,
+                icon,
+                if focused { MUTED } else { DISABLED },
+                None,
+            );
+            // The waves crossed out.
+            cross(
+                primitives,
+                CssPoint::new(icon.x + 10.0, icon.y + 6.0),
+                2.25,
+                if focused { UI_PINK } else { UI_DIM },
+                1.25,
+            );
+        } else {
+            let color = if focused { UI_CYAN } else { UI_DIM };
+            speaker(primitives, icon, color, Some(color));
+        }
+        title_right = title_right.min(button.x - 2.0);
     }
     let title_left = rect.x + 23.0;
     let color = match (tab.asleep, active, focused) {
@@ -742,7 +820,13 @@ fn paint_button(
     );
 }
 
-fn speaker(primitives: &mut Vec<Primitive>, rect: CssRect, color: PaintColor) {
+/// A speaker in a 12 px square; `waves` draws its sound in that color.
+fn speaker(
+    primitives: &mut Vec<Primitive>,
+    rect: CssRect,
+    color: PaintColor,
+    waves: Option<PaintColor>,
+) {
     let at = |x: f32, y: f32| CssPoint::new(rect.x + x, rect.y + y);
     primitives.push(Primitive::Fill {
         shape: PaintShape::Path(vec![
@@ -756,6 +840,9 @@ fn speaker(primitives: &mut Vec<Primitive>, rect: CssRect, color: PaintColor) {
         ]),
         brush: PaintBrush::Solid(color),
     });
+    let Some(waves) = waves else {
+        return;
+    };
     stroke(
         primitives,
         vec![
@@ -764,7 +851,7 @@ fn speaker(primitives: &mut Vec<Primitive>, rect: CssRect, color: PaintColor) {
             PathElement::MoveTo(at(10.0, 2.25)),
             PathElement::CurveTo(at(12.25, 4.5), at(12.25, 7.5), at(10.0, 9.75)),
         ],
-        color,
+        waves,
         1.2,
     );
 }
@@ -1047,6 +1134,76 @@ mod tests {
     }
 
     #[test]
+    fn a_tabs_sound_indicator_is_its_own_part_where_it_shows() {
+        let geometry = TabStripGeometry::new(1280.0, 3, 0.0).with_sound([false, true]);
+        assert_eq!(geometry.sound, [false, true, false]);
+        let center =
+            |rect: CssRect| CssPoint::new(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
+        let sound = geometry.sound_button(1).unwrap();
+        assert_eq!(
+            geometry.part_at(center(sound)),
+            Some(TabStripPart::Sound(1))
+        );
+        let close = geometry.close_button(1).unwrap();
+        assert!(
+            sound.x + sound.width <= close.x,
+            "beside the close button, not under it"
+        );
+        assert_eq!(
+            geometry.part_at(center(close)),
+            Some(TabStripPart::CloseTab(1))
+        );
+        assert_eq!(
+            geometry.part_at(center(geometry.sound_button(0).unwrap())),
+            Some(TabStripPart::Tab(0)),
+            "a tab without sound has no indicator to press"
+        );
+        // A narrow tab hides its close button until hovered; the indicator
+        // keeps its place, so hovering never moves it from the pointer.
+        let narrow = TabStripGeometry::new(700.0, 4, 0.0).with_sound([true; 4]);
+        assert!(narrow.tabs[0].width < CLOSE_ALWAYS_WIDTH);
+        let mut painted = Vec::new();
+        let mut list = tabs(4);
+        list[0].audible = true;
+        for hovered in [None, Some(TabStripPart::Sound(0))] {
+            let mut primitives = Vec::new();
+            paint_tab_strip(
+                &mut primitives,
+                &narrow,
+                &list,
+                &TabStripState {
+                    active: 1,
+                    hovered,
+                    window_focused: true,
+                    ..Default::default()
+                },
+            );
+            let speaker = primitives
+                .iter()
+                .find_map(|primitive| match primitive {
+                    Primitive::Fill {
+                        shape: PaintShape::Path(path),
+                        ..
+                    } => match path.first() {
+                        // Not a tab's outline, which starts at its bottom.
+                        Some(PathElement::MoveTo(start))
+                            if start.x < narrow.tabs[1].x && start.y < TAB_STRIP_HEIGHT - 1.0 =>
+                        {
+                            Some(*start)
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .expect("the speaker paints");
+            painted.push(speaker);
+        }
+        assert_eq!(painted[0], painted[1]);
+        let button = narrow.sound_button(0).unwrap();
+        assert!(button.contains(painted[0]));
+    }
+
+    #[test]
     fn long_titles_end_in_an_ellipsis_that_fits() {
         let style = command_text_style_with_size(TITLE_SIZE);
         let short = fit_text("Short", &style, 400.0);
@@ -1149,6 +1306,7 @@ mod tests {
             ("telnet://bbs.example.org:23", true, false, false, false),
             ("Radio Paradise — Main Mix", false, false, true, false),
             ("Sleeping page", false, false, false, true),
+            ("Muted video", false, false, true, false),
         ];
         for (name, width, count, active, hovered, focused, maximized, scroll) in [
             (
@@ -1169,6 +1327,16 @@ mod tests {
                 Some(TabStripPart::CloseTab(3)),
                 true,
                 true,
+                0.0,
+            ),
+            (
+                "hover-sound",
+                1300.0,
+                6,
+                0,
+                Some(TabStripPart::Sound(3)),
+                true,
+                false,
                 0.0,
             ),
             ("unfocused", 1100.0, 5, 1, None, false, false, 0.0),
@@ -1201,11 +1369,13 @@ mod tests {
                         terminal,
                         loading,
                         audible,
+                        muted: index % titles.len() == 5,
                         asleep,
                     }
                 })
                 .collect();
-            let geometry = TabStripGeometry::new(width, count, scroll);
+            let geometry = TabStripGeometry::new(width, count, scroll)
+                .with_sound(list.iter().map(TabStripTab::shows_sound));
             // Twice the CSS size, as a HiDPI screen shows it.
             let height = 60u32;
             let physical = PhysicalSize::new(width as u32 * 2, height * 2);

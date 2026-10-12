@@ -27,6 +27,9 @@ struct ContextEntry {
     engine: Engine,
     /// The Window realm whose script created the context.
     realm: u64,
+    /// The user's mute of the traversable the realm belongs to
+    /// (`HostState::apply_audio_mutes`); an offline context has no output.
+    mute: crate::media::audio::Mute,
     next_id: u32,
     /// [[current value]] slots and compressor `reduction`s, by id.
     values: HashMap<u32, Arc<AtomicU32>>,
@@ -87,9 +90,29 @@ impl WebAudioHost {
         self.contexts.retain(|_, entry| entry.realm != realm);
     }
 
+    /// Silence the output of each context whose realm `muted(realm)` says
+    /// belongs to a traversable the user muted.
+    pub(super) fn apply_mutes(&self, muted: impl Fn(u64) -> bool) {
+        for entry in self.contexts.values() {
+            entry.mute.set(muted(entry.realm));
+        }
+    }
+
     fn next(&mut self) -> u64 {
         self.next_id += 1;
         self.next_id
+    }
+
+    /// Each context's mute, in creation order.
+    #[cfg(test)]
+    pub(super) fn context_mutes(&self) -> Vec<bool> {
+        let mut mutes: Vec<(u64, bool)> = self
+            .contexts
+            .iter()
+            .map(|(&id, entry)| (id, entry.mute.is_muted()))
+            .collect();
+        mutes.sort_unstable();
+        mutes.into_iter().map(|(_, muted)| muted).collect()
     }
 }
 
@@ -714,6 +737,11 @@ fn create(ctx: &mut Ctx, realtime: bool, args: &[Value]) -> Value {
         return Value::Num(0.0);
     };
     let id = state.webaudio.next();
+    let mute = crate::media::audio::Mute::new(
+        state
+            .muted_traversables
+            .contains(&state.traversable_of_context(realm)),
+    );
     // A realm without an event loop (some tests) renders but hears nothing.
     let sender = Mutex::new(state.task_events.clone());
     let notify = Box::new(move |notices: Vec<Notice>| {
@@ -741,6 +769,7 @@ fn create(ctx: &mut Ctx, realtime: bool, args: &[Value]) -> Value {
                     || args
                         .get(5)
                         .is_some_and(|value| matches!(value, Value::Bool(true))),
+                mute: mute.clone(),
             },
             notify,
         )
@@ -752,6 +781,7 @@ fn create(ctx: &mut Ctx, realtime: bool, args: &[Value]) -> Value {
         ContextEntry {
             engine,
             realm,
+            mute,
             next_id: 1,
             values: HashMap::new(),
             node_values: HashMap::new(),

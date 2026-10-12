@@ -232,7 +232,7 @@ impl Shared {
 }
 
 /// How an AudioContext renders.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Realtime {
     pub rate: f32,
     pub quantum: usize,
@@ -242,6 +242,9 @@ pub struct Realtime {
     pub latency: f64,
     /// `sinkId` {type: "none"}: render without a device.
     pub silent: bool,
+    /// The user's mute of the device output (a muted tab), which the
+    /// context renders into as ever.
+    pub mute: crate::media::audio::Mute,
 }
 
 /// A context's rendering thread, owned by the control thread.
@@ -506,8 +509,12 @@ fn run_realtime(
                         *device = Some(if config.silent {
                             Output::null(format, feed)
                         } else {
-                            Output::open_with_latency(format, latency, feed.clone())
-                                .unwrap_or_else(|_| Output::null(format, feed))
+                            Output::open_with_latency(
+                                format,
+                                latency,
+                                config.mute.gate(feed.clone()),
+                            )
+                            .unwrap_or_else(|_| Output::null(format, feed))
                         });
                     }
                     if let Some(output) = device.as_ref() {
@@ -858,6 +865,7 @@ mod tests {
                 channels: 2,
                 latency: 0.02,
                 silent: true,
+                mute: Default::default(),
             },
             notify,
         );
