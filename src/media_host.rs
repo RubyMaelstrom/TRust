@@ -109,6 +109,24 @@ pub(super) struct MediaHost {
 }
 
 impl MediaHost {
+    /// Whether a media element of the page has a player: live playback the
+    /// page's actor must keep.
+    pub(super) fn has_players(&self) -> bool {
+        !self.players.is_empty()
+    }
+
+    /// The media element player `id` plays for.
+    pub(super) fn player_node(&self, id: u64) -> Option<usize> {
+        self.players.get(&id).map(|entry| entry.node)
+    }
+
+    /// Stop the players of the elements `gone` names (their Documents were
+    /// destroyed, HTML #destroy-a-document), and forget their audio taps.
+    pub(super) fn release_elements(&mut self, gone: impl Fn(usize) -> bool) {
+        self.players.retain(|_, entry| !gone(entry.node));
+        self.taps.retain(|&node, _| !gone(node));
+    }
+
     /// Reroute media element `node`'s audio into a Web Audio graph from now
     /// on (createMediaElementSource()), including its current player's.
     pub(super) fn tap(&mut self, node: usize) -> crate::media::audio::Tap {

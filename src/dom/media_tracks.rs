@@ -29,6 +29,25 @@ impl State {
     pub(super) fn retained_bytes(&self) -> usize {
         self.changes.capacity() * std::mem::size_of::<(NodeId, NodeId, bool)>()
     }
+
+    /// Hand the changes whose media element moves to another arena of the
+    /// group (`Dom::transplant_subtree`) to that arena, in order. The others
+    /// stay with their media element, whose Realm runs their steps; a track
+    /// element among them that moved is still their target.
+    pub(super) fn transplant(&mut self, into: &mut State, moved: &FxHashSet<NodeId>) {
+        if !self
+            .changes
+            .iter()
+            .any(|(_, media, _)| moved.contains(media))
+        {
+            return;
+        }
+        let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.changes)
+            .into_iter()
+            .partition(|(_, media, _)| moved.contains(media));
+        self.changes = kept;
+        into.changes.extend(gone);
+    }
 }
 
 impl Dom {

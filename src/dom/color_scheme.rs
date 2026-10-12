@@ -112,7 +112,7 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// The element color scheme of `id`.
     pub(crate) fn color_scheme(&self, id: NodeId) -> ColorScheme {
         let nodes = self.style_view().nodes;
-        let document = nodes.owner_document_of(id).unwrap_or(super::DOCUMENT);
+        let document = nodes.owner_document_of(id).unwrap_or(self.document());
         // An embedded document's preference is its embedding element's scheme.
         let preference = match nodes.try_parent(document).flatten() {
             Some(frame) if matches!(self.tag_name(frame), Some("iframe" | "frame")) => {

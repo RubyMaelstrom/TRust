@@ -84,7 +84,7 @@ impl Dom {
     /// Native tasks may still deliver author-observable events after the last JS wrapper dies.
     /// They keep their targets until the task queue/animation state relinquishes them.
     pub(crate) fn visit_gc_roots(&self, mut visit: impl FnMut(NodeId)) {
-        visit(DOCUMENT);
+        visit(self.document());
         self.transitions.visit_gc_roots(&mut visit);
         self.animations.visit_gc_roots(&mut visit);
         for &(node, _, _) in &self.scroll_changes {
@@ -123,12 +123,35 @@ impl Dom {
             return removed;
         }
         let dead: FxHashSet<_> = removed.iter().copied().collect();
+        // Scroll and transition events are roots, so a dead target here is a host-tracing bug.
+        debug_assert!(
+            self.scroll_changes
+                .iter()
+                .all(|(id, _, _)| !dead.contains(id))
+        );
+        debug_assert!(self.fragment_targets.values().all(|id| !dead.contains(id)));
+        self.forget_nodes(&removed, &dead, false);
+        removed
+    }
+
+    /// Forget identities that left this arena: retired by the collector
+    /// (whose nodes this removes), or moved to another arena of the group
+    /// with the state that is theirs (`transplant_subtree`, which has
+    /// removed them and says whether a `slot` was among them). Every
+    /// registry, record and cache keyed by them drops them, as if they had
+    /// never been allocated here, except the records that are collector
+    /// roots, whose nodes cannot be dead.
+    pub(super) fn forget_nodes(
+        &mut self,
+        removed: &[NodeId],
+        dead: &FxHashSet<NodeId>,
+        mut retired_slot: bool,
+    ) {
         let mut changed_popovers = false;
         let mut retired_scope = false;
-        let mut retired_slot = false;
         let mut svg_consumers = Vec::new();
-        for &id in &removed {
-            debug_assert_ne!(id, DOCUMENT);
+        for &id in removed {
+            debug_assert_ne!(id, self.document());
             retired_slot |= self.tag_name(id) == Some("slot");
             svg_consumers.extend(self.svg_dependencies.get_mut().remove_node(id));
             self.child_lists.get_mut().remove(id);
@@ -234,13 +257,6 @@ impl Dom {
             .get_mut()
             .0
             .retain(|(id, _)| !dead.contains(id));
-        // Scroll and transition events are roots, so a dead target here is a host-tracing bug.
-        debug_assert!(
-            self.scroll_changes
-                .iter()
-                .all(|(id, _, _)| !dead.contains(id))
-        );
-        debug_assert!(self.fragment_targets.values().all(|id| !dead.contains(id)));
         if self
             .resource_base_element_cache
             .get()
@@ -322,7 +338,6 @@ impl Dom {
             shrink_ref_map!(&mut generated.list_items);
         }
         shrink_ref_map!(&mut self.slot_assignments.get_mut().by_element);
-        removed
     }
 
     /// Called only after joint tracing proves these native identities dead. No JS executes
@@ -333,7 +348,7 @@ impl Dom {
         if removed.is_empty() {
             return removed;
         }
-        debug_assert!(live(DOCUMENT));
+        debug_assert!(live(self.document()));
         let mut svg_consumers = Vec::new();
         for &id in &removed {
             svg_consumers.extend(self.svg_dependencies.get_mut().remove_node(id));

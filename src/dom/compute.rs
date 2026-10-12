@@ -96,6 +96,10 @@ pub(super) trait StyleBackend {
     fn decoration_cache(&self) -> &RefCell<NodeCache<(bool, bool)>>;
 
     // Document queries, through the view.
+    /// The arena's Document.
+    fn document(&self) -> NodeId {
+        self.style_view().state.document
+    }
     fn is_valid(&self, id: NodeId) -> bool {
         self.style_view().nodes.contains(id)
     }

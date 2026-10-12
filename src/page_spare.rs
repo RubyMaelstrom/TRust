@@ -90,6 +90,11 @@ impl SpareEngine {
         })
     }
 
+    /// The engine's interrupt, which the claiming page's handles keep.
+    pub(super) fn interrupt(&self) -> Arc<lumen::RuntimeInterrupt> {
+        self.interrupt.clone()
+    }
+
     /// Reserve this spare for one navigation unless it is mid-bootstrap,
     /// where waiting would cost more than a cold engine. Returns the state
     /// it was reserved in.
@@ -237,6 +242,7 @@ fn warm(engine: &mut lumen::Engine, snapshot: &'static [u8]) -> Result<(), Strin
         false,
         false,
         MainWindowTraces::default(),
+        crate::js::TraversableState::SHOWN,
     );
 
     // As in `host_create_window_realm`, creation and bootstrap are one
@@ -406,10 +412,6 @@ impl SpareEngine {
     pub(super) fn reserved(self) -> Option<Self> {
         self.reserve().map(|_| self)
     }
-
-    pub(super) fn interrupt(&self) -> Arc<lumen::RuntimeInterrupt> {
-        self.interrupt.clone()
-    }
 }
 
 #[cfg(test)]
@@ -421,6 +423,46 @@ pub(super) fn has_spare() -> bool {
 mod tests {
     use super::*;
     use crate::js::{PageEnv, PageEvt};
+
+    /// Diagnostic: the resident memory each additional warmed page engine
+    /// costs (what every tab with a live page pays before its document),
+    /// read from /proc/self/statm after returning freed pages to the OS.
+    /// `cargo test --release --lib warmed_engine_memory_report -- --ignored
+    /// --nocapture` (Linux).
+    #[test]
+    #[ignore = "diagnostic report; run explicitly"]
+    fn warmed_engine_memory_report() {
+        fn resident_mib() -> f64 {
+            crate::release_allocator_memory();
+            let statm = std::fs::read_to_string("/proc/self/statm").unwrap();
+            let pages: f64 = statm.split_whitespace().nth(1).unwrap().parse().unwrap();
+            pages * 4096.0 / (1024.0 * 1024.0)
+        }
+        let base = resident_mib();
+        let snapshot = platform_prelude_snapshot().unwrap();
+        let compiled = resident_mib();
+        eprintln!(
+            "baseline {base:.1} MiB; prelude snapshot +{:.1} MiB ({} bytes)",
+            compiled - base,
+            snapshot.len()
+        );
+        let mut engines = Vec::new();
+        let mut last = compiled;
+        for index in 0..4 {
+            let interrupt = Arc::new(lumen::RuntimeInterrupt::default());
+            let mut engine = lumen::Engine::new_with_interrupt(interrupt);
+            let created = resident_mib();
+            warm(&mut engine, snapshot).unwrap();
+            let warmed = resident_mib();
+            eprintln!(
+                "engine {index}: new +{:.1} MiB, warm +{:.1} MiB, total {warmed:.1} MiB",
+                created - last,
+                warmed - created,
+            );
+            last = warmed;
+            engines.push(engine);
+        }
+    }
 
     const URL: &str = "https://spare.example/doc?q=1";
 

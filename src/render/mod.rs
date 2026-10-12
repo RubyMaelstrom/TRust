@@ -22,12 +22,20 @@ mod hit_index;
 pub(crate) mod matrix3d;
 pub(crate) mod media_controls;
 pub mod selection;
+mod tab_strip;
+mod unload_prompt;
 pub use command_panel::{CommandPanelGeometry, CommandResponse};
 pub use context_menu::{ContextMenuGeometry, ContextMenuIcon, ContextMenuItem, paint_context_menu};
 pub use filter_graph::FilterGraph;
 pub(crate) use hit_index::PageHitIndex;
 pub use selection::{
     HighlightPaint, PageSelection, RunSelection, SelectionSegments, TextSourceSpan,
+};
+pub use tab_strip::{
+    TAB_STRIP_HEIGHT, TabStripGeometry, TabStripPart, TabStripState, TabStripTab, paint_tab_strip,
+};
+pub use unload_prompt::{
+    UnloadPromptButton, UnloadPromptGeometry, UnloadPromptState, paint_unload_prompt,
 };
 pub mod vello_cpu;
 pub mod vello_hybrid;
@@ -2052,6 +2060,8 @@ pub struct ChromeModel {
     /// Fullscreen API: the page is shown fullscreen, so the browse hints and
     /// heart scrollbars are hidden (prompts the user opens still overlay it).
     pub page_fullscreen: bool,
+    /// The height of the tab strip over the page (zero without one).
+    pub tab_strip_height: f32,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -3976,11 +3986,12 @@ pub fn desktop_chrome(
         0.0
     }
     .min(viewport.css.height);
+    let top = model.tab_strip_height.clamp(0.0, viewport.css.height);
     let content = CssRect::new(
         0.0,
-        0.0,
+        top,
         viewport.css.width,
-        (viewport.css.height - panel_height).max(0.0),
+        (viewport.css.height - top - panel_height).max(0.0),
     );
     Scene {
         viewport,

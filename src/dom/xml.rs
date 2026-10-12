@@ -24,12 +24,23 @@ impl Dom {
     /// HTML #read-xml for a top-level navigation: the page's Document is
     /// built by the XML parser, with `content_type` as its content type.
     pub fn parse_xml_page(source: &str, content_type: &str) -> Dom {
-        let mut dom = Dom::new();
+        Self::parse_xml_page_in_group(source, content_type, None)
+    }
+
+    /// `parse_xml_page` into an arena of a browsing context group
+    /// (`Dom::parse_document_in_group`).
+    pub fn parse_xml_page_in_group(
+        source: &str,
+        content_type: &str,
+        ids: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    ) -> Dom {
+        let mut dom = Dom::with_identity_source(ids);
+        let document = dom.document();
         if content_type != "text/html" {
             dom.document_content_types
-                .insert(super::DOCUMENT, content_type.to_owned());
+                .insert(document, content_type.to_owned());
         }
-        dom.populate_xml_document_or_error(super::DOCUMENT, source);
+        dom.populate_xml_document_or_error(document, source);
         // As after an HTML parse (the tree sink's finish): parser-created
         // nodes are connected roots, and the first render is a full one.
         dom.touch();
@@ -193,10 +204,10 @@ impl Dom {
         );
         let mut parsed = Dom::new();
         parsed
-            .populate_xml_document(super::DOCUMENT, &source)
+            .populate_xml_document(parsed.document(), &source)
             .ok()?;
         // The fictional root is the document element and has no siblings.
-        let roots: Vec<NodeId> = parsed.child_iter(super::DOCUMENT).collect();
+        let roots: Vec<NodeId> = parsed.child_iter(parsed.document()).collect();
         let [root] = roots[..] else {
             return None;
         };

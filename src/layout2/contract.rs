@@ -1379,7 +1379,7 @@ pub(crate) fn structured_media_for(
     }
     let media_tag = if video { "video" } else { "audio" };
     let peer_media: Vec<_> = dom
-        .flat_descendants(crate::dom::DOCUMENT)
+        .flat_descendants(dom.document())
         .into_iter()
         .filter(|&id| dom.tag_name(id) == Some(media_tag))
         .collect();
@@ -1430,7 +1430,7 @@ pub(crate) fn unique_structured_media(
 
 fn structured_media_items(dom: &Dom, base: &Url, video: bool) -> Vec<StructuredMedia> {
     let kind = if video { "VideoObject" } else { "AudioObject" };
-    dom.descendants(crate::dom::DOCUMENT)
+    dom.descendants(dom.document())
         .filter(|&id| schema_item_is(dom, id, kind))
         .filter_map(|item| {
             let target = ["contentUrl", "embedUrl", "url"]
@@ -1502,7 +1502,7 @@ fn microdata_url_property(dom: &Dom, base: &Url, item: NodeId, name: &str) -> Op
         }
     }
     // Step 6 sorts the result nodes in tree order before values are read.
-    dom.descendants(crate::dom::DOCUMENT)
+    dom.descendants(dom.document())
         .filter(|id| results.contains(id))
         .find_map(|id| {
             let raw = microdata_value(dom, id)?.trim();
@@ -1541,7 +1541,7 @@ pub(crate) fn page_declares_video(dom: &Dom) -> bool {
     const KEYS: [&str; 3] = ["og:video", "og:video:secure_url", "og:type"];
     let mut metas: [Option<NodeId>; 3] = [None; 3];
     let mut video_objects = 0;
-    for id in dom.descendants(crate::dom::DOCUMENT) {
+    for id in dom.descendants(dom.document()) {
         if dom.tag_name(id) == Some("meta")
             && let Some(key) = dom.attr(id, "property").or_else(|| dom.attr(id, "name"))
         {

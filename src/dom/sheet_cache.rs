@@ -4,6 +4,10 @@
 //! #cascade-order/#layer-ordering: parsing can be shared, but source order,
 //! layer context, base URLs and media evaluation still belong to each use.
 use super::*;
+
+/// The key a cached parse files a sheet's own document-scope rules under,
+/// whichever arena's Document later uses them.
+const DOCUMENT_SCOPE: NodeId = 0;
 use std::hash::{Hash, Hasher};
 
 // Past either bound, a miss evicts the sheets the last two index builds did
@@ -90,10 +94,10 @@ impl Cache {
             parse_sheet(
                 css,
                 &mut orders,
-                parsed.scopes.entry(DOCUMENT).or_default(),
+                parsed.scopes.entry(DOCUMENT_SCOPE).or_default(),
                 &mut parsed.keyframes,
-                parsed.counter_styles.entry(DOCUMENT).or_default(),
-                parsed.properties.entry(DOCUMENT).or_default(),
+                parsed.counter_styles.entry(DOCUMENT_SCOPE).or_default(),
+                parsed.properties.entry(DOCUMENT_SCOPE).or_default(),
                 &mut parsed_fonts,
                 base,
                 media,
@@ -125,18 +129,22 @@ impl Cache {
         };
         // Keep use-site source order independent of the cached parse. In
         // particular, inserting/reordering sheets cannot reuse old order keys.
-        out.extend(entry.parsed.scopes[&DOCUMENT].iter().map(|rule| StyleRule {
-            order: *order + rule.order,
-            data: rule.data.clone(),
-        }));
+        out.extend(
+            entry.parsed.scopes[&DOCUMENT_SCOPE]
+                .iter()
+                .map(|rule| StyleRule {
+                    order: *order + rule.order,
+                    data: rule.data.clone(),
+                }),
+        );
         *order += entry.orders;
         keyframes.extend(entry.parsed.keyframes.clone());
-        for (name, value) in &entry.parsed.counter_styles[&DOCUMENT] {
+        for (name, value) in &entry.parsed.counter_styles[&DOCUMENT_SCOPE] {
             if counters.get(name).is_none_or(|old| value.0 >= old.0) {
                 counters.insert(name.clone(), value.clone());
             }
         }
-        properties.extend(entry.parsed.properties[&DOCUMENT].clone());
+        properties.extend(entry.parsed.properties[&DOCUMENT_SCOPE].clone());
         fonts.extend(entry.fonts.iter().cloned());
         *layers = entry.after.clone();
     }

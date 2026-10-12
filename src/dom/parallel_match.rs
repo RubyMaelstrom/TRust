@@ -282,9 +282,10 @@ pub(super) struct Walk {
 }
 
 impl Walk {
-    pub(super) fn new(slots: &FxHashMap<NodeId, usize>) -> Self {
+    /// A walk of the arena's tree from its Document `document`.
+    pub(super) fn new(document: NodeId, slots: &FxHashMap<NodeId, usize>) -> Self {
         Walk {
-            stack: vec![(DOCUMENT, slots.get(&DOCUMENT).copied().unwrap_or(0))],
+            stack: vec![(document, slots.get(&document).copied().unwrap_or(0))],
             count: 0,
         }
     }
@@ -467,7 +468,7 @@ impl Dom {
             return false;
         };
         let stream = Stream::new(self.nodes.len(), CHUNK);
-        let mut walk = Walk::new(&slots);
+        let mut walk = Walk::new(self.document, &slots);
         let stale = |node| {
             self.selector_cache
                 .borrow()

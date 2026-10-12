@@ -805,7 +805,7 @@ impl Dom {
         let animated = self.animations.origin_elements();
         let pruned = |node| animated.contains(&node);
         let stream = Stream::new(self.nodes.len(), MIN_RUN);
-        let mut walk = Walk::new(&slots);
+        let mut walk = Walk::new(self.document, &slots);
         let min_elements = min_elements
             .max(1)
             .max((MIN_WORK.as_nanos() / element_cost.as_nanos().max(1)) as usize);
@@ -820,7 +820,7 @@ impl Dom {
         stream.publish_all(walk.count);
         let walked = walk_started.elapsed();
         let divisor = 2 * pool.participants();
-        let document_base = self.document_base(DOCUMENT);
+        let document_base = self.document_base(self.document());
         // SAFETY: as in `match_stale_with`: the view is shared only with this
         // pass's job, and `Pool::run` keeps this thread inside the pass until
         // every worker has left it. Meanwhile this thread reads the tree only

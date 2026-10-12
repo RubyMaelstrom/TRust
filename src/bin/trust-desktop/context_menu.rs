@@ -5,7 +5,7 @@
 //! Its items act on the browser, never on the DOM.
 //!
 //! Opening, highlighting and closing it repaint only the menu: the
-//! composed page stays as it is (`DesktopApp::draw_overlay`).
+//! composed page stays as it is (`DesktopApp::draw_partial`).
 
 use super::*;
 
@@ -13,6 +13,10 @@ use trust::render::{ContextMenuGeometry, ContextMenuIcon, ContextMenuItem, paint
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum MenuAction {
+    /// Open the menu's link in a new background tab.
+    OpenLinkInNewTab,
+    /// Copy the menu's link address.
+    CopyLink,
     Copy,
     Reload,
     OpenCommand,
@@ -30,6 +34,8 @@ pub(super) struct PageContextMenu {
     pub(super) pressed: Option<usize>,
     /// The page it acts on, as COMMAND names it.
     pub(super) title: String,
+    /// The hyperlink the menu was opened on, and its address.
+    pub(super) link: Option<(Link, String)>,
 }
 
 /// COMMAND's name for the page: its scheme and host.
@@ -53,14 +59,14 @@ impl DesktopApp {
     /// Pages have a context menu; a Telnet session keeps the secondary
     /// button for the remote host, and a locked pointer is the page's.
     pub(super) fn context_menu_available(&self) -> bool {
-        self.terminal.is_none()
+        self.tab.terminal.is_none()
             && self.pointer_lock.is_none()
-            && (self.page_layout.is_some() || self.protocol_page.is_some())
+            && (self.tab.page_layout.is_some() || self.tab.protocol_page.is_some())
     }
 
     /// The page's bookmark address: its destination as bookmarks store it.
     pub(super) fn page_bookmark_address(&self) -> Option<String> {
-        trust::bookmarks::canonical(self.browser.current_page()?.target()).ok()
+        trust::bookmarks::canonical(self.tab.browser.current_page()?.target()).ok()
     }
 
     pub(super) fn bookmark_worker(&mut self) -> &trust::bookmarks::Worker {
@@ -89,7 +95,7 @@ impl DesktopApp {
 
     /// The bookmark store's answer about an address.
     pub(super) fn page_bookmark_answer(&mut self, address: String, ids: Vec<u64>) {
-        self.page_bookmark = Some((address, ids));
+        self.tab.page_bookmark = Some((address, ids));
         if self.context_menu.is_some() {
             self.update_context_menu_items();
         }
@@ -99,20 +105,47 @@ impl DesktopApp {
         let Some(address) = self.page_bookmark_address() else {
             return false;
         };
-        self.page_bookmark
+        self.tab
+            .page_bookmark
             .as_ref()
             .is_some_and(|(saved, ids)| *saved == address && !ids.is_empty())
     }
 
     fn has_copyable_selection(&self) -> bool {
-        self.form_editor
+        self.tab
+            .form_editor
             .as_ref()
             .and_then(TextEditor::selected_text)
             .is_some_and(|text| !text.is_empty())
-            || self.text_selection.selects()
+            || self.tab.text_selection.selects()
     }
 
-    fn context_menu_entries(&self) -> Vec<(MenuAction, ContextMenuItem)> {
+    /// The hyperlink at `at` (the keyboard's target when the menu key
+    /// opened the menu), resolved as following it would.
+    pub(super) fn hyperlink_at(&self, at: CssPoint, from_keyboard: bool) -> Option<(Link, String)> {
+        let hit = if from_keyboard {
+            self.tab.keyboard_target.clone()
+        } else {
+            self.scene.as_ref().and_then(|scene| scene.page_hit_at(at))
+        }?;
+        let link = match hit.link? {
+            Link::JsClick { href, .. } if !href.is_empty() => self.dead_page_href(&href)?,
+            link @ (Link::Http(_)
+            | Link::Gemini(_)
+            | Link::Gopher(_)
+            | Link::Telnet { .. }
+            | Link::OneShot(_)
+            | Link::Dict(_)) => link,
+            Link::External(target) if parse_telnet_target(&target).is_some() => {
+                Link::External(target)
+            }
+            _ => return None,
+        };
+        let address = link.to_string();
+        Some((link, address))
+    }
+
+    fn context_menu_entries(&self, link: bool) -> Vec<(MenuAction, ContextMenuItem)> {
         let item = |label: &str, shortcut, icon, enabled, separated, caution| ContextMenuItem {
             label: label.to_string(),
             shortcut,
@@ -122,6 +155,30 @@ impl DesktopApp {
             caution,
         };
         let mut entries = Vec::new();
+        if link {
+            entries.push((
+                MenuAction::OpenLinkInNewTab,
+                item(
+                    "Open in New Tab",
+                    None,
+                    ContextMenuIcon::NewTab,
+                    true,
+                    false,
+                    false,
+                ),
+            ));
+            entries.push((
+                MenuAction::CopyLink,
+                item(
+                    "Copy Link",
+                    None,
+                    ContextMenuIcon::Link,
+                    self.clipboard.is_some(),
+                    false,
+                    false,
+                ),
+            ));
+        }
         let copy = self.has_copyable_selection();
         if copy {
             entries.push((
@@ -131,7 +188,7 @@ impl DesktopApp {
                     Some("Ctrl+C"),
                     ContextMenuIcon::Copy,
                     true,
-                    false,
+                    link,
                     false,
                 ),
             ));
@@ -143,7 +200,7 @@ impl DesktopApp {
                 Some("Ctrl+R"),
                 ContextMenuIcon::Reload,
                 true,
-                copy,
+                copy || link,
                 false,
             ),
         ));
@@ -164,7 +221,7 @@ impl DesktopApp {
                 "Kill Page",
                 None,
                 ContextMenuIcon::Kill,
-                self.browser.page_is_live(),
+                self.tab.browser.page_is_live(),
                 false,
                 true,
             ),
@@ -211,7 +268,7 @@ impl DesktopApp {
         } else {
             self.pointer
         };
-        if self.browser.page_is_live() && self.page_layout.is_some() && !bypass {
+        if self.tab.browser.page_is_live() && self.tab.page_layout.is_some() && !bypass {
             self.context_menu_request = Some((at, from_keyboard));
         } else {
             self.open_context_menu(at, from_keyboard);
@@ -225,7 +282,7 @@ impl DesktopApp {
             return self.pointer;
         };
         let content = scene.content_viewport;
-        if let Some(target) = &self.keyboard_target {
+        if let Some(target) = &self.tab.keyboard_target {
             return CssPoint::new(target.rect.x + 8.0, target.rect.y + target.rect.height);
         }
         if content.contains(self.pointer) {
@@ -236,7 +293,7 @@ impl DesktopApp {
 
     /// The live page's answers to context menu requests.
     pub(super) fn sync_context_menu_requests(&mut self) {
-        while let Some(show) = self.browser.take_context_menu_result() {
+        while let Some(show) = self.tab.browser.take_context_menu_result() {
             if let Some((at, from_keyboard)) = self.context_menu_request.take()
                 && show
             {
@@ -255,7 +312,11 @@ impl DesktopApp {
             return;
         };
         self.close_select_popup();
-        let (actions, items): (Vec<_>, Vec<_>) = self.context_menu_entries().into_iter().unzip();
+        let link = self.hyperlink_at(at, from_keyboard);
+        let (actions, items): (Vec<_>, Vec<_>) = self
+            .context_menu_entries(link.is_some())
+            .into_iter()
+            .unzip();
         let geometry = ContextMenuGeometry::new(at, bounds, &items);
         let highlighted = if from_keyboard {
             items.iter().position(|item| item.enabled)
@@ -270,7 +331,8 @@ impl DesktopApp {
             geometry,
             highlighted,
             pressed: None,
-            title: endpoint_title(&self.browser.snapshot().address),
+            title: endpoint_title(&self.tab.browser.snapshot().address),
+            link,
         });
         self.refresh_page_bookmark();
         self.apply_cursor_icon(CursorIcon::Default);
@@ -280,7 +342,12 @@ impl DesktopApp {
 
     /// Rebuild the open menu's items in place (the bookmark store answered).
     fn update_context_menu_items(&mut self) {
-        let (actions, items): (Vec<_>, Vec<_>) = self.context_menu_entries().into_iter().unzip();
+        let link = self
+            .context_menu
+            .as_ref()
+            .is_some_and(|menu| menu.link.is_some());
+        let (actions, items): (Vec<_>, Vec<_>) =
+            self.context_menu_entries(link).into_iter().unzip();
         let Some(menu) = &mut self.context_menu else {
             return;
         };
@@ -435,16 +502,38 @@ impl DesktopApp {
     }
 
     pub(super) fn activate_context_menu_item(&mut self, index: usize) {
-        let Some(action) = self
+        let Some((action, link)) = self
             .context_menu
             .as_ref()
             .filter(|menu| menu.items.get(index).is_some_and(|item| item.enabled))
-            .and_then(|menu| menu.actions.get(index).copied())
+            .and_then(|menu| {
+                menu.actions
+                    .get(index)
+                    .map(|&action| (action, menu.link.clone()))
+            })
         else {
             return;
         };
         self.close_context_menu();
         match action {
+            MenuAction::OpenLinkInNewTab => {
+                if let Some((link, _)) = link {
+                    self.open_link_in_new_tab(link, false);
+                }
+            }
+            MenuAction::CopyLink => {
+                if let Some((_, address)) = link {
+                    let copied = self
+                        .clipboard
+                        .as_mut()
+                        .is_some_and(|clipboard| clipboard.set_text(address).is_ok());
+                    self.tab.browser.set_status(if copied {
+                        "Link copied"
+                    } else {
+                        "The clipboard is unavailable"
+                    });
+                }
+            }
             MenuAction::Copy => self.copy(false),
             MenuAction::Reload => self.dispatch(UserAction::Reload),
             MenuAction::OpenCommand => self.open_command(true),
@@ -455,7 +544,7 @@ impl DesktopApp {
                     let result = self
                         .bookmark_worker()
                         .submit(trust::bookmarks::Operation::RemoveUrl(address));
-                    self.browser.set_status(match result {
+                    self.tab.browser.set_status(match result {
                         Ok(()) => "Updating bookmarks…".into(),
                         Err(error) => error,
                     });
@@ -469,7 +558,7 @@ impl DesktopApp {
     /// note where it starts so an overlay-only repaint replaces just it.
     pub(super) fn paint_page_context_menu(&mut self, scene: &mut Scene) {
         self.overlay_start = scene.primitives.len();
-        self.overlay_damage = self.context_menu.as_ref().map(|menu| {
+        let menu = self.context_menu.as_ref().map(|menu| {
             paint_context_menu(
                 &mut scene.primitives,
                 &menu.geometry,
@@ -479,6 +568,12 @@ impl DesktopApp {
             );
             menu.geometry.damage()
         });
+        // A page's question whether to leave it shows above everything.
+        let prompt = self.paint_unload_prompt(&mut scene.primitives);
+        self.overlay_damage = match (menu, prompt) {
+            (Some(a), Some(b)) => Some(trust::render::union_css_rects(a, b)),
+            (a, b) => a.or(b),
+        };
     }
 
     /// Repaint only the overlay: the menu's commands at the end of the
@@ -491,21 +586,51 @@ impl DesktopApp {
         }
     }
 
-    pub(super) fn draw_overlay(&mut self) -> Result<(), String> {
+    /// Replace the strip's commands in the retained `scene` with a fresh
+    /// paint, keeping everything painted after it; returns the strip's
+    /// rectangle.
+    pub(super) fn repaint_strip_in(&mut self, scene: &mut Scene) -> CssRect {
+        let old = self.strip_range.clone();
+        let tail = scene.primitives.split_off(old.end);
+        scene.primitives.truncate(old.start);
+        self.paint_tab_strip(scene);
+        let grown = self.strip_range.end as isize - old.end as isize;
+        scene.primitives.extend(tail);
+        self.overlay_start = (self.overlay_start as isize + grown) as usize;
+        // Antialiased edges reach a pixel past the strip, as scene damage
+        // bounds them.
+        CssRect::new(0.0, 0.0, self.metrics.css.width, self.strip_height() + 2.0)
+    }
+
+    /// Repaint only the tab strip and/or the overlays over the retained
+    /// scene: their commands are replaced in place, and the raster updates
+    /// their rectangles alone. The page is neither recomposed nor relaid out.
+    pub(super) fn draw_partial(&mut self, strip: bool, overlay: bool) -> Result<(), String> {
         let Some(mut scene) = self.scene.take() else {
             return self.draw();
         };
-        if self.overlay_start > scene.primitives.len() {
+        if self.overlay_start > scene.primitives.len()
+            || self.strip_range.end > self.overlay_start
+            || self.strip_range.start > self.strip_range.end
+        {
             self.scene = Some(scene);
             return self.draw();
         }
-        let previous = self.overlay_damage.take();
-        scene.primitives.truncate(self.overlay_start);
-        self.paint_page_context_menu(&mut scene);
-        let damage = match (previous, self.overlay_damage) {
-            (Some(a), Some(b)) => Some(trust::render::union_css_rects(a, b)),
-            (a, b) => a.or(b),
-        };
+        let mut damage = None;
+        if strip {
+            damage = Some(self.repaint_strip_in(&mut scene));
+        }
+        if overlay {
+            let previous = self.overlay_damage.take();
+            scene.primitives.truncate(self.overlay_start);
+            self.paint_page_context_menu(&mut scene);
+            for rect in [previous, self.overlay_damage].into_iter().flatten() {
+                damage = Some(match damage {
+                    Some(damage) => trust::render::union_css_rects(damage, rect),
+                    None => rect,
+                });
+            }
+        }
         let presented = match damage {
             Some(rect) => self.present_scene(&scene, Some(rect)),
             None => Ok(true),

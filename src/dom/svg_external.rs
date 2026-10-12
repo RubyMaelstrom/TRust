@@ -28,7 +28,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use rustc_hash::FxHashSet;
 
-use super::{DOCUMENT, Dom, NodeId};
+use super::{Dom, NodeId};
 
 /// Documents kept at once; the oldest is dropped beyond this.
 const MAX_DOCUMENTS: usize = 16;
@@ -227,7 +227,7 @@ impl ExternalSvgDocument {
     /// with that ID (SVG 2 #URLReference; the fragment percent-decoded).
     pub(crate) fn target(&self, fragment: &str) -> Option<NodeId> {
         self.dom
-            .svg_resource_target(DOCUMENT, &format!("#{fragment}"), None)
+            .svg_resource_target(self.dom.document(), &format!("#{fragment}"), None)
     }
 }
 

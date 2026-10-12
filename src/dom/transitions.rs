@@ -731,6 +731,25 @@ impl State {
                 .push(old.event(key, "transitioncancel", old.elapsed(now), now));
         }
     }
+
+    /// CSS Transitions 1 #starting: "If an element is no longer in the
+    /// document, implementations must cancel any running transitions on it",
+    /// for elements that left this arena for another of the group
+    /// (`Dom::transplant_subtree`), at the time of the last update. Their
+    /// `transitioncancel` events stay queued here, with the transitions'
+    /// timeline; `remove_node` forgets the rest.
+    pub(super) fn cancel_departed(&mut self, departed: &FxHashSet<NodeId>) {
+        let now = self.now;
+        let keys: Vec<Key> = self
+            .running
+            .keys()
+            .copied()
+            .filter(|((node, _), _)| departed.contains(node))
+            .collect();
+        for key in keys {
+            self.cancel(key, now);
+        }
+    }
     fn advance(&mut self, now: f64) {
         let mut finished = vec![];
         for (&key, track) in &mut self.running {
@@ -956,7 +975,7 @@ pub(super) fn participates<B: StyleBackend + ?Sized>(
     let mut cursor = Some(node);
     let mut result = loop {
         let Some(id) = cursor else { break false };
-        if id == DOCUMENT {
+        if id == dom.document() {
             break true;
         }
         if let Some(&result) = memo.get(&id) {
@@ -1197,7 +1216,7 @@ impl Dom {
                 let tree_order = *pass
                     .tree_order
                     .get_or_insert_with(|| {
-                        self.composed_descendants(DOCUMENT)
+                        self.composed_descendants(self.document())
                             .into_iter()
                             .enumerate()
                             .map(|(order, node)| (node, order))
@@ -1293,7 +1312,7 @@ impl Dom {
         // generation, and expanded property name. Stable sorting preserves
         // run/start/end order when their scheduled times coincide.
         let order: FxHashMap<_, _> = self
-            .composed_descendants(DOCUMENT)
+            .composed_descendants(self.document())
             .into_iter()
             .enumerate()
             .map(|(position, id)| (id, position))
@@ -1363,7 +1382,7 @@ impl Dom {
             // properties after every local mutation made detection O(document).
             let candidates = if full {
                 let mut candidates = self
-                    .composed_descendants(DOCUMENT)
+                    .composed_descendants(self.document())
                     .into_iter()
                     .collect::<FxHashSet<_>>();
                 // Include formerly rendered nodes to retire detached values

@@ -49,6 +49,25 @@ pub enum Mode {
     Find,
 }
 
+/// A navigation the user starts from the terminal's own interface, which
+/// leaves a live page listening for beforeunload only once the page allowed
+/// it (`PageEvt::UnloadChecked`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Leave {
+    Open(String, Option<u16>),
+    /// A local file path or `file:` URL.
+    Local(String),
+    Back,
+    Forward,
+    Reload,
+    /// The browser ends.
+    Quit,
+}
+
+/// How long the terminal waits for a page to answer whether unloading is
+/// canceled before going on without it; an unload prompt waits for the user.
+const UNLOAD_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
+
 pub use crate::terminal::{Encoding, InputMode};
 type Vt = crate::terminal::Terminal;
 fn new_vt(rows: u16, cols: u16) -> Vt {
@@ -880,6 +899,17 @@ pub struct App {
     pub(crate) file_picker: Option<crate::file_picker::FilePicker>,
     /// Prompts requested while one is open: shown one at a time.
     pending_file_pickers: std::collections::VecDeque<crate::js::FilePickerRequest>,
+    /// The live page listens for beforeunload: a navigation the user starts
+    /// from the terminal first asks it (HTML
+    /// #checking-if-unloading-is-canceled).
+    page_beforeunload: bool,
+    /// That navigation, waiting for the page's `PageEvt::UnloadChecked`
+    /// until its deadline.
+    pending_leave: Option<(u64, Leave, tokio::time::Instant)>,
+    next_unload_check: u64,
+    /// The page's request that the user confirm leaving it (HTML
+    /// #steps-to-fire-beforeunload), modal until answered.
+    unload_prompt: Option<crate::js::UnloadPrompt>,
     /// The directory the last file prompt ended in; the next one opens there.
     file_picker_dir: Option<std::path::PathBuf>,
     /// The picker's listing rows as last drawn, for the mouse hit-test.
@@ -1093,6 +1123,10 @@ impl App {
             pending_dict: None,
             select_menu: None,
             file_picker: None,
+            page_beforeunload: false,
+            pending_leave: None,
+            next_unload_check: 0,
+            unload_prompt: None,
             pending_file_pickers: std::collections::VecDeque::new(),
             file_picker_dir: None,
             last_file_picker_rows: None,
@@ -1343,6 +1377,12 @@ impl App {
                 .declarative_refresh
                 .as_ref()
                 .map(|(deadline, _)| *deadline);
+            // A page asking the user to confirm leaving it waits for them.
+            let leave_deadline = self
+                .pending_leave
+                .as_ref()
+                .filter(|_| self.unload_prompt.is_none())
+                .map(|(_, _, deadline)| *deadline);
             tokio::select! {
                 _ = storage_rx.recv() => {
                     if let Some(error) = crate::site_storage::take_notice() { self.status = error; }
@@ -1373,8 +1413,13 @@ impl App {
                         self.on_page_evt(evt);
                     }
                     None => {
-                        // The actor is gone; the last render stands.
-                        self.drop_live_page();
+                        // The actor is gone; the last render stands, and a
+                        // navigation that waited on it goes ahead.
+                        let leave = self.pending_leave.take();
+                        self.retire_live_page();
+                        if let Some((_, leave, _)) = leave {
+                            self.run_leave(leave);
+                        }
                     }
                 },
                 _ = async {
@@ -1401,6 +1446,17 @@ impl App {
                     }
                 }, if declarative_refresh_deadline.is_some() => {
                     self.follow_declarative_refresh();
+                },
+                _ = async {
+                    if let Some(deadline) = leave_deadline {
+                        tokio::time::sleep_until(deadline).await;
+                    }
+                }, if leave_deadline.is_some() => {
+                    // The page did not answer in time: it cannot hold the
+                    // user on it.
+                    if let Some((_, leave, _)) = self.pending_leave.take() {
+                        self.run_leave(leave);
+                    }
                 },
                 _ = tick.tick(), if self.loading() => {
                     self.spinner = self.spinner.wrapping_add(1);
@@ -1507,6 +1563,9 @@ impl App {
             // (incremental-layout contract §14). Diffed.
             self.sync_live_boundaries();
         }
+        // The browser ends: the live page unloads (HTML
+        // #unload-a-document-and-its-descendants).
+        self.drop_live_page();
         Ok(())
     }
 
@@ -1552,6 +1611,9 @@ impl App {
                 self.open_command();
                 return;
             }
+        }
+        if self.unload_prompt.is_some() {
+            return;
         }
         if self.file_picker.is_some() {
             self.file_picker_mouse(mouse);
@@ -1673,10 +1735,10 @@ impl App {
             (MouseEventKind::ScrollUp, true) => self.browser_wheel(-3, mouse.column, mouse.row),
             (MouseEventKind::ScrollDown, true) => self.browser_wheel(3, mouse.column, mouse.row),
             (MouseEventKind::Down(MouseButton::Mouse4), true) if self.mode == Mode::Session => {
-                self.browser_back();
+                self.leave_page(Leave::Back);
             }
             (MouseEventKind::Down(MouseButton::Mouse5), true) if self.mode == Mode::Session => {
-                self.browser_forward();
+                self.leave_page(Leave::Forward);
             }
             (MouseEventKind::Moved, true) if self.mode == Mode::Session => {
                 let on_link = self.browser_mouse_hover(mouse.column, mouse.row);
@@ -1947,6 +2009,11 @@ impl App {
             return;
         }
 
+        // A page's question whether to leave it is modal until answered.
+        if self.unload_prompt.is_some() {
+            self.unload_prompt_key(key);
+            return;
+        }
         // An open file prompt is modal: it owns every key, Tab included (path
         // completion), until the user chooses files or dismisses it.
         if self.file_picker.is_some() {
@@ -2897,11 +2964,11 @@ impl App {
         let mut parts = line.split_whitespace();
         match parts.next() {
             None => {}
-            Some("quit" | "q" | "exit") => self.quit = true,
+            Some("quit" | "q" | "exit") => self.leave_page(Leave::Quit),
             Some("bookmark" | "bookmarks") => self.bookmark_command(line),
-            Some("back") => self.browser_back(),
-            Some("forward") => self.browser_forward(),
-            Some("reload") => self.reload(),
+            Some("back") => self.leave_page(Leave::Back),
+            Some("forward") => self.leave_page(Leave::Forward),
+            Some("reload") => self.leave_page(Leave::Reload),
             // Drop the live page and stop its scripts (what Esc did before it
             // became the page's close request).
             Some("kill") => self.stop_loading(),
@@ -2922,7 +2989,7 @@ impl App {
                     .trim_start()
                     .split_once(char::is_whitespace)
                     .map_or("", |(_, rest)| rest.trim_start());
-                if self.dispatch_local_input(rest) {
+                if self.leave_for_local_input(rest) {
                     return;
                 }
                 match parts.next() {
@@ -2937,7 +3004,7 @@ impl App {
                             },
                             None => None,
                         };
-                        self.dispatch_open(host, port);
+                        self.leave_page(Leave::Open(host.to_string(), port));
                     }
                     None => self.status = String::from("usage: open <host> [port]"),
                 }
@@ -3209,20 +3276,20 @@ impl App {
             // `open` had been typed (the address-bar habit). A schemeless
             // host with no port becomes https (falling back to http).
             Some(target) if crate::command::looks_like_address(target) => {
-                if self.dispatch_local_input(line.trim_start()) {
+                if self.leave_for_local_input(line.trim_start()) {
                     return;
                 }
                 let port = parts.next().and_then(parse_port);
-                self.dispatch_open(target, port);
+                self.leave_page(Leave::Open(target.to_string(), port));
             }
             // Address-bar fallback: once command and URL/address recognition
             // have both failed, search the complete entered line.
             Some(_) => {
-                if self.dispatch_local_input(line.trim_start()) {
+                if self.leave_for_local_input(line.trim_start()) {
                     return;
                 }
                 let target = crate::command::search_url(line.trim());
-                self.dispatch_open(&target, None);
+                self.leave_page(Leave::Open(target, None));
             }
         }
     }
@@ -3609,6 +3676,16 @@ impl App {
     }
 
     /// Handle a whole local path before command parsing can split its spaces.
+    /// `dispatch_local_input` for what the user typed: a local file it
+    /// names opens once the live page allows leaving it (`leave_page`).
+    fn leave_for_local_input(&mut self, target: &str) -> bool {
+        if matches!(crate::file::url_from_input(target), Ok(Some(_))) {
+            self.leave_page(Leave::Local(target.to_string()));
+            return true;
+        }
+        self.dispatch_local_input(target)
+    }
+
     fn dispatch_local_input(&mut self, target: &str) -> bool {
         match crate::file::url_from_input(target) {
             Ok(Some(url)) => self.start_fetch(Link::Http(url)),
@@ -5619,10 +5696,31 @@ impl App {
         self.navigate_from_page(url.as_str(), None);
     }
 
+    /// The live page ends as the terminal leaves it: its Documents unload
+    /// (HTML #unload-a-document-and-its-descendants).
     fn drop_live_page(&mut self) {
+        self.end_live_page(true);
+    }
+
+    /// The live page ends at once, without its unload handlers: the user
+    /// killed it, or its actor already ended.
+    fn retire_live_page(&mut self) {
+        self.end_live_page(false);
+    }
+
+    fn end_live_page(&mut self, unload: bool) {
         if let Some(page) = self.live_page.take() {
-            page.retire();
+            match tokio::runtime::Handle::try_current() {
+                Ok(runtime) if unload => page.unload(&runtime),
+                _ => page.retire(),
+            }
         }
+        // Nothing awaits the ended page's questions.
+        if let Some(prompt) = self.unload_prompt.take() {
+            prompt.answer(true);
+        }
+        self.page_beforeunload = false;
+        self.pending_leave = None;
         http::prune_idle_connections();
         self.page_rx = None;
         self.last_scroll_sent = None;
@@ -6417,7 +6515,7 @@ impl App {
         self.declarative_refresh = None;
         self.pending_travel = None;
         self.abort_image_loads();
-        self.drop_live_page();
+        self.retire_live_page();
         if was_active {
             self.notice = true;
             self.status = String::from("Stopped — load cancelled, page scripts killed.");
@@ -6565,7 +6663,19 @@ impl App {
     /// diagnostic.
     fn on_page_evt_inner(&mut self, evt: crate::js::PageEvt) -> (bool, u32) {
         use crate::js::PageEvt;
-        self.page_busy = false;
+        // What the page reports about itself in passing (its title, sound,
+        // edits, listeners) answers no request: the page is still busy with
+        // what it was asked until another event arrives.
+        let informational = |event: &PageEvt| {
+            matches!(
+                event,
+                PageEvt::Title(_)
+                    | PageEvt::Audible(_)
+                    | PageEvt::UserEdits(_)
+                    | PageEvt::BeforeUnloadListeners(_)
+            )
+        };
+        let mut answered = false;
         let mut latest_update: Option<(
             Option<crate::http::RenderedPage>,
             String,
@@ -6596,10 +6706,14 @@ impl App {
         // HTML #close-requests "alternative processing" for a close request
         // nothing on the page consumed.
         let mut close_request_unconsumed = false;
+        // The page's answer to the user's navigation (`PageCmd::CheckUnload`),
+        // run once the batch is applied.
+        let mut unload_checked: Option<(u64, bool)> = None;
         let mut pending = Some(evt);
         let mut drains = 0u32;
         loop {
             drains += 1;
+            answered |= pending.as_ref().is_some_and(|event| !informational(event));
             match pending {
                 Some(PageEvt::Updated { html, mut outcome }) => {
                     tally_evt(0);
@@ -6626,8 +6740,30 @@ impl App {
                     PageEvt::KeyDefault { .. }
                     | PageEvt::FormValueApplied { .. }
                     | PageEvt::Focused { .. }
-                    | PageEvt::EditableState(_),
+                    | PageEvt::EditableState(_)
+                    // The terminal shows one page and has no tab chrome.
+                    | PageEvt::Title(_)
+                    | PageEvt::Audible(_)
+                    | PageEvt::UserEdits(_)
+                    // Its pages never request a new top-level traversable:
+                    // their environment has none to offer
+                    // (`TraversableState::new_traversables`), so they choose
+                    // the current navigable instead (HTML
+                    // #the-rules-for-choosing-a-navigable).
+                    | PageEvt::OpenTraversable(_)
+                    | PageEvt::OpenAuxiliary(_)
+                    // Its one traversable is the browser itself, which a page
+                    // neither closes nor needs to bring to the front.
+                    | PageEvt::CloseTraversable
+                    | PageEvt::FocusTraversable,
                 ) => {}
+                Some(PageEvt::BeforeUnloadListeners(listening)) => {
+                    self.page_beforeunload = listening;
+                }
+                Some(PageEvt::UnloadPrompt(prompt)) => self.show_unload_prompt(prompt),
+                Some(PageEvt::UnloadChecked { request, proceed }) => {
+                    unload_checked = Some((request, proceed));
+                }
                 Some(PageEvt::Scrolled { node, top, left }) => {
                     tally_evt(2);
                     scrolled.push((node, top, left));
@@ -6712,6 +6848,9 @@ impl App {
                 None => break,
             }
             pending = self.page_rx.as_mut().and_then(|rx| rx.try_recv().ok());
+        }
+        if answered {
+            self.page_busy = false;
         }
 
         if close_request_unconsumed {
@@ -6824,7 +6963,110 @@ impl App {
                 self.navigate_from_page(&url, initiator.map(|initiator| *initiator));
             }
         }
+        if let Some((request, proceed)) = unload_checked
+            && let Some((waiting, ..)) = &self.pending_leave
+            && *waiting == request
+            && let Some((_, leave, _)) = self.pending_leave.take()
+        {
+            if proceed {
+                self.run_leave(leave);
+            } else {
+                self.status = String::from("Stayed on the page.");
+                self.notice = true;
+            }
+        }
         (full_replace, drains)
+    }
+
+    /// HTML #navigate from the terminal's own interface: leaving a live
+    /// page that listens for beforeunload first asks it
+    /// (#checking-if-unloading-is-canceled), and `leave` runs once it
+    /// allowed that. A newer navigation replaces one still waiting.
+    fn leave_page(&mut self, leave: Leave) {
+        if !self.page_beforeunload || !self.leaves_document(&leave) {
+            self.run_leave(leave);
+            return;
+        }
+        if let Some((_, waiting, _)) = &mut self.pending_leave {
+            *waiting = leave;
+            return;
+        }
+        self.next_unload_check += 1;
+        let request = self.next_unload_check;
+        let sent = self.live_page.as_ref().is_some_and(|page| {
+            page.try_send_user(crate::js::PageCmd::CheckUnload { request })
+                .is_ok()
+        });
+        if !sent {
+            // A page that cannot take the task cannot hold the user on it.
+            self.run_leave(leave);
+            return;
+        }
+        let deadline = tokio::time::Instant::now() + UNLOAD_CHECK_TIMEOUT;
+        self.pending_leave = Some((request, leave, deadline));
+        self.status = String::from("Waiting for the page …");
+    }
+
+    /// Whether `leave` navigates away from the live page's Document: a
+    /// same-document history step does not.
+    fn leaves_document(&self, leave: &Leave) -> bool {
+        if self.live_page.is_none() {
+            return false;
+        }
+        let delta = match leave {
+            Leave::Back => -1,
+            Leave::Forward => 1,
+            Leave::Open(..) | Leave::Local(_) | Leave::Reload | Leave::Quit => return true,
+        };
+        self.browser.as_ref().is_some_and(|g| {
+            crate::history::entry(&g.history, &g.forward, delta).is_some_and(|entry| {
+                entry.same_document_generation != Some(self.document_generation)
+            })
+        })
+    }
+
+    fn run_leave(&mut self, leave: Leave) {
+        match leave {
+            Leave::Open(target, port) => self.dispatch_open(&target, port),
+            Leave::Local(target) => {
+                self.dispatch_local_input(&target);
+            }
+            Leave::Back => self.browser_back(),
+            Leave::Forward => self.browser_forward(),
+            Leave::Reload => self.reload(),
+            Leave::Quit => self.quit = true,
+        }
+    }
+
+    /// The page asks the user to confirm leaving it: a modal question in
+    /// the status line (the page waits for the answer).
+    fn show_unload_prompt(&mut self, prompt: crate::js::UnloadPrompt) {
+        if let Some(previous) = self.unload_prompt.replace(prompt) {
+            previous.answer(true);
+        }
+        self.select_menu = None;
+        self.status =
+            String::from("Leave this page? Changes you made may not be saved. [L]eave · [S]tay");
+        self.notice = true;
+    }
+
+    /// The user's answer to the open unload prompt: L/Y/Enter leaves,
+    /// S/N/Esc stays; every other key waits.
+    fn unload_prompt_key(&mut self, key: KeyEvent) {
+        let leave = match key.code {
+            KeyCode::Char('l' | 'L' | 'y' | 'Y') | KeyCode::Enter => true,
+            KeyCode::Char('s' | 'S' | 'n' | 'N') | KeyCode::Esc => false,
+            _ => return,
+        };
+        if let Some(prompt) = self.unload_prompt.take() {
+            prompt.answer(leave);
+        }
+        self.status = String::from(if leave {
+            "Leaving the page …"
+        } else {
+            "Stayed on the page."
+        });
+        self.notice = true;
     }
 
     /// Mirror WHATWG HTML's URL and history update steps in terminal chrome.
@@ -7833,9 +8075,11 @@ impl App {
             KeyCode::End => self.browser_scroll(i64::MAX / 2, false),
             // Alt-Right = forward (the traditional browser pair; plain Left
             // is already back here, so Alt-Left needs no arm of its own).
-            KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => self.browser_forward(),
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.leave_page(Leave::Forward)
+            }
             KeyCode::Right | KeyCode::Enter => self.browser_follow(),
-            KeyCode::Left => self.browser_back(),
+            KeyCode::Left => self.leave_page(Leave::Back),
             KeyCode::Char('v' | 'V') => self.open_in_mpv(),
             KeyCode::Char('y' | 'Y') => self.yank_selected_url(),
             KeyCode::Esc => self.stop_loading(),
@@ -7976,8 +8220,12 @@ impl App {
             KeyCode::Down => self.http_move(1, false),
             // Alt-Left/Alt-Right = history back/forward (the traditional
             // browser pair), checked before the plain-arrow selection moves.
-            KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => self.browser_back(),
-            KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => self.browser_forward(),
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.leave_page(Leave::Back)
+            }
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.leave_page(Leave::Forward)
+            }
             // In a carousel, ←/→ scroll the strip a card at a time; elsewhere
             // they move the selection laterally.
             KeyCode::Left if self.scroll_selected_carousel(-1) => {}
@@ -7993,7 +8241,7 @@ impl App {
             KeyCode::Home => self.http_scroll(i64::MIN / 2),
             KeyCode::End => self.http_scroll(i64::MAX / 2),
             KeyCode::Enter => self.browser_follow(),
-            KeyCode::Backspace => self.browser_back(),
+            KeyCode::Backspace => self.leave_page(Leave::Back),
             KeyCode::Char('v' | 'V') => self.open_in_mpv(),
             KeyCode::Char('y' | 'Y') => self.yank_selected_url(),
             KeyCode::Esc => self.stop_loading(),
@@ -16251,15 +16499,29 @@ mod tests {
         .expect("the click hid the dialog");
     }
 
+    /// Apply the page's events up to its next answer; what it reports in
+    /// passing (title, sound, edits, listeners) is applied on the way.
     async fn drain_page_event(app: &mut super::App) {
-        let evt = app
-            .page_rx
-            .as_mut()
-            .expect("live page receiver")
-            .recv()
-            .await
-            .expect("page event");
-        app.on_page_evt(evt);
+        loop {
+            let evt = app
+                .page_rx
+                .as_mut()
+                .expect("live page receiver")
+                .recv()
+                .await
+                .expect("page event");
+            let informational = matches!(
+                evt,
+                crate::js::PageEvt::Title(_)
+                    | crate::js::PageEvt::Audible(_)
+                    | crate::js::PageEvt::UserEdits(_)
+                    | crate::js::PageEvt::BeforeUnloadListeners(_)
+            );
+            app.on_page_evt(evt);
+            if !informational {
+                break;
+            }
+        }
     }
 
     /// A live SPA's anchor with a click listener becomes a `JsClick` marker
@@ -19332,6 +19594,55 @@ mod file_picker_tests {
         app.open_file_picker(request(6));
         app.drop_live_page();
         assert!(app.file_picker.is_none() && app.pending_file_pickers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn leaving_a_page_that_listens_for_beforeunload_asks_it_first() {
+        // HTML #navigate from the browser's interface: the terminal asks a
+        // live page that listens for beforeunload (PageCmd::CheckUnload)
+        // before it leaves, and its unload prompt is modal until answered.
+        let mut app = App::new(None, 23);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        app.live_page = Some(crate::js::PageHandle::from_test_sender(tx));
+        app.on_page_evt_inner(crate::js::PageEvt::BeforeUnloadListeners(true));
+        app.leave_page(Leave::Open(String::from("https://example.test/"), None));
+        let request = match rx.try_recv() {
+            Ok(PageCmd::CheckUnload { request }) => request,
+            other => panic!("expected a check, got {other:?}"),
+        };
+        assert!(app.fetch_rx.is_none(), "the navigation waits");
+        // The page asks the user; every key belongs to the question.
+        let (answer, mut reply) = tokio::sync::oneshot::channel();
+        app.on_page_evt_inner(crate::js::PageEvt::UnloadPrompt(
+            crate::js::UnloadPrompt::new(answer),
+        ));
+        assert!(app.status.contains("Leave this page?"), "{}", app.status);
+        app.on_terminal_event(Event::Key(KeyEvent::from(KeyCode::Tab)))
+            .await;
+        assert!(app.unload_prompt.is_some());
+        app.on_terminal_event(Event::Key(KeyEvent::from(KeyCode::Char('s'))))
+            .await;
+        assert_eq!(reply.try_recv(), Ok(false));
+        app.on_page_evt_inner(crate::js::PageEvt::UnloadChecked {
+            request,
+            proceed: false,
+        });
+        assert!(app.pending_leave.is_none());
+        assert!(app.fetch_rx.is_none(), "staying keeps the page");
+        // Asked again, the page lets the user leave.
+        app.leave_page(Leave::Open(String::from("https://example.test/"), None));
+        let request = match rx.try_recv() {
+            Ok(PageCmd::CheckUnload { request }) => request,
+            other => panic!("expected a check, got {other:?}"),
+        };
+        app.on_page_evt_inner(crate::js::PageEvt::UnloadChecked {
+            request,
+            proceed: true,
+        });
+        assert!(app.fetch_rx.is_some(), "the navigation started");
+        // Killing the page retires it without unloading.
+        app.stop_loading();
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]

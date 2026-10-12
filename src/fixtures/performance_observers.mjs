@@ -6,7 +6,7 @@
     performance.clearMarks();performance.clearMeasures();
     check(Object.isFrozen(PerformanceObserver.supportedEntryTypes) &&
         PerformanceObserver.supportedEntryTypes===PerformanceObserver.supportedEntryTypes &&
-        PerformanceObserver.supportedEntryTypes.join(',')===(worker ? 'mark,measure,resource' : 'mark,measure,navigation,resource'),'truthful stable supported types');
+        PerformanceObserver.supportedEntryTypes.join(',')===(worker ? 'mark,measure,resource' : 'mark,measure,navigation,resource,visibility-state'),'truthful stable supported types');
     throws('TypeError',()=>new PerformanceObserver());
     throws('TypeError',()=>new PerformanceObserver({handleEvent(){}}));
     throws('TypeError',()=>new PerformanceObserverEntryList());

@@ -265,7 +265,7 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
         self.style_view()
             .nodes
             .owner_document_of(id)
-            .unwrap_or(DOCUMENT)
+            .unwrap_or(self.document())
     }
 }
 

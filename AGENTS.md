@@ -133,6 +133,10 @@ The project favors:
 - `src/core/`: shared browser controller and event delivery for desktop and
   headless clients.
 - `src/bin/trust-desktop.rs`: winit window, native input, and presentation loop.
+  Its modules: `tabs.rs` (tabs, their sleep and the pages' requests for new
+  ones), `window_chrome.rs` (the tab strip replacing the title bar and its
+  partial repaints), `unload_prompt.rs` (the "leave this page?" question),
+  `context_menu.rs` and `text_selection.rs`.
 - `src/render/`: renderer-neutral display list, Parley-shaped text, Vello CPU
   reference renderer, Hybrid wgpu backend (Vello GPU), and windowless
   `trust::render::headless` pipeline. See module comments for backend limits.
@@ -160,10 +164,24 @@ The project favors:
   snapshots rather than reparsing declaration strings.
 - HTML output uses positioned `Row`/`Item` data. Gopher, Gemini, one-shot
   protocols, and plain text use the simpler line model.
-- Only one foreground page engine remains live. Navigation drops the old page
-  actor and its heap. At most one pre-warmed spare engine (`src/page_spare.rs`)
-  waits beside it; it has run no page code, and exactly one navigation claims
-  it and creates its Window there exactly as in a new engine.
+- One page engine (actor, Lumen Agent) runs each browsing context group: a
+  tab's pages, plus the auxiliary browsing contexts they open (pop-up tabs,
+  which share their opener's engine). Navigation drops the old page actor and
+  its heap, unless the tab shares its group with another tab: then the next
+  Document is created in the group's engine (`js::spawn_page_in`). At most
+  one pre-warmed spare engine (`src/page_spare.rs`) waits beside them; it has
+  run no page code, and exactly one navigation claims it and creates its
+  Window there exactly as in a new engine.
+- A group's top-level traversables each have their own Dom arena (their
+  frames' Documents stay in it); node identities are unique across a group's
+  arenas (`Dom::share_identities`), and `dom.document()` is an arena's
+  Document (node 0 only in an engine's first arena). The actor and HostState
+  hold the selected traversable's fields and park the others'
+  (`select_traversable`); every host call selects the traversable its first
+  node argument or its calling Realm belongs to (`routed_host_call`), and host
+  tasks the one their content names (`host_task_traversable`). A single
+  traversable never switches. The prelude's `topDocumentId` stands for the
+  top-level Document; never write a literal 0 for it.
 - Incremental layout is an optimization. If a patch cannot be proven safe,
   fall back to the always-correct full relayout.
 - The retained graphical paint is an optimization of the same kind: a cached
@@ -532,7 +550,7 @@ current behavior and limits; consult the governing standards before changing it.
   Shift+secondary click bypasses the page and fires none. While it shows it
   takes the pointer and keys and is an AccessKit menu; opening, highlighting
   and closing repaint only its rectangle over the retained scene
-  (`draw_overlay`), never recomposing or relaying out the page. Telnet keeps
+  (`draw_partial`), never recomposing or relaying out the page. Telnet keeps
   the secondary button for the remote host.
 - COMMAND overlays the page without changing layout or the JavaScript viewport.
   Its image-cache readout counts decoded pixel bytes, excluding GPU copies,
@@ -546,12 +564,53 @@ current behavior and limits; consult the governing standards before changing it.
   they applied, as `PageCmd::SessionHistory`; `history.length` reads it,
   replaying the updates not yet applied as HTML's best guesses.
 - `window.close()` runs HTML's checks on a top-level traversable: "is
-  closing", script-closable (a reported session history of one entry; until
-  the first report it is not), familiar with, and allowed by sandboxing to
-  navigate. Child navigables' WindowProxies do nothing. TRust has one
-  top-level traversable and no tabs or pop-ups, so actually closing it is
-  deferred to the tabs design: rather than quit, the definitely-close task
-  logs a console warning and clears "is closing".
+  closing", script-closable (created by web content, or a reported session
+  history of one entry; until the first report it is not), familiar with
+  (an auxiliary browsing context's opener included), and allowed by
+  sandboxing to navigate. Child navigables' WindowProxies do nothing. The
+  definitely-close task asks the frontend to close it
+  (`PageEvt::CloseTraversable`), which trust-desktop does as for its user's
+  close (beforeunload first; the last tab quits). Frontends without tabs (the
+  terminal, trust-headless) present the browser itself as the traversable:
+  the task logs a console warning and clears "is closing".
+- Tabs (trust-desktop): a strip in place of the title bar (window moves,
+  minimize/maximize/close, scroll arrows on overflow), Ctrl+T, Ctrl+W,
+  Ctrl+Tab/Ctrl+Shift+Tab (not for a Telnet session in character mode),
+  Ctrl+Shift+T (this session's closed tabs), Ctrl+Q. A background tab unseen
+  for 10 minutes sleeps (Page Lifecycle discard: freeze, then its engine
+  goes; its history wakes it), except a Telnet session, an audible page, one
+  with unsubmitted form edits, a loading one, one being asked whether to
+  leave, and one sharing its browsing context group. Pages unload (pagehide,
+  unload, keepalive beacons outliving them) when their tab closes or
+  navigates; beforeunload asks the user through `UnloadPrompt`.
+- HTML's rules for choosing a navigable in trust-desktop: `_blank`
+  hyperlinks, Ctrl/middle clicks and `noopener` requests open a tab in a new
+  browsing context group (`PageEvt::OpenTraversable`); `window.open` and
+  named targets without noopener create an auxiliary browsing context in the
+  page's own group (`__traversable_create`): an initial about:blank Document
+  with the creator's origin, URL as referrer, policy container and base URL,
+  a copy of its storage shed (sessionStorage is per traversable,
+  `session:<shed>:<origin>`), target name and popup state. Its frontend learns
+  of it from `PageEvt::OpenAuxiliary` and keeps its `TraversableLink` while it
+  shares the group; a navigation result without a page actor (a download, an
+  image, another protocol) leaves the group, as a browsing context group
+  switch would, and the opener's view of it reports `closed`. Each Realm
+  holds one WindowProxy per other traversable that follows its navigations
+  (`traversableWindowProxy`, cross-origin views as for frames); a raw Window
+  reached through another Realm (`popup.frames[0].parent`) is not that
+  object, as a Lumen WindowProxy exotic object would make it. `opener`,
+  `name` (reset on cross-origin Documents of non-auxiliary traversables),
+  `BarProp.visible`, `focus()` (shows the tab when the caller's user just
+  interacted) and named lookup across the group's traversables and their
+  frames follow HTML. Nodes inserted into or adopted by another traversable's
+  Document move between arenas with their identities and state
+  (`dom/transplant.rs`), only once the insertion is known to be valid. The
+  source arena then names none of them, as after a collector sweep: work
+  still owed to them is handed over, their running CSS transitions and
+  animations are canceled there, and the Documents of child navigables they
+  contained stay behind, destroyed. A script that `document.write()` inserts
+  into a Document without an active parser is appended but does not run
+  (there is no script-created parser).
 - SVG presentation attributes are author declarations of specificity zero
   before every author sheet (`svg_presentation_attributes` in `src/dom.rs`),
   except `transform` and its gradient/pattern forms, which only the SVG

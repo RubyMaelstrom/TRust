@@ -3,7 +3,7 @@
 //! The browser-facing contract delegates JavaScript execution to the sibling
 //! Lumen engine in every build configuration.
 
-use crate::dom::{DOCUMENT, Dom};
+use crate::dom::Dom;
 use std::time::{Duration, Instant};
 
 /// What a page's scripts did, for status and diagnostics.
@@ -52,9 +52,49 @@ impl Outcome {
 }
 
 /// Origin-bucketed RAM storage; the site storage service persists only localStorage.
+/// sessionStorage buckets are `session:<storage shed>:<origin>`, one shed per
+/// top-level traversable (Storage #traversable-storage-shed).
 pub type WebStorage = std::sync::Arc<
     std::sync::Mutex<std::collections::HashMap<String, std::collections::HashMap<String, String>>>,
 >;
+
+/// A new top-level traversable's storage shed (Storage
+/// #traversable-storage-shed): its sessionStorage, which no other
+/// traversable shares. Shed 0 is that of frontends that present a single
+/// traversable.
+pub fn new_storage_shed() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Storage #legacy-clone-a-traversable-storage-shed: `to` begins with a copy
+/// of `from`'s session storage (HTML #copy-session-storage).
+pub(crate) fn clone_storage_shed(storage: &WebStorage, from: u64, to: u64) {
+    let source = format!("session:{from}:");
+    let mut storage = storage
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let copies: Vec<(String, std::collections::HashMap<String, String>)> = storage
+        .iter()
+        .filter_map(|(bucket, entries)| {
+            let origin = bucket.strip_prefix(&source)?;
+            Some((format!("session:{to}:{origin}"), entries.clone()))
+        })
+        .collect();
+    storage.extend(copies);
+}
+
+/// A closed top-level traversable's session storage goes with it.
+pub fn forget_storage_shed(shed: u64) {
+    if shed == 0 {
+        return;
+    }
+    let prefix = format!("session:{shed}:");
+    crate::site_storage::web_storage()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|bucket, _| !bucket.starts_with(&prefix));
+}
 
 #[derive(Debug)]
 pub enum WorkerOut {
@@ -195,6 +235,44 @@ pub struct PageEnv {
     /// present this page fullscreen (`document.fullscreenEnabled` and
     /// `requestFullscreen()` consult it).
     pub(crate) fullscreen_supported: bool,
+    /// How the frontend presents the page's top-level traversable as the
+    /// document is created: its initial visibility state and system focus.
+    pub(crate) traversable: TraversableState,
+}
+
+/// The frontend's presentation of a top-level traversable, which its pages
+/// observe: HTML #page-visibility's system visibility state, HTML
+/// #system-focus, and Page Lifecycle #discarding.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TraversableState {
+    /// The traversable cannot be seen: a background tab, or an occluded or
+    /// minimized window.
+    pub hidden: bool,
+    /// The traversable has system focus: it is shown in the focused window.
+    pub focused: bool,
+    /// This document replaces one the user agent discarded to save memory
+    /// (Page Lifecycle #dom-document-wasdiscarded).
+    pub was_discarded: bool,
+    /// The user agent can create new top-level traversables (tabs) beside
+    /// this one. Without them it is configured to choose the current
+    /// navigable whenever a page requests a new one (HTML
+    /// #the-rules-for-choosing-a-navigable).
+    pub new_traversables: bool,
+    /// The traversable's storage shed (`new_storage_shed`), which holds its
+    /// sessionStorage across its Documents.
+    pub storage_shed: u64,
+}
+
+impl TraversableState {
+    /// A traversable that can be seen and has the keyboard, as a single-page
+    /// frontend's always does.
+    pub const SHOWN: Self = Self {
+        hidden: false,
+        focused: true,
+        was_discarded: false,
+        new_traversables: false,
+        storage_shed: 0,
+    };
 }
 
 impl PageEnv {
@@ -222,6 +300,7 @@ impl PageEnv {
             referrer_policy: Default::default(),
             referrer: String::new(),
             fullscreen_supported: true,
+            traversable: TraversableState::SHOWN,
         }
     }
 }
@@ -310,7 +389,7 @@ pub fn css_finish(mut dom: Dom, sheets: &[crate::http::PageSheet]) -> String {
     if !sheets.is_empty() {
         dom.attach_external_sheets(sheets);
     }
-    dom.serialize(DOCUMENT)
+    dom.serialize(dom.document())
 }
 
 pub fn transform(html: &str, env: &PageEnv) -> (String, Outcome) {
@@ -390,6 +469,23 @@ pub enum PageCmd {
     /// canceling every fetch of theirs, scripts' fetch() and XMLHttpRequest
     /// included. The page and its scripts keep running.
     StopLoading,
+    /// HTML #checking-if-unloading-is-canceled for the top-level
+    /// traversable's Document and its descendants', before the user closes
+    /// the traversable or navigates it from the browser's own interface:
+    /// the actor fires beforeunload at each, asks the user when one asks
+    /// for that (`PageEvt::UnloadPrompt`), and answers
+    /// `PageEvt::UnloadChecked`.
+    CheckUnload {
+        request: u64,
+    },
+    /// HTML #unload-a-document-and-its-descendants as the page ends
+    /// (`PageHandle::unload`): pagehide, visibilitychange and unload, after
+    /// which the actor ends with its Documents.
+    Unload,
+    /// Page Lifecycle #discarding to free memory (`PageHandle::discard`):
+    /// the actor runs the freeze steps for its Documents, then ends without
+    /// unloading them.
+    Discard,
     /// The user's copy action (Clipboard API #copy-action): the page fires
     /// `copy`, then the selection's text, or the data its listeners set,
     /// reaches the frontend as a `PageEvt::ClipboardWrite`.
@@ -513,10 +609,14 @@ pub enum PageCmd {
     Viewport(crate::layout2::Viewport),
     DevicePixelRatio(f32),
     ScreenPosition(i32, i32),
-    /// The native window cannot be seen (minimized or fully covered). Like
-    /// Gecko for an inactive presentation, the actor then requests no frames
-    /// for paint-only CSS animations.
-    Occluded(bool),
+    /// HTML #page-visibility: the traversable's system visibility state
+    /// changed (`true`: hidden, as a background tab or an occluded window).
+    /// The actor updates its Documents' visibility state; hidden Documents
+    /// get no rendering opportunities.
+    SystemVisibility(bool),
+    /// HTML #system-focus: the traversable gained or lost system focus. The
+    /// actor runs the focus update steps for its current focus chain.
+    SystemFocus(bool),
 }
 
 impl PageCmd {
@@ -533,6 +633,7 @@ impl PageCmd {
                 | Self::ReleasePointerLock
                 | Self::CloseRequest { .. }
                 | Self::StopLoading
+                | Self::CheckUnload { .. }
                 | Self::FullscreenResult { .. }
                 | Self::ExitFullscreen
                 | Self::InputModifiers(_)
@@ -541,6 +642,9 @@ impl PageCmd {
                 | Self::LockedWheel { .. }
                 | Self::PointerButton { .. }
                 | Self::Focus(_)
+                | Self::KeyboardFocus(_)
+                | Self::PickerOpen { .. }
+                | Self::SelectPick { .. }
                 | Self::Key { .. }
                 | Self::EditKey { .. }
                 | Self::SetValue { .. }
@@ -740,6 +844,65 @@ impl FormSubmission {
     }
 }
 
+/// A navigation the page asks to happen in a new top-level traversable
+/// (HTML #the-rules-for-choosing-a-navigable: "a new top-level traversable
+/// is being requested"), or a hyperlink the user asked to follow in one.
+#[derive(Debug)]
+pub struct NewTraversable {
+    pub url: String,
+    /// The navigation's source Document's request context (`None`: none).
+    pub initiator: Option<Box<crate::http::NavigationInitiator>>,
+    /// The new traversable's target name; empty for `_blank`.
+    pub name: String,
+    /// The new traversable starts a new browsing context group, without an
+    /// opener (HTML #get-an-element's-noopener).
+    pub noopener: bool,
+    /// Show it at once; a link the user opened in the background is not.
+    pub foreground: bool,
+    /// A form's submission to run there instead of a GET of `url`.
+    pub submission: Option<FormSubmission>,
+}
+
+/// A top-level traversable a page created in its own browsing context
+/// group (HTML #creating-a-new-auxiliary-browsing-context: `window.open`, or
+/// a hyperlink's or form's named target without `noopener`). Its initial
+/// `about:blank` Document runs in the opener's page engine, where the
+/// opener and it reach each other synchronously; `handle` and `events` are
+/// its page, as `spawn_page` returns them. The frontend presents it beside
+/// the opener and keeps `handle.link()` while it shares the group.
+#[derive(Debug)]
+pub struct AuxiliaryTraversable {
+    pub handle: PageHandle,
+    pub events: tokio::sync::mpsc::Receiver<PageEvt>,
+    /// Its target name (`window.name`); empty for `_blank`.
+    pub name: String,
+    /// The page asked for a popup window (HTML #popup-window-is-requested),
+    /// whose bars `BarProp.visible` reports hidden.
+    pub popup: bool,
+    /// Its storage shed, a copy of the opener's (HTML #copy-session-storage).
+    pub storage_shed: u64,
+}
+
+/// A page's request that the user confirm unloading it (HTML
+/// #steps-to-fire-beforeunload). The page is paused (HTML #pause) until the
+/// frontend answers; the question is the user agent's own, never the page's
+/// text. Dropping it unanswered lets the page unload.
+#[derive(Debug)]
+pub struct UnloadPrompt {
+    answer: tokio::sync::oneshot::Sender<bool>,
+}
+
+impl UnloadPrompt {
+    pub(crate) fn new(answer: tokio::sync::oneshot::Sender<bool>) -> Self {
+        Self { answer }
+    }
+
+    /// The user's answer: `true` when they confirmed leaving the page.
+    pub fn answer(self, leave: bool) {
+        let _ = self.answer.send(leave);
+    }
+}
+
 /// The MIME type of form-encoded POST bodies TRust sends itself.
 pub const FORM_URLENCODED: &str = "application/x-www-form-urlencoded";
 
@@ -791,6 +954,38 @@ pub enum PageEvt {
     FilePicker(FilePickerRequest),
     Trouble(Vec<String>),
     Settled,
+    /// The top-level Document's title (HTML #document.title) changed.
+    Title(String),
+    /// The page started or stopped making sound: a media element plays
+    /// audibly or an audio context renders sound.
+    Audible(bool),
+    /// The user started or stopped having unsubmitted edits in the page's
+    /// form controls or editing hosts.
+    UserEdits(bool),
+    /// A navigation in a new top-level traversable.
+    OpenTraversable(Box<NewTraversable>),
+    /// The page opened an auxiliary browsing context: a new top-level
+    /// traversable of its browsing context group (`AuxiliaryTraversable`).
+    OpenAuxiliary(Box<AuxiliaryTraversable>),
+    /// The page asked to close its top-level traversable and nothing
+    /// stopped it (HTML #definitely-close-a-top-level-traversable): the
+    /// frontend closes it as it does for the user.
+    CloseTraversable,
+    /// The page asked that its top-level traversable be shown (HTML
+    /// #dom-window-focus): the frontend brings it to the front.
+    FocusTraversable,
+    /// Whether the page listens for beforeunload, so that closing it or
+    /// navigating it away must first check whether unloading is canceled
+    /// (`PageCmd::CheckUnload`).
+    BeforeUnloadListeners(bool),
+    /// HTML #steps-to-fire-beforeunload: a Document asks the user to
+    /// confirm that they want to unload it. The page waits for the answer.
+    UnloadPrompt(UnloadPrompt),
+    /// The answer to `PageCmd::CheckUnload`: whether unloading continues.
+    UnloadChecked {
+        request: u64,
+        proceed: bool,
+    },
     /// The close request steps for `PageCmd::CloseRequest` finished.
     /// `consumed` is false when nothing handled the request: HTML's
     /// "alternative processing", which the frontend performs (it stops
@@ -863,8 +1058,189 @@ pub struct PageHandle {
 struct PageHandleState {
     interactions: Option<tokio::sync::mpsc::Sender<PageCmd>>,
     hover: Option<tokio::sync::watch::Sender<PageHover>>,
+    /// The page's top-level traversable, which keeps its engine running.
+    link: TraversableLink,
+}
+
+/// A page engine's life as its frontends see it: while any of them holds one
+/// of its traversables (`TraversableLink`), its scripts and fetches go on;
+/// the last one gone cancels both.
+#[derive(Debug)]
+pub(crate) struct EngineLife {
+    interrupt: std::sync::Arc<lumen::RuntimeInterrupt>,
     cache: std::sync::Arc<crate::http::PageCache>,
-    runtime_interrupt: std::sync::Arc<lumen::RuntimeInterrupt>,
+}
+
+impl EngineLife {
+    pub(crate) fn new(
+        interrupt: std::sync::Arc<lumen::RuntimeInterrupt>,
+        cache: std::sync::Arc<crate::http::PageCache>,
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self { interrupt, cache })
+    }
+
+    fn cancel(&self) {
+        self.interrupt.cancel();
+        self.cache.cancel();
+    }
+}
+
+impl Drop for EngineLife {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+/// A browsing context group (HTML #browsing-context-group-set) whose
+/// top-level traversables one page actor's Agent runs: what its frontends
+/// share with the actor. A group begins with the page actor's first
+/// Document; a page opening an auxiliary browsing context (`window.open`,
+/// a named target) adds a traversable to it, which a frontend presents
+/// beside the opener (`PageEvt::OpenAuxiliary`).
+#[derive(Debug)]
+pub struct GroupShared {
+    commands: tokio::sync::mpsc::UnboundedSender<GroupCmd>,
+    /// How many top-level traversables the group has; the actor keeps it.
+    members: std::sync::atomic::AtomicUsize,
+    life: std::sync::Weak<EngineLife>,
+    /// The network state the group's Documents share: their fetches, image
+    /// responses and blob URL store, which every frontend of the group
+    /// presents from.
+    cache: std::sync::Arc<crate::http::PageCache>,
+    blobs: BlobMap,
+}
+
+impl GroupShared {
+    pub(crate) fn new(
+        commands: tokio::sync::mpsc::UnboundedSender<GroupCmd>,
+        life: &std::sync::Arc<EngineLife>,
+        cache: std::sync::Arc<crate::http::PageCache>,
+        blobs: BlobMap,
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            commands,
+            members: std::sync::atomic::AtomicUsize::new(1),
+            life: std::sync::Arc::downgrade(life),
+            cache,
+            blobs,
+        })
+    }
+
+    /// The actor's count of the group's traversables changed.
+    pub(crate) fn set_members(&self, members: usize) {
+        self.members
+            .store(members, std::sync::atomic::Ordering::Release);
+    }
+
+    /// A frontend's hold on the group's traversable `traversable`, or `None`
+    /// once no frontend keeps the engine running.
+    pub(crate) fn link(self: &std::sync::Arc<Self>, traversable: u32) -> Option<TraversableLink> {
+        let life = self.life.upgrade()?;
+        Some(TraversableLink(std::sync::Arc::new(LinkInner {
+            group: self.clone(),
+            life,
+            traversable,
+        })))
+    }
+}
+
+/// Requests a group's frontends make of its page actor.
+pub enum GroupCmd {
+    /// The frontend's navigation of a traversable produced its next Document
+    /// (`spawn_page_in`).
+    Load(Box<GroupLoad>),
+    /// No frontend holds the traversable any more: once its Document has
+    /// unloaded, it is discarded (HTML #destroy-a-top-level-traversable).
+    Release { traversable: u32 },
+}
+
+/// A Document for a traversable of a page actor's group: what
+/// `spawn_page` would give a new actor.
+pub struct GroupLoad {
+    pub(crate) traversable: u32,
+    pub(crate) html: String,
+    pub(crate) env: PageEnv,
+    pub(crate) cmds: tokio::sync::mpsc::Receiver<PageCmd>,
+    pub(crate) interactions: tokio::sync::mpsc::Receiver<PageCmd>,
+    pub(crate) hover: tokio::sync::watch::Receiver<PageHover>,
+    pub(crate) events: tokio::sync::mpsc::Sender<PageEvt>,
+}
+
+/// A frontend's hold on a top-level traversable of a page engine's browsing
+/// context group. Every page handle holds its traversable's; a frontend
+/// keeps one across its navigations while the traversable shares its group
+/// with others (`shared`), so that its next Document is created in the same
+/// engine (`spawn_page_in`), where its opener and the Windows it opened can
+/// still reach it. The traversable is discarded once its last link is
+/// dropped and its Document has unloaded.
+#[derive(Clone, Debug)]
+pub struct TraversableLink(std::sync::Arc<LinkInner>);
+
+#[derive(Debug)]
+struct LinkInner {
+    group: std::sync::Arc<GroupShared>,
+    life: std::sync::Arc<EngineLife>,
+    traversable: u32,
+}
+
+impl Drop for LinkInner {
+    fn drop(&mut self) {
+        let _ = self.group.commands.send(GroupCmd::Release {
+            traversable: self.traversable,
+        });
+    }
+}
+
+impl TraversableLink {
+    /// Whether the traversable's group has other traversables, which a
+    /// navigation must keep it with.
+    pub fn shared(&self) -> bool {
+        self.0
+            .group
+            .members
+            .load(std::sync::atomic::Ordering::Acquire)
+            > 1
+    }
+
+    /// The network state the group's Documents share (`GroupShared`).
+    pub(crate) fn cache(&self) -> std::sync::Arc<crate::http::PageCache> {
+        self.0.group.cache.clone()
+    }
+
+    pub(crate) fn blobs(&self) -> BlobMap {
+        self.0.group.blobs.clone()
+    }
+
+    pub(crate) fn traversable(&self) -> u32 {
+        self.0.traversable
+    }
+
+    pub(crate) fn send(&self, command: GroupCmd) -> bool {
+        self.0.group.commands.send(command).is_ok()
+    }
+
+    /// Whether this frontend's hold is the only one keeping the engine
+    /// running.
+    fn sole(&self) -> bool {
+        std::sync::Arc::strong_count(&self.0.life) == 1
+    }
+
+    /// The engine's interrupt, which its page thread polls.
+    pub(crate) fn interrupt(&self) -> std::sync::Arc<lumen::RuntimeInterrupt> {
+        self.0.life.interrupt.clone()
+    }
+
+    /// The first traversable of a group no actor serves, for handles that
+    /// tests drive themselves.
+    #[cfg(test)]
+    pub(crate) fn for_test(interrupt: std::sync::Arc<lumen::RuntimeInterrupt>) -> Self {
+        let cache = std::sync::Arc::<crate::http::PageCache>::default();
+        let life = EngineLife::new(interrupt, cache.clone());
+        let (commands, _) = tokio::sync::mpsc::unbounded_channel();
+        GroupShared::new(commands, &life, cache, Default::default())
+            .link(0)
+            .expect("the test group's engine life is held")
+    }
 }
 
 impl PageHandle {
@@ -872,18 +1248,22 @@ impl PageHandle {
         cmds: tokio::sync::mpsc::Sender<PageCmd>,
         interactions: tokio::sync::mpsc::Sender<PageCmd>,
         hover: tokio::sync::watch::Sender<PageHover>,
-        cache: std::sync::Arc<crate::http::PageCache>,
-        runtime_interrupt: std::sync::Arc<lumen::RuntimeInterrupt>,
+        link: TraversableLink,
     ) -> Self {
         Self {
             cmds,
             state: Box::new(PageHandleState {
                 interactions: Some(interactions),
                 hover: Some(hover),
-                cache,
-                runtime_interrupt,
+                link,
             }),
         }
+    }
+
+    /// The page's top-level traversable, which a frontend keeps across a
+    /// navigation while it shares its browsing context group with others.
+    pub fn link(&self) -> &TraversableLink {
+        &self.state.link
     }
 
     pub fn try_send_user(
@@ -956,9 +1336,39 @@ impl PageHandle {
         sender.send(hover).is_ok()
     }
 
+    /// End the page now, its scripts and fetches with it, unless other
+    /// traversables of its group keep its engine running: then only this
+    /// Document's frontend goes away when the handle is dropped.
     pub fn retire(&self) {
-        self.state.runtime_interrupt.cancel();
-        self.state.cache.cancel();
+        if self.state.link.sole() {
+            self.state.link.0.life.cancel();
+        }
+    }
+
+    /// End the page as its Documents unload (HTML
+    /// #unload-a-document-and-its-descendants): its pagehide,
+    /// visibilitychange and unload handlers run, and keepalive fetches they
+    /// start outlive it. A page still running after [`PAGE_END_GRACE`] is
+    /// retired regardless.
+    pub fn unload(self, runtime: &tokio::runtime::Handle) {
+        self.end_with(PageCmd::Unload, runtime);
+    }
+
+    /// End the page to free memory (Page Lifecycle #discarding): its
+    /// Documents are frozen (their freeze handlers run) and not unloaded.
+    pub fn discard(self, runtime: &tokio::runtime::Handle) {
+        self.end_with(PageCmd::Discard, runtime);
+    }
+
+    fn end_with(self, command: PageCmd, runtime: &tokio::runtime::Handle) {
+        if self.cmds.try_send(command).is_err() {
+            // The actor cannot take it: retire now (dropping `self`).
+            return;
+        }
+        runtime.spawn(async move {
+            let _ = tokio::time::timeout(PAGE_END_GRACE, self.cmds.closed()).await;
+            drop(self);
+        });
     }
 
     /// HTML #nav-stop for a page whose actor and scripts stay alive (the
@@ -968,11 +1378,12 @@ impl PageHandle {
     /// its scripts' fetch() and XMLHttpRequest included, with their
     /// script-visible results. Returns whether any fetch was still loading.
     pub fn stop_loading(&self) -> bool {
-        let loading = self.state.cache.loading();
+        let cache = &self.state.link.0.life.cache;
+        let loading = cache.loading();
         if self.try_send_user(PageCmd::StopLoading).is_err() {
             // The actor cannot take the task: still stop the browser's own
             // fetches for the document.
-            return self.state.cache.stop_loading() || loading;
+            return cache.stop_loading() || loading;
         }
         loading
     }
@@ -984,18 +1395,15 @@ impl PageHandle {
             state: Box::new(PageHandleState {
                 interactions: None,
                 hover: None,
-                cache: Default::default(),
-                runtime_interrupt: Default::default(),
+                link: TraversableLink::for_test(Default::default()),
             }),
         }
     }
 }
 
-impl Drop for PageHandle {
-    fn drop(&mut self) {
-        self.retire();
-    }
-}
+/// How long a page's unload or freeze handlers may run once it ends before
+/// it is retired regardless (`PageHandle::unload`, `PageHandle::discard`).
+pub const PAGE_END_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Finish resident page cleanup before the process unloads native GPU drivers.
 /// Call once at process shutdown, after dropping the frontend's page handles
@@ -1003,6 +1411,21 @@ impl Drop for PageHandle {
 /// Further page actors are rejected; ordinary navigation remains asynchronous.
 pub fn shutdown_page_threads() {
     crate::lumen_backend::shutdown_spare_engine();
+    crate::page_threads::shutdown();
+}
+
+/// [`shutdown_page_threads`] for a browser that has just unloaded its pages
+/// ([`PageHandle::unload`]): first give their unload handlers, and the
+/// keepalive fetches they started (Fetch #request-keepalive-flag), up to
+/// `grace` to finish. Keep the network runtime alive meanwhile.
+pub fn shutdown_page_threads_after(grace: std::time::Duration) {
+    crate::lumen_backend::shutdown_spare_engine();
+    let deadline = std::time::Instant::now() + grace;
+    while std::time::Instant::now() < deadline
+        && (crate::page_threads::running() || crate::http::keepalive_fetches_in_flight() > 0)
+    {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
     crate::page_threads::shutdown();
 }
 
@@ -1045,6 +1468,40 @@ pub fn spawn_page(
     env: PageEnv,
 ) -> (PageHandle, tokio::sync::mpsc::Receiver<PageEvt>) {
     crate::lumen_backend::spawn_page(html, env)
+}
+
+/// [`spawn_page`] for the next Document of `link`'s traversable, which the
+/// engine running its browsing context group creates (HTML #navigate keeps a
+/// navigable in its group). The handle and events behave as `spawn_page`'s;
+/// the events end at once when the engine has gone.
+pub fn spawn_page_in(
+    link: &TraversableLink,
+    html: String,
+    env: PageEnv,
+) -> (PageHandle, tokio::sync::mpsc::Receiver<PageEvt>) {
+    let (cmd_tx, cmds) = tokio::sync::mpsc::channel(16);
+    let (interaction_tx, interactions) = tokio::sync::mpsc::channel(16);
+    let (hover_tx, hover) = tokio::sync::watch::channel(PageHover {
+        node: None,
+        x: 0.0,
+        y: 0.0,
+        metadata: PointerMetadata::default(),
+    });
+    let (events, event_rx) = tokio::sync::mpsc::channel(16);
+    // Without the engine, `events` is dropped with the command.
+    link.send(GroupCmd::Load(Box::new(GroupLoad {
+        traversable: link.traversable(),
+        html,
+        env,
+        cmds,
+        interactions,
+        hover,
+        events,
+    })));
+    (
+        PageHandle::from_lumen_parts(cmd_tx, interaction_tx, hover_tx, link.clone()),
+        event_rx,
+    )
 }
 
 /// Wrap a platform bootstrap (Window or worker prelude) so that it owns the host boundary
@@ -1243,7 +1700,7 @@ pub(crate) fn needs_live_dom(dom: &Dom) -> bool {
 /// Whether the document has `audio` or `video` elements, whose players
 /// only a page actor runs.
 pub(crate) fn has_media_elements(dom: &Dom) -> bool {
-    dom.composed_descendants(DOCUMENT)
+    dom.composed_descendants(dom.document())
         .into_iter()
         .any(|node| matches!(dom.tag_name(node), Some("video" | "audio")))
 }
@@ -1254,14 +1711,16 @@ pub(crate) fn has_media_elements(dom: &Dom) -> bool {
 /// owns those elements' image requests and navigations, so the canonical DOM
 /// applies them.
 fn element_referrer_policies(dom: &Dom) -> bool {
-    dom.composed_descendants(DOCUMENT).into_iter().any(|node| {
-        hyperlink_chooses_referrer(dom, node)
-            || (matches!(
-                dom.tag_name(node),
-                Some("img" | "iframe" | "link" | "script")
-            ) && dom.attr(node, "referrerpolicy").is_some())
-            || (dom.tag_name(node) == Some("form") && has_noreferrer(dom, node))
-    })
+    dom.composed_descendants(dom.document())
+        .into_iter()
+        .any(|node| {
+            hyperlink_chooses_referrer(dom, node)
+                || (matches!(
+                    dom.tag_name(node),
+                    Some("img" | "iframe" | "link" | "script")
+                ) && dom.attr(node, "referrerpolicy").is_some())
+                || (dom.tag_name(node) == Some("form") && has_noreferrer(dom, node))
+        })
 }
 
 /// An `a` or `area` whose hyperlink referrer policy (HTML
@@ -1293,9 +1752,9 @@ pub(crate) fn clickable_set_for_dom(
 fn listening_walk(dom: &Dom, listeners: &std::collections::HashSet<usize>) -> Vec<(usize, bool)> {
     let listens = |node: usize| listeners.contains(&node) || dom.attr(node, "onclick").is_some();
     let mut walk = Vec::new();
-    let mut stack = vec![(DOCUMENT, listens(DOCUMENT))];
+    let mut stack = vec![(dom.document(), listens(dom.document()))];
     while let Some((node, listening)) = stack.pop() {
-        if node != DOCUMENT {
+        if node != dom.document() {
             walk.push((node, listening));
         }
         let start = stack.len();
@@ -1450,7 +1909,7 @@ pub(crate) fn hover_set_for_dom(
 ) -> (std::collections::HashSet<usize>, bool) {
     hover_set_in(
         dom,
-        dom.composed_descendants(DOCUMENT).into_iter(),
+        dom.composed_descendants(dom.document()).into_iter(),
         listener_hosts,
     )
 }
@@ -1500,11 +1959,11 @@ mod interaction_set_tests {
             std::collections::HashSet::new(),
             std::collections::HashSet::from([root]),
             std::collections::HashSet::from([host, i]),
-            std::collections::HashSet::from([DOCUMENT]),
+            std::collections::HashSet::from([dom.document()]),
         ] {
             let walk = listening_walk(&dom, &listeners);
             let nodes: Vec<usize> = walk.iter().map(|&(node, _)| node).collect();
-            assert_eq!(nodes, dom.composed_descendants(DOCUMENT));
+            assert_eq!(nodes, dom.composed_descendants(dom.document()));
             for (node, listening) in walk {
                 let mut expected = false;
                 let mut current = Some(node);
@@ -1530,7 +1989,7 @@ mod interaction_set_tests {
         assert!(sets.complete_hover_hits);
         assert_eq!(sets.hover, std::collections::HashSet::from([a]));
         dom.set_hover_hosts(sets.hover, sets.complete_hover_hits);
-        let html = dom.serialize_live(DOCUMENT, &Default::default());
+        let html = dom.serialize_live(dom.document(), &Default::default());
         assert!(
             html.contains(&format!("data-trust-hover=\"{s}\"")),
             "{html}"
@@ -1764,7 +2223,7 @@ pub(crate) fn external_resources_at(
             });
         }
     }
-    for node in dom.shadow_including_subtree(DOCUMENT) {
+    for node in dom.shadow_including_subtree(dom.document()) {
         let tag = dom.tag_name(node);
         let rel_has = |name: &str| {
             dom.attr(node, "rel").is_some_and(|rel| {
@@ -1854,7 +2313,7 @@ pub fn sprite_use_sheets(html: &str) -> Vec<String> {
     let dom = Dom::parse_document(html);
     let mut seen = std::collections::HashSet::new();
     let mut sheets = Vec::new();
-    for node in dom.shadow_including_subtree(DOCUMENT) {
+    for node in dom.shadow_including_subtree(dom.document()) {
         if dom.tag_name(node) != Some("use") {
             continue;
         }
@@ -1880,7 +2339,7 @@ pub fn module_preloads(html: &str) -> Vec<String> {
     let dom = Dom::parse_document(html);
     let mut seen = std::collections::HashSet::new();
     let mut targets = Vec::new();
-    for node in dom.shadow_including_subtree(DOCUMENT) {
+    for node in dom.shadow_including_subtree(dom.document()) {
         let target = match dom.tag_name(node) {
             Some("link")
                 if dom.attr(node, "rel").is_some_and(|rel| {

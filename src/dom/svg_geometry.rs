@@ -40,8 +40,7 @@ use vello_cpu::kurbo::{
 };
 
 use super::{
-    DOCUMENT, Dom, NodeData, NodeId, SVG_PRESENTATION_PROPERTIES, SvgImageRefs, escape_attr,
-    escape_text,
+    Dom, NodeData, NodeId, SVG_PRESENTATION_PROPERTIES, SvgImageRefs, escape_attr, escape_text,
 };
 
 const SVG_NS: &str = "http://www.w3.org/2000/svg";
@@ -782,7 +781,7 @@ impl Dom {
         };
         self.is_connected(id)
             && std::iter::successors(Some(id), |&node| self.nodes[node].parent)
-                .take_while(|&node| node != DOCUMENT)
+                .take_while(|&node| node != self.document())
                 .filter(|&node| matches!(self.nodes[node].data, NodeData::Element { .. }))
                 .all(|node| !hidden(node))
     }

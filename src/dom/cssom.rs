@@ -282,7 +282,7 @@ impl Dom {
     /// need a fetch.
     pub(crate) fn note_fetched_imports(&self) {
         let mut sources: Vec<(String, Option<url::Url>)> = Vec::new();
-        for id in self.shadow_including_subtree(DOCUMENT) {
+        for id in self.shadow_including_subtree(self.document()) {
             if self.tag_name(id) == Some("style") {
                 let base = self
                     .doc_url

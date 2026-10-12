@@ -317,6 +317,14 @@ page engine still warming; this navigation runs cold` (a navigation never waits
 for the warm-up bootstrap; the spare stays for the next one), and `spare page
 engine warm after N ms`. An idle spare costs about 22 MiB of resident memory.
 
+Every tab whose page is live runs its own engine, so the warmed engine's
+resident cost bounds what each additional tab pays before its document. Report
+it (Linux, release build):
+
+```sh
+cargo test --release --lib warmed_engine_memory_report -- --ignored --nocapture
+```
+
 ## Command-line inputs
 
 ### `trust`

@@ -85,6 +85,7 @@ mod svg_references;
 mod svg_resources;
 pub(crate) use svg_resources::FilterUse;
 mod transitions;
+mod transplant;
 mod validity;
 mod xml;
 mod xml_serialize;
@@ -282,6 +283,44 @@ pub enum PreInsertError {
     NotFound,
 }
 
+/// What DOM #concept-node-ensure-pre-insertion-validity reads of the node
+/// being inserted (`Dom::inserted_node`): its type and, for a
+/// DocumentFragment, its element and Text children. A node of another arena
+/// of the group, whose insertion adopts it across arenas
+/// (`Dom::transplant_subtree`), is described by its own arena.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct InsertedNode {
+    /// The node, when it is the validating arena's.
+    local: Option<NodeId>,
+    kind: InsertedKind,
+}
+
+impl InsertedNode {
+    /// The description of a node for another arena, in whose trees it is
+    /// not, so never a host-including inclusive ancestor of a parent.
+    pub(crate) fn foreign(self) -> Self {
+        Self {
+            local: None,
+            ..self
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum InsertedKind {
+    Document,
+    Doctype,
+    /// Text, including CDATASection.
+    Text,
+    /// Comment or ProcessingInstruction.
+    OtherCharacterData,
+    Element,
+    Fragment {
+        elements: usize,
+        text: bool,
+    },
+}
+
 /// DOM strings (text, attributes, CSSOM values) live as Lumen engine text (see
 /// `lumen_backend::host_arg_string`): a character in U+10F800..=U+10FFFF is the pair of
 /// private-use scalars that encodes its surrogate pair, and a lone surrogate is one such scalar.
@@ -383,6 +422,9 @@ pub enum AdoptError {
     InvalidNode,
     Document,
     ShadowRoot,
+    /// Not an error: DOM #dom-document-adoptnode returns a DocumentFragment
+    /// whose host is non-null (a template's contents) without adopting it.
+    HostedFragment,
 }
 
 pub struct Node {
@@ -629,6 +671,14 @@ type ImportRequests = (Vec<(NodeId, String)>, FxHashSet<String>);
 
 pub struct Dom {
     nodes: arena::DenseIdMap<Node>,
+    /// This arena's Document: the first node it allocated. A page's arena
+    /// starts at identity 0; an arena created beside others of its browsing
+    /// context group (`new_in_group`) shares their identity space.
+    document: NodeId,
+    /// The identity source this arena shares with the other top-level
+    /// traversables' arenas of its browsing context group, so that no node
+    /// identity names nodes of two arenas.
+    shared_ids: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
     /// Numeric IDs may briefly be held by binding code before its JS owner registers them.
     /// Keep new allocations until that handoff or the host's end-of-job boundary.
     pending_allocations: FxHashSet<NodeId>,
@@ -890,6 +940,11 @@ pub struct Dom {
     fragment_targets: FxHashMap<NodeId, NodeId>,
     /// HTML focused DOM anchor per Document, shared with the page focus model.
     focused_areas: FxHashMap<NodeId, NodeId>,
+    /// HTML #system-focus of the arena's top-level traversable. Without it
+    /// the current focus chain is empty, so no element matches `:focus`,
+    /// `:focus-visible` or `:focus-within` (HTML #selector-focus), while
+    /// each Document keeps its focused area.
+    system_focus: bool,
     /// Incremental layout (incremental-layout contract): the element nodes mutated
     /// since the last `take_dirty_targets`, with the kind of change. A mutation
     /// confined to a relayout boundary's subtree lets the app re-lay ONLY that
@@ -1172,7 +1227,13 @@ impl CascadedMaps {
 }
 
 /// The document node is always index 0.
+/// The Document of an arena that does not share its identities: a page's
+/// first arena, and every test arena. Code that may run on another arena of
+/// a browsing context group uses `Dom::document`.
+#[cfg(test)]
 pub const DOCUMENT: NodeId = 0;
+const HTML_NAMESPACE: &str = "http://www.w3.org/1999/xhtml";
+const SVG_NAMESPACE: &str = "http://www.w3.org/2000/svg";
 
 /// Lazy pre-order walk of a subtree (see `Dom::descendants`). Advancing
 /// costs O(1) amortized: first child, else next sibling, else the first
@@ -1227,6 +1288,8 @@ impl Dom {
         // classified before the crate builds.
         let Dom {
             nodes,
+            document: _,
+            shared_ids: _,
             pending_allocations,
             gc_allocation_leases,
             document_content_types,
@@ -1312,6 +1375,7 @@ impl Dom {
             doc_url,
             fragment_targets: _,
             focused_areas,
+            system_focus: _,
             dirty_nodes,
             dirty_attributed,
             hover_hosts,
@@ -1816,8 +1880,43 @@ impl Dom {
     }
 
     pub fn new() -> Self {
+        Self::with_identity_source(None)
+    }
+
+    /// An arena for another top-level traversable of a browsing context
+    /// group, allocating node identities from `ids`, which every arena of
+    /// the group shares (`share_identities`).
+    pub fn new_in_group(ids: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        Self::with_identity_source(Some(ids))
+    }
+
+    /// From now on allocate identities from the group's shared source,
+    /// which continues past every identity this arena has allocated. Returns
+    /// the source for the group's other arenas.
+    pub fn share_identities(&mut self) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+        if let Some(ids) = &self.shared_ids {
+            return ids.clone();
+        }
+        let ids = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
+            self.nodes.next_identity(),
+        ));
+        self.shared_ids = Some(ids.clone());
+        ids
+    }
+
+    /// This arena's Document.
+    #[inline]
+    pub fn document(&self) -> NodeId {
+        self.document
+    }
+
+    fn with_identity_source(
+        shared_ids: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    ) -> Self {
         let mut dom = Dom {
             nodes: arena::DenseIdMap::default(),
+            document: 0,
+            shared_ids,
             pending_allocations: FxHashSet::default(),
             gc_allocation_leases: false,
             document_content_types: FxHashMap::default(),
@@ -1903,6 +2002,7 @@ impl Dom {
             doc_url: None,
             fragment_targets: FxHashMap::default(),
             focused_areas: FxHashMap::default(),
+            system_focus: true,
             dirty_nodes: Vec::new(),
             dirty_attributed: true,
             hover_hosts: std::collections::HashSet::new(),
@@ -1924,7 +2024,11 @@ impl Dom {
             dialog_elements: 0,
             started_scripts: FxHashSet::default(),
         };
-        dom.new_node(NodeData::Document);
+        dom.document = dom.new_node(NodeData::Document);
+        // DOM #concept-node-document: a Document's node document is itself
+        // (created before it was this arena's Document, it took the unset id).
+        let document = dom.document;
+        dom.nodes[document].owner_document = document;
         dom
     }
 
@@ -2141,7 +2245,7 @@ impl Dom {
     /// standards-required case every rendered candidate is marked because
     /// omitting the designated element would be a false negative.
     pub fn hover_css_candidates(&self) -> Vec<NodeId> {
-        self.hover_css_candidates_in(&[DOCUMENT])
+        self.hover_css_candidates_in(&[self.document()])
     }
 
     /// `hover_css_candidates` restricted to the given subtrees (each root plus
@@ -2185,7 +2289,7 @@ impl Dom {
             let view = self.style_view();
             let mut ancestors = rule_index::WalkAncestors::new();
             for &root in roots {
-                let descendants: std::sync::Arc<[NodeId]> = if root == DOCUMENT {
+                let descendants: std::sync::Arc<[NodeId]> = if root == self.document() {
                     self.composed_document_order()
                 } else {
                     self.composed_descendants(root).into()
@@ -2220,7 +2324,7 @@ impl Dom {
         // not enter its ordinary rightmost buckets.
         for (&host, &scope) in &self.shadow_roots {
             if roots.iter().any(|&root| {
-                root == crate::dom::DOCUMENT
+                root == self.document()
                     || root == host
                     || self.composed_descendants(root).contains(&host)
             }) && index.scopes.get(&scope).is_some_and(|rules| {
@@ -2607,7 +2711,7 @@ impl Dom {
         // proportional to plausible subjects rather than elements × all rules.
         type HoverMatchSnapshot = (NodeId, NodeId, Vec<(u32, bool)>);
         let mut old: Vec<HoverMatchSnapshot> = Vec::new();
-        for id in self.composed_descendants(DOCUMENT) {
+        for id in self.composed_descendants(self.document()) {
             if self.tag_name(id).is_none() {
                 continue;
             }
@@ -3567,7 +3671,7 @@ impl Dom {
         boundary: NodeId,
         clickable: &std::collections::HashSet<NodeId>,
     ) -> String {
-        let from = self.parent_composed(boundary).unwrap_or(DOCUMENT);
+        let from = self.parent_composed(boundary).unwrap_or(self.document());
         let mut style = String::new();
         for &p in INHERITED_LAYOUT_PROPS {
             // font-size is carried RESOLVED below — its declared string
@@ -3723,7 +3827,7 @@ impl Dom {
     }
 
     pub(crate) fn set_fragment_target(&mut self, fragment: Option<&str>) -> Option<NodeId> {
-        self.set_document_fragment_target(DOCUMENT, fragment)
+        self.set_document_fragment_target(self.document(), fragment)
     }
 
     /// HTML #scroll-to-the-fragment-identifier for `document` (the top-level
@@ -4072,6 +4176,16 @@ impl Dom {
         Self::parse_html_document(html, true)
     }
 
+    /// `parse_document` into an arena of a browsing context group, whose
+    /// node identities come from the group's shared source (`new_in_group`),
+    /// or a fresh arena's own without one.
+    pub fn parse_document_in_group(
+        html: &str,
+        ids: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    ) -> Self {
+        Self::parse_html_document_from(html, true, true, ids)
+    }
+
     fn parse_html_document(html: &str, allow_declarative_shadow_roots: bool) -> Self {
         Self::parse_html_document_with(html, allow_declarative_shadow_roots, true)
     }
@@ -4083,8 +4197,17 @@ impl Dom {
         allow_declarative_shadow_roots: bool,
         scripting: bool,
     ) -> Self {
+        Self::parse_html_document_from(html, allow_declarative_shadow_roots, scripting, None)
+    }
+
+    fn parse_html_document_from(
+        html: &str,
+        allow_declarative_shadow_roots: bool,
+        scripting: bool,
+        ids: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    ) -> Self {
         let sink = Sink {
-            dom: RefCell::new(Dom::new()),
+            dom: RefCell::new(Dom::with_identity_source(ids)),
             allow_declarative_shadow_roots,
         };
         let mut opts = ParseOpts::default();
@@ -4116,15 +4239,21 @@ impl Dom {
         {
             self.dialog_elements = self.dialog_elements.saturating_add(1);
         }
-        let id = self.nodes.allocate(Node {
+        let node = Node {
             parent: None,
             first_child: None,
             last_child: None,
             prev_sibling: None,
             next_sibling: None,
-            owner_document: DOCUMENT,
+            owner_document: self.document,
             data,
-        });
+        };
+        let id = match &self.shared_ids {
+            Some(ids) => self
+                .nodes
+                .allocate_at(ids.fetch_add(1, std::sync::atomic::Ordering::Relaxed), node),
+            None => self.nodes.allocate(node),
+        };
         if self.gc_allocation_leases {
             self.pending_allocations.insert(id);
         }
@@ -4205,7 +4334,7 @@ impl Dom {
         let Some(document) = self.owner_document(id) else {
             return false;
         };
-        document == DOCUMENT
+        document == self.document()
             || self.nodes[document].parent.is_some_and(|container| {
                 matches!(self.tag_name(container), Some("iframe" | "frame"))
             })
@@ -4302,6 +4431,29 @@ impl Dom {
         self.new_node(NodeData::Fragment)
     }
 
+    /// DOM #concept-documentfragment-host of `fragment`: a shadow root's
+    /// host, or the template whose contents it is. Template contents always
+    /// belong to an inert template contents owner document (HTML
+    /// #template-contents), so only fragments of one are searched for.
+    pub(crate) fn fragment_host(&self, fragment: NodeId) -> Option<NodeId> {
+        if let Some(&host) = self.shadow_hosts.get(&fragment) {
+            return Some(host);
+        }
+        let node = self.nodes.get(fragment)?;
+        if !matches!(node.data, NodeData::Fragment)
+            || node.parent.is_some()
+            || !self.is_template_contents_owner(node.owner_document)
+        {
+            return None;
+        }
+        self.nodes.ids().find(|&id| {
+            matches!(&self.nodes[id].data, NodeData::Element {
+                template_contents: Some(contents),
+                ..
+            } if *contents == fragment)
+        })
+    }
+
     pub fn create_fragment(&mut self) -> NodeId {
         self.new_node(NodeData::Fragment)
     }
@@ -4377,7 +4529,7 @@ impl Dom {
         ) {
             id
         } else {
-            self.owner_document(id).unwrap_or(DOCUMENT)
+            self.owner_document(id).unwrap_or(self.document())
         };
         self.document_encoding(document)
     }
@@ -4846,6 +4998,9 @@ impl Dom {
         if self.shadow_hosts.contains_key(&id) {
             return Err(AdoptError::ShadowRoot);
         }
+        if self.fragment_host(id).is_some() {
+            return Err(AdoptError::HostedFragment);
+        }
         let old_document = self.nodes[id].owner_document;
         let registry_context = self.registry_context_before_insertion(id);
         self.detach(id);
@@ -4934,6 +5089,59 @@ impl Dom {
             NodeData::Element { name, .. } => name.prefix.as_deref(),
             _ => None,
         }
+    }
+
+    /// HTML #the-title-element-2: the first HTML `title` element in tree
+    /// order in `document`'s own tree (not a nested navigable's document).
+    pub fn title_element_of(&self, document: NodeId) -> Option<NodeId> {
+        if !self.is_valid(document) {
+            return None;
+        }
+        self.descendants(document).find(|&id| {
+            self.nodes[id].owner_document == document
+                && self.tag_name(id) == Some("title")
+                && self.namespace_uri(id) == Some(HTML_NAMESPACE)
+        })
+    }
+
+    /// HTML #document.title on getting: the child text content of the SVG
+    /// document element's first SVG `title` child, or of the title element,
+    /// with ASCII whitespace stripped and collapsed.
+    pub fn document_title_of(&self, document: NodeId) -> String {
+        if !self.is_valid(document) {
+            return String::new();
+        }
+        let root = self
+            .child_iter(document)
+            .find(|&child| matches!(self.nodes[child].data, NodeData::Element { .. }));
+        let element = match root {
+            Some(root)
+                if self.tag_name(root) == Some("svg")
+                    && self.namespace_uri(root) == Some(SVG_NAMESPACE) =>
+            {
+                self.child_iter(root).find(|&child| {
+                    self.tag_name(child) == Some("title")
+                        && self.namespace_uri(child) == Some(SVG_NAMESPACE)
+                })
+            }
+            _ => self.title_element_of(document),
+        };
+        let Some(element) = element else {
+            return String::new();
+        };
+        // DOM #concept-child-text-content: the data of the Text (and
+        // CDATASection) children only.
+        let text: String = self
+            .child_iter(element)
+            .filter_map(|child| match &self.nodes[child].data {
+                NodeData::Text(text) | NodeData::CData(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        text.split(['\t', '\n', '\x0c', '\r', ' '])
+            .filter(|word| !word.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     /// DOM #concept-getelementsbytagname / #concept-getelementsbytagnamens
@@ -5074,7 +5282,7 @@ impl Dom {
     /// as absent. Host-agnostic: this is the standard cross-site preview/typing
     /// surface, used to give an unplayable `<video>` a preview thumbnail.
     pub fn meta_content(&self, key: &str) -> Option<&str> {
-        self.descendants(DOCUMENT)
+        self.descendants(self.document())
             .filter(|&id| self.tag_name(id) == Some("meta"))
             .find(|&id| {
                 self.attr(id, "property")
@@ -5382,7 +5590,7 @@ impl Dom {
         let document = if matches!(self.nodes[context].data, NodeData::Document) {
             context
         } else {
-            self.owner_document(context).unwrap_or(DOCUMENT)
+            self.owner_document(context).unwrap_or(self.document())
         };
         let target = self
             .descendants(document)
@@ -7447,7 +7655,7 @@ impl Dom {
     /// (#overflow-propagation).
     fn cssom_scrollport(&self, id: NodeId, layout: &crate::layout2::LayoutFragments) -> [f32; 2] {
         let mut ancestor = self.style_parent(id);
-        while let Some(node) = ancestor.filter(|&node| node != DOCUMENT) {
+        while let Some(node) = ancestor.filter(|&node| node != self.document()) {
             if !matches!(self.tag_name(node), Some("html" | "body"))
                 && self
                     .overflow_axes(node)
@@ -7765,7 +7973,7 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// The document's root element (`<html>`) — the element `rem` units and
     /// `:root` refer to.
     pub(crate) fn document_element(&self) -> Option<NodeId> {
-        self.child_iter(DOCUMENT)
+        self.child_iter(self.document())
             .find(|&c| self.tag_name(c).is_some())
     }
 }
@@ -7835,7 +8043,7 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
         }
         let _timer = StyleTimer::start();
         let parent_px = match self.style_parent(id) {
-            Some(p) if p != DOCUMENT => self.font_px(p),
+            Some(p) if p != self.document() => self.font_px(p),
             _ => FONT_SIZE_INITIAL,
         };
         // `rem` on the root element itself resolves against the initial
@@ -7902,7 +8110,7 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
         if !own
             && !self
                 .style_parent(id)
-                .is_some_and(|parent| parent != DOCUMENT && monospace(parent))
+                .is_some_and(|parent| parent != self.document() && monospace(parent))
         {
             return None;
         }
@@ -7924,7 +8132,7 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     fn font_size_keyword(&self, id: NodeId) -> Option<(&'static str, f32)> {
         let mut factor = 1.0;
         let mut node = Some(id);
-        while let Some(current) = node.filter(|&node| node != DOCUMENT) {
+        while let Some(current) = node.filter(|&node| node != self.document()) {
             if let Some(raw) = self.cascaded(current, "font-size") {
                 let value = self.resolve_vars(current, &raw).trim().to_ascii_lowercase();
                 if let Some(keyword) = ABSOLUTE_SIZE_KEYWORDS
@@ -9933,9 +10141,10 @@ impl Dom {
                 if sets.contains_key(&scope) {
                     continue;
                 }
-                let child_document =
-                    scope != DOCUMENT && matches!(self.nodes[scope].data, NodeData::Document);
-                let foreground = !child_document && self.registration_document(scope) == DOCUMENT;
+                let child_document = scope != self.document()
+                    && matches!(self.nodes[scope].data, NodeData::Document);
+                let foreground =
+                    !child_document && self.registration_document(scope) == self.document();
                 let fonts = faces
                     .remove(&scope)
                     .unwrap_or_default()
@@ -10103,8 +10312,8 @@ impl Dom {
         let mut layer_regs: std::collections::HashMap<NodeId, LayerRegistry> =
             std::collections::HashMap::new();
         self.parsed_sheets.borrow_mut().begin_build();
-        for id in self.composed_descendants(DOCUMENT) {
-            if id != DOCUMENT && matches!(self.nodes[id].data, NodeData::Document) {
+        for id in self.composed_descendants(self.document()) {
+            if id != self.document() && matches!(self.nodes[id].data, NodeData::Document) {
                 // Each content Document has an independent font environment,
                 // including when it declares no downloadable fonts at all.
                 font_faces.entry(id).or_default();
@@ -10563,7 +10772,7 @@ impl Dom {
     /// Raw hrefs of external stylesheets, document order, so the fetch
     /// pipeline can resolve and download them before scripts run.
     pub fn stylesheet_links(&self) -> Vec<String> {
-        self.shadow_including_subtree(DOCUMENT)
+        self.shadow_including_subtree(self.document())
             .into_iter()
             .filter(|&id| self.is_stylesheet_link(id))
             .filter_map(|id| self.attr(id, "href").map(str::to_string))
@@ -10576,7 +10785,7 @@ impl Dom {
     /// uses this before the resident actor starts so first layout can shape
     /// with inline-declared web fonts.
     pub(crate) fn inline_stylesheets(&self) -> Vec<String> {
-        self.shadow_including_subtree(DOCUMENT)
+        self.shadow_including_subtree(self.document())
             .into_iter()
             .filter(|&id| self.tag_name(id) == Some("style"))
             .map(|id| self.text_content(id))
@@ -10606,7 +10815,7 @@ impl Dom {
             imported = true;
         }
         let links: Vec<(NodeId, String)> = self
-            .shadow_including_subtree(DOCUMENT)
+            .shadow_including_subtree(self.document())
             .into_iter()
             .filter(|&id| self.is_stylesheet_link(id))
             .filter_map(|id| self.attr(id, "href").map(|h| (id, h.to_string())))
@@ -10634,7 +10843,7 @@ impl Dom {
         }
         if imported {
             let styles: Vec<NodeId> = self
-                .shadow_including_subtree(DOCUMENT)
+                .shadow_including_subtree(self.document())
                 .into_iter()
                 .filter(|&id| self.tag_name(id) == Some("style"))
                 .collect();
@@ -10736,7 +10945,7 @@ impl Dom {
     pub fn is_connected(&self, id: NodeId) -> bool {
         let mut cur = Some(id);
         while let Some(c) = cur {
-            if c == DOCUMENT {
+            if c == self.document() {
                 return true;
             }
             cur = self.parent_composed(c);
@@ -10804,6 +11013,51 @@ impl Dom {
         child: Option<NodeId>,
         exclude: &dyn Fn(NodeId) -> bool,
     ) -> Result<(), PreInsertError> {
+        self.ensure_pre_insert_validity_of(self.inserted_node(node), parent, child, exclude)
+    }
+
+    /// What pre-insert validity reads of `node`, a node of this arena or,
+    /// for [`Self::ensure_pre_insert_validity_of`] in another arena of the
+    /// group, [`InsertedNode::foreign`].
+    pub(crate) fn inserted_node(&self, node: NodeId) -> InsertedNode {
+        let kind = match &self.nodes[node].data {
+            NodeData::Document => InsertedKind::Document,
+            NodeData::Doctype(_) => InsertedKind::Doctype,
+            NodeData::Text(_) | NodeData::CData(_) => InsertedKind::Text,
+            NodeData::Comment(_) | NodeData::ProcessingInstruction { .. } => {
+                InsertedKind::OtherCharacterData
+            }
+            NodeData::Element { .. } => InsertedKind::Element,
+            NodeData::Fragment => {
+                let children = self
+                    .child_iter(node)
+                    .filter(|&c| !matches!(self.nodes[c].data, NodeData::Document));
+                let (mut elements, mut text) = (0, false);
+                for c in children {
+                    match self.nodes[c].data {
+                        NodeData::Element { .. } => elements += 1,
+                        NodeData::Text(_) | NodeData::CData(_) => text = true,
+                        _ => {}
+                    }
+                }
+                InsertedKind::Fragment { elements, text }
+            }
+        };
+        InsertedNode {
+            local: Some(node),
+            kind,
+        }
+    }
+
+    /// [`Self::ensure_pre_insert_validity`] for the node `inserted`
+    /// describes, which may be another arena's.
+    pub(crate) fn ensure_pre_insert_validity_of(
+        &self,
+        inserted: InsertedNode,
+        parent: NodeId,
+        child: Option<NodeId>,
+        exclude: &dyn Fn(NodeId) -> bool,
+    ) -> Result<(), PreInsertError> {
         use PreInsertError::{HierarchyRequest, NotFound};
         // Step 1.
         if !matches!(
@@ -10812,21 +11066,27 @@ impl Dom {
         ) {
             return Err(HierarchyRequest);
         }
-        // Steps 2–3.
-        if self.is_host_including_inclusive_ancestor(node, parent) {
+        // Steps 2–3. Another arena's node is in none of this arena's trees.
+        if inserted
+            .local
+            .is_some_and(|node| self.is_host_including_inclusive_ancestor(node, parent))
+        {
             return Err(HierarchyRequest);
         }
-        if child.is_some_and(|child| self.nodes[child].parent != Some(parent)) {
+        // Another arena's node is no child of `parent` either.
+        if child.is_some_and(|child| {
+            self.nodes.get(child).map(|node| node.parent) != Some(Some(parent))
+        }) {
             return Err(NotFound);
         }
         // Step 4: a DocumentFragment, DocumentType, Element or CharacterData.
-        if matches!(self.nodes[node].data, NodeData::Document) {
+        if matches!(inserted.kind, InsertedKind::Document) {
             return Err(HierarchyRequest);
         }
         // Step 5.
         if !matches!(self.nodes[parent].data, NodeData::Document) {
-            return match self.nodes[node].data {
-                NodeData::Doctype(_) => Err(HierarchyRequest),
+            return match inserted.kind {
+                InsertedKind::Doctype => Err(HierarchyRequest),
                 _ => Ok(()),
             };
         }
@@ -10837,18 +11097,14 @@ impl Dom {
         let is_element = |id: NodeId| matches!(self.nodes[id].data, NodeData::Element { .. });
         let is_doctype = |id: NodeId| matches!(self.nodes[id].data, NodeData::Doctype(_));
         let element_child_kept = || tree_children(parent).any(|c| is_element(c) && !exclude(c));
-        match self.nodes[node].data {
+        match inserted.kind {
             // Steps 6–7: Text (including CDATASection) cannot be a document
             // child; other CharacterData can.
-            NodeData::Text(_) | NodeData::CData(_) => Err(HierarchyRequest),
-            NodeData::Comment(_) | NodeData::ProcessingInstruction { .. } => Ok(()),
+            InsertedKind::Text => Err(HierarchyRequest),
+            InsertedKind::OtherCharacterData => Ok(()),
             // Steps 8–9.
-            NodeData::Fragment | NodeData::Element { .. } => {
-                if matches!(self.nodes[node].data, NodeData::Fragment) {
-                    let elements = tree_children(node).filter(|&c| is_element(c)).count();
-                    let text = tree_children(node).any(|c| {
-                        matches!(self.nodes[c].data, NodeData::Text(_) | NodeData::CData(_))
-                    });
+            InsertedKind::Fragment { .. } | InsertedKind::Element => {
+                if let InsertedKind::Fragment { elements, text } = inserted.kind {
                     if elements > 1 || text {
                         return Err(HierarchyRequest);
                     }
@@ -10870,8 +11126,10 @@ impl Dom {
                     Ok(())
                 }
             }
+            // Step 4 refused a Document.
+            InsertedKind::Document => Err(HierarchyRequest),
             // Steps 10–11: a doctype.
-            _ => {
+            InsertedKind::Doctype => {
                 let doctype_kept = tree_children(parent).any(|c| is_doctype(c) && !exclude(c));
                 let element_precedes = child.is_some_and(|child| {
                     std::iter::successors(self.nodes[child].prev_sibling, |&s| {
@@ -11037,7 +11295,7 @@ impl Dom {
         {
             return order;
         }
-        let order: std::sync::Arc<[NodeId]> = self.flat_descendants(DOCUMENT).into();
+        let order: std::sync::Arc<[NodeId]> = self.flat_descendants(self.document()).into();
         self.document_orders.borrow_mut().flat = Some((self.epoch, order.clone()));
         order
     }
@@ -11049,7 +11307,7 @@ impl Dom {
         {
             return order;
         }
-        let order: std::sync::Arc<[NodeId]> = self.composed_descendants(DOCUMENT).into();
+        let order: std::sync::Arc<[NodeId]> = self.composed_descendants(self.document()).into();
         self.document_orders.borrow_mut().composed = Some((self.epoch, order.clone()));
         order
     }
@@ -11269,7 +11527,7 @@ impl Dom {
     /// retain redirects and the inherited base of about:srcdoc documents.
     pub(crate) fn resource_base_url(&self, id: NodeId, page_url: &url::Url) -> url::Url {
         let owner = self.frame_owner(id);
-        let root = owner.unwrap_or(DOCUMENT);
+        let root = owner.unwrap_or(self.document());
         let fallback = self
             .properties
             .document_bases
@@ -11421,7 +11679,7 @@ impl Dom {
     /// are flattened into the parent's presentation, so only the top-level
     /// Document's top layer is promoted there.
     fn write_top_layer_markers(&self, id: NodeId, out: &mut String) {
-        if self.nodes[id].owner_document == DOCUMENT
+        if self.nodes[id].owner_document == self.document()
             && let Some(order) = self.top_layer.iter().position(|&node| node == id)
         {
             out.push_str(&format!(" data-trust-top-layer=\"{order}\""));
@@ -11542,7 +11800,7 @@ impl Dom {
         base: &str,
     ) -> Option<NodeId> {
         let src_html = doc
-            .children(DOCUMENT)
+            .children(doc.document())
             .into_iter()
             .find(|&c| doc.tag_name(c) == Some("html"))?;
         // Retained old Documents keep their old trees. Joint GC, not navigation, decides
@@ -11552,7 +11810,7 @@ impl Dom {
                 self.detach(c);
             }
         }
-        let document = self.create_document(doc.document_content_type(DOCUMENT));
+        let document = self.create_document(doc.document_content_type(doc.document()));
         // A navigable's active Document is its Window's associated Document,
         // created with the Window's custom element registry.
         self.set_window_document_registry(document);
@@ -11561,7 +11819,7 @@ impl Dom {
         // part of the frame's document (DOM #concept-document, HTML
         // #the-initial-insertion-mode), not only the root.
         let mut new_html = None;
-        for child in doc.children(DOCUMENT) {
+        for child in doc.children(doc.document()) {
             let copy = self.transplant(doc, child);
             self.append(document, copy);
             if child == src_html {
@@ -11572,7 +11830,7 @@ impl Dom {
         let new_html = new_html?;
         self.append(frame, document);
         self.document_modes
-            .insert(document, doc.document_mode(DOCUMENT));
+            .insert(document, doc.document_mode(doc.document()));
         if let Ok(base_url) = url::Url::parse(base) {
             self.absolutize_subtree_urls(new_html, &base_url);
             self.properties
@@ -12155,9 +12413,9 @@ impl Dom {
             .one(StrTendril::from(html));
         // The fragment's children land under <html> under the document.
         let html_el = frag
-            .child_iter(DOCUMENT)
+            .child_iter(frag.document())
             .find(|&c| frag.tag_name(c) == Some("html"))
-            .unwrap_or(DOCUMENT);
+            .unwrap_or(frag.document());
         frag.child_iter(html_el)
             .map(|c| self.transplant(&frag, c))
             .collect()
@@ -12188,8 +12446,9 @@ impl Dom {
         let src = Dom::parse_html_document_with(html, declarative_shadow_roots, false);
         let doc = self.new_node(NodeData::Document);
         self.nodes[doc].owner_document = doc;
-        self.document_modes.insert(doc, src.document_mode(DOCUMENT));
-        for c in src.child_iter(DOCUMENT) {
+        self.document_modes
+            .insert(doc, src.document_mode(src.document()));
+        for c in src.child_iter(src.document()) {
             let cc = self.transplant(&src, c);
             self.append(doc, cc);
         }
@@ -12454,7 +12713,7 @@ impl Dom {
 
     /// First element (document order) whose id attribute matches.
     pub fn get_by_id(&self, target: &str) -> Option<NodeId> {
-        self.descendants(DOCUMENT)
+        self.descendants(self.document())
             .into_iter()
             .find(|&d| self.attr(d, "id") == Some(target))
     }
@@ -12471,8 +12730,8 @@ impl Dom {
     /// without one every relayout would run in quirks mode.
     pub fn serialize(&self, root: NodeId) -> String {
         let mut out = String::new();
-        if root == DOCUMENT {
-            out.push_str(match self.document_mode(DOCUMENT) {
+        if root == self.document() {
+            out.push_str(match self.document_mode(self.document()) {
                 QuirksMode::NoQuirks => "<!DOCTYPE html>",
                 QuirksMode::LimitedQuirks => {
                     "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Transitional//EN\" \
@@ -14264,7 +14523,7 @@ impl Dom {
     /// classic script executes.
     pub fn scripts(&self) -> Vec<(Option<String>, String, Option<String>, NodeId)> {
         let mut scripts: Vec<_> = self
-            .shadow_including_subtree(DOCUMENT)
+            .shadow_including_subtree(self.document())
             .into_iter()
             .filter(|&d| self.tag_name(d) == Some("script"))
             .map(|d| {
@@ -15301,7 +15560,7 @@ impl<'a> StyleView<'a> {
             }
             cur = self.nodes.parent(a);
         }
-        DOCUMENT
+        self.state.document
     }
 
     /// HTML's "actually disabled": a disableable element with the `disabled`
@@ -17097,11 +17356,11 @@ fn sprite_has_symbol(abs_url: &str, frag: &str) -> bool {
 fn build_sprite_symbols(text: &str) -> FxHashMap<String, String> {
     let dom = Dom::parse_document(text);
     let root = dom
-        .descendants(DOCUMENT)
+        .descendants(dom.document())
         .into_iter()
         .find(|&node| dom.tag_name(node) == Some("svg"));
     let mut out = FxHashMap::default();
-    for sym in dom.descendants(DOCUMENT) {
+    for sym in dom.descendants(dom.document()) {
         if Some(sym) == root
             || !matches!(
                 dom.tag_name(sym),
@@ -25896,7 +26155,7 @@ impl TreeSink for Sink {
     fn parse_error(&self, _msg: Cow<'static, str>) {}
 
     fn get_document(&self) -> NodeId {
-        DOCUMENT
+        self.dom.borrow().document()
     }
 
     fn elem_name<'a>(&'a self, target: &'a NodeId) -> Ref<'a, QualName> {
@@ -25912,7 +26171,8 @@ impl TreeSink for Sink {
         // template contents owner document owns the contents.
         let contents = flags.template.then(|| {
             let contents = dom.new_template_contents();
-            let owner = dom.appropriate_template_contents_owner(DOCUMENT);
+            let document = dom.document();
+            let owner = dom.appropriate_template_contents_owner(document);
             dom.nodes[contents].owner_document = owner;
             contents
         });
@@ -25960,7 +26220,8 @@ impl TreeSink for Sink {
     ) {
         let mut dom = self.dom.borrow_mut();
         let dt = dom.create_doctype(&name, &public_id, &system_id);
-        dom.parser_append(DOCUMENT, dt);
+        let document = dom.document();
+        dom.parser_append(document, dt);
     }
 
     fn get_template_contents(&self, target: &NodeId) -> NodeId {
@@ -25993,7 +26254,9 @@ impl TreeSink for Sink {
     }
 
     fn set_quirks_mode(&self, mode: QuirksMode) {
-        self.dom.borrow_mut().document_modes.insert(DOCUMENT, mode);
+        let mut dom = self.dom.borrow_mut();
+        let document = dom.document();
+        dom.document_modes.insert(document, mode);
     }
 
     fn append_before_sibling(&self, sibling: &NodeId, new_node: NodeOrText<NodeId>) {

@@ -234,7 +234,7 @@ struct Event {
 fn events(dom: &Dom) -> Vec<Event> {
     let mut result = Vec::new();
     let mut previous: FxHashMap<Option<usize>, usize> = FxHashMap::default();
-    let mut stack = vec![(DOCUMENT, None, None)];
+    let mut stack = vec![(dom.document(), None, None)];
     while let Some((id, pseudo, parent)) = stack.pop() {
         // CSS Lists 3 #marker-properties: `display` and the counter
         // properties do not apply to a marker box, only its `content`.

@@ -413,6 +413,40 @@ impl<T> DenseIdMap<T> {
         Some(value)
     }
 
+    /// Remove `id` wherever it is, the old generation included (a node that
+    /// moves to another arena of the group), in constant time. The last old
+    /// entry fills the hole and the last entry fills the gap that leaves at
+    /// the generation boundary, which moves down one slot, so the nursery
+    /// stays a suffix and no old entry becomes young.
+    pub(crate) fn remove_anywhere(&mut self, id: NodeId) -> Option<T> {
+        let slot = self.slot(id)?;
+        let boundary = self.generation.as_ref().map_or(0, |g| g.first_young_slot);
+        if slot >= boundary {
+            return self.remove(id);
+        }
+        self.dense_gaps = false;
+        self.relocated.remove(id);
+        let last_old = boundary - 1;
+        self.slots.swap(slot, last_old);
+        let last = self.slots.len() - 1;
+        self.slots.swap(last_old, last);
+        let (_, value) = self.slots.pop()?;
+        if let Some(generation) = &mut self.generation {
+            generation.first_young_slot = last_old;
+            generation.remembered.remove(&id);
+        }
+        for filled in [slot, last_old] {
+            if let Some(&(moved, _)) = self.slots.get(filled) {
+                if moved == filled {
+                    self.relocated.remove(moved);
+                } else {
+                    self.relocated.insert(moved, filled);
+                }
+            }
+        }
+        Some(value)
+    }
+
     pub(crate) fn shrink_spare(&mut self) {
         if self.slots.capacity() > self.slots.len().saturating_mul(4).max(64) {
             self.slots.shrink_to(self.slots.len().saturating_mul(2));
@@ -452,6 +486,15 @@ impl<T> DenseIdMap<T> {
         None
     }
 
+    /// Insert `value` under `id`, an identity another arena of the group
+    /// allocated (a node moving here). The identities this arena allocates
+    /// later follow it, so the next generation counts it as old, as its slot
+    /// will be.
+    pub(crate) fn insert_moved(&mut self, id: NodeId, value: T) {
+        self.next_id = self.next_id.max(id + 1);
+        self.insert(id, value);
+    }
+
     /// Memo tables commonly omit document/text nodes. Keep short untouched gaps as default
     /// slots so the original parsed-document lookup remains an array access. Never extend by
     /// an unbounded identity gap, or reintroduce holes after compaction has relocated entries.
@@ -471,6 +514,24 @@ impl<T> DenseIdMap<T> {
             }
         }
         self.insert(id, value)
+    }
+
+    /// The identity `allocate` hands out next.
+    pub(crate) fn next_identity(&self) -> NodeId {
+        self.next_id
+    }
+
+    /// Allocate `value` at `id`, an identity a source shared with other
+    /// maps handed out: past every identity this map allocated.
+    pub(crate) fn allocate_at(&mut self, id: NodeId, value: T) -> NodeId {
+        assert!(id >= self.next_id, "shared DOM identities only increase");
+        assert!(
+            (id as u128) < (1u128 << 53) - 1,
+            "DOM identity space exhausted"
+        );
+        self.next_id = id + 1;
+        self.insert(id, value);
+        id
     }
 
     pub(crate) fn allocate(&mut self, value: T) -> NodeId {
@@ -752,5 +813,42 @@ mod tests {
         let c = arena.allocate(9);
         assert!(c > b);
         assert!(arena.get(a).is_none());
+    }
+
+    #[test]
+    fn removal_from_the_old_generation_keeps_the_nursery_a_suffix() {
+        let mut arena = DenseIdMap::default();
+        for i in 0..6 {
+            arena.allocate(i * 10);
+        }
+        arena.enable_generations();
+        let young: Vec<_> = (0..3).map(|i| arena.allocate(100 + i)).collect();
+        arena[2] = 21;
+        assert_eq!(arena.remembered_ids().collect::<Vec<_>>(), [2]);
+        // An old entry in the middle, the last old entry, then with an
+        // empty nursery.
+        assert_eq!(arena.remove_anywhere(2), Some(21));
+        assert_eq!(arena.remembered_ids().count(), 0);
+        assert_eq!(arena.remove_anywhere(5), Some(50));
+        let mut nursery: Vec<_> = arena.young_ids().collect();
+        nursery.sort_unstable();
+        assert_eq!(nursery, young);
+        for (id, value) in [(0, 0), (1, 10), (3, 30), (4, 40)] {
+            assert_eq!(arena.get(id), Some(&value));
+            assert!(!arena.is_young(id));
+        }
+        for (i, &id) in young.iter().enumerate() {
+            assert_eq!(arena.get(id), Some(&(100 + i)));
+        }
+        arena.remove_anywhere(young[0]);
+        assert_eq!(arena.young_ids().count(), 2);
+        arena.finish_generation();
+        assert_eq!(arena.remove_anywhere(0), Some(0));
+        assert_eq!(arena.young_ids().count(), 0);
+        assert_eq!(arena.len(), 5);
+        for (id, value) in [(1, 10), (3, 30), (4, 40), (young[1], 101), (young[2], 102)] {
+            assert_eq!(arena.get(id), Some(&value));
+        }
+        assert!(arena.get(2).is_none() && arena.get(0).is_none());
     }
 }

@@ -565,6 +565,57 @@ pub(super) fn retain(
     shrink!(manual.slot_of, manual.assigned, signals.known);
 }
 
+/// Hand the slotting state of a subtree moving to another arena of the
+/// group (`Dom::transplant_subtree`) to that arena before `retain` drops it
+/// here: manual slot assignments whose slot and slottable both move (another
+/// arena's node is never a child of the host, so never a slottable), each
+/// moved slot's pending slot change signal, the moved shadow roots a parser
+/// created, and the assignment each moved slot last signalled. That one is
+/// only compared, never dereferenced, so it is carried whole: a slot that
+/// left its shadow tree is assigned nothing next and signals the change, as
+/// DOM #concept-node-remove's "assign slottables for a tree" would.
+pub(super) fn transplant(
+    from_manual: &ManualSlots,
+    from_signals: &SlotSignals,
+    into_manual: &mut ManualSlots,
+    into_signals: &mut SlotSignals,
+    moved: &FxHashSet<NodeId>,
+) {
+    for (&node, &slot) in &from_manual.slot_of {
+        if moved.contains(&node) && moved.contains(&slot) {
+            into_manual.slot_of.insert(node, slot);
+        }
+    }
+    for (&slot, nodes) in &from_manual.assigned {
+        if !moved.contains(&slot) {
+            continue;
+        }
+        let nodes: Vec<NodeId> = nodes
+            .iter()
+            .copied()
+            .filter(|node| moved.contains(node))
+            .collect();
+        if !nodes.is_empty() {
+            into_manual.assigned.insert(slot, nodes);
+        }
+    }
+    for (&slot, nodes) in &from_signals.known {
+        if moved.contains(&slot) {
+            into_signals.known.insert(slot, nodes.clone());
+        }
+    }
+    for &slot in &from_signals.pending {
+        if moved.contains(&slot) && !into_signals.pending.contains(&slot) {
+            into_signals.pending.push(slot);
+        }
+    }
+    for &root in &from_signals.parsed_roots {
+        if moved.contains(&root) && !into_signals.parsed_roots.contains(&root) {
+            into_signals.parsed_roots.push(root);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

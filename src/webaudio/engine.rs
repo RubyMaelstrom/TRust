@@ -164,6 +164,10 @@ pub enum Notice {
     SuspendMissed(u64),
     /// A startRendering() job's buffer.
     Rendered(Arc<AudioData>),
+    /// A real-time context's output became audible (a quantum above the
+    /// silence threshold) or silent (none for `SILENT_AFTER`): the
+    /// frontend's indication that the page makes sound.
+    Audible(bool),
     /// A startRendering() buffer could not be allocated.
     RenderFailed,
     /// An AudioWorkletProcessor threw (fire `processorerror`).
@@ -407,6 +411,55 @@ impl Render for Feed {
     }
 }
 
+/// Silence this long ends a real-time context's audibility.
+const SILENT_AFTER: Duration = Duration::from_secs(2);
+/// A sample within this of zero is silence (-80 dBFS).
+const SILENCE: f32 = 1.0e-4;
+
+/// Whether a real-time context's output makes sound, with hysteresis: one
+/// quantum above the silence threshold makes it audible; `SILENT_AFTER` of
+/// silent output makes it silent again.
+struct OutputLevel {
+    audible: bool,
+    silent_frames: u64,
+    silent_limit: u64,
+    channels: usize,
+}
+
+impl OutputLevel {
+    fn new(rate: f32, channels: usize) -> Self {
+        Self {
+            audible: false,
+            silent_frames: 0,
+            silent_limit: (f64::from(rate.max(1.0)) * SILENT_AFTER.as_secs_f64()) as u64,
+            channels: channels.max(1),
+        }
+    }
+
+    /// The output's audibility, when this block of interleaved samples
+    /// changes it.
+    fn observe(&mut self, samples: &[f32]) -> Option<bool> {
+        if samples.iter().any(|sample| sample.abs() > SILENCE) {
+            self.silent_frames = 0;
+            return (!std::mem::replace(&mut self.audible, true)).then_some(true);
+        }
+        if !self.audible {
+            return None;
+        }
+        self.silent_frames += (samples.len() / self.channels) as u64;
+        (self.silent_frames >= self.silent_limit).then(|| {
+            self.audible = false;
+            false
+        })
+    }
+
+    /// The output stopped (the context suspended or closed).
+    fn stop(&mut self) -> Option<bool> {
+        self.silent_frames = 0;
+        std::mem::take(&mut self.audible).then_some(false)
+    }
+}
+
 fn run_realtime(
     shared: &Arc<Shared>,
     mut graph: Graph,
@@ -421,6 +474,7 @@ fn run_realtime(
     let _ = shared.ring.set(ring.clone());
     let mut device_bus = Bus::new(channels, quantum);
     let mut interleaved = vec![0f32; room];
+    let mut output_level = OutputLevel::new(config.rate, channels);
     let mut notices = Vec::new();
     let mut worklet: Option<Box<dyn Worklet>> = None;
     let setup = setup(shared, &graph);
@@ -472,11 +526,17 @@ fn run_realtime(
                         output.set_paused(true);
                     }
                     running = false;
+                    if let Some(audible) = output_level.stop() {
+                        notices.push(Notice::Audible(audible));
+                    }
                     notices.push(Notice::Suspended(token));
                 }
                 Command::Close(token) => {
                     // #AudioContext-methods close(): release the device and
                     // stop rendering for good.
+                    if let Some(audible) = output_level.stop() {
+                        notices.push(Notice::Audible(audible));
+                    }
                     shared.closed.store(true, Ordering::Release);
                     shared
                         .device
@@ -501,6 +561,9 @@ fn run_realtime(
                 for channel in 0..channels {
                     interleaved[frame * channels + channel] = device_bus.channel(channel)[frame];
                 }
+            }
+            if let Some(audible) = output_level.observe(&interleaved) {
+                notices.push(Notice::Audible(audible));
             }
             ring.push(&interleaved);
             shared.frame.store(graph.frame, Ordering::Release);
@@ -640,6 +703,32 @@ fn run_offline(shared: &Arc<Shared>, mut graph: Graph, channels: usize, notify: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_audibility_has_hysteresis_and_ends_with_the_output() {
+        // 2 channels at 1000 Hz: two seconds of silence are 2000 frames.
+        let mut level = OutputLevel::new(1000.0, 2);
+        let silent = vec![0.0f32; 256];
+        let mut loud = silent.clone();
+        loud[17] = 0.25;
+        assert_eq!(level.observe(&silent), None, "silence starts silent");
+        assert_eq!(level.observe(&loud), Some(true));
+        assert_eq!(level.observe(&loud), None);
+        // Quiet passages shorter than two seconds keep it audible.
+        for _ in 0..14 {
+            assert_eq!(level.observe(&silent), None);
+        }
+        assert_eq!(level.observe(&loud), None);
+        let mut ended = None;
+        for _ in 0..16 {
+            ended = ended.or(level.observe(&silent));
+        }
+        assert_eq!(ended, Some(false), "two seconds of silence end it");
+        assert_eq!(level.observe(&[f32::NAN; 4]), None, "NaN is not sound");
+        assert_eq!(level.observe(&loud), Some(true));
+        assert_eq!(level.stop(), Some(false), "a suspended context is silent");
+        assert_eq!(level.stop(), None);
+    }
     use crate::webaudio::bus::{ChannelConfig, CountMode, Interpretation};
     use crate::webaudio::graph::NodeInit;
     use crate::webaudio::nodes::{Control, Destination, Oscillator};
@@ -788,17 +877,24 @@ mod tests {
         // About 0.3 s of audio (a loaded machine may lag), never far ahead.
         assert!(frame > 4_800 && frame < 48_000, "{frame}");
         engine.send(Command::Suspend(2));
-        assert!(matches!(
-            notices.recv_timeout(Duration::from_secs(5)),
-            Ok(Notice::Suspended(2))
-        ));
+        // Rendering reports what the device hears along the way.
+        let suspended = loop {
+            match notices.recv_timeout(Duration::from_secs(5)) {
+                Ok(Notice::Audible(_)) => {}
+                other => break other,
+            }
+        };
+        assert!(matches!(suspended, Ok(Notice::Suspended(2))));
         let held = engine.frame();
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(engine.frame(), held);
         engine.send(Command::Close(3));
-        assert!(matches!(
-            notices.recv_timeout(Duration::from_secs(5)),
-            Ok(Notice::Closed(3))
-        ));
+        let closed = loop {
+            match notices.recv_timeout(Duration::from_secs(5)) {
+                Ok(Notice::Audible(_)) => {}
+                other => break other,
+            }
+        };
+        assert!(matches!(closed, Ok(Notice::Closed(3))));
     }
 }

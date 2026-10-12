@@ -234,7 +234,7 @@ impl<'a> Environment<'a> {
                             };
                             document
                                 .dom
-                                .canvas_svg_filter(crate::dom::DOCUMENT, &fragment)?
+                                .canvas_svg_filter(document.dom.document(), &fragment)?
                         }
                     };
                     chain.push(Resolved::Svg {

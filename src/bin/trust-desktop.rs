@@ -133,8 +133,12 @@ fn ensure_embedded_heart_assets(store: &ImageStore) -> Result<(), String> {
 #[derive(Debug)]
 enum DesktopEvent {
     Bookmarks(trust::bookmarks::Completion),
-    BrowserWake,
+    /// A tab's controller has asynchronous events (`None`: the shown tab's
+    /// shared services, such as site storage notices).
+    BrowserWake(Option<tabs::TabId>),
     ChromeTick,
+    /// The tab strip's loading jewels need their next frame.
+    StripTick,
     ImageLoaded {
         generation: u64,
         image_epoch: u64,
@@ -171,6 +175,8 @@ enum DesktopEvent {
     },
     /// A selection drag beyond the content viewport scrolls it.
     SelectionAutoscroll,
+    /// A background tab may have stayed unseen long enough to sleep.
+    SleepCheck,
 }
 
 /// A drag of native files from another application over the window. winit reports the files
@@ -216,8 +222,14 @@ impl NativeFileDrag {
 
 #[path = "trust-desktop/context_menu.rs"]
 mod context_menu;
+#[path = "trust-desktop/tabs.rs"]
+mod tabs;
 #[path = "trust-desktop/text_selection.rs"]
 mod text_selection;
+#[path = "trust-desktop/unload_prompt.rs"]
+mod unload_prompt;
+#[path = "trust-desktop/window_chrome.rs"]
+mod window_chrome;
 
 /// The pointer's position in the window while another application's drag holds the pointer
 /// grab (winit 0.30 delivers no motion then), in physical pixels.
@@ -1104,7 +1116,23 @@ struct ImageLoadScheduler {
     retired: bool,
 }
 
+/// Image request epochs are unique across tabs, so a completion for one
+/// tab's document can never be taken for another's.
+fn next_image_epoch() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 impl ImageLoadScheduler {
+    /// The tab went to the background: its requests stop, and those still
+    /// wanted are made again when it is shown (they are neither failed nor
+    /// complete).
+    fn suspend(&mut self) {
+        self.epoch = next_image_epoch();
+        self.queued.clear();
+        self.pending.clear();
+    }
+
     /// HTML #nav-stop for a document that stays live: requests in flight end
     /// as broken (their fetches were aborted) and their completions become
     /// inert, while the document may still request images afterwards.
@@ -1112,7 +1140,7 @@ impl ImageLoadScheduler {
         if self.retired || (self.pending.is_empty() && self.queued.is_empty()) {
             return false;
         }
-        self.epoch = self.epoch.wrapping_add(1);
+        self.epoch = next_image_epoch();
         self.queued.clear();
         let pending: Vec<ImageHandle> = self.pending.drain().collect();
         self.failed.extend(pending);
@@ -1125,7 +1153,7 @@ impl ImageLoadScheduler {
         }
         self.generation = Some(generation);
         self.page = Some(page.to_string());
-        self.epoch = self.epoch.wrapping_add(1);
+        self.epoch = next_image_epoch();
         self.queued.clear();
         self.pending.clear();
         self.failed.clear();
@@ -1139,7 +1167,7 @@ impl ImageLoadScheduler {
             return false;
         }
         self.retired = true;
-        self.epoch = self.epoch.wrapping_add(1);
+        self.epoch = next_image_epoch();
         self.queued.clear();
         self.pending.clear();
         true
@@ -1844,7 +1872,28 @@ impl SelectPopup {
 }
 
 struct DesktopApp {
-    browser: BrowserController,
+    /// The tab shown in the window. Every other tab is in `tabs`.
+    tab: Box<tabs::Tab>,
+    tabs: tabs::TabSet,
+    /// The tab strip's interaction state.
+    strip: window_chrome::StripUi,
+    /// Only the tab strip needs repainting (`draw_partial`), and where its
+    /// commands lie in the retained scene.
+    strip_redraw_pending: bool,
+    strip_range: std::ops::Range<usize>,
+    /// Since when a background tab has been loading, which the strip's
+    /// loading jewels pulse from while the shown tab is not loading.
+    background_loading_since: Option<Instant>,
+    strip_tick_scheduled: bool,
+    /// The title last given to the native window.
+    window_title: String,
+    /// Keys whose press was a browser shortcut: their release is the
+    /// browser's too.
+    swallowed_keys: HashSet<winit::keyboard::PhysicalKey>,
+    /// The hyperlink the middle button was pressed on.
+    aux_press_link: Option<String>,
+    /// When the next `SleepCheck` is due, if one is scheduled.
+    sleep_check_scheduled: Option<Instant>,
     /// A page's file prompt is showing in the native dialog (one at a time),
     /// for the document of this generation.
     file_dialog_open: bool,
@@ -1879,51 +1928,14 @@ struct DesktopApp {
     modifiers: ModifiersState,
     screen_origin: (i32, i32),
     page_pointer_buttons: u16,
-    focus: FocusTarget,
-    /// The command-line URL starts only after the native window reports its
-    /// real CSS viewport and device scale. Responsive scripts must not observe
-    /// the constructor's provisional 1x environment during initial parsing.
-    initial_navigation: Option<String>,
-    find: TextEditor,
-    command: TextEditor,
     command_history: trust::command::History,
-    /// RAM-only line-entry history, separate from COMMAND for this app run.
-    session_history: trust::command::History,
-    file_action_selected: usize,
     downloads_in_flight: usize,
-    form_editor: Option<TextEditor>,
-    form_scroll_x: f32,
-    /// A select's open drop-down box.
-    select_popup: Option<SelectPopup>,
-    /// A press outside the drop-down box closed it; its release is consumed.
-    select_popup_swallow_release: bool,
     composing: bool,
-    page_layout: Option<PageLayoutCache>,
-    protocol_page: Option<ProtocolPageCache>,
     runtime: Handle,
     event_proxy: EventLoopProxy<DesktopEvent>,
     image_store: ImageStore,
-    image_sizes: trust::layout2::ImageSizes,
-    /// Number of decoded intrinsic sizes successfully queued to the resident
-    /// page actor. `try_send` can legitimately find the command queue full;
-    /// retain the unsent map and retry from the native draw/event loop.
-    image_sizes_sent: usize,
-    image_loads: ImageLoadScheduler,
-    image_tasks: HashMap<ImageHandle, tokio::task::JoinHandle<()>>,
-    image_flush_scheduled: bool,
-    decoded_images_pending_layout: bool,
-    animation_sources: AnimationSourceStore,
     animations: AnimationPlayer,
-    active_animations: HashSet<ImageHandle>,
-    image_schedule_key: Option<ImageScheduleKey>,
     window_focused: bool,
-    hovered_actor: Option<usize>,
-    hover_document_generation: u64,
-    css_animation_generation: u64,
-    css_animation_started: Instant,
-    link_preview: String,
-    /// The user's selection of page text (`text_selection`).
-    text_selection: text_selection::TextSelectionState,
     /// The page's context menu, while it shows (`context_menu`).
     context_menu: Option<context_menu::PageContextMenu>,
     /// A secondary click or the menu key asked a live page whether the
@@ -1932,36 +1944,24 @@ struct DesktopApp {
     /// The button whose press closed the context menu; its release is
     /// consumed with it.
     context_menu_swallow: Option<MouseButton>,
-    /// The bookmark store's last answer about an address: its bookmarks.
-    page_bookmark: Option<(String, Vec<u64>)>,
-    /// Only the overlay needs repainting (`draw_overlay`).
+    /// Only the overlay needs repainting (`draw_partial`).
     overlay_redraw_pending: bool,
     /// Where the overlay's commands start in the retained scene, and the
     /// rectangle they painted.
     overlay_start: usize,
     overlay_damage: Option<CssRect>,
-    find_matches: Vec<TextSelection>,
-    find_index: usize,
+    /// A page's request that the user confirm leaving it, while it shows
+    /// (`unload_prompt`), and the requests waiting behind it.
+    unload_prompt: Option<unload_prompt::UnloadPromptUi>,
+    queued_unload_prompts: VecDeque<(tabs::TabId, trust::js::UnloadPrompt)>,
+    /// Tabs whose pages were asked whether they may be left, and why.
+    leaving: HashMap<tabs::TabId, (u64, unload_prompt::Leaving)>,
+    /// Quitting waits for the pages' answers.
+    quitting: Option<unload_prompt::Quitting>,
     clipboard: Option<arboard::Clipboard>,
     exit_requested: bool,
-    terminal: Option<TerminalSession>,
-    bookmark_terminal: Option<TerminalSession>,
     bookmarks: Option<trust::bookmarks::Worker>,
-    bookmark_filter: String,
-    gopher_query: Option<trust::gopher::GopherUrl>,
-    gemini_input: bool,
-    pending_page_keys: VecDeque<PendingPageKey>,
-    browser_events_pending: bool,
-    queued_form_keys: VecDeque<PendingPageKey>,
-    keyboard_target: Option<PageHit>,
-    pressed_hit: Option<PageHit>,
     pressed_control: Option<ControlId>,
-    heart_hover: Option<ScrollbarAxis>,
-    heart_drag: Option<HeartDrag>,
-    heart_glide: Option<HeartGlide>,
-    last_document_generation: u64,
-    last_vertical_heart_fraction: Option<f32>,
-    loading_started: Option<Instant>,
     chrome_tick_scheduled: bool,
     /// When the earliest scheduled `ChromeTick` fires, if `schedule_chrome_tick`
     /// set it. A request for an earlier tick schedules another.
@@ -2223,6 +2223,28 @@ fn native_cursor_pixels(
 
 impl DesktopApp {
     fn new(
+        runtime: Handle,
+        event_proxy: EventLoopProxy<DesktopEvent>,
+        renderer_preference: RendererPreference,
+        initial_navigation: Option<String>,
+    ) -> Self {
+        let mut tabs = tabs::TabSet::default();
+        let first = tabs.allocate_id();
+        let browser = tabs::new_controller(&runtime, &event_proxy, first);
+        Self::with_first_tab(
+            tabs,
+            first,
+            browser,
+            runtime,
+            event_proxy,
+            renderer_preference,
+            initial_navigation,
+        )
+    }
+
+    fn with_first_tab(
+        tabs: tabs::TabSet,
+        first: tabs::TabId,
         mut browser: BrowserController,
         runtime: Handle,
         event_proxy: EventLoopProxy<DesktopEvent>,
@@ -2231,16 +2253,25 @@ impl DesktopApp {
     ) -> Self {
         let clipboard = arboard::Clipboard::new().ok();
         browser.set_clipboard_available(clipboard.is_some());
-        browser.set_fullscreen_available(true);
-        browser.set_file_picker_available(true);
-        let style = chrome_text_style();
         let image_store = ImageStore::default();
         if let Err(error) = ensure_embedded_heart_assets(&image_store) {
             eprintln!("trust-desktop: heart assets unavailable: {error}");
         }
         let animations = AnimationPlayer::new(event_proxy.clone());
+        let mut tabs = tabs;
+        tabs.order.push(first);
         Self {
-            browser,
+            tab: Box::new(tabs::Tab::new(first, browser, initial_navigation)),
+            tabs,
+            strip: Default::default(),
+            strip_redraw_pending: false,
+            strip_range: 0..0,
+            background_loading_since: None,
+            strip_tick_scheduled: false,
+            window_title: String::new(),
+            swallowed_keys: HashSet::new(),
+            aux_press_link: None,
+            sleep_check_scheduled: None,
             file_dialog_open: false,
             file_dialog_generation: 0,
             file_drag: None,
@@ -2270,70 +2301,28 @@ impl DesktopApp {
             modifiers: ModifiersState::empty(),
             screen_origin: (0, 0),
             page_pointer_buttons: 0,
-            focus: FocusTarget::for_startup(initial_navigation.as_deref()),
-            initial_navigation,
-            find: TextEditor::new("", &style, 500.0, false),
-            command: TextEditor::new("", &style, 700.0, false),
             command_history: trust::command::History::default(),
-            session_history: trust::command::History::default(),
-            file_action_selected: 0,
             downloads_in_flight: 0,
-            form_editor: None,
-            form_scroll_x: 0.0,
-            select_popup: None,
-            select_popup_swallow_release: false,
             composing: false,
-            page_layout: None,
-            protocol_page: None,
             runtime,
             event_proxy,
             image_store,
-            image_sizes: trust::layout2::ImageSizes::new(),
-            image_sizes_sent: 0,
-            image_loads: ImageLoadScheduler::default(),
-            image_tasks: HashMap::new(),
-            image_flush_scheduled: false,
-            decoded_images_pending_layout: false,
-            animation_sources: AnimationSourceStore::default(),
             animations,
-            active_animations: HashSet::new(),
-            image_schedule_key: None,
             window_focused: true,
-            hovered_actor: None,
-            hover_document_generation: 0,
-            css_animation_generation: 0,
-            css_animation_started: Instant::now(),
-            link_preview: String::new(),
-            text_selection: Default::default(),
             context_menu: None,
             context_menu_request: None,
             context_menu_swallow: None,
-            page_bookmark: None,
             overlay_redraw_pending: false,
             overlay_start: 0,
             overlay_damage: None,
-            find_matches: Vec::new(),
-            find_index: 0,
+            unload_prompt: None,
+            queued_unload_prompts: VecDeque::new(),
+            leaving: HashMap::new(),
+            quitting: None,
             clipboard,
             exit_requested: false,
-            terminal: None,
-            bookmark_terminal: None,
             bookmarks: None,
-            bookmark_filter: String::new(),
-            gopher_query: None,
-            gemini_input: false,
-            pending_page_keys: VecDeque::new(),
-            browser_events_pending: false,
-            queued_form_keys: VecDeque::new(),
-            keyboard_target: None,
-            pressed_hit: None,
             pressed_control: None,
-            heart_hover: None,
-            heart_drag: None,
-            heart_glide: None,
-            last_document_generation: 0,
-            last_vertical_heart_fraction: None,
-            loading_started: None,
             chrome_tick_scheduled: false,
             chrome_tick_deadline: None,
             redraw_pending: false,
@@ -2350,12 +2339,12 @@ impl DesktopApp {
         visible_retries: &HashSet<ImageHandle>,
     ) {
         self.sync_image_document(generation, page);
-        if self.image_loads.retired {
+        if self.tab.image_loads.retired {
             return;
         }
-        let image_epoch = self.image_loads.epoch();
+        let image_epoch = self.tab.image_loads.epoch();
         for request in requests {
-            if self.image_loads.completed.contains(&request.handle)
+            if self.tab.image_loads.completed.contains(&request.handle)
                 && self.image_store.contains(request.handle)
             {
                 if visible_retries.contains(&request.handle) {
@@ -2364,22 +2353,25 @@ impl DesktopApp {
                 continue;
             }
             if let Some(image) = self.image_store.get(request.handle) {
-                if self.image_loads.mark_cached(request.handle)
-                    && self.image_sizes.get(&request.source) != Some(&(image.width, image.height))
+                if self.tab.image_loads.mark_cached(request.handle)
+                    && self.tab.image_sizes.get(&request.source)
+                        != Some(&(image.width, image.height))
                 {
-                    self.image_sizes
+                    self.tab
+                        .image_sizes
                         .insert(request.source.clone(), (image.width, image.height));
-                    self.decoded_images_pending_layout = true;
+                    self.tab.decoded_images_pending_layout = true;
                 }
                 continue;
             }
-            if self.image_loads.failed.contains(&request.handle) {
+            if self.tab.image_loads.failed.contains(&request.handle) {
                 continue;
             }
-            if let Some(result) =
-                self.image_loads
-                    .prepare_svg_data(request, &self.image_store, &mut self.image_sizes)
-            {
+            if let Some(result) = self.tab.image_loads.prepare_svg_data(
+                request,
+                &self.image_store,
+                &mut self.tab.image_sizes,
+            ) {
                 match result {
                     Ok(evicted) => self.handle_decoded_image_evictions(evicted),
                     Err(error) => {
@@ -2388,48 +2380,50 @@ impl DesktopApp {
                         }
                     }
                 }
-                self.decoded_images_pending_layout = true;
+                self.tab.decoded_images_pending_layout = true;
                 continue;
             }
-            if self.image_loads.completed.contains(&request.handle) {
+            if self.tab.image_loads.completed.contains(&request.handle) {
                 if !visible_retries.contains(&request.handle) {
                     continue;
                 }
-                self.image_loads.retry_evicted(request.handle);
+                self.tab.image_loads.retry_evicted(request.handle);
             }
-            self.image_loads.enqueue(request.clone());
+            self.tab.image_loads.enqueue(request.clone());
         }
         self.pump_image_loads(generation, image_epoch, page);
-        if self.decoded_images_pending_layout {
+        if self.tab.decoded_images_pending_layout {
             self.flush_images_when_settled(generation, image_epoch);
         }
     }
 
     fn sync_image_document(&mut self, generation: u64, page: &url::Url) {
-        if !self.image_loads.reset(generation, page) {
+        if !self.tab.image_loads.reset(generation, page) {
             return;
         }
         // Decoded pixels belong to one foreground document. Compressed HTTP
         // cache entries remain reusable, but retaining the previous page's
         // full decoded gallery would pin its high-water after navigation.
         self.image_store.clear();
-        self.image_sizes.clear();
+        self.tab.image_sizes.clear();
         self.custom_cursors.clear();
         self.cursor_hotspots.clear();
-        self.image_sizes_sent = 0;
-        self.animation_sources.clear();
-        self.active_animations.clear();
-        self.image_schedule_key = None;
-        self.animations.reset(generation, self.image_loads.epoch());
-        for (_, task) in self.image_tasks.drain() {
+        self.tab.image_sizes_sent = 0;
+        self.tab.animation_sources.clear();
+        self.tab.active_animations.clear();
+        self.tab.image_schedule_key = None;
+        self.animations
+            .reset(generation, self.tab.image_loads.epoch());
+        for (_, task) in self.tab.image_tasks.drain() {
             task.abort();
         }
-        self.image_flush_scheduled = false;
-        self.decoded_images_pending_layout = false;
+        self.tab.image_flush_scheduled = false;
+        self.tab.decoded_images_pending_layout = false;
     }
 
     fn current_page_blobs(&self) -> Option<trust::js::BlobMap> {
-        self.browser
+        self.tab
+            .browser
             .current_page()
             .and_then(|page| match &page.document {
                 FetchedDocument::Http(response) => response.blobs.clone(),
@@ -2443,30 +2437,33 @@ impl DesktopApp {
     /// discards their queued tasks; the epoch makes already-queued native
     /// completion events equally inert.
     fn retire_page_loading(&mut self) {
-        if let Some(cache) = &mut self.page_layout {
+        if let Some(cache) = &mut self.tab.page_layout {
             cache.frozen = true;
         }
-        if !self.image_loads.retire() {
+        if !self.tab.image_loads.retire() {
             return;
         }
-        for (_, task) in self.image_tasks.drain() {
+        for (_, task) in self.tab.image_tasks.drain() {
             task.abort();
         }
-        self.image_flush_scheduled = false;
-        self.decoded_images_pending_layout = false;
-        self.animation_sources.clear();
-        self.active_animations.clear();
-        self.image_schedule_key = None;
-        self.animations
-            .reset(self.browser.document_generation(), self.image_loads.epoch());
+        self.tab.image_flush_scheduled = false;
+        self.tab.decoded_images_pending_layout = false;
+        self.tab.animation_sources.clear();
+        self.tab.active_animations.clear();
+        self.tab.image_schedule_key = None;
+        self.animations.reset(
+            self.tab.browser.document_generation(),
+            self.tab.image_loads.epoch(),
+        );
     }
 
     fn pump_image_loads(&mut self, generation: u64, image_epoch: u64, page: &url::Url) {
-        let slots = IMAGE_FETCH_CONCURRENCY.saturating_sub(self.image_tasks.len());
+        let slots = IMAGE_FETCH_CONCURRENCY.saturating_sub(self.tab.image_tasks.len());
         let blobs = self.current_page_blobs();
         // HTML #updating-the-image-data: the live document requests its own
         // images; present those responses instead of fetching again.
         let images = self
+            .tab
             .browser
             .current_page()
             .and_then(|page| match &page.document {
@@ -2474,14 +2471,17 @@ impl DesktopApp {
                 _ => None,
             });
         // Fetch #main-fetch step 7: the Document's policy container's policy.
-        let referrer_policy = self
-            .browser
-            .current_page()
-            .map_or_else(Default::default, |page| match &page.document {
-                FetchedDocument::Http(response) => trust::http::response_referrer_policy(response),
-                _ => Default::default(),
-            });
-        for request in self.image_loads.take_ready(slots) {
+        let referrer_policy =
+            self.tab
+                .browser
+                .current_page()
+                .map_or_else(Default::default, |page| match &page.document {
+                    FetchedDocument::Http(response) => {
+                        trust::http::response_referrer_policy(response)
+                    }
+                    _ => Default::default(),
+                });
+        for request in self.tab.image_loads.take_ready(slots) {
             let proxy = self.event_proxy.clone();
             let page = page.clone();
             let source = request.source.clone();
@@ -2489,6 +2489,7 @@ impl DesktopApp {
             let blobs = blobs.clone();
             let images = images.clone();
             let restricted = self
+                .tab
                 .browser
                 .current_page()
                 .and_then(|page| page.rendered_page())
@@ -2523,15 +2524,15 @@ impl DesktopApp {
                     result,
                 });
             });
-            self.image_tasks.insert(handle, task);
+            self.tab.image_tasks.insert(handle, task);
         }
     }
 
     fn schedule_image_flush(&mut self, generation: u64, image_epoch: u64) {
-        if self.image_flush_scheduled {
+        if self.tab.image_flush_scheduled {
             return;
         }
-        self.image_flush_scheduled = true;
+        self.tab.image_flush_scheduled = true;
         let proxy = self.event_proxy.clone();
         self.runtime.spawn(async move {
             tokio::time::sleep(IMAGE_PROGRESS_RELAYOUT_DELAY).await;
@@ -2543,7 +2544,7 @@ impl DesktopApp {
     }
 
     fn flush_images_when_settled(&mut self, generation: u64, image_epoch: u64) {
-        if self.image_loads.pending.is_empty() {
+        if self.tab.image_loads.pending.is_empty() {
             // Do not make a fast gallery wait for the progressive-load timer.
             // A previously armed timer is harmless: after this event drains the
             // dirty flag, the delayed event becomes a no-op.
@@ -2564,13 +2565,13 @@ impl DesktopApp {
     }
 
     fn set_active_animations(&mut self, handles: HashSet<ImageHandle>) {
-        if self.active_animations == handles {
+        if self.tab.active_animations == handles {
             return;
         }
-        self.active_animations = handles.clone();
+        self.tab.active_animations = handles.clone();
         self.animations.set_active(
-            self.browser.document_generation(),
-            self.image_loads.epoch(),
+            self.tab.browser.document_generation(),
+            self.tab.image_loads.epoch(),
             handles,
         );
     }
@@ -2579,21 +2580,21 @@ impl DesktopApp {
         if evicted.is_empty() {
             return;
         }
-        self.image_schedule_key = None;
+        self.tab.image_schedule_key = None;
         for handle in evicted {
-            if self.animation_sources.remove(handle).is_some() {
+            if self.tab.animation_sources.remove(handle).is_some() {
                 self.animations.unregister(handle);
             }
-            self.image_loads.retry_evicted(handle);
-            self.active_animations.remove(&handle);
+            self.tab.image_loads.retry_evicted(handle);
+            self.tab.active_animations.remove(&handle);
         }
     }
 
     fn chrome_loading(&self, snapshot: &trust::core::BrowserSnapshot) -> bool {
         snapshot.loading
-            || !self.image_loads.pending.is_empty()
-            || !self.image_tasks.is_empty()
-            || self.image_flush_scheduled
+            || !self.tab.image_loads.pending.is_empty()
+            || !self.tab.image_tasks.is_empty()
+            || self.tab.image_flush_scheduled
             || self.downloads_in_flight > 0
     }
 
@@ -2620,11 +2621,12 @@ impl DesktopApp {
     /// `None` once every animation is paused or finished. Composition then
     /// stops sampling the timeline instead of presenting identical frames.
     fn css_animation_wake(&mut self) -> Option<Duration> {
-        if !self.window_focused || self.page_layout.is_none() {
+        if !self.window_focused || self.tab.page_layout.is_none() {
             return None;
         }
         let elapsed = self.css_animation_elapsed();
         let wake = self
+            .tab
             .page_layout
             .as_ref()?
             .layout
@@ -2637,22 +2639,23 @@ impl DesktopApp {
         // Web Animations #document-timelines: focus affects frame scheduling,
         // not the document's monotonically increasing timeline. A redraw on
         // blur must not rewind filled animations to their first keyframe.
-        let generation = self.browser.document_generation();
-        if self.css_animation_generation != generation {
-            self.css_animation_generation = generation;
-            self.css_animation_started = Instant::now();
+        let generation = self.tab.browser.document_generation();
+        if self.tab.css_animation_generation != generation {
+            self.tab.css_animation_generation = generation;
+            self.tab.css_animation_started = Instant::now();
         }
         // A page actor's paint carries the document timeline its animation
         // start times are measured on; a script-free document's timeline
         // starts when this frontend first presents it.
-        self.page_layout
+        self.tab
+            .page_layout
             .as_ref()
             .and_then(|page| page.layout.paint.timeline_seconds())
-            .unwrap_or_else(|| self.css_animation_started.elapsed().as_secs_f32())
+            .unwrap_or_else(|| self.tab.css_animation_started.elapsed().as_secs_f32())
     }
 
     fn cancel_heart_glide(&mut self) {
-        self.heart_glide = None;
+        self.tab.heart_glide = None;
     }
 
     fn heart_visual(
@@ -2662,53 +2665,55 @@ impl DesktopApp {
     ) -> HeartVisual {
         let now = Instant::now();
         let loading = self.chrome_loading(snapshot);
-        match (loading, self.loading_started) {
-            (true, None) => self.loading_started = Some(now),
-            (false, Some(_)) => self.loading_started = None,
+        match (loading, self.tab.loading_started) {
+            (true, None) => self.tab.loading_started = Some(now),
+            (false, Some(_)) => self.tab.loading_started = None,
             _ => {}
         }
         let energy = self
+            .tab
             .loading_started
             .map_or(0.0, |started| heartbeat_energy(now.duration_since(started)));
         let actual_vertical = scrollbar_fraction(
-            self.browser.interaction().scroll.y,
+            self.tab.browser.interaction().scroll.y,
             scene.page_size.height,
             scene.content_viewport.height,
         )
         .or_else(|| (scene.page_size.height > 0.0 || loading).then_some(0.0));
         let actual_horizontal = scrollbar_fraction(
-            self.browser.interaction().scroll.x,
+            self.tab.browser.interaction().scroll.x,
             scene.page_size.width,
             scene.content_viewport.width,
         );
-        let generation = self.browser.document_generation();
-        if self.last_document_generation == 0 {
-            self.last_document_generation = generation;
-        } else if generation != self.last_document_generation {
+        let generation = self.tab.browser.document_generation();
+        if self.tab.last_document_generation == 0 {
+            self.tab.last_document_generation = generation;
+        } else if generation != self.tab.last_document_generation {
             let from = self
+                .tab
                 .last_vertical_heart_fraction
                 .or(actual_vertical)
                 .unwrap_or(0.0);
             let to = actual_vertical.unwrap_or(0.0);
-            self.heart_glide = ((from - to).abs() > 0.001).then_some(HeartGlide {
+            self.tab.heart_glide = ((from - to).abs() > 0.001).then_some(HeartGlide {
                 from,
                 to,
                 started: now,
             });
-            self.last_document_generation = generation;
+            self.tab.last_document_generation = generation;
         }
-        if let Some(glide) = &mut self.heart_glide {
+        if let Some(glide) = &mut self.tab.heart_glide {
             // Fragment navigation and history restoration can establish their
             // authoritative offset just after document commit. The decoration
             // follows that actual offset; it never delays or rewrites it.
             glide.to = actual_vertical.unwrap_or(0.0);
         }
-        let vertical_fraction = match self.heart_glide {
+        let vertical_fraction = match self.tab.heart_glide {
             Some(glide) => {
                 let (position, finished) =
                     heart_glide_position(glide.from, glide.to, now.duration_since(glide.started));
                 if finished {
-                    self.heart_glide = None;
+                    self.tab.heart_glide = None;
                     actual_vertical
                 } else {
                     Some(position)
@@ -2716,27 +2721,27 @@ impl DesktopApp {
             }
             None => actual_vertical,
         };
-        self.last_vertical_heart_fraction = vertical_fraction;
+        self.tab.last_vertical_heart_fraction = vertical_fraction;
         HeartVisual {
             vertical_visible: scene.page_size.height > 0.0 || loading,
             vertical_fraction,
             horizontal_fraction: actual_horizontal,
             energy,
-            vertical_engaged: self.heart_hover == Some(ScrollbarAxis::Vertical),
-            horizontal_engaged: self.heart_hover == Some(ScrollbarAxis::Horizontal),
-            dragging: self.heart_drag.map(|drag| drag.axis),
+            vertical_engaged: self.tab.heart_hover == Some(ScrollbarAxis::Vertical),
+            horizontal_engaged: self.tab.heart_hover == Some(ScrollbarAxis::Horizontal),
+            dragging: self.tab.heart_drag.map(|drag| drag.axis),
         }
     }
 
     fn dispatch(&mut self, action: UserAction) {
         if matches!(action, UserAction::Back)
-            && self.bookmark_terminal.is_some()
-            && self.browser.snapshot().address == "about:bookmarks"
+            && self.tab.bookmark_terminal.is_some()
+            && self.tab.browser.snapshot().address == "about:bookmarks"
         {
-            self.terminal = self.bookmark_terminal.take();
-            let address = self.terminal.as_ref().unwrap().address.clone();
-            self.browser.open_external_session(address);
-            self.protocol_page = None;
+            self.tab.terminal = self.tab.bookmark_terminal.take();
+            let address = self.tab.terminal.as_ref().unwrap().address.clone();
+            self.tab.browser.open_external_session(address);
+            self.tab.protocol_page = None;
             self.set_focus(FocusTarget::Page);
             self.request_redraw();
             return;
@@ -2763,18 +2768,18 @@ impl DesktopApp {
                 | UserAction::Navigate(_)
                 | UserAction::Activate(_)
         );
-        if leaves_terminal && let Some(session) = self.terminal.take() {
+        if leaves_terminal && let Some(session) = self.tab.terminal.take() {
             let _ = session
                 .handle
                 .commands
                 .try_send(trust::telnet::Command::Close);
         }
         if leaves_keyboard_target {
-            self.keyboard_target = None;
-            self.pending_page_keys.clear();
-            self.queued_form_keys.clear();
+            self.tab.keyboard_target = None;
+            self.tab.pending_page_keys.clear();
+            self.tab.queued_form_keys.clear();
         }
-        let outcome = self.browser.handle_action(action);
+        let outcome = self.tab.browser.handle_action(action);
         self.sync_pointer_lock();
         self.sync_page_fullscreen();
         self.sync_close_requests();
@@ -2788,7 +2793,7 @@ impl DesktopApp {
         // is classified. If the user activates another page link while the
         // prompt is visible, that navigation clears the offer synchronously;
         // do not leave the desktop stuck in the download-only focus/viewport.
-        if self.focus == FocusTarget::Download && self.browser.download_offer().is_none() {
+        if self.tab.focus == FocusTarget::Download && self.tab.browser.download_offer().is_none() {
             self.set_focus(FocusTarget::Page);
         }
         if outcome.invalidated {
@@ -2797,10 +2802,10 @@ impl DesktopApp {
     }
 
     fn launch_external_media_requests(&mut self) {
-        while let Some((url, referrer)) = self.browser.take_external_media() {
+        while let Some((url, referrer)) = self.tab.browser.take_external_media() {
             match trust::media::launch_mpv(url.as_str(), referrer.as_ref()) {
-                Ok(()) => self.browser.set_status(format!("▶ mpv {url}")),
-                Err(error) => self.browser.set_status(error),
+                Ok(()) => self.tab.browser.set_status(format!("▶ mpv {url}")),
+                Err(error) => self.tab.browser.set_status(error),
             }
         }
     }
@@ -2810,18 +2815,20 @@ impl DesktopApp {
     /// its own image loads. A live page and its scripts keep running, so its
     /// layout stays live; without one, the stopped document is frozen.
     fn stop_current_page(&mut self) {
-        let was_loading = self.chrome_loading(&self.browser.snapshot());
-        let live = self.browser.page_is_live();
+        let was_loading = self.chrome_loading(&self.tab.browser.snapshot());
+        let live = self.tab.browser.page_is_live();
         self.dispatch(UserAction::Stop);
-        if live && self.browser.page_is_live() {
+        if live && self.tab.browser.page_is_live() {
             self.stop_frontend_image_loads();
         } else {
             // Image fetch/decode is frontend-owned, while the document fetch
             // is controller-owned; both halves share one abort boundary.
             self.retire_page_loading();
         }
-        if was_loading && !self.browser.snapshot().status.starts_with("Stopped") {
-            self.browser.set_status("Stopped loading page resources.");
+        if was_loading && !self.tab.browser.snapshot().status.starts_with("Stopped") {
+            self.tab
+                .browser
+                .set_status("Stopped loading page resources.");
         }
         self.request_redraw();
     }
@@ -2837,18 +2844,18 @@ impl DesktopApp {
     /// Stop the frontend's image loads for a document that stays live: the
     /// requests in flight become broken, later requests may start.
     fn stop_frontend_image_loads(&mut self) {
-        if self.image_loads.stop_pending() {
-            for (_, task) in self.image_tasks.drain() {
+        if self.tab.image_loads.stop_pending() {
+            for (_, task) in self.tab.image_tasks.drain() {
                 task.abort();
             }
-            self.image_flush_scheduled = false;
+            self.tab.image_flush_scheduled = false;
         }
     }
 
     /// HTML #close-requests "alternative processing" happened in the
     /// controller (it stopped loading); stop the frontend's half as well.
     fn sync_close_requests(&mut self) {
-        while let Some(consumed) = self.browser.take_close_request_result() {
+        while let Some(consumed) = self.tab.browser.take_close_request_result() {
             if !consumed {
                 self.stop_frontend_image_loads();
                 self.request_redraw();
@@ -2859,17 +2866,19 @@ impl DesktopApp {
     /// Fullscreen API: present the live page's top-level viewport fullscreen
     /// as a borderless fullscreen window, and restore it on exit.
     fn sync_page_fullscreen(&mut self) {
-        while let Some(change) = self.browser.take_fullscreen_change() {
+        while let Some(change) = self.tab.browser.take_fullscreen_change() {
             match change {
                 FullscreenChange::Enter(request) => {
                     let Some(window) = &self.window else {
-                        self.browser
+                        self.tab
+                            .browser
                             .handle_action(UserAction::FullscreenResult { request, ok: false });
                         continue;
                     };
                     self.page_fullscreen = true;
                     if window.fullscreen().is_some() {
-                        self.browser
+                        self.tab
+                            .browser
                             .handle_action(UserAction::FullscreenResult { request, ok: true });
                         continue;
                     }
@@ -2878,7 +2887,8 @@ impl DesktopApp {
                 }
                 FullscreenChange::Exit(reply) => {
                     if let Some((request, _)) = self.fullscreen_reply.take() {
-                        self.browser
+                        self.tab
+                            .browser
                             .handle_action(UserAction::FullscreenResult { request, ok: true });
                     }
                     let restored = std::mem::take(&mut self.page_fullscreen)
@@ -2892,7 +2902,8 @@ impl DesktopApp {
                             // Answered once the restored size reached the page.
                             self.fullscreen_reply = Some((request, std::time::Instant::now()));
                         } else {
-                            self.browser
+                            self.tab
+                                .browser
                                 .handle_action(UserAction::FullscreenResult { request, ok: true });
                         }
                     }
@@ -2921,7 +2932,8 @@ impl DesktopApp {
         if !ok {
             self.page_fullscreen = false;
         }
-        self.browser
+        self.tab
+            .browser
             .handle_action(UserAction::FullscreenResult { request, ok });
     }
 
@@ -2930,29 +2942,29 @@ impl DesktopApp {
     /// Editing APIs leave editing-host insertion to the user agent;
     /// HTML §4.10.22.2 defines Enter submission for single-line text controls.
     fn apply_page_key_defaults(&mut self) {
-        while let Some((prevented, state)) = self.browser.take_page_key_result() {
-            let Some(pending) = self.pending_page_keys.pop_front() else {
+        while let Some((prevented, state)) = self.tab.browser.take_page_key_result() {
+            let Some(pending) = self.tab.pending_page_keys.pop_front() else {
                 continue;
             };
             if std::env::var_os("TRUST_DESKTOP_TRACE").is_some() {
                 eprintln!(
                     "desktop: key default key={:?} state={:?} prevented={prevented} form={:?} focus={:?}",
-                    pending.input.key, pending.input.state, pending.form, self.focus
+                    pending.input.key, pending.input.state, pending.form, self.tab.focus
                 );
             }
             let Some((form, field)) = pending.form else {
                 if !prevented
-                    && self.focus == FocusTarget::Page
+                    && self.tab.focus == FocusTarget::Page
                     && pending.input.state == KeyState::Pressed
                     && !self.handle_http_scroll_key(&pending.input)
                     && pending.input.key == Key::Enter
-                    && let Some(target) = self.keyboard_target.clone()
+                    && let Some(target) = self.tab.keyboard_target.clone()
                 {
                     self.activate_page_hit(target);
                 }
                 continue;
             };
-            if self.focus == (FocusTarget::Form { form, field }) {
+            if self.tab.focus == (FocusTarget::Form { form, field }) {
                 if !pending.actor_default && pending.input.state == KeyState::Pressed {
                     // A native glyph default accepts the keyboard handlers'
                     // canonical selection before replaying later feedback.
@@ -2960,14 +2972,15 @@ impl DesktopApp {
                     self.sync_focused_form();
                 }
                 if let Some(state) = state
-                    && let Some(editor) = &mut self.form_editor
+                    && let Some(editor) = &mut self.tab.form_editor
                 {
                     reconcile_text_preview(
                         editor,
                         &state,
-                        self.pending_page_keys
+                        self.tab
+                            .pending_page_keys
                             .iter()
-                            .chain(self.queued_form_keys.iter())
+                            .chain(self.tab.queued_form_keys.iter())
                             .filter(|_| prevented || pending.input.state == KeyState::Released),
                         (form, field),
                     );
@@ -2975,12 +2988,13 @@ impl DesktopApp {
                 }
             }
             if prevented
-                || self.focus != (FocusTarget::Form { form, field })
+                || self.tab.focus != (FocusTarget::Form { form, field })
                 || pending.input.state != KeyState::Pressed
             {
                 continue;
             }
             let kind = self
+                .tab
                 .page_layout
                 .as_ref()
                 .and_then(|page| page.document.forms.get(form))
@@ -3010,7 +3024,7 @@ impl DesktopApp {
                     self.submit_form_default(form);
                 }
                 _ => {
-                    if let Some(editor) = &mut self.form_editor {
+                    if let Some(editor) = &mut self.tab.form_editor {
                         apply_editor_key(editor, &pending.input, pending.text.as_deref());
                         self.finish_text_edit_as(match pending.input.key {
                             Key::Backspace => Some("deleteContentBackward"),
@@ -3022,14 +3036,15 @@ impl DesktopApp {
                     }
                 }
             }
-            if self.focus == (FocusTarget::Form { form, field })
-                && let Some(editor) = &mut self.form_editor
+            if self.tab.focus == (FocusTarget::Form { form, field })
+                && let Some(editor) = &mut self.tab.form_editor
             {
                 replay_text_feedback(
                     editor,
-                    self.pending_page_keys
+                    self.tab
+                        .pending_page_keys
                         .iter()
-                        .chain(self.queued_form_keys.iter()),
+                        .chain(self.tab.queued_form_keys.iter()),
                     (form, field),
                 );
             }
@@ -3043,6 +3058,7 @@ impl DesktopApp {
     /// action; static forms retain the existing native submission path.
     fn submit_form_default(&mut self, form_index: usize) {
         let Some(form) = self
+            .tab
             .page_layout
             .as_ref()
             .and_then(|page| page.document.forms.get(form_index))
@@ -3072,7 +3088,7 @@ impl DesktopApp {
     /// that the resident actor returned. A navigation retires the old key
     /// queue along with the old page.
     fn process_browser_events(&mut self) -> trust::core::ActionOutcome {
-        let outcome = self.browser.process_async_events();
+        let outcome = self.tab.browser.process_async_events();
         self.sync_context_menu_requests();
         self.sync_actor_focus();
         self.sync_pointer_lock();
@@ -3081,49 +3097,55 @@ impl DesktopApp {
         self.sync_clipboard_writes();
         self.sync_file_pickers();
         self.launch_external_media_requests();
-        if self.browser.download_offer().is_some()
-            && !matches!(self.focus, FocusTarget::Command | FocusTarget::Download)
+        if self.tab.browser.download_offer().is_some()
+            && !matches!(self.tab.focus, FocusTarget::Command | FocusTarget::Download)
         {
-            self.file_action_selected = 0;
+            self.tab.file_action_selected = 0;
             self.set_focus(FocusTarget::Download);
         }
         if outcome.loading_retired {
-            let had_pending_key = !self.pending_page_keys.is_empty();
-            self.pending_page_keys.clear();
-            self.queued_form_keys.clear();
+            let had_pending_key = !self.tab.pending_page_keys.is_empty();
+            self.tab.pending_page_keys.clear();
+            self.tab.queued_form_keys.clear();
             if had_pending_key {
                 self.set_focus(FocusTarget::Page);
             }
             self.retire_page_loading();
         }
-        if self.focus == FocusTarget::Download && self.browser.download_offer().is_none() {
+        if self.tab.focus == FocusTarget::Download && self.tab.browser.download_offer().is_none() {
             self.set_focus(FocusTarget::Page);
         }
-        if let Some(prompt) = self.browser.prompt()
-            && !self.gemini_input
+        if let Some(prompt) = self.tab.browser.prompt()
+            && !self.tab.gemini_input
         {
             let initial = prompt.initial.clone();
-            self.gopher_query = None;
-            self.gemini_input = true;
-            self.command.set_text(&initial);
+            self.tab.gopher_query = None;
+            self.tab.gemini_input = true;
+            self.tab.command.set_text(&initial);
             self.set_focus(FocusTarget::Command);
-        } else if self.browser.prompt().is_none() && self.gemini_input {
-            self.gemini_input = false;
-            self.command.set_text("");
+        } else if self.tab.browser.prompt().is_none() && self.tab.gemini_input {
+            self.tab.gemini_input = false;
+            self.tab.command.set_text("");
             self.set_focus(FocusTarget::Page);
         }
         self.apply_page_key_defaults();
+        // Last: a tab the page opens in front becomes the shown tab, and a
+        // page's question about leaving it may show another tab.
+        let shown = self.tab.id;
+        self.open_requested_traversables(shown);
+        self.collect_unload_requests(shown);
+        self.service_traversable_requests(shown);
         outcome
     }
 
     fn sync_actor_focus(&mut self) {
-        let Some(node) = self.browser.take_page_focus() else {
+        let Some(node) = self.tab.browser.take_page_focus() else {
             return;
         };
-        if !self.browser.page_is_live()
-            || self.terminal.is_some()
+        if !self.tab.browser.page_is_live()
+            || self.tab.terminal.is_some()
             || matches!(
-                self.focus,
+                self.tab.focus,
                 FocusTarget::Command | FocusTarget::Find | FocusTarget::Download
             )
         {
@@ -3131,7 +3153,8 @@ impl DesktopApp {
         }
         self.ensure_page_layout(self.browser_viewport());
         let target = node.and_then(|node| {
-            self.page_layout
+            self.tab
+                .page_layout
                 .as_ref()
                 .and_then(|page| page.document.controls.get(&node).copied())
         });
@@ -3139,13 +3162,28 @@ impl DesktopApp {
             // HTML focus updates are actor decisions, not a request to commit
             // the old native draft or send a new focusing command back.
             self.present_form_focus(form, field);
-        } else if matches!(self.focus, FocusTarget::Form { .. }) {
-            self.form_editor = None;
+        } else if matches!(self.tab.focus, FocusTarget::Form { .. }) {
+            self.tab.form_editor = None;
             self.set_focus(FocusTarget::Page);
         }
     }
 
     fn navigate(&mut self, address: String) {
+        // Navigations the window runs itself leave a live page only once it
+        // allowed that (HTML #checking-if-unloading-is-canceled); the
+        // controller's own navigations ask it themselves.
+        let runs_itself = parse_telnet_target(&address).is_some()
+            || address.eq_ignore_ascii_case("about:gemini")
+            || address.eq_ignore_ascii_case("about:bookmarks")
+            || trust::gopher::GopherUrl::parse(&address)
+                .is_some_and(|url| url.needs_query() || url.item_type == '8' || url.is_download());
+        if runs_itself && !self.may_leave_now(&address) {
+            return;
+        }
+        self.navigate_now(address);
+    }
+
+    fn navigate_now(&mut self, address: String) {
         if let Some(url) = trust::gopher::GopherUrl::parse(&address)
             && (url.needs_query() || url.item_type == '8' || url.is_download())
         {
@@ -3163,7 +3201,7 @@ impl DesktopApp {
         if let Some((host, port, tls)) = parse_telnet_target(&address) {
             self.start_terminal(host, port, tls, address);
         } else {
-            if let Some(session) = self.terminal.take() {
+            if let Some(session) = self.tab.terminal.take() {
                 let _ = session
                     .handle
                     .commands
@@ -3174,13 +3212,13 @@ impl DesktopApp {
     }
 
     fn start_terminal(&mut self, host: String, port: u16, tls: bool, address: String) {
-        if let Some(session) = self.bookmark_terminal.take() {
+        if let Some(session) = self.tab.bookmark_terminal.take() {
             let _ = session
                 .handle
                 .commands
                 .try_send(trust::telnet::Command::Close);
         }
-        if let Some(session) = self.terminal.take() {
+        if let Some(session) = self.tab.terminal.take() {
             let _ = session
                 .handle
                 .commands
@@ -3229,15 +3267,15 @@ impl DesktopApp {
                 }
             })
             .abort_handle();
-        self.browser.open_external_session(address.clone());
+        self.tab.browser.open_external_session(address.clone());
         self.retire_page_loading();
         self.image_store.clear();
-        self.image_sizes.clear();
-        self.image_sizes_sent = 0;
-        self.page_layout = None;
-        self.protocol_page = None;
-        self.session_history.detach();
-        self.terminal = Some(TerminalSession {
+        self.tab.image_sizes.clear();
+        self.tab.image_sizes_sent = 0;
+        self.tab.page_layout = None;
+        self.tab.protocol_page = None;
+        self.tab.session_history.detach();
+        self.tab.terminal = Some(TerminalSession {
             id,
             forwarder,
             address,
@@ -3266,6 +3304,7 @@ impl DesktopApp {
         ));
         self.dispatch(UserAction::Resize(self.browser_viewport()));
         self.update_screen_position();
+        self.present_background_tabs();
     }
 
     fn update_screen_position(&mut self) {
@@ -3300,7 +3339,7 @@ impl DesktopApp {
     }
 
     fn browser_viewport(&self) -> CssSize {
-        self.focus.viewport(self.metrics.css)
+        self.viewport_for(self.tab.focus)
     }
 
     fn editor_visual(editor: &mut TextEditor, password: bool) -> EditorVisual {
@@ -3320,34 +3359,40 @@ impl DesktopApp {
     }
 
     fn chrome_model(&mut self, snapshot: &trust::core::BrowserSnapshot) -> ChromeModel {
-        if self.focus == FocusTarget::Command {
-            self.command
+        if self.tab.focus == FocusTarget::Command {
+            self.tab
+                .command
                 .set_width(CommandPanelGeometry::new(self.metrics.css).editor.width);
         }
-        self.find
+        self.tab
+            .find
             .set_width((self.metrics.css.width - 160.0).max(1.0));
-        let find =
-            (self.focus == FocusTarget::Find).then(|| Self::editor_visual(&mut self.find, false));
-        let command = (self.focus == FocusTarget::Command).then(|| {
+        let find = (self.tab.focus == FocusTarget::Find)
+            .then(|| Self::editor_visual(&mut self.tab.find, false));
+        let command = (self.tab.focus == FocusTarget::Command).then(|| {
             Self::editor_visual(
-                &mut self.command,
-                self.browser.prompt().is_some_and(|p| p.sensitive),
+                &mut self.tab.command,
+                self.tab.browser.prompt().is_some_and(|p| p.sensitive),
             )
         });
-        let download = (self.focus == FocusTarget::Download)
+        let download = (self.tab.focus == FocusTarget::Download)
             .then(|| {
-                self.browser.download_offer().map(|offer| DownloadVisual {
-                    summary: offer.summary(),
-                    origin: offer.url[..url::Position::BeforePath].to_string(),
-                    selected: self.file_action_selected,
-                })
+                self.tab
+                    .browser
+                    .download_offer()
+                    .map(|offer| DownloadVisual {
+                        summary: offer.summary(),
+                        origin: offer.url[..url::Position::BeforePath].to_string(),
+                        selected: self.tab.file_action_selected,
+                    })
             })
             .flatten();
         ChromeModel {
             command,
-            response: (self.focus == FocusTarget::Command)
+            response: (self.tab.focus == FocusTarget::Command)
                 .then(|| {
-                    self.browser
+                    self.tab
+                        .browser
                         .current_page()
                         .and_then(|page| match &page.document {
                             FetchedDocument::Http(response) => Some(CommandResponse {
@@ -3362,29 +3407,30 @@ impl DesktopApp {
             download,
             status: snapshot.status.clone(),
             status_label: self.status_label(snapshot),
-            link_preview: self.link_preview.clone(),
-            terminal_session: self.terminal.is_some(),
+            link_preview: self.tab.link_preview.clone(),
+            terminal_session: self.tab.terminal.is_some(),
             terminal_input_top: None,
             find,
-            find_count: (!self.find_matches.is_empty())
-                .then_some((self.find_index + 1, self.find_matches.len())),
+            find_count: (!self.tab.find_matches.is_empty())
+                .then_some((self.tab.find_index + 1, self.tab.find_matches.len())),
             heart: HeartVisual::default(),
             page_fullscreen: self.page_fullscreen,
+            tab_strip_height: self.strip_height(),
         }
     }
 
     fn status_label(&self, snapshot: &trust::core::BrowserSnapshot) -> String {
-        if let Some(prompt) = self.browser.prompt() {
+        if let Some(prompt) = self.tab.browser.prompt() {
             return prompt.tag().into();
         }
-        if self.terminal.is_some() {
+        if self.tab.terminal.is_some() {
             return if snapshot.loading {
                 String::from("LINK:OPENING")
             } else {
                 String::from("TELNET")
             };
         }
-        match self.browser.current_page().map(|page| &page.document) {
+        match self.tab.browser.current_page().map(|page| &page.document) {
             Some(FetchedDocument::Http(response))
                 if trust::gopher::is_scheme(response.url.scheme()) =>
             {
@@ -3425,19 +3471,20 @@ impl DesktopApp {
     /// draw changed only independently spliceable paint segments and is
     /// therefore eligible for renderer-neutral damage comparison.
     fn ensure_page_layout(&mut self, viewport: CssSize) -> bool {
-        let generation = self.browser.document_generation();
+        let generation = self.tab.browser.document_generation();
         let device_pixel_ratio = self.metrics.scale_factor.get() as f32;
-        let navigation_pending = self.browser.snapshot().loading;
+        let navigation_pending = self.tab.browser.snapshot().loading;
         let (revision, rendered_revision) = self
+            .tab
             .browser
             .current_page()
             .map_or((0, 0), |page| (page.revision(), page.rendered_revision()));
-        let page_is_live = self.browser.page_is_live();
+        let page_is_live = self.tab.browser.page_is_live();
 
         // A viewport or image-size command can be in flight while the actor's
         // last typed render is still current. Keep those known-good pixels for
         // that brief interval; never rebuild them from response HTML.
-        if let Some(cache) = &mut self.page_layout
+        if let Some(cache) = &mut self.tab.page_layout
             && may_reuse_page_layout(
                 cache.generation,
                 generation,
@@ -3453,7 +3500,8 @@ impl DesktopApp {
             )
         {
             cache.scroll_offsets.extend(
-                self.browser
+                self.tab
+                    .browser
                     .interaction()
                     .nested_scroll
                     .iter()
@@ -3475,15 +3523,16 @@ impl DesktopApp {
         }
 
         let seed = self
+            .tab
             .page_layout
             .as_ref()
             .filter(|cache| cache.generation == generation)
             .map(|cache| cache.document.forms.clone());
         let force_static_reflow = !page_is_live
-            && self.page_layout.as_ref().is_some_and(|cache| {
+            && self.tab.page_layout.as_ref().is_some_and(|cache| {
                 cache.generation == generation && cache.rendered_revision != rendered_revision
             });
-        let typed = self.browser.current_page().and_then(|page| {
+        let typed = self.tab.browser.current_page().and_then(|page| {
             let FetchedDocument::Http(response) = &page.document else {
                 return None;
             };
@@ -3495,8 +3544,8 @@ impl DesktopApp {
                     || rendered.device_pixel_ratio != device_pixel_ratio)
             {
                 let image_sizes = image_sizes_for_layout(
-                    &self.image_sizes,
-                    &self.image_loads.failed,
+                    &self.tab.image_sizes,
+                    &self.tab.image_loads.failed,
                     &rendered.image_urls,
                 );
                 rendered = trust::http::render_html_for_environment(
@@ -3510,19 +3559,21 @@ impl DesktopApp {
             Some((response.url.clone(), rendered))
         });
         let mut scroll_offsets = self
+            .tab
             .page_layout
             .as_ref()
             .filter(|cache| cache.generation == generation)
             .map(|cache| cache.scroll_offsets.clone())
             .unwrap_or_default();
         scroll_offsets.extend(
-            self.browser
+            self.tab
+                .browser
                 .interaction()
                 .nested_scroll
                 .iter()
                 .map(|(node, offset)| (*node, *offset)),
         );
-        self.page_layout = typed.map(|(base, rendered)| {
+        self.tab.page_layout = typed.map(|(base, rendered)| {
             self.sync_image_document(generation, &base);
             let requests = rendered
                 .eager_image_urls
@@ -3548,24 +3599,26 @@ impl DesktopApp {
         });
         if page_is_live && let Some(old) = seed.as_deref() {
             let new = self
+                .tab
                 .page_layout
                 .as_ref()
                 .map_or(&[][..], |page| page.document.forms.as_slice());
             // HTML #focus-fixup-rule / UI Events keyboard targets: focus is
             // attached to a DOM node, never to an extraction-vector index.
             // Inserting a tool dialog before the composer must not retarget it.
-            let next_focus = if let FocusTarget::Form { form, field } = self.focus {
+            let next_focus = if let FocusTarget::Form { form, field } = self.tab.focus {
                 remap_form_index(old, new, (form, field)).map_or(
                     FocusTarget::Page,
                     |(form, field)| FocusTarget::Form { form, field },
                 )
             } else {
-                self.focus
+                self.tab.focus
             };
             for pending in self
+                .tab
                 .pending_page_keys
                 .iter_mut()
-                .chain(self.queued_form_keys.iter_mut())
+                .chain(self.tab.queued_form_keys.iter_mut())
             {
                 if let Some(indices) = pending.form {
                     // Keep the FIFO acknowledgement slot if its target was
@@ -3575,20 +3628,20 @@ impl DesktopApp {
                     );
                 }
             }
-            if next_focus != self.focus {
+            if next_focus != self.tab.focus {
                 if next_focus == FocusTarget::Page {
-                    self.form_editor = None;
+                    self.tab.form_editor = None;
                 }
                 self.set_focus(next_focus);
             }
         }
-        if let Some(cache) = &self.page_layout {
+        if let Some(cache) = &self.tab.page_layout {
             let live = graphical_live_boundaries(&cache.layout);
-            self.browser.set_live_layout_boundaries(live.0, live.1);
+            self.tab.browser.set_live_layout_boundaries(live.0, live.1);
         }
 
-        if self.page_layout.is_none() {
-            let fresh = self.protocol_page.as_ref().is_some_and(|cache| {
+        if self.tab.page_layout.is_none() {
+            let fresh = self.tab.protocol_page.as_ref().is_some_and(|cache| {
                 cache.generation == generation
                     && cache.revision == revision
                     && cache.viewport == viewport
@@ -3596,6 +3649,7 @@ impl DesktopApp {
             if !fresh {
                 let mut anchored_y = None;
                 let carried_selection = self
+                    .tab
                     .protocol_page
                     .as_ref()
                     .filter(|cache| cache.generation == generation)
@@ -3608,7 +3662,7 @@ impl DesktopApp {
                                 .map(|line| (index, line.link.clone()))
                         })
                     });
-                self.protocol_page = self.browser.current_page().and_then(|page| {
+                self.tab.protocol_page = self.tab.browser.current_page().and_then(|page| {
                     let document =
                         trust::render::documents::document_for_viewport(page, viewport.width)?;
                     let mut selected = carried_selection.and_then(|(index, target)| {
@@ -3632,7 +3686,7 @@ impl DesktopApp {
                         viewport.width,
                         selected,
                     );
-                    if let Some(old) = &self.protocol_page
+                    if let Some(old) = &self.tab.protocol_page
                         && old.generation == generation
                         && (old.document.registration_section().is_some()
                             || old.document.dict.is_some())
@@ -3646,9 +3700,9 @@ impl DesktopApp {
                                 .as_ref()
                                 .map(|p| (p.section, p.selected, &p.filter))
                         && old.document.registration_section() == document.registration_section()
-                        && self.browser.interaction().scroll.y > 0.0
+                        && self.tab.browser.interaction().scroll.y > 0.0
                     {
-                        let y = self.browser.interaction().scroll.y;
+                        let y = self.tab.browser.interaction().scroll.y;
                         if let Some(row) = old
                             .layout
                             .lines
@@ -3686,7 +3740,8 @@ impl DesktopApp {
                         selected,
                     })
                 });
-                self.link_preview = self
+                self.tab.link_preview = self
+                    .tab
                     .protocol_page
                     .as_ref()
                     .and_then(|cache| cache.selected.map(|line| (&cache.document, line)))
@@ -3694,10 +3749,10 @@ impl DesktopApp {
                     .and_then(|line| line.link.as_ref())
                     .map(ToString::to_string)
                     .unwrap_or_default();
-                if let Some(cache) = &self.protocol_page
+                if let Some(cache) = &self.tab.protocol_page
                     && cache.document.text_view().is_some()
                 {
-                    let scroll = self.browser.interaction().scroll;
+                    let scroll = self.tab.browser.interaction().scroll;
                     let clamped = CssPoint::new(
                         scroll
                             .x
@@ -3707,13 +3762,14 @@ impl DesktopApp {
                             .min((cache.layout.paint.height - viewport.height).max(0.0)),
                     );
                     if clamped != scroll {
-                        self.browser
+                        self.tab
+                            .browser
                             .handle_action(UserAction::SetViewportScroll(clamped));
                     }
                 }
             }
         } else {
-            self.protocol_page = None;
+            self.tab.protocol_page = None;
         }
         false
     }
@@ -3723,8 +3779,8 @@ impl DesktopApp {
         // has no resident engine; invalidate its cache so the next draw runs
         // the shared transient DOM→PixelLayout routine with current form/image
         // inputs. Either way desktop itself never owns a DOM.
-        if !self.browser.page_is_live()
-            && let Some(cache) = &mut self.page_layout
+        if !self.tab.browser.page_is_live()
+            && let Some(cache) = &mut self.tab.page_layout
         {
             cache.rendered_revision = u64::MAX;
         }
@@ -3849,8 +3905,8 @@ impl DesktopApp {
         }
         let trace = std::env::var_os("TRUST_DESKTOP_TRACE").is_some();
         let frame_started = std::time::Instant::now();
-        let snapshot = self.browser.snapshot();
-        if self.text_selection.document_generation != self.browser.document_generation() {
+        let snapshot = self.tab.browser.snapshot();
+        if self.tab.text_selection.document_generation != self.tab.browser.document_generation() {
             // A new document: the context menu acted on the old one.
             self.context_menu = None;
             self.context_menu_request = None;
@@ -3863,7 +3919,7 @@ impl DesktopApp {
             initial_scene.content_viewport.width,
             initial_scene.content_viewport.height,
         );
-        let layout_patch = if self.terminal.is_none() {
+        let layout_patch = if self.tab.terminal.is_none() {
             let eligible = self.ensure_page_layout(page_viewport);
             self.sync_focused_form();
             // A fragment request can arrive before the matching layout exists.
@@ -3886,21 +3942,22 @@ impl DesktopApp {
         let _ = ensure_embedded_heart_assets(&self.image_store);
         scene.image_store = self.image_store.clone();
 
-        let generation = self.browser.document_generation();
+        let generation = self.tab.browser.document_generation();
         // The actor owns the canonical layout, so decoded native pixels become
         // paintable at the actor's next geometry pass. `BrowserController`
         // deliberately uses a nonblocking send; retry a full command queue on
         // the next redraw instead of silently leaving image boxes at their
         // pending intrinsic size.
-        if self.browser.page_is_live() && self.image_sizes.len() > self.image_sizes_sent {
-            if self.browser.send_image_sizes(&self.image_sizes) {
-                self.image_sizes_sent = self.image_sizes.len();
+        if self.tab.browser.page_is_live() && self.tab.image_sizes.len() > self.tab.image_sizes_sent
+        {
+            if self.tab.browser.send_image_sizes(&self.tab.image_sizes) {
+                self.tab.image_sizes_sent = self.tab.image_sizes.len();
             } else {
                 self.request_redraw();
             }
         }
         let css_animation_elapsed = self.css_animation_elapsed();
-        if let Some(terminal) = &mut self.terminal {
+        if let Some(terminal) = &mut self.tab.terminal {
             let line_mode = terminal.connected && !terminal.char_mode();
             let terminal_viewport = CssSize::new(
                 page_viewport.width,
@@ -3917,7 +3974,7 @@ impl DesktopApp {
                     .try_send(trust::telnet::Command::Resize { cols, rows });
             }
             terminal.view.set_cursor_active(
-                terminal.connected && terminal.char_mode() && self.focus == FocusTarget::Page,
+                terminal.connected && terminal.char_mode() && self.tab.focus == FocusTarget::Page,
             );
             scene.append_page(terminal.view.paint(), CssPoint::default());
             if line_mode {
@@ -3930,7 +3987,7 @@ impl DesktopApp {
                 );
                 terminal.line_input.paint(
                     &mut scene.primitives,
-                    self.focus == FocusTarget::Page && self.window_focused,
+                    self.tab.focus == FocusTarget::Page && self.window_focused,
                 );
                 scene.controls.push(trust::render::ControlRegion {
                     id: ControlId::TerminalInput,
@@ -3940,49 +3997,49 @@ impl DesktopApp {
             } else {
                 terminal.line_input.selecting = false;
             }
-        } else if let Some(page) = &self.page_layout {
+        } else if let Some(page) = &self.tab.page_layout {
             scene.append_page_with_selection(
                 &page.layout.paint,
-                self.browser.interaction().scroll,
+                self.tab.browser.interaction().scroll,
                 css_animation_elapsed,
                 &page.scroll_offsets,
-                self.text_selection.paint.as_ref(),
+                self.tab.text_selection.paint.as_ref(),
             );
-        } else if let Some(page) = &self.protocol_page {
+        } else if let Some(page) = &self.tab.protocol_page {
             scene.append_page_with_selection(
                 &page.layout.paint,
-                self.browser.interaction().scroll,
+                self.tab.browser.interaction().scroll,
                 0.0,
                 &HashMap::new(),
-                self.text_selection.paint.as_ref(),
+                self.tab.text_selection.paint.as_ref(),
             );
         }
 
-        if let Some(page) = &self.page_layout {
+        if let Some(page) = &self.tab.page_layout {
             let key = ImageScheduleKey {
                 generation,
                 revision: page.revision,
-                scroll: self.browser.interaction().scroll,
+                scroll: self.tab.browser.interaction().scroll,
                 viewport: page_viewport,
             };
-            if self.image_schedule_key != Some(key) {
+            if self.tab.image_schedule_key != Some(key) {
                 let base = page.document.base.clone();
                 let (requests, visible_retries) =
                     scheduled_page_images(page, key.scroll, page_viewport, Some(&scene));
                 self.request_page_images(generation, &base, &requests, &visible_retries);
-                self.image_schedule_key = Some(key);
+                self.tab.image_schedule_key = Some(key);
             }
         } else {
             self.set_active_animations(HashSet::new());
-            self.image_schedule_key = None;
+            self.tab.image_schedule_key = None;
         }
 
-        let query = self.find.text();
-        self.find_matches = scene.find_text(&query);
-        if !self.find_matches.is_empty() {
-            self.find_index = self.find_index.min(self.find_matches.len() - 1);
-            for (index, found) in self.find_matches.iter().copied().enumerate() {
-                let color = if index == self.find_index {
+        let query = self.tab.find.text();
+        self.tab.find_matches = scene.find_text(&query);
+        if !self.tab.find_matches.is_empty() {
+            self.tab.find_index = self.tab.find_index.min(self.tab.find_matches.len() - 1);
+            for (index, found) in self.tab.find_matches.iter().copied().enumerate() {
+                let color = if index == self.tab.find_index {
                     PaintColor::Rgba(255, 166, 32, 125)
                 } else {
                     PaintColor::Rgba(255, 226, 64, 80)
@@ -3995,20 +4052,24 @@ impl DesktopApp {
             }
         }
         self.paint_focused_form(&mut scene);
-        if let Some(page) = &self.page_layout {
+        if let Some(page) = &self.tab.page_layout {
             scene.append_browser_media_with_scroll_offsets(
                 &page.layout.paint,
-                self.browser.interaction().scroll,
+                self.tab.browser.interaction().scroll,
                 css_animation_elapsed,
                 &page.scroll_offsets,
             );
         }
         self.paint_keyboard_focus(&mut scene);
+        // The strip covers the top of the window, above anything the page
+        // painted beyond its viewport.
+        self.paint_tab_strip(&mut scene);
         self.paint_select_popup(&mut scene);
         chrome.heart = self.heart_visual(&scene, &snapshot);
         paint_desktop_overlay(&mut scene, &snapshot, &chrome);
-        if self.focus == FocusTarget::Command
+        if self.tab.focus == FocusTarget::Command
             && let Some(report) = self
+                .tab
                 .terminal
                 .as_ref()
                 .and_then(|terminal| terminal.view.terminal.report.as_ref())
@@ -4066,15 +4127,16 @@ impl DesktopApp {
         // fetch band spans several screens and must not keep all of those
         // offscreen decoders and redraws running.
         let image_revisions = scene.visible_image_revisions();
-        let active_animations = if self.window_focused && !self.animation_sources.entries.is_empty()
-        {
-            let visible = image_revisions.keys().copied().collect();
-            self.animation_sources.touch_visible(&visible);
-            self.animation_sources
-                .bounded_active_handles(&visible, &self.image_store)
-        } else {
-            HashSet::new()
-        };
+        let active_animations =
+            if self.window_focused && !self.tab.animation_sources.entries.is_empty() {
+                let visible = image_revisions.keys().copied().collect();
+                self.tab.animation_sources.touch_visible(&visible);
+                self.tab
+                    .animation_sources
+                    .bounded_active_handles(&visible, &self.image_store)
+            } else {
+                HashSet::new()
+            };
         self.set_active_animations(active_animations);
         let changed_images = image_revisions
             .iter()
@@ -4115,27 +4177,35 @@ impl DesktopApp {
             );
         }
         if let Some(window) = &self.window {
-            let title = if snapshot.address.is_empty() {
+            // The system knows the window by the shown tab (its task bar
+            // and window switcher still show titles).
+            let tab = tabs::tab_title(&self.tab);
+            let title = if snapshot.address.is_empty() && self.tab.terminal.is_none() {
                 String::from("TRust")
             } else {
-                format!("TRust — {}", snapshot.address)
+                format!("{tab} — TRust")
             };
-            window.set_title(&title);
+            if self.window_title != title {
+                window.set_title(&title);
+                self.window_title = title;
+            }
         }
         let css_wake = self.css_animation_wake();
         let loading = self.chrome_loading(&snapshot);
-        if loading || self.heart_glide.is_some() || css_wake.is_some() {
+        if loading || self.tab.heart_glide.is_some() || css_wake.is_some() {
             // Glides and CSS animations in play need every frame; a delayed
             // animation needs the frame at which it starts. The loading heart
             // needs every frame only while it beats; between beats a slower
             // tick still keeps the other loading chrome current.
-            let delay = if self.heart_glide.is_some() {
+            let delay = if self.tab.heart_glide.is_some() {
                 CSS_ANIMATION_FRAME_DELAY
             } else {
                 let loading_delay = loading.then(|| {
-                    self.loading_started.map_or(LOADING_TICK_DELAY, |started| {
-                        heartbeat_tick_delay(started.elapsed())
-                    })
+                    self.tab
+                        .loading_started
+                        .map_or(LOADING_TICK_DELAY, |started| {
+                            heartbeat_tick_delay(started.elapsed())
+                        })
                 });
                 let css_delay = css_wake.map(|wake| wake.max(CSS_ANIMATION_FRAME_DELAY));
                 loading_delay
@@ -4149,6 +4219,7 @@ impl DesktopApp {
         if !self.chrome_tick_scheduled
             && self.window_focused
             && let Some(delay) = self
+                .tab
                 .terminal
                 .as_ref()
                 .and_then(|terminal| terminal.view.animation_delay())
@@ -4161,7 +4232,7 @@ impl DesktopApp {
             });
         }
         self.scene = Some(scene);
-        if self.terminal.is_some() && self.focus == FocusTarget::Page {
+        if self.tab.terminal.is_some() && self.tab.focus == FocusTarget::Page {
             self.update_ime_cursor_area();
         }
         // UI Events `mouseout`/`mouseover` target the element currently under
@@ -4171,10 +4242,10 @@ impl DesktopApp {
         // every newly committed scene. Also clear actor identity at a document
         // boundary: arena ids are document-local and may be numerically reused.
         if self.pointer_inside {
-            let generation = self.browser.document_generation();
-            if generation != self.hover_document_generation {
-                self.hover_document_generation = generation;
-                self.hovered_actor = None;
+            let generation = self.tab.browser.document_generation();
+            if generation != self.tab.hover_document_generation {
+                self.tab.hover_document_generation = generation;
+                self.tab.hovered_actor = None;
             }
             self.pointer_moved(None, self.pointer);
         }
@@ -4186,10 +4257,10 @@ impl DesktopApp {
     }
 
     fn paint_focused_form(&mut self, scene: &mut Scene) {
-        let FocusTarget::Form { form, field } = self.focus else {
+        let FocusTarget::Form { form, field } = self.tab.focus else {
             return;
         };
-        let Some(cache) = &self.page_layout else {
+        let Some(cache) = &self.tab.page_layout else {
             return;
         };
         let Some((&node, _)) = cache
@@ -4204,13 +4275,13 @@ impl DesktopApp {
             return;
         };
         let rect = CssRect::new(
-            scene.content_viewport.x + bounds.left as f32 - self.browser.interaction().scroll.x,
-            scene.content_viewport.y + bounds.top as f32 - self.browser.interaction().scroll.y,
+            scene.content_viewport.x + bounds.left as f32 - self.tab.browser.interaction().scroll.x,
+            scene.content_viewport.y + bounds.top as f32 - self.tab.browser.interaction().scroll.y,
             bounds.width as f32,
             bounds.height.max(26.0) as f32,
         );
         if let Some(presentation) = cache.document.rich_editors.get(&node) {
-            if let Some(editor) = &mut self.form_editor {
+            if let Some(editor) = &mut self.tab.form_editor {
                 editor.set_width(presentation.width);
                 if presentation.native_input.is_some() {
                     let password =
@@ -4220,14 +4291,14 @@ impl DesktopApp {
                         &mut scene.primitives,
                         &line,
                         presentation,
-                        &mut self.form_scroll_x,
+                        &mut self.tab.form_scroll_x,
                     );
                     return;
                 }
                 let visual = Self::editor_visual(editor, false);
                 if cache.document.forms[form].fields[field]
                     .live_node
-                    .is_some_and(|actor| self.browser.form_value_pending(actor))
+                    .is_some_and(|actor| self.tab.browser.form_value_pending(actor))
                 {
                     trust::render::paint_pending_editor_text(
                         &mut scene.primitives,
@@ -4245,7 +4316,7 @@ impl DesktopApp {
             }
             return;
         }
-        if let Some(editor) = &mut self.form_editor {
+        if let Some(editor) = &mut self.tab.form_editor {
             let control = cache
                 .document
                 .forms
@@ -4279,7 +4350,7 @@ impl DesktopApp {
     }
 
     fn paint_keyboard_focus(&self, scene: &mut Scene) {
-        let Some(target) = &self.keyboard_target else {
+        let Some(target) = &self.tab.keyboard_target else {
             return;
         };
         let rect = scene
@@ -4297,17 +4368,17 @@ impl DesktopApp {
     }
 
     fn clear_gemini_input(&mut self) {
-        if self.gemini_input {
-            self.gemini_input = false;
-            self.command.set_text("");
+        if self.tab.gemini_input {
+            self.tab.gemini_input = false;
+            self.tab.command.set_text("");
             self.composing = false;
-            self.browser.cancel_prompt();
+            self.tab.browser.cancel_prompt();
         }
     }
 
     fn set_focus(&mut self, focus: FocusTarget) {
         // The drop-down box belongs to its focused select (closes on blur).
-        if self.select_popup.as_ref().is_some_and(|popup| {
+        if self.tab.select_popup.as_ref().is_some_and(|popup| {
             focus
                 != (FocusTarget::Form {
                     form: popup.form,
@@ -4323,10 +4394,10 @@ impl DesktopApp {
             self.clear_gemini_input();
         }
         let old_viewport = self.browser_viewport();
-        self.focus = focus;
+        self.tab.focus = focus;
         if focus != FocusTarget::Page {
-            self.keyboard_target = None;
-            if let Some(terminal) = &mut self.terminal {
+            self.tab.keyboard_target = None;
+            if let Some(terminal) = &mut self.tab.terminal {
                 terminal.line_input.selecting = false;
             }
         }
@@ -4334,6 +4405,7 @@ impl DesktopApp {
             FocusTarget::Find | FocusTarget::Command => true,
             FocusTarget::Download => false,
             FocusTarget::Form { form, field } => self
+                .tab
                 .page_layout
                 .as_ref()
                 .and_then(|page| page.document.forms.get(form))
@@ -4348,12 +4420,15 @@ impl DesktopApp {
                     )
                 }),
             FocusTarget::Page => self
+                .tab
                 .terminal
                 .as_ref()
                 .is_some_and(|terminal| terminal.connected),
         };
         if let Some(window) = &self.window {
-            window.set_ime_allowed(editable && !self.browser.prompt().is_some_and(|p| p.sensitive));
+            window.set_ime_allowed(
+                editable && !self.tab.browser.prompt().is_some_and(|p| p.sensitive),
+            );
         }
         let new_viewport = self.browser_viewport();
         if new_viewport != old_viewport {
@@ -4365,21 +4440,21 @@ impl DesktopApp {
 
     fn open_command(&mut self, replace_with_address: bool) {
         self.clear_gemini_input();
-        self.gopher_query = None;
-        if self.focus == FocusTarget::Download {
-            self.browser.dismiss_download_offer();
+        self.tab.gopher_query = None;
+        if self.tab.focus == FocusTarget::Download {
+            self.tab.browser.dismiss_download_offer();
         }
-        if replace_with_address || self.command.text().is_empty() {
-            let address = self.browser.snapshot().address;
-            self.command.set_text(&address);
+        if replace_with_address || self.tab.command.text().is_empty() {
+            let address = self.tab.browser.snapshot().address;
+            self.tab.command.set_text(&address);
         }
-        self.command.select_all();
+        self.tab.command.select_all();
         self.set_focus(FocusTarget::Command);
     }
 
     /// Close COMMAND when it has focus, otherwise open it.
     fn toggle_command(&mut self, replace_with_address: bool) {
-        if self.focus == FocusTarget::Command {
+        if self.tab.focus == FocusTarget::Command {
             self.close_command();
         } else {
             self.open_command(replace_with_address);
@@ -4387,8 +4462,8 @@ impl DesktopApp {
     }
 
     fn close_command(&mut self) {
-        self.gopher_query = None;
-        self.set_focus(if self.browser.download_offer().is_some() {
+        self.tab.gopher_query = None;
+        self.set_focus(if self.tab.browser.download_offer().is_some() {
             FocusTarget::Download
         } else {
             FocusTarget::Page
@@ -4397,12 +4472,12 @@ impl DesktopApp {
 
     fn activate_file_action(&mut self, action: usize) {
         if action >= 2 {
-            self.browser.dismiss_download_offer();
-            self.browser.set_status("File action cancelled.");
+            self.tab.browser.dismiss_download_offer();
+            self.tab.browser.set_status("File action cancelled.");
             self.set_focus(FocusTarget::Page);
             return;
         }
-        let Some(offer) = self.browser.take_download_offer() else {
+        let Some(offer) = self.tab.browser.take_download_offer() else {
             self.set_focus(FocusTarget::Page);
             return;
         };
@@ -4415,13 +4490,15 @@ impl DesktopApp {
         let destination = match destination {
             Ok(path) => path,
             Err(error) => {
-                self.browser.set_status(format!("Download failed: {error}"));
+                self.tab
+                    .browser
+                    .set_status(format!("Download failed: {error}"));
                 self.set_focus(FocusTarget::Page);
                 return;
             }
         };
         self.downloads_in_flight = self.downloads_in_flight.saturating_add(1);
-        self.browser.set_status(format!(
+        self.tab.browser.set_status(format!(
             "Downloading {} in background…",
             offer.suggested_filename
         ));
@@ -4446,19 +4523,22 @@ impl DesktopApp {
         self.downloads_in_flight = self.downloads_in_flight.saturating_sub(1);
         match result {
             Ok(bytes) if open => match trust::download::open_external(&path) {
-                Ok(()) => self.browser.set_status(format!(
+                Ok(()) => self.tab.browser.set_status(format!(
                     "Opened {} ({}).",
                     path.display(),
                     trust::download::human_bytes(bytes)
                 )),
-                Err(error) => self.browser.set_status(error),
+                Err(error) => self.tab.browser.set_status(error),
             },
-            Ok(bytes) => self.browser.set_status(format!(
+            Ok(bytes) => self.tab.browser.set_status(format!(
                 "Saved {} ({}).",
                 path.display(),
                 trust::download::human_bytes(bytes)
             )),
-            Err(error) => self.browser.set_status(format!("Download failed: {error}")),
+            Err(error) => self
+                .tab
+                .browser
+                .set_status(format!("Download failed: {error}")),
         }
         self.request_redraw();
     }
@@ -4512,24 +4592,25 @@ impl DesktopApp {
     }
 
     fn advance_find(&mut self, forward: bool) {
-        if self.find_matches.is_empty() {
+        if self.tab.find_matches.is_empty() {
             return;
         }
-        self.find_index = if forward {
-            (self.find_index + 1) % self.find_matches.len()
+        self.tab.find_index = if forward {
+            (self.tab.find_index + 1) % self.tab.find_matches.len()
         } else {
-            (self.find_index + self.find_matches.len() - 1) % self.find_matches.len()
+            (self.tab.find_index + self.tab.find_matches.len() - 1) % self.tab.find_matches.len()
         };
         if let Some(scene) = &self.scene
             && let Some(rect) = scene
-                .selection_rects(self.find_matches[self.find_index])
+                .selection_rects(self.tab.find_matches[self.tab.find_index])
                 .first()
         {
-            let y =
-                (self.browser.interaction().scroll.y + rect.y - scene.content_viewport.y - 24.0)
-                    .max(0.0);
+            let y = (self.tab.browser.interaction().scroll.y + rect.y
+                - scene.content_viewport.y
+                - 24.0)
+                .max(0.0);
             self.dispatch(UserAction::SetViewportScroll(CssPoint::new(
-                self.browser.interaction().scroll.x,
+                self.tab.browser.interaction().scroll.x,
                 y,
             )));
         }
@@ -4537,12 +4618,13 @@ impl DesktopApp {
     }
 
     fn active_editor_mut(&mut self) -> Option<&mut TextEditor> {
-        match self.focus {
-            FocusTarget::Find => Some(&mut self.find),
-            FocusTarget::Command => Some(&mut self.command),
+        match self.tab.focus {
+            FocusTarget::Find => Some(&mut self.tab.find),
+            FocusTarget::Command => Some(&mut self.tab.command),
             FocusTarget::Download => None,
-            FocusTarget::Form { .. } => self.form_editor.as_mut(),
+            FocusTarget::Form { .. } => self.tab.form_editor.as_mut(),
             FocusTarget::Page => self
+                .tab
                 .terminal
                 .as_mut()
                 .filter(|terminal| terminal.connected && !terminal.char_mode())
@@ -4551,11 +4633,12 @@ impl DesktopApp {
     }
 
     fn finish_text_edit(&mut self) {
-        if let FocusTarget::Form { form, field } = self.focus
+        if let FocusTarget::Form { form, field } = self.tab.focus
             && self
+                .tab
                 .pending_page_keys
                 .iter()
-                .chain(self.queued_form_keys.iter())
+                .chain(self.tab.queued_form_keys.iter())
                 .any(|key| key.previewed && key.form == Some((form, field)))
         {
             // The queued key tasks already own these edits. Blurring must not
@@ -4566,17 +4649,21 @@ impl DesktopApp {
     }
 
     fn finish_text_edit_as(&mut self, input_type: Option<&str>) {
-        if self.focus == FocusTarget::Page && self.terminal.is_some() {
-            self.session_history.detach();
+        if self.tab.focus == FocusTarget::Page && self.tab.terminal.is_some() {
+            self.tab.session_history.detach();
         }
-        let FocusTarget::Form { form, field } = self.focus else {
+        let FocusTarget::Form { form, field } = self.tab.focus else {
             return;
         };
-        let Some(value) = self.form_editor.as_ref().map(TextEditor::text) else {
+        let Some(value) = self.tab.form_editor.as_ref().map(TextEditor::text) else {
             return;
         };
-        let selection = self.form_editor.as_ref().map(TextEditor::control_selection);
-        let Some(cache) = &mut self.page_layout else {
+        let selection = self
+            .tab
+            .form_editor
+            .as_ref()
+            .map(TextEditor::control_selection);
+        let Some(cache) = &mut self.tab.page_layout else {
             return;
         };
         let Some(control) = cache
@@ -4588,16 +4675,17 @@ impl DesktopApp {
             return;
         };
         if control.number.as_ref().is_some_and(|n| !n.mutable) {
-            if let Some(editor) = self.form_editor.as_mut() {
+            if let Some(editor) = self.tab.form_editor.as_mut() {
                 editor.set_text(&control.value);
             }
             return;
         }
         let editable = control.kind == FieldKind::Textarea && control.selection.is_none();
         let state = control.live_node.and_then(|node| {
-            self.browser
+            self.tab
+                .browser
                 .page_text_control_state(node)
-                .or_else(|| self.browser.page_editable_state(node))
+                .or_else(|| self.tab.browser.page_editable_state(node))
         });
         let previous = state.map_or_else(|| control.editing_value(), |state| state.text.as_str());
         let previous_selection = state.map_or(control.selection, |state| Some(state.selection));
@@ -4663,18 +4751,20 @@ impl DesktopApp {
     /// for outstanding input tasks, then accept script edits (including an
     /// empty composer after submission) even if no new layout was needed.
     fn sync_focused_form(&mut self) {
-        let FocusTarget::Form { form, field } = self.focus else {
+        let FocusTarget::Form { form, field } = self.tab.focus else {
             return;
         };
         if self
+            .tab
             .pending_page_keys
             .iter()
-            .chain(self.queued_form_keys.iter())
+            .chain(self.tab.queued_form_keys.iter())
             .any(|key| key.previewed && key.form == Some((form, field)))
         {
             return;
         }
         let Some(control) = self
+            .tab
             .page_layout
             .as_ref()
             .and_then(|page| page.document.forms.get(form))
@@ -4682,16 +4772,17 @@ impl DesktopApp {
         else {
             return;
         };
-        if self.browser.page_is_live()
+        if self.tab.browser.page_is_live()
             && !control
                 .live_node
-                .is_some_and(|node| self.browser.form_value_pending(node))
-            && let Some(editor) = self.form_editor.as_mut()
+                .is_some_and(|node| self.tab.browser.form_value_pending(node))
+            && let Some(editor) = self.tab.form_editor.as_mut()
         {
             let state = control.live_node.and_then(|node| {
-                self.browser
+                self.tab
+                    .browser
                     .page_text_control_state(node)
-                    .or_else(|| self.browser.page_editable_state(node))
+                    .or_else(|| self.tab.browser.page_editable_state(node))
             });
             sync_editor_value(
                 editor,
@@ -4706,11 +4797,11 @@ impl DesktopApp {
     }
 
     fn copy(&mut self, cut: bool) {
-        if self.gemini_input && self.browser.prompt().is_some_and(|p| p.sensitive) {
+        if self.tab.gemini_input && self.tab.browser.prompt().is_some_and(|p| p.sensitive) {
             return;
         }
-        if self.focus == FocusTarget::Page
-            && self.terminal.as_ref().is_some_and(|terminal| {
+        if self.tab.focus == FocusTarget::Page
+            && self.tab.terminal.as_ref().is_some_and(|terminal| {
                 !terminal.char_mode() && terminal.view.terminal.remote_echo()
             })
         {
@@ -4746,11 +4837,11 @@ impl DesktopApp {
         else {
             return;
         };
-        if self.focus == FocusTarget::Page
-            && let Some(terminal) = &mut self.terminal
+        if self.tab.focus == FocusTarget::Page
+            && let Some(terminal) = &mut self.tab.terminal
         {
-            if let Err(error) = terminal.paste(&text, &mut self.session_history) {
-                self.browser.set_status(error);
+            if let Err(error) = terminal.paste(&text, &mut self.tab.session_history) {
+                self.tab.browser.set_status(error);
             }
             self.request_redraw();
             return;
@@ -4770,7 +4861,7 @@ impl DesktopApp {
         {
             return false;
         }
-        let Some(cache) = &self.protocol_page else {
+        let Some(cache) = &self.tab.protocol_page else {
             return false;
         };
         self.protocol_pointer_selection = false;
@@ -4781,12 +4872,12 @@ impl DesktopApp {
                     return true;
                 }
                 if cache.document.gopher.is_some() && key.eq_ignore_ascii_case("e") {
-                    self.browser.gopher_encoding();
+                    self.tab.browser.gopher_encoding();
                     self.request_redraw();
                     return true;
                 }
                 if cache.document.whois.is_some() && key.eq_ignore_ascii_case("e") {
-                    self.browser.whois_encoding(None);
+                    self.tab.browser.whois_encoding(None);
                     self.request_redraw();
                     return true;
                 }
@@ -4796,8 +4887,8 @@ impl DesktopApp {
                     || cache.document.gemini.is_some())
                     && key.eq_ignore_ascii_case("s")
                 {
-                    self.browser.offer_whois_export(None);
-                    if self.browser.download_offer().is_some() {
+                    self.tab.browser.offer_whois_export(None);
+                    if self.tab.browser.download_offer().is_some() {
                         self.set_focus(FocusTarget::Download);
                     }
                     self.request_redraw();
@@ -4811,13 +4902,13 @@ impl DesktopApp {
                     None
                 };
                 if let Some(action) = action {
-                    self.browser.reply_view_action(action, None);
+                    self.tab.browser.reply_view_action(action, None);
                     self.request_redraw();
                     return true;
                 }
             }
             if input.modifiers.shift && matches!(input.key, Key::ArrowLeft | Key::ArrowRight) {
-                let mut scroll = self.browser.interaction().scroll;
+                let mut scroll = self.tab.browser.interaction().scroll;
                 let max = (cache.layout.paint.width - cache.viewport.width).max(0.0);
                 scroll.x = (scroll.x
                     + if input.key == Key::ArrowLeft {
@@ -4851,7 +4942,7 @@ impl DesktopApp {
                 let position = gopherus_arrow(
                     &cache.layout.lines,
                     cache.selected,
-                    self.browser.interaction().scroll.y,
+                    self.tab.browser.interaction().scroll.y,
                     cache.viewport.height,
                     cache.layout.paint.height,
                     direction,
@@ -4860,7 +4951,7 @@ impl DesktopApp {
                 true
             }
             Key::PageUp | Key::PageDown | Key::Home | Key::End => {
-                let current = self.browser.interaction().scroll.y;
+                let current = self.tab.browser.interaction().scroll.y;
                 let max_scroll = (cache.layout.paint.height - cache.viewport.height).max(0.0);
                 let (target, direction) = match &input.key {
                     Key::PageUp => ((current - cache.viewport.height * 0.9).max(0.0), -1),
@@ -4891,7 +4982,7 @@ impl DesktopApp {
             || input.modifiers.control
             || input.modifiers.meta
             || input.modifiers.alt
-            || self.page_layout.is_none()
+            || self.tab.page_layout.is_none()
         {
             return false;
         }
@@ -4900,14 +4991,14 @@ impl DesktopApp {
         };
         let Some(target) = viewport_scroll_key_target(
             &input.key,
-            self.browser.interaction().scroll,
+            self.tab.browser.interaction().scroll,
             CssSize::new(scene.content_viewport.width, scene.content_viewport.height),
             scene.page_size,
         ) else {
             return false;
         };
         self.cancel_heart_glide();
-        self.keyboard_target = None;
+        self.tab.keyboard_target = None;
         self.dispatch(UserAction::SetViewportScroll(target));
         true
     }
@@ -4918,13 +5009,14 @@ impl DesktopApp {
     /// acknowledgements asynchronously; sending releases eagerly would let a
     /// keyup handler observe the value from before its keydown's default.
     fn dispatch_live_form_key(&mut self, input: &KeyInput, text: Option<String>) -> bool {
-        if !self.browser.page_is_live() {
+        if !self.tab.browser.page_is_live() {
             return false;
         }
-        let FocusTarget::Form { form, field } = self.focus else {
+        let FocusTarget::Form { form, field } = self.tab.focus else {
             return false;
         };
         let control = self
+            .tab
             .page_layout
             .as_ref()
             .and_then(|page| page.document.forms.get(form))
@@ -4936,18 +5028,22 @@ impl DesktopApp {
         if control.live_node.is_none() {
             return false;
         }
-        if self.queued_form_keys.len() + self.pending_page_keys.len() >= 4096 {
+        if self.tab.queued_form_keys.len() + self.tab.pending_page_keys.len() >= 4096 {
             self.stop_current_page();
             return true;
         }
         let actor_default = actor_text_key(input, text.as_deref(), &control);
         let previewed = native_text_feedback_key(input, text.as_deref(), &control)
-            && self.form_editor.is_some();
+            && self.tab.form_editor.is_some();
         if previewed {
-            apply_editor_key(self.form_editor.as_mut().unwrap(), input, text.as_deref());
+            apply_editor_key(
+                self.tab.form_editor.as_mut().unwrap(),
+                input,
+                text.as_deref(),
+            );
             self.request_redraw();
         }
-        self.queued_form_keys.push_back(PendingPageKey {
+        self.tab.queued_form_keys.push_back(PendingPageKey {
             form: Some((form, field)),
             input: input.clone(),
             text,
@@ -4960,6 +5056,7 @@ impl DesktopApp {
 
     fn dispatch_next_form_key(&mut self) {
         if self
+            .tab
             .pending_page_keys
             .iter()
             .any(|key| key.input.state == KeyState::Pressed && !key.actor_default)
@@ -4971,14 +5068,15 @@ impl DesktopApp {
         // Actor-owned insertions/releases may share the FIFO lane. A key that
         // needs native glyph navigation/IME remains a barrier; its KeyDefault
         // follows presentation so it accepts script value/selection first.
-        while let Some(mut pending) = self.queued_form_keys.pop_front() {
+        while let Some(mut pending) = self.tab.queued_form_keys.pop_front() {
             let Some((form, field)) = pending.form else {
                 continue;
             };
-            if self.focus != (FocusTarget::Form { form, field }) {
+            if self.tab.focus != (FocusTarget::Form { form, field }) {
                 continue;
             }
             let Some(control) = self
+                .tab
                 .page_layout
                 .as_ref()
                 .and_then(|page| page.document.forms.get(form))
@@ -4998,7 +5096,7 @@ impl DesktopApp {
             } else {
                 None
             };
-            self.pending_page_keys.push_back(pending);
+            self.tab.pending_page_keys.push_back(pending);
             if actor_default {
                 // Keyboard handlers, UTF-16 insertion and input checkpoints
                 // share the actor's FIFO lane. Native glyph navigation/IME
@@ -5014,9 +5112,9 @@ impl DesktopApp {
     fn apply_gopherus_position(&mut self, position: GopherusPosition) {
         self.protocol_pointer_selection = false;
         self.cancel_heart_glide();
-        let old_scroll = self.browser.interaction().scroll;
+        let old_scroll = self.tab.browser.interaction().scroll;
         let (selection_changed, preview) = {
-            let Some(cache) = &mut self.protocol_page else {
+            let Some(cache) = &mut self.tab.protocol_page else {
                 return;
             };
             let changed = cache.select(position.selected);
@@ -5026,8 +5124,8 @@ impl DesktopApp {
                 .unwrap_or_default();
             (changed, preview)
         };
-        self.keyboard_target = None;
-        self.link_preview = preview;
+        self.tab.keyboard_target = None;
+        self.tab.link_preview = preview;
         if (old_scroll.y - position.scroll).abs() > f32::EPSILON {
             self.dispatch(UserAction::SetViewportScroll(CssPoint::new(
                 old_scroll.x,
@@ -5045,6 +5143,23 @@ impl DesktopApp {
             if pressed {
                 self.release_native_pointer_lock(true);
             }
+            return;
+        }
+        // The page's question whether to leave it takes every key.
+        if self.unload_prompt.is_some() {
+            self.unload_prompt_key(&KeyInput {
+                key: translate_key(&event.logical_key),
+                code: String::new(),
+                location: 0,
+                state: if pressed {
+                    KeyState::Pressed
+                } else {
+                    KeyState::Released
+                },
+                modifiers: translate_modifiers(self.modifiers),
+                repeat: event.repeat,
+                composing: false,
+            });
             return;
         }
         // Every key belongs to the context menu while it shows.
@@ -5067,6 +5182,27 @@ impl DesktopApp {
         if pressed {
             self.protocol_pointer_selection = false;
         }
+        // Tab shortcuts belong to the browser, so neither their presses nor
+        // their releases reach a page. A Telnet session in character mode
+        // receives every key while it has the keyboard.
+        if !pressed && self.swallowed_keys.remove(&event.physical_key) {
+            return;
+        }
+        if pressed
+            && !(self.tab.focus == FocusTarget::Page
+                && self
+                    .tab
+                    .terminal
+                    .as_ref()
+                    .is_some_and(TerminalSession::char_mode))
+            && let Some(shortcut) = tabs::TabShortcut::of(&event.logical_key, self.modifiers)
+        {
+            self.swallowed_keys.insert(event.physical_key);
+            if !event.repeat || shortcut.repeats() {
+                self.run_tab_shortcut(shortcut);
+            }
+            return;
+        }
         // The platform's context menu keys (the menu key, Shift+F10): a live
         // page fires `contextmenu` at its focused element as the key's
         // default action, which decides whether the menu shows.
@@ -5078,7 +5214,7 @@ impl DesktopApp {
         if pressed
             && !event.repeat
             && menu_key
-            && matches!(self.focus, FocusTarget::Page | FocusTarget::Form { .. })
+            && matches!(self.tab.focus, FocusTarget::Page | FocusTarget::Form { .. })
             && self.context_menu_available()
         {
             self.request_page_context_menu(false, true);
@@ -5087,7 +5223,7 @@ impl DesktopApp {
             }
         }
         if pressed
-            && self.terminal.is_none()
+            && self.tab.terminal.is_none()
             && !self.modifiers.super_key()
             && let WinitKey::Character(character) = &event.logical_key
             && character.eq_ignore_ascii_case("b")
@@ -5101,7 +5237,7 @@ impl DesktopApp {
                 return;
             }
         }
-        let remote_focus = self.focus == FocusTarget::Page && self.terminal.is_some();
+        let remote_focus = self.tab.focus == FocusTarget::Page && self.tab.terminal.is_some();
         let command = self.modifiers.control_key() || self.modifiers.super_key();
         let local_shortcut =
             !remote_focus || self.modifiers.super_key() || self.modifiers.shift_key();
@@ -5117,13 +5253,14 @@ impl DesktopApp {
                 return;
             }
             if character.eq_ignore_ascii_case("f") {
-                if let Some(terminal) = &self.terminal {
-                    self.command
+                if let Some(terminal) = &self.tab.terminal {
+                    self.tab
+                        .command
                         .set_text(&format!("find {}", terminal.view.terminal.search));
                     self.set_focus(FocusTarget::Command);
                     return;
                 }
-                self.find.select_all();
+                self.tab.find.select_all();
                 self.set_focus(FocusTarget::Find);
                 return;
             }
@@ -5138,8 +5275,8 @@ impl DesktopApp {
             // Select-all of a page without a live Document; a live page
             // selects its own as the key's default action.
             if character.eq_ignore_ascii_case("a")
-                && self.focus == FocusTarget::Page
-                && self.terminal.is_none()
+                && self.tab.focus == FocusTarget::Page
+                && self.tab.terminal.is_none()
                 && self.select_all_page_text()
             {
                 return;
@@ -5198,7 +5335,7 @@ impl DesktopApp {
             self.dispatch(UserAction::Key(input));
             return;
         }
-        if self.select_popup.is_some() && self.select_popup_key(&input, event.text.as_deref()) {
+        if self.tab.select_popup.is_some() && self.select_popup_key(&input, event.text.as_deref()) {
             return;
         }
         // UI Events §3.5.6.1 routes keydown to the focused element and makes
@@ -5213,9 +5350,9 @@ impl DesktopApp {
             && !input.modifiers.control
             && !input.modifiers.meta
         {
-            if self.focus == FocusTarget::Command {
+            if self.tab.focus == FocusTarget::Command {
                 self.close_command();
-            } else if tab_keeps_document_focus(self.focus, self.form_editor.is_some()) {
+            } else if tab_keeps_document_focus(self.tab.focus, self.tab.form_editor.is_some()) {
                 self.focus_next(input.modifiers.shift);
             } else {
                 self.open_command(false);
@@ -5229,20 +5366,20 @@ impl DesktopApp {
             self.toggle_command(false);
             return;
         }
-        if pressed && self.focus == FocusTarget::Download {
+        if pressed && self.tab.focus == FocusTarget::Download {
             match &input.key {
                 Key::ArrowLeft | Key::ArrowUp => {
-                    self.file_action_selected = (self.file_action_selected + 2) % 3;
+                    self.tab.file_action_selected = (self.tab.file_action_selected + 2) % 3;
                     self.request_redraw();
                     return;
                 }
                 Key::ArrowRight | Key::ArrowDown => {
-                    self.file_action_selected = (self.file_action_selected + 1) % 3;
+                    self.tab.file_action_selected = (self.tab.file_action_selected + 1) % 3;
                     self.request_redraw();
                     return;
                 }
                 Key::Enter => {
-                    self.activate_file_action(self.file_action_selected);
+                    self.activate_file_action(self.tab.file_action_selected);
                     return;
                 }
                 Key::Character(text) if text.eq_ignore_ascii_case("s") => {
@@ -5271,9 +5408,9 @@ impl DesktopApp {
         // scripts (`sync_close_requests`). Elsewhere, and in COMMAND or Find,
         // Escape stops loading; it never dismisses COMMAND. `kill` drops the
         // page. The Escape release still reaches the page as its keyup.
-        if pressed && input.key == Key::Escape && self.terminal.is_none() {
-            if matches!(self.focus, FocusTarget::Page | FocusTarget::Form { .. })
-                && self.browser.page_is_live()
+        if pressed && input.key == Key::Escape && self.tab.terminal.is_none() {
+            if matches!(self.tab.focus, FocusTarget::Page | FocusTarget::Form { .. })
+                && self.tab.browser.page_is_live()
                 && !input.composing
             {
                 self.dispatch(UserAction::CloseRequest(input.modifiers));
@@ -5282,17 +5419,19 @@ impl DesktopApp {
             }
             return;
         }
-        if self.focus == FocusTarget::Page
-            && self.terminal.is_none()
+        if self.tab.focus == FocusTarget::Page
+            && self.tab.terminal.is_none()
             && self.handle_gopherus_key(&input)
         {
             return;
         }
-        if self.focus == FocusTarget::Page && self.terminal.is_none() && self.browser.page_is_live()
+        if self.tab.focus == FocusTarget::Page
+            && self.tab.terminal.is_none()
+            && self.tab.browser.page_is_live()
         {
             // UI Events keydown/keyup target live DOM focus. Wait for cancellation before
             // running page scrolling/activation defaults; UA shortcuts above remain native.
-            self.pending_page_keys.push_back(PendingPageKey {
+            self.tab.pending_page_keys.push_back(PendingPageKey {
                 form: None,
                 input: input.clone(),
                 text: None,
@@ -5302,8 +5441,8 @@ impl DesktopApp {
             self.dispatch(UserAction::Key(input));
             return;
         }
-        if self.focus == FocusTarget::Page
-            && self.terminal.is_none()
+        if self.tab.focus == FocusTarget::Page
+            && self.tab.terminal.is_none()
             && self.handle_http_scroll_key(&input)
         {
             return;
@@ -5321,7 +5460,7 @@ impl DesktopApp {
             return;
         }
         if pressed {
-            let focus = self.focus;
+            let focus = self.tab.focus;
             match (focus, &input.key) {
                 (FocusTarget::Find, Key::Enter) => {
                     self.advance_find(!input.modifiers.shift);
@@ -5332,23 +5471,24 @@ impl DesktopApp {
                     return;
                 }
                 (FocusTarget::Command, Key::ArrowUp | Key::ArrowDown) => {
-                    if self.gemini_input {
+                    if self.tab.gemini_input {
                         return;
                     }
-                    let current = self.command.text();
+                    let current = self.tab.command.text();
                     let recalled = if input.key == Key::ArrowUp {
                         self.command_history.up(&current)
                     } else {
                         self.command_history.down()
                     };
                     if let Some(recalled) = recalled {
-                        self.command.set_text(&recalled);
+                        self.tab.command.set_text(&recalled);
                     }
                     self.request_redraw();
                     return;
                 }
                 (FocusTarget::Form { form, field }, _)
                     if self
+                        .tab
                         .page_layout
                         .as_ref()
                         .and_then(|page| page.document.forms.get(form))
@@ -5361,6 +5501,7 @@ impl DesktopApp {
                 }
                 (FocusTarget::Form { form, field }, Key::ArrowUp | Key::ArrowDown)
                     if self
+                        .tab
                         .page_layout
                         .as_ref()
                         .and_then(|page| page.document.forms.get(form))
@@ -5376,6 +5517,7 @@ impl DesktopApp {
                 }
                 (FocusTarget::Form { form, field }, Key::Enter) => {
                     let kind = self
+                        .tab
                         .page_layout
                         .as_ref()
                         .and_then(|page| page.document.forms.get(form))
@@ -5386,6 +5528,7 @@ impl DesktopApp {
                         Some(FieldKind::Text | FieldKind::Number | FieldKind::Password) => {
                             self.finish_text_edit();
                             let submitter = self
+                                .tab
                                 .page_layout
                                 .as_ref()
                                 .and_then(|page| page.document.forms.get(form))
@@ -5406,6 +5549,7 @@ impl DesktopApp {
                 }
                 (FocusTarget::Form { form, field }, Key::Character(text)) if text == " " => {
                     let editable = self
+                        .tab
                         .page_layout
                         .as_ref()
                         .and_then(|page| page.document.forms.get(form))
@@ -5424,14 +5568,15 @@ impl DesktopApp {
                         return;
                     }
                 }
-                (FocusTarget::Page, Key::Enter) if self.terminal.is_none() => {
-                    if let Some(target) = self.keyboard_target.clone() {
+                (FocusTarget::Page, Key::Enter) if self.tab.terminal.is_none() => {
+                    if let Some(target) = self.tab.keyboard_target.clone() {
                         self.activate_page_hit(target);
                         return;
                     }
                 }
                 (_, Key::Escape)
                     if self
+                        .tab
                         .terminal
                         .as_ref()
                         .is_some_and(|terminal| !terminal.char_mode()) =>
@@ -5445,7 +5590,7 @@ impl DesktopApp {
                 _ => {}
             }
         }
-        if remote_focus && let Some(terminal) = &mut self.terminal {
+        if remote_focus && let Some(terminal) = &mut self.tab.terminal {
             if input.composing {
                 return;
             }
@@ -5458,7 +5603,8 @@ impl DesktopApp {
                 return;
             }
             if !terminal.connected {
-                self.browser
+                self.tab
+                    .browser
                     .set_status("Telnet connection is not ready. COMMAND: status / reconnect");
                 return;
             }
@@ -5471,7 +5617,7 @@ impl DesktopApp {
                     }
                 });
                 if let Err(error) = result {
-                    self.browser.set_status(error);
+                    self.tab.browser.set_status(error);
                 }
                 self.request_redraw();
                 return;
@@ -5517,18 +5663,18 @@ impl DesktopApp {
                             }
                             LineControl::Send(bytes) => return terminal.send_input(bytes),
                         }
-                        self.session_history.detach();
+                        self.tab.session_history.detach();
                     }
                     Ok(())
                 });
                 if let Err(error) = result {
-                    self.browser.set_status(error);
+                    self.tab.browser.set_status(error);
                 }
                 self.request_redraw();
                 return;
             }
             if pressed && !input.composing && matches!(input.key, Key::ArrowUp | Key::ArrowDown) {
-                terminal.recall_line(input.key == Key::ArrowUp, &mut self.session_history);
+                terminal.recall_line(input.key == Key::ArrowUp, &mut self.tab.session_history);
                 self.request_redraw();
                 return;
             }
@@ -5537,20 +5683,20 @@ impl DesktopApp {
             .active_editor_mut()
             .is_some_and(|editor| editor.handle_key(&input));
         if consumed {
-            if self.focus == FocusTarget::Command {
+            if self.tab.focus == FocusTarget::Command {
                 self.command_history.detach();
             }
             self.finish_text_edit();
             self.request_redraw();
             return;
         }
-        if self.focus == FocusTarget::Page
-            && let Some(terminal) = &mut self.terminal
+        if self.tab.focus == FocusTarget::Page
+            && let Some(terminal) = &mut self.tab.terminal
             && pressed
             && input.key == Key::Enter
         {
-            if let Err(error) = terminal.submit_line(&mut self.session_history) {
-                self.browser.set_status(error);
+            if let Err(error) = terminal.submit_line(&mut self.tab.session_history) {
+                self.tab.browser.set_status(error);
             }
             self.request_redraw();
             return;
@@ -5570,7 +5716,7 @@ impl DesktopApp {
                 && let Some(editor) = self.active_editor_mut()
             {
                 editor.replace_selection(&text);
-                if self.focus == FocusTarget::Command {
+                if self.tab.focus == FocusTarget::Command {
                     self.command_history.detach();
                 }
                 self.finish_text_edit();
@@ -5579,7 +5725,7 @@ impl DesktopApp {
             }
         }
         // Keys consumed by browser chrome must not leak into the underlying document.
-        if self.focus == FocusTarget::Page && self.terminal.is_none() {
+        if self.tab.focus == FocusTarget::Page && self.tab.terminal.is_none() {
             self.dispatch(UserAction::Key(input));
         }
     }
@@ -5607,8 +5753,8 @@ impl DesktopApp {
             editor.handle_ime(&action);
             self.finish_text_edit();
         } else if let ImeAction::Commit(text) = &action
-            && self.focus == FocusTarget::Page
-            && let Some(terminal) = &mut self.terminal
+            && self.tab.focus == FocusTarget::Page
+            && let Some(terminal) = &mut self.tab.terminal
         {
             let result = terminal
                 .view
@@ -5617,10 +5763,10 @@ impl DesktopApp {
                 .encode(text)
                 .and_then(|bytes| terminal.send_input(bytes));
             if let Err(error) = result {
-                self.browser.set_status(error);
+                self.tab.browser.set_status(error);
             }
         }
-        if self.terminal.is_none() || self.focus != FocusTarget::Page {
+        if self.tab.terminal.is_none() || self.tab.focus != FocusTarget::Page {
             self.dispatch(UserAction::Ime(action));
         }
         self.update_ime_cursor_area();
@@ -5628,8 +5774,8 @@ impl DesktopApp {
     }
 
     fn update_ime_cursor_area(&mut self) {
-        if self.focus == FocusTarget::Page
-            && let Some(terminal) = &mut self.terminal
+        if self.tab.focus == FocusTarget::Page
+            && let Some(terminal) = &mut self.tab.terminal
             && terminal.connected
             && !terminal.char_mode()
             && let Some(scene) = &self.scene
@@ -5647,11 +5793,11 @@ impl DesktopApp {
             }
             return;
         }
-        if let FocusTarget::Form { form, field } = self.focus
+        if let FocusTarget::Form { form, field } = self.tab.focus
             && let (Some(page), Some(scene), Some(editor), Some(window)) = (
-                &self.page_layout,
+                &self.tab.page_layout,
                 &self.scene,
-                &mut self.form_editor,
+                &mut self.tab.form_editor,
                 &self.window,
             )
             && let Some((&node, _)) = page
@@ -5675,22 +5821,22 @@ impl DesktopApp {
                             + bounds.left as f32
                             + presentation.origin.x
                             + area.x
-                            - self.browser.interaction().scroll.x
-                            - self.form_scroll_x,
+                            - self.tab.browser.interaction().scroll.x
+                            - self.tab.form_scroll_x,
                     ),
                     f64::from(
                         scene.content_viewport.y
                             + bounds.top as f32
                             + presentation.origin.y
                             + area.y
-                            - self.browser.interaction().scroll.y,
+                            - self.tab.browser.interaction().scroll.y,
                     ),
                 ),
                 LogicalSize::new(f64::from(area.width), f64::from(area.height)),
             );
             return;
         }
-        let focus = self.focus;
+        let focus = self.tab.focus;
         let Some(editor) = self.active_editor_mut() else {
             return;
         };
@@ -5713,6 +5859,7 @@ impl DesktopApp {
                 .unwrap_or_default(),
             FocusTarget::Download => CssPoint::default(),
             FocusTarget::Form { form, field } => self
+                .tab
                 .page_layout
                 .as_ref()
                 .and_then(|page| {
@@ -5726,9 +5873,9 @@ impl DesktopApp {
                     self.scene.as_ref().map(|scene| {
                         CssPoint::new(
                             scene.content_viewport.x + bounds.left as f32
-                                - self.browser.interaction().scroll.x,
+                                - self.tab.browser.interaction().scroll.x,
                             scene.content_viewport.y + bounds.top as f32
-                                - self.browser.interaction().scroll.y,
+                                - self.tab.browser.interaction().scroll.y,
                         )
                     })
                 })
@@ -5757,27 +5904,29 @@ impl DesktopApp {
 
     fn gopher_information(&mut self, page: bool) {
         let selected = self
+            .tab
             .protocol_page
             .as_ref()
             .and_then(ProtocolPageCache::selected_link);
-        let current = self.browser.current_page().map(|page| page.target());
+        let current = self.tab.browser.current_page().map(|page| page.target());
         match trust::gopher::information_target(selected, current, page) {
             Ok(link) => {
                 self.close_command();
                 self.activate_link(link);
             }
-            Err(error) => self.browser.set_status(error),
+            Err(error) => self.tab.browser.set_status(error),
         }
         self.request_redraw();
     }
 
     fn bookmark_command(&mut self, command: &str) {
-        let current = if let Some(terminal) = &self.terminal {
+        let current = if let Some(terminal) = &self.tab.terminal {
             trust::gopher::absolute_link(&terminal.address)
                 .map(|link| (link, terminal.address.clone()))
         } else {
-            self.browser.current_page().map(|page| {
+            self.tab.browser.current_page().map(|page| {
                 let title = self
+                    .tab
                     .protocol_page
                     .as_ref()
                     .map(|cache| trust::bookmarks::suggested_title(&cache.document))
@@ -5786,6 +5935,7 @@ impl DesktopApp {
             })
         };
         let selected = self
+            .tab
             .protocol_page
             .as_ref()
             .and_then(|cache| {
@@ -5799,7 +5949,7 @@ impl DesktopApp {
                 })
             })
             .or_else(|| {
-                trust::gopher::absolute_link(&self.link_preview).map(|link| {
+                trust::gopher::absolute_link(&self.tab.link_preview).map(|link| {
                     let title = link.to_string();
                     (link, title)
                 })
@@ -5807,7 +5957,7 @@ impl DesktopApp {
         let context = trust::bookmarks::Context { current, selected };
         let result = trust::bookmarks::operation(command, &context).and_then(|operation| {
             if let trust::bookmarks::Operation::List(filter) = &operation {
-                self.bookmark_filter = filter.clone();
+                self.tab.bookmark_filter = filter.clone();
             }
             if self.bookmarks.is_none() {
                 let proxy = self.event_proxy.clone();
@@ -5820,7 +5970,7 @@ impl DesktopApp {
             }
             self.bookmarks.as_ref().unwrap().submit(operation)
         });
-        self.browser.set_status(match result {
+        self.tab.browser.set_status(match result {
             Ok(()) => "Updating bookmarks…".into(),
             Err(e) => e,
         });
@@ -5841,35 +5991,36 @@ impl DesktopApp {
                 // A change: what the menu offers for the page may follow.
                 self.refresh_page_bookmark();
                 if let Some(source) = outcome.listing {
-                    if self.terminal.is_some() {
-                        self.bookmark_terminal = self.terminal.take();
+                    if self.tab.terminal.is_some() {
+                        self.tab.bookmark_terminal = self.tab.terminal.take();
                     }
                     self.open_internal_page("about:bookmarks", source.into_bytes());
                     self.close_command();
-                } else if self.browser.snapshot().address == "about:bookmarks"
+                } else if self.tab.browser.snapshot().address == "about:bookmarks"
                     && let Some(worker) = &self.bookmarks
                 {
                     let _ = worker.submit(trust::bookmarks::Operation::List(
-                        self.bookmark_filter.clone(),
+                        self.tab.bookmark_filter.clone(),
                     ));
                 }
-                self.browser.set_status(outcome.message);
+                self.tab.browser.set_status(outcome.message);
             }
-            Err(error) => self.browser.set_status(error),
+            Err(error) => self.tab.browser.set_status(error),
         }
         self.request_redraw();
     }
 
     fn gemini_heading(&mut self, which: &str) {
-        self.browser.reply_view_action("outline", Some(false));
-        let Some(page) = self.browser.current_page() else {
+        self.tab.browser.reply_view_action("outline", Some(false));
+        let Some(page) = self.tab.browser.current_page() else {
             return;
         };
         let Some(doc) = trust::render::documents::document(page) else {
             return;
         };
         let Some(view) = &doc.gemini else {
-            self.browser
+            self.tab
+                .browser
                 .set_status("Heading navigation applies to Gemini.");
             return;
         };
@@ -5878,7 +6029,7 @@ impl DesktopApp {
         let current = layout
             .lines
             .iter()
-            .rposition(|l| l.rect.y <= self.browser.interaction().scroll.y + 1.0)
+            .rposition(|l| l.rect.y <= self.tab.browser.interaction().scroll.y + 1.0)
             .unwrap_or(0);
         match trust::gemini::heading_row(view, current, which) {
             Ok(row) => {
@@ -5889,56 +6040,56 @@ impl DesktopApp {
                     )));
                 }
             }
-            Err(error) => self.browser.set_status(error),
+            Err(error) => self.tab.browser.set_status(error),
         }
         self.request_redraw();
     }
 
     fn execute_command(&mut self) {
-        let line = self.command.text();
-        if self.gemini_input {
-            self.command.set_text("");
-            let asked = self.browser.prompt().cloned();
-            self.browser.submit_prompt(&line);
-            if let Some(prompt) = self.browser.prompt() {
+        let line = self.tab.command.text();
+        if self.tab.gemini_input {
+            self.tab.command.set_text("");
+            let asked = self.tab.browser.prompt().cloned();
+            self.tab.browser.submit_prompt(&line);
+            if let Some(prompt) = self.tab.browser.prompt() {
                 // The next question starts from its own prefill; a refused
                 // answer stays for correction, unless it was a secret.
                 if Some(prompt) != asked.as_ref() {
                     let initial = prompt.initial.clone();
-                    self.command.set_text(&initial);
+                    self.tab.command.set_text(&initial);
                 } else if !prompt.sensitive {
-                    self.command.set_text(&line);
+                    self.tab.command.set_text(&line);
                 }
             }
-            if self.browser.prompt().is_none() {
-                self.gemini_input = false;
+            if self.tab.browser.prompt().is_none() {
+                self.tab.gemini_input = false;
                 self.set_focus(FocusTarget::Page);
             }
             self.request_redraw();
             return;
         }
-        if let Some(base) = self.gopher_query.take() {
+        if let Some(base) = self.tab.gopher_query.take() {
             match base.with_query(&line) {
                 Ok(url) => {
                     self.close_command();
                     self.navigate(url.to_string());
                 }
-                Err(error) => self.browser.set_status(error),
+                Err(error) => self.tab.browser.set_status(error),
             }
             return;
         }
         let command = line.trim();
         self.command_history.push(command);
-        if let Some(terminal) = &mut self.terminal {
+        if let Some(terminal) = &mut self.tab.terminal {
             terminal.view.terminal.report = None;
             if let Some(result) = terminal.view.terminal.control(command, terminal.connected) {
                 match result {
-                    Err(error) => self.browser.set_status(error),
+                    Err(error) => self.tab.browser.set_status(error),
                     Ok(trust::terminal::Control::Message(message)) => {
-                        self.browser.set_status(message)
+                        self.tab.browser.set_status(message)
                     }
                     Ok(trust::terminal::Control::Send(command, message)) => {
-                        self.browser.set_status(
+                        self.tab.browser.set_status(
                             terminal
                                 .handle
                                 .commands
@@ -5947,7 +6098,7 @@ impl DesktopApp {
                         );
                     }
                     Ok(trust::terminal::Control::Copy(text)) => {
-                        self.browser.set_status(match self.clipboard.as_mut() {
+                        self.tab.browser.set_status(match self.clipboard.as_mut() {
                             Some(clipboard) => clipboard.set_text(text).map_or_else(
                                 |error| format!("Clipboard: {error}"),
                                 |_| "Terminal text copied".into(),
@@ -5962,7 +6113,7 @@ impl DesktopApp {
                         let input_mode = terminal.view.terminal.input_mode;
                         let crlf = terminal.view.terminal.crlf;
                         self.navigate(address);
-                        if let Some(terminal) = &mut self.terminal {
+                        if let Some(terminal) = &mut self.tab.terminal {
                             terminal.line_editor.set_text(&draft);
                             terminal.view.terminal.encoding = encoding;
                             terminal.view.terminal.input_mode = input_mode;
@@ -5976,11 +6127,13 @@ impl DesktopApp {
                             .try_send(trust::telnet::Command::Close);
                         terminal.connected = false;
                         terminal.view.terminal.reset_negotiation();
-                        self.browser
+                        self.tab
+                            .browser
                             .set_status("Connection closed. COMMAND: reconnect");
                     }
                 }
                 if self
+                    .tab
                     .terminal
                     .as_ref()
                     .is_none_or(|terminal| terminal.view.terminal.report.is_none())
@@ -5999,7 +6152,7 @@ impl DesktopApp {
                 self.bookmark_command(command);
                 self.close_command();
             }
-            "q" | "quit" | "exit" => self.exit_requested = true,
+            "q" | "quit" | "exit" => self.request_quit(),
             "back" => {
                 self.close_command();
                 self.dispatch(UserAction::Back);
@@ -6015,14 +6168,16 @@ impl DesktopApp {
             "stop" => self.stop_current_page(),
             "kill" => self.kill_current_page(),
             "close" | "c" => {
-                if let Some(terminal) = self.terminal.take() {
+                if let Some(terminal) = self.tab.terminal.take() {
                     let _ = terminal
                         .handle
                         .commands
                         .try_send(trust::telnet::Command::Close);
-                    self.browser.set_status("Terminal connection closed.");
+                    self.tab.browser.set_status("Terminal connection closed.");
                 } else {
-                    self.browser.set_status("No terminal connection to close.");
+                    self.tab
+                        .browser
+                        .set_status("No terminal connection to close.");
                 }
             }
             "open" | "o" => {
@@ -6033,14 +6188,15 @@ impl DesktopApp {
                     return;
                 }
                 let Some(target) = parts.next() else {
-                    self.browser.set_status("usage: open <host|url> [port]");
+                    self.tab.browser.set_status("usage: open <host|url> [port]");
                     return;
                 };
                 let port = match parts.next() {
                     Some(value) => match trust::command::parse_port(value) {
                         Some(port) => Some(port),
                         None => {
-                            self.browser
+                            self.tab
+                                .browser
                                 .set_status(format!("bad port or service name: {value}"));
                             return;
                         }
@@ -6053,63 +6209,65 @@ impl DesktopApp {
             }
             "post" => {
                 let Some(target) = parts.next() else {
-                    self.browser.set_status("usage: post <url> [body]");
+                    self.tab.browser.set_status("usage: post <url> [body]");
                     return;
                 };
                 let Some(url) = trust::http::parse_url(target) else {
-                    self.browser.set_status("post needs an http(s):// URL");
+                    self.tab.browser.set_status("post needs an http(s):// URL");
                     return;
                 };
                 let body = parts.collect::<Vec<_>>().join(" ");
                 self.close_command();
-                let outcome = self.browser.post(url, body);
+                let outcome = self.tab.browser.post(url, body);
                 if outcome.loading_retired {
                     self.retire_page_loading();
                 }
-                self.keyboard_target = None;
+                self.tab.keyboard_target = None;
                 self.request_redraw();
             }
             "find" => {
-                self.find.set_text(&parts.collect::<Vec<_>>().join(" "));
-                self.find.select_all();
+                self.tab.find.set_text(&parts.collect::<Vec<_>>().join(" "));
+                self.tab.find.select_all();
                 self.set_focus(FocusTarget::Find);
             }
             "set" => match (parts.next(), parts.next()) {
                 (Some("encoding"), Some("cp437")) => {
-                    if let Some(terminal) = &mut self.terminal {
+                    if let Some(terminal) = &mut self.tab.terminal {
                         terminal.view.terminal.encoding = trust::terminal_view::Encoding::Cp437;
-                        self.browser.set_status("Terminal encoding: CP437");
+                        self.tab.browser.set_status("Terminal encoding: CP437");
                     } else {
-                        self.browser
+                        self.tab
+                            .browser
                             .set_status("CP437 applies to a Telnet session.");
                     }
                 }
                 (Some("encoding"), Some("utf8" | "utf-8")) => {
-                    if let Some(terminal) = &mut self.terminal {
+                    if let Some(terminal) = &mut self.tab.terminal {
                         terminal.view.terminal.encoding = trust::terminal_view::Encoding::Utf8;
-                        self.browser.set_status("Terminal encoding: UTF-8");
+                        self.tab.browser.set_status("Terminal encoding: UTF-8");
                     } else {
-                        self.browser
+                        self.tab
+                            .browser
                             .set_status("UTF-8 is already the page encoding path.");
                     }
                 }
                 (Some("cookies"), Some("on")) => {
-                    self.browser.set_cookies_enabled(true);
+                    self.tab.browser.set_cookies_enabled(true);
                 }
                 (Some("cookies"), Some("off")) => {
-                    self.browser.set_cookies_enabled(false);
+                    self.tab.browser.set_cookies_enabled(false);
                 }
                 (Some("borders"), Some("on")) => {
                     trust::layout2::set_borders_enabled(true);
                     self.relayout_cached_page();
-                    self.browser.set_status("CSS borders enabled.");
+                    self.tab.browser.set_status("CSS borders enabled.");
                 }
                 (Some("borders"), Some("off")) => {
                     trust::layout2::set_borders_enabled(false);
                     self.relayout_cached_page();
-                    self.browser.set_status("CSS borders disabled.");
+                    self.tab.browser.set_status("CSS borders disabled.");
                 }
-                _ => self.browser.set_status(
+                _ => self.tab.browser.set_status(
                     "usage: set encoding cp437|utf8 · set cookies on|off · set borders on|off",
                 ),
             },
@@ -6131,7 +6289,8 @@ impl DesktopApp {
             }
             "certificates" | "identities" => {
                 self.close_command();
-                self.browser
+                self.tab
+                    .browser
                     .open_certificates(trust::gemini::security::MANAGER);
                 self.request_redraw();
             }
@@ -6140,7 +6299,7 @@ impl DesktopApp {
                     .split_once(char::is_whitespace)
                     .map_or("", |(_, s)| s);
                 self.close_command();
-                self.browser.dict_auth_command(arguments);
+                self.tab.browser.dict_auth_command(arguments);
                 self.request_redraw();
             }
             "identity" => {
@@ -6148,12 +6307,12 @@ impl DesktopApp {
                     .split_once(char::is_whitespace)
                     .map_or("", |(_, s)| s);
                 self.close_command();
-                self.browser.identity_command(arguments);
+                self.tab.browser.identity_command(arguments);
                 self.request_redraw();
             }
             "outline" => {
                 self.close_command();
-                self.browser.reply_view_action("outline", None);
+                self.tab.browser.reply_view_action("outline", None);
                 self.request_redraw();
             }
             "heading" => {
@@ -6162,7 +6321,8 @@ impl DesktopApp {
             }
             "gemini-width" => {
                 self.close_command();
-                self.browser
+                self.tab
+                    .browser
                     .gemini_width(parts.next().and_then(|v| v.parse().ok()).unwrap_or(0));
                 self.request_redraw();
             }
@@ -6172,18 +6332,18 @@ impl DesktopApp {
                     Some("on") => Some(true),
                     Some("off") => Some(false),
                     _ => {
-                        self.browser.set_status("usage: gemini-alt [on|off]");
+                        self.tab.browser.set_status("usage: gemini-alt [on|off]");
                         return;
                     }
                 };
                 self.close_command();
-                self.browser.reply_view_action("alt", value);
+                self.tab.browser.reply_view_action("alt", value);
                 self.request_redraw();
             }
             "gopher-info" => match (parts.next(), parts.next()) {
                 (None, None) => self.gopher_information(false),
                 (Some("page"), None) => self.gopher_information(true),
-                _ => self.browser.set_status("usage: gopher-info [page]"),
+                _ => self.tab.browser.set_status("usage: gopher-info [page]"),
             },
             "wrap" | "changes" => {
                 let action = verb.as_str();
@@ -6192,27 +6352,30 @@ impl DesktopApp {
                     Some("on") => Some(true),
                     Some("off") => Some(false),
                     _ => {
-                        self.browser.set_status(format!("usage: {action} [on|off]"));
+                        self.tab
+                            .browser
+                            .set_status(format!("usage: {action} [on|off]"));
                         return;
                     }
                 };
                 self.close_command();
-                if !self.browser.reply_view_action(action, enabled) {
-                    self.browser
+                if !self.tab.browser.reply_view_action(action, enabled) {
+                    self.tab.browser
                         .set_status("Wrap applies to Finger, WHOIS, RDAP and DICT; changes applies to Finger and WHOIS.");
                 }
                 self.request_redraw();
             }
             "rdap" => {
-                let current = self
-                    .browser
-                    .current_page()
-                    .and_then(|page| match page.target() {
-                        Link::OneShot(url) if url.scheme == trust::oneshot::Scheme::Whois => {
-                            Some(url.query.as_str())
-                        }
-                        _ => None,
-                    });
+                let current =
+                    self.tab
+                        .browser
+                        .current_page()
+                        .and_then(|page| match page.target() {
+                            Link::OneShot(url) if url.scheme == trust::oneshot::Scheme::Whois => {
+                                Some(url.query.as_str())
+                            }
+                            _ => None,
+                        });
                 match trust::rdap::command_target(
                     command.trim_start().get(4..).unwrap_or(""),
                     current,
@@ -6221,7 +6384,7 @@ impl DesktopApp {
                         self.close_command();
                         self.activate_link(link);
                     }
-                    Err(error) => self.browser.set_status(error),
+                    Err(error) => self.tab.browser.set_status(error),
                 }
             }
             "encoding" => {
@@ -6230,15 +6393,17 @@ impl DesktopApp {
                     Some(value) => match trust::whois::Encoding::parse(value) {
                         Some(encoding) => Some(encoding),
                         None => {
-                            self.browser
+                            self.tab
+                                .browser
                                 .set_status("usage: encoding [auto|utf8|latin1]");
                             return;
                         }
                     },
                 };
                 self.close_command();
-                if !self.browser.whois_encoding(encoding) {
-                    self.browser
+                if !self.tab.browser.whois_encoding(encoding) {
+                    self.tab
+                        .browser
                         .set_status("Encoding controls apply to WHOIS replies.");
                 }
                 self.request_redraw();
@@ -6249,24 +6414,26 @@ impl DesktopApp {
                     Some(value) => match value.parse::<usize>() {
                         Ok(index) => Some(index),
                         Err(_) => {
-                            self.browser.set_status("usage: save [server-number]");
+                            self.tab.browser.set_status("usage: save [server-number]");
                             return;
                         }
                     },
                 };
                 self.close_command();
-                if !self.browser.offer_whois_export(server) {
-                    self.browser
+                if !self.tab.browser.offer_whois_export(server) {
+                    self.tab
+                        .browser
                         .set_status("Save applies to WHOIS, RDAP and DICT replies.");
                 }
-                if self.browser.download_offer().is_some() {
+                if self.tab.browser.download_offer().is_some() {
                     self.set_focus(FocusTarget::Download);
                 }
                 self.request_redraw();
             }
             "finger" | "f" => {
                 let Some(url) = parts.next().and_then(trust::finger::command_target) else {
-                    self.browser
+                    self.tab
+                        .browser
                         .set_status("usage: finger [user]@<host>[:port]");
                     return;
                 };
@@ -6279,7 +6446,7 @@ impl DesktopApp {
                         self.close_command();
                         self.navigate(url.to_string());
                     }
-                    Err(error) => self.browser.set_status(error),
+                    Err(error) => self.tab.browser.set_status(error),
                 }
             }
             "dict" | "define" => {
@@ -6291,15 +6458,16 @@ impl DesktopApp {
                         self.close_command();
                         self.navigate(target.to_string());
                     }
-                    Err(error) => self.browser.set_status(error),
+                    Err(error) => self.tab.browser.set_status(error),
                 }
             }
             "dict-filter" => {
                 let filter = command
                     .split_once(char::is_whitespace)
                     .map_or("", |(_, s)| s);
-                if !self.browser.dict_filter(filter) {
-                    self.browser
+                if !self.tab.browser.dict_filter(filter) {
+                    self.tab
+                        .browser
                         .set_status("Filter applies to dictionary pages.");
                 }
                 self.close_command();
@@ -6313,7 +6481,8 @@ impl DesktopApp {
                     Some(value) => match trust::command::parse_port(value) {
                         Some(port) => command_target(&verb, Some(port)),
                         None => {
-                            self.browser
+                            self.tab
+                                .browser
                                 .set_status(format!("bad port or service name: {value}"));
                             return;
                         }
@@ -6341,24 +6510,25 @@ impl DesktopApp {
                 self.navigate(url.to_string());
             }
             Ok(None) => return false,
-            Err(error) => self.browser.set_status(error),
+            Err(error) => self.tab.browser.set_status(error),
         }
         true
     }
 
     fn open_internal_page(&mut self, address: &str, source: Vec<u8>) {
         let outcome = self
+            .tab
             .browser
             .open_internal_gemtext(address.to_string(), source);
         if outcome.loading_retired {
             self.retire_page_loading();
         }
-        self.keyboard_target = None;
+        self.tab.keyboard_target = None;
         self.request_redraw();
     }
 
     fn desktop_status_page(&self) -> Vec<u8> {
-        let snapshot = self.browser.snapshot();
+        let snapshot = self.tab.browser.snapshot();
         let renderer = self
             .renderer
             .as_ref()
@@ -6372,8 +6542,8 @@ impl DesktopApp {
             vw = self.browser_viewport().width,
             vh = self.browser_viewport().height,
             scale = self.metrics.scale_factor.get(),
-            sx = self.browser.interaction().scroll.x,
-            sy = self.browser.interaction().scroll.y,
+            sx = self.tab.browser.interaction().scroll.x,
+            sy = self.tab.browser.interaction().scroll.y,
         )
         .into_bytes()
     }
@@ -6383,10 +6553,11 @@ impl DesktopApp {
             self.set_focus(FocusTarget::Page);
             return;
         };
-        let mut controls = self.page_layout.as_ref().map_or_else(Vec::new, |page| {
+        let mut controls = self.tab.page_layout.as_ref().map_or_else(Vec::new, |page| {
             scene.ordered_focus_hits(&page.document.focus_order)
         });
         if self
+            .tab
             .page_layout
             .as_ref()
             .is_some_and(|page| page.document.direct_actor_nodes)
@@ -6404,6 +6575,7 @@ impl DesktopApp {
             return;
         }
         let current = self
+            .tab
             .keyboard_target
             .as_ref()
             .and_then(|current| {
@@ -6412,7 +6584,7 @@ impl DesktopApp {
                     .position(|candidate| same_page_target(candidate, current))
             })
             .or_else(|| {
-                let FocusTarget::Form { form, field } = self.focus else {
+                let FocusTarget::Form { form, field } = self.tab.focus else {
                     return None;
                 };
                 controls.iter().position(|candidate| {
@@ -6422,16 +6594,18 @@ impl DesktopApp {
             .map_or(0, |index| index + 1);
         let target = controls[current % controls.len()].clone();
         if let Some((form, field)) = self.form_target_for_hit(&target) {
-            self.keyboard_target = None;
+            self.tab.keyboard_target = None;
             // Sequential navigation indicates the control's focus.
             let actor = self
+                .tab
                 .page_layout
                 .as_ref()
                 .and_then(|page| page.document.forms.get(form))
                 .and_then(|form| form.fields.get(field))
                 .and_then(|control| control.live_node);
-            if actor.is_some() && self.focus != (FocusTarget::Form { form, field }) {
-                self.browser
+            if actor.is_some() && self.tab.focus != (FocusTarget::Form { form, field }) {
+                self.tab
+                    .browser
                     .handle_action(UserAction::KeyboardFocus { actor });
             }
             self.focus_form(form, field);
@@ -6440,15 +6614,15 @@ impl DesktopApp {
         self.finish_text_edit();
         self.set_focus(FocusTarget::Page);
         self.scroll_page_target_into_view(target.node, target.rect);
-        self.link_preview = target
+        self.tab.link_preview = target
             .link
             .as_ref()
             .map(ToString::to_string)
             .unwrap_or_default();
-        self.browser.handle_action(UserAction::KeyboardFocus {
+        self.tab.browser.handle_action(UserAction::KeyboardFocus {
             actor: target.actor,
         });
-        self.keyboard_target = Some(target);
+        self.tab.keyboard_target = Some(target);
         self.request_redraw();
     }
 
@@ -6458,7 +6632,7 @@ impl DesktopApp {
     /// adapter already carries `Link::Form` on its item, while the graphical
     /// border-box hit intentionally carries only the canonical actor node.
     fn form_target_for_hit(&self, hit: &trust::render::PageHit) -> Option<(usize, usize)> {
-        let page = self.page_layout.as_ref()?;
+        let page = self.tab.page_layout.as_ref()?;
         form_target_for_node(hit.node, &page.document.controls, &page.document.parents)
     }
 
@@ -6470,7 +6644,7 @@ impl DesktopApp {
             .iter()
             .rev()
             .find(|container| {
-                if !self.page_layout.as_ref().is_some_and(|page| {
+                if !self.tab.page_layout.as_ref().is_some_and(|page| {
                     page.layout.boxes.contains_key(&node)
                         && page.document.is_inclusive_ancestor(container.node, node)
                 }) {
@@ -6514,7 +6688,7 @@ impl DesktopApp {
         let rect = nested.map_or(rect, |container| container.viewport);
         let Some(scene) = &self.scene else { return };
         let viewport = scene.content_viewport;
-        let current = self.browser.interaction().scroll;
+        let current = self.tab.browser.interaction().scroll;
         let y = if rect.y < viewport.y {
             current.y - (viewport.y - rect.y)
         } else if rect.y + rect.height > viewport.y + viewport.height {
@@ -6531,11 +6705,12 @@ impl DesktopApp {
     }
 
     fn focus_form(&mut self, form: usize, field: usize) {
-        if self.focus == (FocusTarget::Form { form, field }) && self.form_editor.is_some() {
+        if self.tab.focus == (FocusTarget::Form { form, field }) && self.tab.form_editor.is_some() {
             return;
         }
         self.finish_text_edit();
         let actor = self
+            .tab
             .page_layout
             .as_ref()
             .and_then(|page| page.document.forms.get(form))
@@ -6546,10 +6721,11 @@ impl DesktopApp {
     }
 
     fn present_form_focus(&mut self, form: usize, field: usize) {
-        if self.focus == (FocusTarget::Form { form, field }) && self.form_editor.is_some() {
+        if self.tab.focus == (FocusTarget::Form { form, field }) && self.tab.form_editor.is_some() {
             return;
         }
         let Some(control) = self
+            .tab
             .page_layout
             .as_ref()
             .and_then(|page| page.document.forms.get(form))
@@ -6558,14 +6734,14 @@ impl DesktopApp {
         else {
             return;
         };
-        let presentation = self.page_layout.as_ref().and_then(|page| {
+        let presentation = self.tab.page_layout.as_ref().and_then(|page| {
             page.document.controls.iter().find_map(|(node, indices)| {
                 (*indices == (form, field))
                     .then(|| page.document.rich_editors.get(node))
                     .flatten()
             })
         });
-        self.form_editor = match control.kind {
+        self.tab.form_editor = match control.kind {
             FieldKind::Text | FieldKind::Number | FieldKind::Password | FieldKind::Textarea => {
                 Some(TextEditor::new(
                     control.editing_value(),
@@ -6576,7 +6752,7 @@ impl DesktopApp {
             }
             _ => None,
         };
-        self.form_scroll_x = 0.0;
+        self.tab.form_scroll_x = 0.0;
         self.set_focus(FocusTarget::Form { form, field });
         self.sync_focused_form();
         self.scroll_control_into_view(form, field);
@@ -6584,6 +6760,7 @@ impl DesktopApp {
 
     fn activate_form_control(&mut self, form: usize, field: usize) {
         let Some(control) = self
+            .tab
             .page_layout
             .as_ref()
             .and_then(|page| page.document.forms.get(form))
@@ -6600,7 +6777,7 @@ impl DesktopApp {
                 | FieldKind::Textarea
                 | FieldKind::Hidden
         ) {
-            self.form_editor = None;
+            self.tab.form_editor = None;
             self.set_focus(FocusTarget::Form { form, field });
         }
         // DOM #dispatching-events / HTML #the-input-element: native checkbox
@@ -6608,7 +6785,7 @@ impl DesktopApp {
         // cancellation handled by the page actor. SetValue is an edit command;
         // using it here lost pointer coordinates/trust and ignored cancellation.
         if matches!(control.kind, FieldKind::Checkbox | FieldKind::Radio)
-            && self.browser.page_is_live()
+            && self.tab.browser.page_is_live()
             && let Some(node) = control.live_node
         {
             self.dispatch(UserAction::Activate(Link::JsClick {
@@ -6627,7 +6804,7 @@ impl DesktopApp {
             // HTML #the-select-element: a live select receives the click of
             // its activation, and the drop-down box shows its options.
             FieldKind::Select(_) => {
-                if self.browser.page_is_live()
+                if self.tab.browser.page_is_live()
                     && let Some(node) = control.live_node
                 {
                     self.dispatch(UserAction::Activate(Link::JsClick {
@@ -6652,7 +6829,7 @@ impl DesktopApp {
             // activation.
             FieldKind::File(_) => {
                 if let Some(actor) = control.live_node
-                    && self.browser.page_is_live()
+                    && self.tab.browser.page_is_live()
                 {
                     self.dispatch(UserAction::Activate(Link::JsClick {
                         node: actor,
@@ -6669,7 +6846,7 @@ impl DesktopApp {
     /// box under the viewport scroll.
     fn form_control_rect(&self, form: usize, field: usize) -> Option<CssRect> {
         let scene = self.scene.as_ref()?;
-        let cache = self.page_layout.as_ref()?;
+        let cache = self.tab.page_layout.as_ref()?;
         let (&node, _) = cache
             .document
             .controls
@@ -6683,8 +6860,8 @@ impl DesktopApp {
         }
         let bounds = cache.layout.boxes.get(&node)?;
         Some(CssRect::new(
-            scene.content_viewport.x + bounds.left as f32 - self.browser.interaction().scroll.x,
-            scene.content_viewport.y + bounds.top as f32 - self.browser.interaction().scroll.y,
+            scene.content_viewport.x + bounds.left as f32 - self.tab.browser.interaction().scroll.x,
+            scene.content_viewport.y + bounds.top as f32 - self.tab.browser.interaction().scroll.y,
             bounds.width as f32,
             bounds.height as f32,
         ))
@@ -6694,6 +6871,7 @@ impl DesktopApp {
     /// is not mutable and shows none.
     fn open_select_popup(&mut self, form: usize, field: usize) {
         let Some((control, node)) = self
+            .tab
             .page_layout
             .as_ref()
             .and_then(|page| page.document.forms.get(form))
@@ -6709,9 +6887,9 @@ impl DesktopApp {
             return;
         };
         self.close_select_popup();
-        self.select_popup = Some(SelectPopup::new(form, field, node, control, anchor));
+        self.tab.select_popup = Some(SelectPopup::new(form, field, node, control, anchor));
         // HTML #selector-open: the select's picker is showing.
-        if self.browser.page_is_live()
+        if self.tab.browser.page_is_live()
             && let Some(node) = node
         {
             self.dispatch(UserAction::PickerOpen { node, open: true });
@@ -6720,10 +6898,10 @@ impl DesktopApp {
     }
 
     fn close_select_popup(&mut self) {
-        let Some(popup) = self.select_popup.take() else {
+        let Some(popup) = self.tab.select_popup.take() else {
             return;
         };
-        if self.browser.page_is_live()
+        if self.tab.browser.page_is_live()
             && let Some(node) = popup.node
         {
             self.dispatch(UserAction::PickerOpen { node, open: false });
@@ -6734,7 +6912,7 @@ impl DesktopApp {
     /// The user picked `option` in the open drop-down box: a single select
     /// selects it and closes; a multiple select toggles it and stays open.
     fn select_popup_pick(&mut self, option: usize) {
-        let Some(popup) = self.select_popup.as_mut() else {
+        let Some(popup) = self.tab.select_popup.as_mut() else {
             return;
         };
         if popup.control.pick(option).is_none() {
@@ -6769,7 +6947,7 @@ impl DesktopApp {
             .selected_index()
             .map(|index| control.options[index].value.clone())
             .unwrap_or_default();
-        if let Some(page) = &mut self.page_layout
+        if let Some(page) = &mut self.tab.page_layout
             && let Some(control_field) = page
                 .document
                 .forms
@@ -6779,7 +6957,7 @@ impl DesktopApp {
             control_field.value = value;
             control_field.select = Some(Box::new(control));
         }
-        if self.browser.page_is_live() {
+        if self.tab.browser.page_is_live() {
             if let (Some(select), Some(option)) = (node, option_node) {
                 self.dispatch(UserAction::PickSelectOption {
                     select,
@@ -6815,6 +6993,7 @@ impl DesktopApp {
             _ => return false,
         };
         let Some((mut control, node)) = self
+            .tab
             .page_layout
             .as_ref()
             .and_then(|page| page.document.forms.get(form))
@@ -6846,7 +7025,7 @@ impl DesktopApp {
 
     /// Keys while the drop-down box is open; true when consumed.
     fn select_popup_key(&mut self, input: &KeyInput, text: Option<&str>) -> bool {
-        let Some(popup) = self.select_popup.as_mut() else {
+        let Some(popup) = self.tab.select_popup.as_mut() else {
             return false;
         };
         if input.state != KeyState::Pressed {
@@ -6912,11 +7091,11 @@ impl DesktopApp {
     /// elsewhere (the select included) closes it, and its release is
     /// consumed too.
     fn select_popup_pointer_button(&mut self, pressed: bool, primary: bool) -> bool {
-        if !pressed && std::mem::take(&mut self.select_popup_swallow_release) {
+        if !pressed && std::mem::take(&mut self.tab.select_popup_swallow_release) {
             return true;
         }
         let point = self.pointer;
-        let Some(popup) = self.select_popup.as_mut() else {
+        let Some(popup) = self.tab.select_popup.as_mut() else {
             return false;
         };
         match popup.option_at(point) {
@@ -6934,7 +7113,7 @@ impl DesktopApp {
             None => {
                 if pressed {
                     self.close_select_popup();
-                    self.select_popup_swallow_release = true;
+                    self.tab.select_popup_swallow_release = true;
                 }
                 true
             }
@@ -6944,7 +7123,7 @@ impl DesktopApp {
     /// The pointer moved over the open drop-down box: highlight the enabled
     /// option under it. True when the box owns the pointer.
     fn select_popup_hover(&mut self, point: CssPoint) -> bool {
-        let Some(popup) = self.select_popup.as_mut() else {
+        let Some(popup) = self.tab.select_popup.as_mut() else {
             return false;
         };
         let Some(option) = popup.option_at(point) else {
@@ -6965,7 +7144,7 @@ impl DesktopApp {
     /// closes the box. True when consumed.
     fn select_popup_scroll(&mut self, delta: MouseScrollDelta) -> bool {
         let point = self.pointer;
-        let Some(popup) = self.select_popup.as_mut() else {
+        let Some(popup) = self.tab.select_popup.as_mut() else {
             return false;
         };
         if popup.option_at(point).is_none() {
@@ -6992,10 +7171,11 @@ impl DesktopApp {
     /// option, dimmed disabled options, and a scroll indicator. A box whose
     /// select left the presentation closes.
     fn paint_select_popup(&mut self, scene: &mut Scene) {
-        let Some(popup) = &self.select_popup else {
+        let Some(popup) = &self.tab.select_popup else {
             return;
         };
         let present = self
+            .tab
             .page_layout
             .as_ref()
             .and_then(|page| page.document.forms.get(popup.form))
@@ -7019,7 +7199,7 @@ impl DesktopApp {
         };
         let line_height = trust::text::shape("Xg", &style).line_height.max(14.0);
         let row_height = line_height + 6.0;
-        let Some(popup) = self.select_popup.as_mut() else {
+        let Some(popup) = self.tab.select_popup.as_mut() else {
             return;
         };
         popup.anchor = anchor;
@@ -7160,7 +7340,7 @@ impl DesktopApp {
     }
 
     fn position_form_caret(&mut self, form: usize, field: usize) {
-        let origin = self.page_layout.as_ref().and_then(|page| {
+        let origin = self.tab.page_layout.as_ref().and_then(|page| {
             page.document.controls.iter().find_map(|(node, indices)| {
                 if *indices != (form, field) {
                     return None;
@@ -7174,22 +7354,23 @@ impl DesktopApp {
                     .map_or(CssPoint::new(6.0, 5.0), |p| p.origin);
                 Some(CssPoint::new(
                     scene.content_viewport.x + bounds.left as f32 + inset.x
-                        - self.browser.interaction().scroll.x
-                        - self.form_scroll_x,
+                        - self.tab.browser.interaction().scroll.x
+                        - self.tab.form_scroll_x,
                     scene.content_viewport.y + bounds.top as f32 + inset.y
-                        - self.browser.interaction().scroll.y,
+                        - self.tab.browser.interaction().scroll.y,
                 ))
             })
         });
         if let Some(origin) = origin {
             let point = self.pointer;
             let password = self
+                .tab
                 .page_layout
                 .as_ref()
                 .and_then(|page| page.document.forms.get(form))
                 .and_then(|form| form.fields.get(field))
                 .is_some_and(|field| field.kind == FieldKind::Password);
-            if let Some(editor) = &mut self.form_editor {
+            if let Some(editor) = &mut self.tab.form_editor {
                 editor.move_to_line_point(
                     (point.x - origin.x).max(0.0),
                     (point.y - origin.y).max(0.0),
@@ -7203,7 +7384,7 @@ impl DesktopApp {
 
     fn scroll_control_into_view(&mut self, form: usize, field: usize) {
         self.cancel_heart_glide();
-        let Some(page) = &self.page_layout else {
+        let Some(page) = &self.tab.page_layout else {
             return;
         };
         let Some(rect) = page.document.controls.iter().find_map(|(node, indices)| {
@@ -7213,7 +7394,7 @@ impl DesktopApp {
         }) else {
             return;
         };
-        let current = self.browser.interaction().scroll;
+        let current = self.tab.browser.interaction().scroll;
         let mut y = current.y;
         if (rect.top as f32) < current.y {
             y = rect.top as f32;
@@ -7227,6 +7408,7 @@ impl DesktopApp {
 
     fn reset_form(&mut self, form: usize) {
         if let Some(actor) = self
+            .tab
             .page_layout
             .as_ref()
             .and_then(|page| page.document.forms.get(form))
@@ -7243,7 +7425,7 @@ impl DesktopApp {
             }));
             return;
         }
-        let Some(page) = &mut self.page_layout else {
+        let Some(page) = &mut self.tab.page_layout else {
             return;
         };
         let Some(current) = page.document.forms.get(form).cloned() else {
@@ -7270,6 +7452,7 @@ impl DesktopApp {
 
     fn toggle_check(&mut self, form: usize, field: usize, checked: bool) {
         let value = self
+            .tab
             .page_layout
             .as_ref()
             .and_then(|page| page.document.forms.get(form))
@@ -7280,7 +7463,7 @@ impl DesktopApp {
     }
 
     fn toggle_radio(&mut self, form: usize, field: usize) {
-        let Some(page) = &mut self.page_layout else {
+        let Some(page) = &mut self.tab.page_layout else {
             return;
         };
         let Some(target) = page
@@ -7308,7 +7491,7 @@ impl DesktopApp {
     }
 
     fn set_field_value(&mut self, form: usize, field: usize, value: String, checked: Option<bool>) {
-        let Some(page) = &mut self.page_layout else {
+        let Some(page) = &mut self.tab.page_layout else {
             return;
         };
         let Some(control) = page
@@ -7333,8 +7516,9 @@ impl DesktopApp {
     }
 
     fn step_number_control(&mut self, form: usize, field: usize, direction: i8) {
-        if self.browser.page_is_live()
+        if self.tab.browser.page_is_live()
             && let Some(node) = self
+                .tab
                 .page_layout
                 .as_ref()
                 .and_then(|p| p.document.forms.get(form))
@@ -7349,6 +7533,7 @@ impl DesktopApp {
             return;
         }
         let next = self
+            .tab
             .page_layout
             .as_ref()
             .and_then(|page| page.document.forms.get(form))
@@ -7363,8 +7548,8 @@ impl DesktopApp {
         let Some(next) = next else {
             return;
         };
-        if self.focus == (FocusTarget::Form { form, field })
-            && let Some(editor) = self.form_editor.as_mut()
+        if self.tab.focus == (FocusTarget::Form { form, field })
+            && let Some(editor) = self.tab.form_editor.as_mut()
         {
             editor.set_text(&next);
         }
@@ -7374,6 +7559,7 @@ impl DesktopApp {
     fn submit_form(&mut self, form: usize, submitter: Option<usize>) {
         let index = form;
         let Some(form) = self
+            .tab
             .page_layout
             .as_ref()
             .and_then(|page| page.document.forms.get(form))
@@ -7385,12 +7571,12 @@ impl DesktopApp {
         // submitter's no-validate state (formnovalidate, else novalidate) is
         // true, an invalid form is not submitted and the first invalid
         // control's problem is reported (#interactively-validate-the-constraints).
-        if !self.browser.page_is_live()
+        if !self.tab.browser.page_is_live()
             && form
                 .submission(submitter)
                 .is_some_and(|submission| !submission.no_validate)
-            && let Some((field, message)) = self.page_layout.as_ref().and_then(|layout| {
-                let page = self.browser.current_page()?;
+            && let Some((field, message)) = self.tab.page_layout.as_ref().and_then(|layout| {
+                let page = self.tab.browser.current_page()?;
                 let FetchedDocument::Http(response) = &page.document else {
                     return None;
                 };
@@ -7405,7 +7591,7 @@ impl DesktopApp {
         {
             self.set_focus(FocusTarget::Form { form: index, field });
             self.scroll_control_into_view(index, field);
-            self.browser.set_status(message);
+            self.tab.browser.set_status(message);
             self.request_redraw();
             return;
         }
@@ -7413,13 +7599,13 @@ impl DesktopApp {
         // #close-the-dialog removes its nearest ancestor dialog's `open`
         // attribute (nothing happens without one), and it never navigates.
         // The static presentation keeps the dialog closed across re-layouts.
-        if !self.browser.page_is_live()
+        if !self.tab.browser.page_is_live()
             && form
                 .submission(submitter)
                 .is_some_and(|submission| submission.method == trust::doc::FormMethod::Dialog)
         {
             if form.dialog.is_some()
-                && let Some(page) = &mut self.page_layout
+                && let Some(page) = &mut self.tab.page_layout
                 && let Some(form) = page.document.forms.get_mut(index)
             {
                 form.dialog_closed = true;
@@ -7435,10 +7621,11 @@ impl DesktopApp {
     fn activate_link(&mut self, link: Link) {
         if let Link::Gopher(url) = &link {
             if url.needs_query() {
-                self.gopher_query = Some(url.clone());
-                self.command.set_text("");
+                self.tab.gopher_query = Some(url.clone());
+                self.tab.command.set_text("");
                 self.set_focus(FocusTarget::Command);
-                self.browser
+                self.tab
+                    .browser
                     .set_status("Gopher search: enter a query, then Enter");
                 return;
             }
@@ -7457,13 +7644,14 @@ impl DesktopApp {
                 // RFC 1436 §3.8: the selector names the account to log in as.
                 let hint = String::from_utf8_lossy(&url.selector).into_owned();
                 if !hint.is_empty() {
-                    self.browser
+                    self.tab
+                        .browser
                         .set_status(format!("Telnet login hint: {hint}"));
                 }
                 return;
             }
             if url.is_download() {
-                self.browser.offer_gopher_download(url);
+                self.tab.browser.offer_gopher_download(url);
                 self.set_focus(FocusTarget::Download);
                 self.request_redraw();
                 return;
@@ -7471,16 +7659,16 @@ impl DesktopApp {
         }
         if let Some(action) = trust::dict::Action::from_link(&link)
             && let Some(FetchedDocument::Dict(page)) =
-                self.browser.current_page().map(|p| &p.document)
+                self.tab.browser.current_page().map(|p| &p.document)
         {
             if let Some(command) = page.command_for(&action) {
-                self.command.set_text(&command);
+                self.tab.command.set_text(&command);
                 self.set_focus(FocusTarget::Command);
                 self.request_redraw();
                 return;
             }
             if action == trust::dict::Action::Save {
-                self.browser.offer_whois_export(None);
+                self.tab.browser.offer_whois_export(None);
                 self.set_focus(FocusTarget::Download);
                 self.request_redraw();
                 return;
@@ -7489,12 +7677,12 @@ impl DesktopApp {
         // HTML §6.5 activation behavior still applies to page links. The
         // prompt is a browser chrome affordance, not a modal document dialog;
         // keep the retained page usable when the user chooses another link.
-        if self.focus == FocusTarget::Download {
-            self.browser.dismiss_download_offer();
+        if self.tab.focus == FocusTarget::Download {
+            self.tab.browser.dismiss_download_offer();
             self.set_focus(FocusTarget::Page);
         }
         match link {
-            Link::JsClick { href, .. } if !self.browser.page_is_live() => {
+            Link::JsClick { href, .. } if !self.tab.browser.page_is_live() => {
                 // Download prompts retire the resident actor while retaining
                 // the last complete page pixels. Listener-wrapped anchors
                 // still carry their real href, so progressive enhancement can
@@ -7502,7 +7690,8 @@ impl DesktopApp {
                 if let Some(target) = self.dead_page_href(&href) {
                     self.activate_link(target);
                 } else {
-                    self.browser
+                    self.tab
+                        .browser
                         .set_status("This page link needs the page engine; reload to use it.");
                 }
             }
@@ -7520,6 +7709,7 @@ impl DesktopApp {
 
     fn dead_page_href(&self, href: &str) -> Option<Link> {
         let base = self
+            .tab
             .browser
             .current_page()
             .and_then(|page| match page.target() {
@@ -7534,7 +7724,7 @@ impl DesktopApp {
             self.activate_form_control(form, field);
             return;
         }
-        if let Some(activation) = page_hit_activation(&target, self.browser.page_is_live()) {
+        if let Some(activation) = page_hit_activation(&target, self.tab.browser.page_is_live()) {
             self.activate_link(activation);
         }
     }
@@ -7558,6 +7748,7 @@ impl DesktopApp {
             return;
         };
         let Some(kind) = self
+            .tab
             .page_layout
             .as_ref()
             .and_then(|page| page.document.forms.get(form))
@@ -7572,13 +7763,13 @@ impl DesktopApp {
                 self.position_form_caret(form, field);
             }
             FieldKind::Select(_) => {
-                self.form_editor = None;
+                self.tab.form_editor = None;
                 self.set_focus(FocusTarget::Form { form, field });
                 self.open_select_popup(form, field);
             }
             FieldKind::Hidden => {}
             _ => {
-                self.form_editor = None;
+                self.tab.form_editor = None;
                 self.set_focus(FocusTarget::Form { form, field });
             }
         }
@@ -7589,6 +7780,7 @@ impl DesktopApp {
             return false;
         };
         let is_number = self
+            .tab
             .page_layout
             .as_ref()
             .and_then(|page| page.document.forms.get(form))
@@ -7613,8 +7805,9 @@ impl DesktopApp {
             -1
         };
         self.focus_form(form, field);
-        if self.browser.page_is_live()
+        if self.tab.browser.page_is_live()
             && let Some(node) = self
+                .tab
                 .page_layout
                 .as_ref()
                 .and_then(|p| p.document.forms.get(form))
@@ -7636,12 +7829,13 @@ impl DesktopApp {
     /// Clipboard API writes that passed the page's permission check (transient
     /// activation) go to the native system clipboard; the page learns the result.
     fn sync_clipboard_writes(&mut self) {
-        while let Some((request, text)) = self.browser.take_clipboard_write() {
+        while let Some((request, text)) = self.tab.browser.take_clipboard_write() {
             let ok = self
                 .clipboard
                 .as_mut()
                 .is_some_and(|clipboard| clipboard.set_text(text).is_ok());
-            self.browser
+            self.tab
+                .browser
                 .handle_action(UserAction::ClipboardResult { request, ok });
         }
     }
@@ -7654,11 +7848,11 @@ impl DesktopApp {
         if self.file_dialog_open {
             return;
         }
-        let Some(request) = self.browser.take_file_picker() else {
+        let Some(request) = self.tab.browser.take_file_picker() else {
             return;
         };
         self.file_dialog_open = true;
-        self.file_dialog_generation = self.browser.document_generation();
+        self.file_dialog_generation = self.tab.browser.document_generation();
         let mut dialog = rfd::AsyncFileDialog::new().set_title(if request.directory {
             "Choose a folder"
         } else if request.multiple {
@@ -7726,6 +7920,7 @@ impl DesktopApp {
             hit.actor.or(match &hit.link {
                 Some(Link::JsClick { node, .. }) => Some(*node),
                 Some(Link::Form { form, field }) => self
+                    .tab
                     .page_layout
                     .as_ref()
                     .and_then(|page| page.document.forms.get(*form))
@@ -7804,16 +7999,18 @@ impl DesktopApp {
     /// Pointer Lock 2.0: capture must succeed before acknowledging the page.
     fn sync_pointer_lock(&mut self) {
         if self.pointer_lock.as_ref().is_some_and(|lock| {
-            lock.generation != self.browser.document_generation() || !self.browser.page_is_live()
+            lock.generation != self.tab.browser.document_generation()
+                || !self.tab.browser.page_is_live()
         }) {
             self.release_native_pointer_lock(false);
         }
-        while let Some((request, node, _unadjusted)) = self.browser.take_pointer_lock_request() {
+        while let Some((request, node, _unadjusted)) = self.tab.browser.take_pointer_lock_request()
+        {
             if node.is_none() {
                 self.release_native_pointer_lock(false);
                 continue;
             }
-            let error = if !self.window_focused || self.focus != FocusTarget::Page {
+            let error = if !self.window_focused || self.tab.focus != FocusTarget::Page {
                 Some(String::from("WrongDocumentError"))
             } else if let Some(window) = &self.window {
                 let grab = window
@@ -7828,18 +8025,20 @@ impl DesktopApp {
                     Ok(confined) => {
                         if self.pointer_lock.is_none() {
                             self.pointer_lock = Some(NativePointerLock {
-                                generation: self.browser.document_generation(),
+                                generation: self.tab.browser.document_generation(),
                                 position: self.pointer,
                                 confined,
                             });
                         }
                         window.set_cursor_visible(false);
                         self.cursor_visible = false;
-                        self.text_selection.gesture = None;
+                        self.tab.text_selection.gesture = None;
                         self.close_context_menu();
-                        self.pressed_hit = None;
+                        self.tab.pressed_hit = None;
                         self.pressed_control = None;
-                        self.browser.set_status("Mouse captured · Esc to release");
+                        self.tab
+                            .browser
+                            .set_status("Mouse captured · Esc to release");
                         None
                     }
                     Err(_) => Some(String::from("NotSupportedError")),
@@ -7847,7 +8046,8 @@ impl DesktopApp {
             } else {
                 Some(String::from("NotSupportedError"))
             };
-            self.browser
+            self.tab
+                .browser
                 .handle_action(UserAction::PointerLockResult { request, error });
         }
     }
@@ -7863,14 +8063,17 @@ impl DesktopApp {
             }
             self.pointer = lock.position;
             self.cursor_visible = true;
-            if lock.generation == self.browser.document_generation() && self.browser.page_is_live()
+            if lock.generation == self.tab.browser.document_generation()
+                && self.tab.browser.page_is_live()
             {
-                self.browser.set_status("Mouse released");
+                self.tab.browser.set_status("Mouse released");
             }
             self.request_redraw();
         }
         if notify_page {
-            self.browser.handle_action(UserAction::ReleasePointerLock);
+            self.tab
+                .browser
+                .handle_action(UserAction::ReleasePointerLock);
         }
     }
 
@@ -7910,6 +8113,7 @@ impl DesktopApp {
             return;
         };
         let base = self
+            .tab
             .page_layout
             .as_ref()
             .map(|page| page.document.base.clone());
@@ -7966,8 +8170,9 @@ impl DesktopApp {
 
     fn terminal_mouse(&mut self, action: trust::terminal::MouseAction) -> bool {
         let captured_release = matches!(action, trust::terminal::MouseAction::Release(button)
-            if self.terminal.as_ref().is_some_and(|terminal| terminal.mouse_button == Some(button)));
-        if !captured_release && (self.focus != FocusTarget::Page || self.modifiers.shift_key()) {
+            if self.tab.terminal.as_ref().is_some_and(|terminal| terminal.mouse_button == Some(button)));
+        if !captured_release && (self.tab.focus != FocusTarget::Page || self.modifiers.shift_key())
+        {
             return false;
         }
         let Some(scene) = &self.scene else {
@@ -7979,7 +8184,7 @@ impl DesktopApp {
         {
             return false;
         }
-        let Some(terminal) = &mut self.terminal else {
+        let Some(terminal) = &mut self.tab.terminal else {
             return false;
         };
         if !terminal.connected
@@ -8027,7 +8232,7 @@ impl DesktopApp {
                 .commands
                 .try_send(trust::telnet::Command::Send(bytes))
         {
-            self.browser.set_status(error.to_string());
+            self.tab.browser.set_status(error.to_string());
         }
         true
     }
@@ -8038,13 +8243,14 @@ impl DesktopApp {
             .and_then(|scene| scene.control_at(self.pointer))
             == Some(ControlId::TerminalInput)
             && self
+                .tab
                 .terminal
                 .as_ref()
                 .is_some_and(|terminal| terminal.connected && !terminal.char_mode())
     }
 
     fn move_terminal_input_pointer(&mut self, extend: bool) {
-        if let Some(terminal) = &mut self.terminal {
+        if let Some(terminal) = &mut self.tab.terminal {
             terminal
                 .line_input
                 .move_to_point(&mut terminal.line_editor, self.pointer, extend);
@@ -8064,13 +8270,20 @@ impl DesktopApp {
         if self.select_popup_hover(point) {
             return;
         }
-        // The context menu holds the pointer while it shows: the page sees
-        // no motion or hover until it closes.
+        // The unload prompt and the context menu hold the pointer while they
+        // show: the page sees no motion or hover until they close.
+        if self.unload_prompt.is_some() && self.unload_prompt_pointer_moved() {
+            return;
+        }
         if self.context_menu.is_some() {
             self.context_menu_pointer_moved();
             return;
         }
+        if self.pointer_lock.is_none() && self.chrome_pointer_moved(point) {
+            return;
+        }
         let dragging_input = self
+            .tab
             .terminal
             .as_ref()
             .is_some_and(|terminal| terminal.line_input.selecting);
@@ -8086,7 +8299,7 @@ impl DesktopApp {
         if self.terminal_mouse(trust::terminal::MouseAction::Motion(None)) {
             return;
         }
-        let chrome_owned = self.heart_drag.is_some()
+        let chrome_owned = self.tab.heart_drag.is_some()
             || self
                 .scene
                 .as_ref()
@@ -8096,7 +8309,7 @@ impl DesktopApp {
             self.dispatch(UserAction::PointerMove(point));
         }
         let mut visual_changed = false;
-        if self.heart_drag.is_some() {
+        if self.tab.heart_drag.is_some() {
             self.seek_heart_drag(point);
             self.apply_cursor_icon(CursorIcon::Grabbing);
             return;
@@ -8135,8 +8348,8 @@ impl DesktopApp {
                 None
             }
         });
-        if heart_hover != self.heart_hover {
-            self.heart_hover = heart_hover;
+        if heart_hover != self.tab.heart_hover {
+            self.tab.heart_hover = heart_hover;
             visual_changed = true;
         }
         // Selection API §2: motion with the primary button held extends the
@@ -8164,9 +8377,9 @@ impl DesktopApp {
                 _ => None,
             })
         });
-        let actor_changed = actor != self.hovered_actor;
+        let actor_changed = actor != self.tab.hovered_actor;
         if actor_changed {
-            self.hovered_actor = actor;
+            self.tab.hovered_actor = actor;
             visual_changed = true;
         }
         // A native motion sample remains observable as pointermove/mousemove
@@ -8189,28 +8402,30 @@ impl DesktopApp {
                 metadata,
             });
         }
-        let selecting = self.text_selection.gesture.is_some();
-        if let Some(cache) = &mut self.protocol_page
+        let selecting = self.tab.text_selection.gesture.is_some();
+        if let Some(cache) = &mut self.tab.protocol_page
             && cache.hover(hit.as_ref(), self.protocol_pointer_selection && !selecting)
         {
-            self.keyboard_target = None;
+            self.tab.keyboard_target = None;
             visual_changed = true;
         }
-        let preview = if !self.protocol_pointer_selection && self.protocol_page.is_some() {
-            self.protocol_page
+        let preview = if !self.protocol_pointer_selection && self.tab.protocol_page.is_some() {
+            self.tab
+                .protocol_page
                 .as_ref()
                 .and_then(ProtocolPageCache::selected_link)
         } else {
             hit.as_ref().and_then(|hit| hit.link.as_ref())
         };
         let link_preview = preview.map(ToString::to_string).unwrap_or_default();
-        if link_preview != self.link_preview {
-            self.link_preview = link_preview;
+        if link_preview != self.tab.link_preview {
+            self.tab.link_preview = link_preview;
             visual_changed = true;
         }
-        let cursor = if self.heart_hover.is_some() {
+        let cursor = if self.tab.heart_hover.is_some() {
             CursorIcon::Grab
         } else if self
+            .tab
             .text_selection
             .gesture
             .is_some_and(|gesture| gesture.drag)
@@ -8235,6 +8450,7 @@ impl DesktopApp {
             match hit.as_ref().and_then(|hit| hit.link.as_ref()) {
                 Some(Link::Form { form, field })
                     if self
+                        .tab
                         .page_layout
                         .as_ref()
                         .and_then(|page| page.document.forms.get(*form))
@@ -8277,7 +8493,7 @@ impl DesktopApp {
     }
 
     fn handle_pointer_button(&mut self, state: ElementState, button: MouseButton) {
-        if (self.select_popup.is_some() || self.select_popup_swallow_release)
+        if (self.tab.select_popup.is_some() || self.tab.select_popup_swallow_release)
             && self.select_popup_pointer_button(
                 state == ElementState::Pressed,
                 button == MouseButton::Left,
@@ -8285,7 +8501,13 @@ impl DesktopApp {
         {
             return;
         }
+        if self.unload_prompt_pointer_button(state, button) {
+            return;
+        }
         if self.context_menu_pointer_button(state, button) {
+            return;
+        }
+        if self.pointer_lock.is_none() && self.chrome_pointer_button(state, button) {
             return;
         }
         if self.pointer_lock.is_some() {
@@ -8304,27 +8526,29 @@ impl DesktopApp {
             return;
         }
         let dragging_input = self
+            .tab
             .terminal
             .as_ref()
             .is_some_and(|terminal| terminal.line_input.selecting);
         if (dragging_input || self.over_terminal_input())
             && !(state == ElementState::Released
                 && self
+                    .tab
                     .terminal
                     .as_ref()
                     .is_some_and(|terminal| terminal.mouse_button.is_some()))
         {
             if button == MouseButton::Left {
                 if state == ElementState::Pressed {
-                    if self.focus != FocusTarget::Page {
+                    if self.tab.focus != FocusTarget::Page {
                         self.set_focus(FocusTarget::Page);
                     }
                     self.clear_text_selection();
                     self.pressed_control = None;
-                    self.pressed_hit = None;
+                    self.tab.pressed_hit = None;
                     self.move_terminal_input_pointer(self.modifiers.shift_key());
                 }
-                if let Some(terminal) = &mut self.terminal {
+                if let Some(terminal) = &mut self.tab.terminal {
                     terminal.line_input.selecting = state == ElementState::Pressed;
                 }
             }
@@ -8356,7 +8580,7 @@ impl DesktopApp {
             PointerButton::Other(n) => n as i16,
         };
         let button_mask = 1_u16.checked_shl(button_id as u32).unwrap_or(0);
-        let chrome_owned = self.heart_drag.is_some()
+        let chrome_owned = self.tab.heart_drag.is_some()
             || self
                 .scene
                 .as_ref()
@@ -8393,7 +8617,7 @@ impl DesktopApp {
                     (0, true) => self.page_press_selection(hit.as_ref()),
                     (0, false) => self.end_selection_gesture(),
                     (2, false) if self.context_menu_available() => Some(
-                        trust::js::PointerSelection::new(None, self.text_selection.serial),
+                        trust::js::PointerSelection::new(None, self.tab.text_selection.serial),
                     ),
                     _ => None,
                 };
@@ -8417,8 +8641,8 @@ impl DesktopApp {
             });
         }
         if state == ElementState::Released {
-            self.text_selection.gesture = None;
-            if self.heart_drag.take().is_some() {
+            self.tab.text_selection.gesture = None;
+            if self.tab.heart_drag.take().is_some() {
                 self.request_redraw();
                 return;
             }
@@ -8437,7 +8661,7 @@ impl DesktopApp {
                         && self.pressed_control.take() == Some(control)
                     {
                         self.activate_control(control);
-                        self.pressed_hit = None;
+                        self.tab.pressed_hit = None;
                         return;
                     }
                     let released = self
@@ -8448,18 +8672,19 @@ impl DesktopApp {
                     if std::env::var_os("TRUST_DESKTOP_TRACE").is_some() {
                         eprintln!(
                             "desktop: primary release pressed={:?} released={released:?}",
-                            self.pressed_hit
+                            self.tab.pressed_hit
                         );
                     }
-                    let click_target =
-                        self.pressed_hit
-                            .take()
-                            .zip(released)
-                            .and_then(|(pressed, released)| {
-                                let parents =
-                                    self.page_layout.as_ref().map(|page| &page.document.parents);
-                                click_target_for_hits(&pressed, &released, parents)
-                            });
+                    let click_target = self.tab.pressed_hit.take().zip(released).and_then(
+                        |(pressed, released)| {
+                            let parents = self
+                                .tab
+                                .page_layout
+                                .as_ref()
+                                .map(|page| &page.document.parents);
+                            click_target_for_hits(&pressed, &released, parents)
+                        },
+                    );
                     if std::env::var_os("TRUST_DESKTOP_TRACE").is_some() {
                         eprintln!("desktop: primary click target={click_target:?}");
                     }
@@ -8469,18 +8694,46 @@ impl DesktopApp {
                     // behavior. The frontend keeps only its native control
                     // duties; a static page has no actor, so it activates here.
                     if let Some(target) = click_target {
-                        if self.browser.page_is_live() {
+                        if self.tab.browser.page_is_live() {
                             self.native_pointer_activation(target);
+                        } else if (self.modifiers.control_key()
+                            || self.modifiers.super_key()
+                            || self.modifiers.shift_key())
+                            && let Some((link, _)) = self.hyperlink_at(self.pointer, false)
+                        {
+                            // The user's preference to follow the hyperlink
+                            // in a new top-level traversable (HTML
+                            // #following-hyperlinks-2), as a live page's
+                            // actor reads it: Ctrl (or Meta) for a tab in the
+                            // background, with Shift (or Shift alone) one in
+                            // front.
+                            self.open_link_in_new_tab(link, self.modifiers.shift_key());
                         } else if !self.step_number_from_pointer(&target) {
                             self.activate_page_hit(target);
                         }
                     }
                 }
+                PointerButton::Auxiliary if !chrome_owned => {
+                    // A static page has no actor to fire `auxclick`; its
+                    // hyperlinks follow the middle button into a new tab.
+                    let pressed = self.aux_press_link.take();
+                    if !self.tab.browser.page_is_live()
+                        && let Some((link, address)) = self.hyperlink_at(self.pointer, false)
+                        && pressed.as_deref() == Some(address.as_str())
+                    {
+                        self.open_link_in_new_tab(link, self.modifiers.shift_key());
+                    }
+                }
                 _ => {}
             }
             self.pressed_control = None;
-            self.pressed_hit = None;
+            self.tab.pressed_hit = None;
             return;
+        }
+        if button == PointerButton::Auxiliary && !chrome_owned {
+            self.aux_press_link = self
+                .hyperlink_at(self.pointer, false)
+                .map(|(_, address)| address);
         }
         if button != PointerButton::Primary {
             return;
@@ -8536,7 +8789,7 @@ impl DesktopApp {
         });
         if let Some((axis, pointer_offset, on_heart)) = scrollbar_press {
             self.cancel_heart_glide();
-            self.heart_drag = Some(HeartDrag {
+            self.tab.heart_drag = Some(HeartDrag {
                 axis,
                 pointer_offset,
             });
@@ -8557,24 +8810,25 @@ impl DesktopApp {
         if self.pressed_control.is_some() {
             return;
         }
-        self.pressed_hit = self
+        self.tab.pressed_hit = self
             .scene
             .as_ref()
             .and_then(|scene| scene.page_hit_at(self.pointer))
             .filter(|hit| hit.link.is_some() || hit.actor.is_some());
         let clicked_form = self
+            .tab
             .pressed_hit
             .as_ref()
             .and_then(|hit| self.form_target_for_hit(hit));
-        let keeps_editor = matches!(self.focus, FocusTarget::Form { form, field }
+        let keeps_editor = matches!(self.tab.focus, FocusTarget::Form { form, field }
             if clicked_form == Some((form, field)));
         if !keeps_editor {
             // All page hits can end editing, including plain DOM text with an
             // actor but no activation behavior. Commit before blur handlers or
             // the following click can read/submit the field's value.
             self.finish_text_edit();
-            self.form_editor = None;
-            self.keyboard_target = None;
+            self.tab.form_editor = None;
+            self.tab.keyboard_target = None;
             self.set_focus(FocusTarget::Page);
         }
         // A live page's pointerdown/mousedown task performs focusing only if
@@ -8592,6 +8846,9 @@ impl DesktopApp {
                 ),
             };
             self.dispatch(UserAction::LockedWheel { dx, dy });
+            return;
+        }
+        if self.chrome_scroll(delta) {
             return;
         }
         if self.select_popup_scroll(delta) {
@@ -8621,7 +8878,7 @@ impl DesktopApp {
         if dy != 0.0 && self.terminal_mouse(trust::terminal::MouseAction::Wheel(dy < 0.0)) {
             return;
         }
-        if let Some(terminal) = &mut self.terminal {
+        if let Some(terminal) = &mut self.tab.terminal {
             let (_, height) = terminal.view.cell_size();
             terminal.wheel_remainder -= dy / height;
             let lines = terminal.wheel_remainder.trunc() as i32;
@@ -8640,6 +8897,7 @@ impl DesktopApp {
             // static documents which have no actor.
             let key = container.actor.unwrap_or(container.node);
             if let Some(offset) = self
+                .tab
                 .page_layout
                 .as_ref()
                 .and_then(|cache| cache.scroll_offsets.get(&key))
@@ -8649,10 +8907,10 @@ impl DesktopApp {
             let (next, residual) = scroll_container_delta(&container, remaining);
             let changed = next != container.offset;
             if changed {
-                if let Some(cache) = &mut self.page_layout {
+                if let Some(cache) = &mut self.tab.page_layout {
                     cache.scroll_offsets.insert(key, next);
                 }
-                self.image_schedule_key = None;
+                self.tab.image_schedule_key = None;
                 self.dispatch(UserAction::SetNestedScroll {
                     actor: container.actor,
                     top: next.y,
@@ -8677,7 +8935,7 @@ impl DesktopApp {
         let Some(scene) = &self.scene else { return };
         let max_x = (scene.page_size.width - scene.content_viewport.width).max(0.0);
         let max_y = (scene.page_size.height - scene.content_viewport.height).max(0.0);
-        let current = self.browser.interaction().scroll;
+        let current = self.tab.browser.interaction().scroll;
         self.dispatch(UserAction::SetViewportScroll(CssPoint::new(
             (current.x + remaining.x).clamp(0.0, max_x),
             (current.y + remaining.y).clamp(0.0, max_y),
@@ -8685,10 +8943,12 @@ impl DesktopApp {
     }
 
     fn seek_heart_drag(&mut self, point: CssPoint) {
-        let Some(drag) = self.heart_drag else { return };
+        let Some(drag) = self.tab.heart_drag else {
+            return;
+        };
         let Some(scene) = &self.scene else { return };
         let content = scene.content_viewport;
-        let current = self.browser.interaction().scroll;
+        let current = self.tab.browser.interaction().scroll;
         let target = match drag.axis {
             ScrollbarAxis::Vertical => {
                 let reserve_corner =
@@ -8714,29 +8974,30 @@ impl DesktopApp {
     }
 
     fn scroll_to_fragment(&mut self) {
-        let Some(page) = &self.page_layout else {
+        let Some(page) = &self.tab.page_layout else {
             return;
         };
-        if page.generation != self.browser.document_generation() {
+        if page.generation != self.tab.browser.document_generation() {
             return;
         }
         if self
+            .tab
             .browser
             .current_page()
             .is_some_and(|current| current.revision() != page.revision)
         {
             return;
         }
-        let Some(fragment) = self.browser.take_fragment_request() else {
+        let Some(fragment) = self.tab.browser.take_fragment_request() else {
             return;
         };
         let target =
             trust::fragment::position(&fragment, &page.document.fragment_y, Some(0.0)).flatten();
         if let Some(y) = target {
             let max_y =
-                (page.layout.paint.height - self.browser.snapshot().viewport.height).max(0.0);
+                (page.layout.paint.height - self.tab.browser.snapshot().viewport.height).max(0.0);
             self.dispatch(UserAction::SetViewportScroll(CssPoint::new(
-                self.browser.interaction().scroll.x,
+                self.tab.browser.interaction().scroll.x,
                 y.clamp(0.0, max_y),
             )));
         }
@@ -8748,7 +9009,8 @@ impl DesktopApp {
             .as_ref()
             .map(|scene| scene.content_viewport)
             .unwrap_or(CssRect::new(0.0, 0.0, self.metrics.css.width, 0.0));
-        let scroll = self.browser.interaction().scroll;
+        let scroll = self.tab.browser.interaction().scroll;
+        let tab_strip = self.access_tab_strip();
         let Some(adapter) = &mut self.accessibility else {
             return;
         };
@@ -8756,25 +9018,28 @@ impl DesktopApp {
             build_accessibility_update(
                 AccessibilityFrame {
                     metrics: self.metrics,
-                    page: self.page_layout.as_ref(),
-                    focus: self.focus,
+                    page: self.tab.page_layout.as_ref(),
+                    focus: self.tab.focus,
                     content_viewport: viewport,
                     scroll,
-                    keyboard_node: self.keyboard_target.as_ref().map(|target| target.node),
-                    command_prompt: self.browser.prompt(),
-                    command_value: (self.focus == FocusTarget::Command).then(|| {
-                        if self.browser.prompt().is_some_and(|p| p.sensitive) {
+                    keyboard_node: self.tab.keyboard_target.as_ref().map(|target| target.node),
+                    command_prompt: self.tab.browser.prompt(),
+                    command_value: (self.tab.focus == FocusTarget::Command).then(|| {
+                        if self.tab.browser.prompt().is_some_and(|p| p.sensitive) {
                             "Sensitive input"
                         } else {
-                            self.command.raw_text()
+                            self.tab.command.raw_text()
                         }
                     }),
-                    find_value: (self.focus == FocusTarget::Find).then(|| self.find.raw_text()),
+                    find_value: (self.tab.focus == FocusTarget::Find)
+                        .then(|| self.tab.find.raw_text()),
                     terminal_text: self
+                        .tab
                         .terminal
                         .as_ref()
                         .map(|terminal| terminal.view.terminal.visible_text()),
                     terminal_input: self
+                        .tab
                         .terminal
                         .as_ref()
                         .filter(|terminal| terminal.connected && !terminal.char_mode())
@@ -8785,6 +9050,8 @@ impl DesktopApp {
                             )
                         }),
                     context_menu: self.context_menu.as_ref(),
+                    unload_prompt: self.unload_prompt.as_ref(),
+                    tab_strip,
                 },
                 initial,
             )
@@ -8792,6 +9059,16 @@ impl DesktopApp {
     }
 
     fn handle_access_action(&mut self, request: ActionRequest) {
+        if self.unload_prompt_access_action(&request) {
+            return;
+        }
+        // The prompt is modal: nothing else acts while it shows.
+        if self.unload_prompt.is_some() {
+            return;
+        }
+        if self.tab_strip_access_action(&request) {
+            return;
+        }
         match request.target_node {
             AccessNodeId(id)
                 if id >= ACCESS_CONTEXT_MENU_ITEMS
@@ -8818,7 +9095,7 @@ impl DesktopApp {
             }
             ACCESS_COMMAND => match request.action {
                 AccessAction::Focus | AccessAction::Click => {
-                    if self.gemini_input {
+                    if self.tab.gemini_input {
                         self.set_focus(FocusTarget::Command);
                     } else {
                         self.open_command(false);
@@ -8826,7 +9103,7 @@ impl DesktopApp {
                 }
                 AccessAction::SetValue | AccessAction::ReplaceSelectedText => {
                     if let Some(ActionData::Value(value)) = request.data {
-                        self.command.set_text(&value);
+                        self.tab.command.set_text(&value);
                         self.set_focus(FocusTarget::Command);
                     }
                 }
@@ -8836,7 +9113,7 @@ impl DesktopApp {
                 AccessAction::Focus | AccessAction::Click => self.set_focus(FocusTarget::Find),
                 AccessAction::SetValue | AccessAction::ReplaceSelectedText => {
                     if let Some(ActionData::Value(value)) = request.data {
-                        self.find.set_text(&value);
+                        self.tab.find.set_text(&value);
                         self.set_focus(FocusTarget::Find);
                     }
                 }
@@ -8845,6 +9122,7 @@ impl DesktopApp {
             AccessNodeId(id) if id >= PAGE_ACCESS_BASE + SemanticTree::DOM_BASE => {
                 let node = (id - PAGE_ACCESS_BASE - SemanticTree::DOM_BASE) as usize;
                 let control = self
+                    .tab
                     .page_layout
                     .as_ref()
                     .and_then(|page| page.document.controls.get(&node).copied());
@@ -8884,7 +9162,7 @@ impl DesktopApp {
                             AccessAction::Focus | AccessAction::ScrollIntoView
                         ) {
                             self.scroll_page_target_into_view(target.node, target.rect);
-                            self.keyboard_target = Some(target);
+                            self.tab.keyboard_target = Some(target);
                             self.set_focus(FocusTarget::Page);
                         }
                     }
@@ -8898,12 +9176,20 @@ impl DesktopApp {
 impl ApplicationHandler<DesktopEvent> for DesktopApp {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.service_file_drag();
-        if std::mem::take(&mut self.browser_events_pending) {
+        if std::mem::take(&mut self.tab.browser_events_pending) {
             let outcome = self.process_browser_events();
             if outcome.invalidated {
                 self.scroll_to_fragment();
                 self.request_redraw();
             }
+        }
+        // Background pages keep running; their events are drained after
+        // the shown tab's, so the actor channels never back up.
+        self.service_background_tabs();
+        if self.exit_requested {
+            self.release_native_pointer_lock(false);
+            event_loop.exit();
+            return;
         }
         // A fullscreen request the window manager never resized for is
         // answered at its deadline.
@@ -8919,10 +9205,12 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
         self.force_full_raster = true;
         event_loop.set_control_flow(ControlFlow::Wait);
         self.window_focused = true;
-        self.image_schedule_key = None;
+        self.tab.image_schedule_key = None;
         if self.window.is_none() {
+            // The tab strip replaces the system title bar (`window_chrome`).
             let attributes = Window::default_attributes()
                 .with_title("TRust")
+                .with_decorations(false)
                 .with_visible(false)
                 .with_inner_size(LogicalSize::new(960.0, 640.0))
                 .with_min_inner_size(LogicalSize::new(480.0, 320.0));
@@ -8981,8 +9269,8 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
         self.update_metrics(None);
         // Reapply startup focus once the window exists: an explicit address
         // starts in the page, while an empty launch enables the COMMAND IME.
-        self.set_focus(self.focus);
-        if let Some(address) = self.initial_navigation.take() {
+        self.set_focus(self.tab.focus);
+        if let Some(address) = self.tab.initial_navigation.take() {
             self.navigate(address);
         }
         let _outcome = self.process_browser_events();
@@ -9034,22 +9322,33 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: DesktopEvent) {
         match event {
             DesktopEvent::Bookmarks(completion) => self.on_bookmark(completion),
-            DesktopEvent::BrowserWake => {
+            DesktopEvent::BrowserWake(tab) => {
                 // Native key/pointer events in this turn get first service.
                 // A wake must not drain a continuously refilled page queue
                 // ahead of window input.
-                self.browser_events_pending = true;
+                match tab {
+                    Some(tab) if tab != self.tab.id => self.tabs.wake(tab),
+                    _ => self.tab.browser_events_pending = true,
+                }
+            }
+            DesktopEvent::StripTick => {
+                self.strip_tick_scheduled = false;
+                self.schedule_strip_tick();
+                if self.background_loading_since.is_some() {
+                    self.request_strip_redraw();
+                }
             }
             DesktopEvent::ChromeTick => {
                 self.chrome_tick_scheduled = false;
                 self.chrome_tick_deadline = None;
-                let snapshot = self.browser.snapshot();
+                let snapshot = self.tab.browser.snapshot();
                 let css_wake = self.css_animation_wake();
                 if self.chrome_loading(&snapshot)
-                    || self.heart_glide.is_some()
+                    || self.tab.heart_glide.is_some()
                     || css_wake.is_some_and(|wake| wake <= CSS_ANIMATION_FRAME_DELAY)
                     || (self.window_focused
                         && self
+                            .tab
                             .terminal
                             .as_ref()
                             .is_some_and(|terminal| terminal.view.animation_delay().is_some()))
@@ -9067,7 +9366,7 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
                 self.file_dialog_open = false;
                 // A prompt belongs to its page: files chosen after the user
                 // left it must never reach the next document's actor.
-                if self.file_dialog_generation == self.browser.document_generation() {
+                if self.file_dialog_generation == self.tab.browser.document_generation() {
                     self.dispatch(UserAction::FilePickerResult { request, files });
                 }
                 self.sync_file_pickers();
@@ -9075,6 +9374,10 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
             }
             DesktopEvent::FileDragTick { session } => self.file_drag_iteration(session),
             DesktopEvent::SelectionAutoscroll => self.selection_autoscroll_tick(),
+            DesktopEvent::SleepCheck => {
+                self.sleep_check_scheduled = None;
+                self.sleep_unseen_tabs();
+            }
             DesktopEvent::ImageLoaded {
                 generation,
                 image_epoch,
@@ -9082,16 +9385,16 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
                 source,
                 result,
             } => {
-                if generation != self.browser.document_generation()
-                    || !self.image_loads.accepts(generation, image_epoch)
+                if generation != self.tab.browser.document_generation()
+                    || !self.tab.image_loads.accepts(generation, image_epoch)
                 {
                     return;
                 }
                 let success = result.is_ok();
-                if !self.image_loads.finish(handle, success) {
+                if !self.tab.image_loads.finish(handle, success) {
                     return;
                 }
-                self.image_tasks.remove(&handle);
+                self.tab.image_tasks.remove(&handle);
                 match result {
                     Ok(decoded) => {
                         let trust::img::DecodedGraphicalImage {
@@ -9102,7 +9405,9 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
                         if let Some(hotspot) = cursor_hotspot {
                             self.cursor_hotspots.insert(handle, hotspot);
                         }
-                        self.image_sizes.insert(source, (image.width, image.height));
+                        self.tab
+                            .image_sizes
+                            .insert(source, (image.width, image.height));
                         let evicted = self.image_store.insert(handle, image);
                         self.handle_decoded_image_evictions(evicted);
                         let mut animation_registered = false;
@@ -9110,15 +9415,15 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
                             && self.image_store.contains(handle)
                         {
                             let worker_source = animation.clone();
-                            let evicted = self.animation_sources.insert(handle, animation);
+                            let evicted = self.tab.animation_sources.insert(handle, animation);
                             for old in evicted {
                                 self.animations.unregister(old);
                                 self.image_store.remove(old);
-                                self.image_loads.retry_evicted(old);
-                                self.active_animations.remove(&old);
-                                self.image_schedule_key = None;
+                                self.tab.image_loads.retry_evicted(old);
+                                self.tab.active_animations.remove(&old);
+                                self.tab.image_schedule_key = None;
                             }
-                            if self.animation_sources.contains(handle) {
+                            if self.tab.animation_sources.contains(handle) {
                                 self.animations.register(
                                     generation,
                                     image_epoch,
@@ -9134,10 +9439,10 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
                             // static image. Recompute it immediately so a
                             // visible animation becomes active without waiting
                             // for the gallery relayout timer or another scroll.
-                            self.image_schedule_key = None;
+                            self.tab.image_schedule_key = None;
                             self.request_redraw();
                         }
-                        self.decoded_images_pending_layout = true;
+                        self.tab.decoded_images_pending_layout = true;
                     }
                     Err(error) => {
                         if std::env::var_os("TRUST_DESKTOP_TRACE").is_some() {
@@ -9146,10 +9451,11 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
                         // A pending image was represented by the CSS default
                         // object size. Relayout once it becomes broken so the
                         // HTML alt-text rendering path replaces that box.
-                        self.decoded_images_pending_layout = true;
+                        self.tab.decoded_images_pending_layout = true;
                     }
                 }
                 if let Some(page) = self
+                    .tab
                     .page_layout
                     .as_ref()
                     .map(|page| page.document.base.clone())
@@ -9165,43 +9471,44 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
                 if std::env::var_os("TRUST_DESKTOP_TRACE").is_some() {
                     eprintln!(
                         "desktop: images-ready dirty={} pending={}",
-                        self.decoded_images_pending_layout,
-                        self.image_loads.pending.len()
+                        self.tab.decoded_images_pending_layout,
+                        self.tab.image_loads.pending.len()
                     );
                 }
-                if generation != self.browser.document_generation()
-                    || !self.image_loads.accepts(generation, image_epoch)
+                if generation != self.tab.browser.document_generation()
+                    || !self.tab.image_loads.accepts(generation, image_epoch)
                 {
                     return;
                 }
-                self.image_flush_scheduled = false;
-                if !self.decoded_images_pending_layout {
+                self.tab.image_flush_scheduled = false;
+                if !self.tab.decoded_images_pending_layout {
                     return;
                 }
-                self.decoded_images_pending_layout = false;
-                if self.browser.page_is_live()
-                    && self.image_sizes.len() > self.image_sizes_sent
-                    && !self.browser.send_image_sizes(&self.image_sizes)
+                self.tab.decoded_images_pending_layout = false;
+                if self.tab.browser.page_is_live()
+                    && self.tab.image_sizes.len() > self.tab.image_sizes_sent
+                    && !self.tab.browser.send_image_sizes(&self.tab.image_sizes)
                 {
                     // Keep the dirty bit set. The next redraw retries the
                     // nonblocking handoff after the actor drains its queue.
-                    self.decoded_images_pending_layout = true;
+                    self.tab.decoded_images_pending_layout = true;
                     self.request_redraw();
                     return;
                 }
-                self.image_sizes_sent = self.image_sizes.len();
+                self.tab.image_sizes_sent = self.tab.image_sizes.len();
                 self.relayout_cached_page();
-                self.image_schedule_key = None;
+                self.tab.image_schedule_key = None;
                 self.request_redraw();
             }
             DesktopEvent::AnimationWake => {
                 let mut redraw = false;
                 for update in self.animations.drain() {
-                    if update.generation != self.browser.document_generation()
+                    if update.generation != self.tab.browser.document_generation()
                         || !self
+                            .tab
                             .image_loads
                             .accepts(update.generation, update.image_epoch)
-                        || !self.animation_sources.contains(update.handle)
+                        || !self.tab.animation_sources.contains(update.handle)
                     {
                         continue;
                     }
@@ -9215,10 +9522,10 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
                             // The decoded-frame LRU evicted this image. Stop
                             // producing invisible frames; the ordinary visible
                             // retry path can fetch/decode it again if needed.
-                            self.animation_sources.remove(update.handle);
+                            self.tab.animation_sources.remove(update.handle);
                             self.animations.unregister(update.handle);
-                            self.image_loads.retry_evicted(update.handle);
-                            self.image_schedule_key = None;
+                            self.tab.image_loads.retry_evicted(update.handle);
+                            self.tab.image_schedule_key = None;
                             redraw = true;
                         }
                         Err(error) => {
@@ -9227,7 +9534,7 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
                             }
                             // Graceful degradation: retain the last complete
                             // canvas as a static image and release source data.
-                            self.animation_sources.remove(update.handle);
+                            self.tab.animation_sources.remove(update.handle);
                             self.animations.unregister(update.handle);
                         }
                     }
@@ -9255,15 +9562,18 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
                 acknowledged,
             } => {
                 let visible = self
+                    .tab
                     .terminal
                     .as_ref()
                     .is_some_and(|terminal| terminal.id == session);
                 if let Some(terminal) = self
+                    .tab
                     .terminal
                     .as_mut()
                     .filter(|terminal| terminal.id == session)
                     .or_else(|| {
-                        self.bookmark_terminal
+                        self.tab
+                            .bookmark_terminal
                             .as_mut()
                             .filter(|terminal| terminal.id == session)
                     })
@@ -9282,12 +9592,37 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
                             ));
                         }
                         if let Some(status) = status {
-                            self.browser.set_status(status);
+                            self.tab.browser.set_status(status);
                         }
-                        if input_changed && self.focus == FocusTarget::Page {
+                        if input_changed && self.tab.focus == FocusTarget::Page {
                             self.set_focus(FocusTarget::Page);
                         }
                         self.request_redraw();
+                    }
+                } else if let Some(tab) = self.tabs.awake_tabs_mut().find(|tab| {
+                    tab.terminal
+                        .as_ref()
+                        .or(tab.bookmark_terminal.as_ref())
+                        .is_some_and(|terminal| terminal.id == session)
+                }) {
+                    // A background tab's session keeps running: Telnet tabs
+                    // never sleep, and their output is ready when shown.
+                    let terminal = tab
+                        .terminal
+                        .as_mut()
+                        .filter(|terminal| terminal.id == session)
+                        .or(tab.bookmark_terminal.as_mut())
+                        .expect("the session was found in this tab");
+                    let bells_before = terminal.view.terminal.callbacks().bells;
+                    let status = terminal.receive(session, events);
+                    let rang = terminal.view.terminal.callbacks().bells != bells_before;
+                    if let Some(status) = status {
+                        tab.browser.set_status(status);
+                    }
+                    if rang && let Some(window) = &self.window {
+                        window.request_user_attention(Some(
+                            winit::window::UserAttentionType::Informational,
+                        ));
                     }
                 }
                 let _ = acknowledged.send(());
@@ -9314,7 +9649,12 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
         match event {
             WindowEvent::CloseRequested => {
                 self.release_native_pointer_lock(false);
-                event_loop.exit();
+                // The pages decide first (HTML
+                // #definitely-close-a-top-level-traversable).
+                self.request_quit();
+                if self.exit_requested {
+                    event_loop.exit();
+                }
             }
             WindowEvent::Destroyed => {
                 self.surface = None;
@@ -9353,12 +9693,13 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
             }
             WindowEvent::RedrawRequested => {
                 let overlay = std::mem::take(&mut self.overlay_redraw_pending);
+                let strip = std::mem::take(&mut self.strip_redraw_pending);
                 let result = if consume_pending_redraw(&mut self.redraw_pending) {
                     self.draw()
-                } else if overlay {
-                    // Only the context menu changed: repaint it over the
-                    // retained page composition.
-                    self.draw_overlay()
+                } else if overlay || strip {
+                    // Only the tab strip or the overlays changed: repaint
+                    // them over the retained page composition.
+                    self.draw_partial(strip, overlay)
                 } else {
                     return;
                 };
@@ -9374,13 +9715,13 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
                     self.release_native_pointer_lock(true);
                     self.page_pointer_buttons = 0;
                     self.composing = false;
-                    self.text_selection.gesture = None;
-                    if let Some(terminal) = &mut self.terminal {
+                    self.tab.text_selection.gesture = None;
+                    if let Some(terminal) = &mut self.tab.terminal {
                         terminal.line_input.selecting = false;
                     }
                     self.set_active_animations(HashSet::new());
                 } else {
-                    self.image_schedule_key = None;
+                    self.tab.image_schedule_key = None;
                 }
                 self.request_redraw();
                 self.dispatch(UserAction::Focus(focused));
@@ -9422,11 +9763,12 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
                 if self.pointer_lock.is_some() {
                     return;
                 }
+                self.clear_strip_hover();
                 self.pointer_inside = false;
                 self.protocol_pointer_selection = false;
-                self.hovered_actor = None;
-                self.link_preview.clear();
-                self.heart_hover = None;
+                self.tab.hovered_actor = None;
+                self.tab.link_preview.clear();
+                self.tab.heart_hover = None;
                 self.dispatch(UserAction::PageHover {
                     actor: None,
                     position: CssPoint::default(),
@@ -9486,6 +9828,8 @@ struct AccessibilityFrame<'a> {
     terminal_text: Option<String>,
     terminal_input: Option<(String, bool)>,
     context_menu: Option<&'a context_menu::PageContextMenu>,
+    unload_prompt: Option<&'a unload_prompt::UnloadPromptUi>,
+    tab_strip: Option<window_chrome::AccessTabStrip>,
 }
 
 fn build_accessibility_update(frame: AccessibilityFrame<'_>, initial: bool) -> TreeUpdate {
@@ -9502,6 +9846,8 @@ fn build_accessibility_update(frame: AccessibilityFrame<'_>, initial: bool) -> T
         terminal_text,
         terminal_input,
         context_menu,
+        unload_prompt,
+        tab_strip,
     } = frame;
     let mut nodes = Vec::new();
     let mut root = AccessNode::new(AccessRole::Window);
@@ -9516,6 +9862,9 @@ fn build_accessibility_update(frame: AccessibilityFrame<'_>, initial: bool) -> T
         Affine::translate(AccessVec2::ZERO) * Affine::scale(metrics.scale_factor.get()),
     );
     let mut children = Vec::new();
+    if let Some(strip) = &tab_strip {
+        window_chrome::tab_strip_access_nodes(strip, &mut nodes, &mut children);
+    }
     if let Some(value) = command_value {
         let mut command = AccessNode::new(if command_prompt.is_some_and(|p| p.sensitive) {
             AccessRole::PasswordInput
@@ -9717,9 +10066,13 @@ fn build_accessibility_update(frame: AccessibilityFrame<'_>, initial: bool) -> T
             AccessNodeId(ACCESS_CONTEXT_MENU_ITEMS + index as u64)
         })
     });
+    // A page's question whether to leave it is modal over everything.
+    let prompt_focus = unload_prompt
+        .map(|ui| unload_prompt::unload_prompt_access_nodes(ui, &mut nodes, &mut children));
     root.set_children(children);
     nodes.push((ACCESS_ROOT, root));
     let focus = match focus {
+        _ if let Some(prompt) = prompt_focus => prompt,
         _ if let Some(menu) = menu_focus => menu,
         FocusTarget::Find => ACCESS_FIND,
         FocusTarget::Command => ACCESS_COMMAND,
@@ -10228,23 +10581,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     let event_loop = EventLoop::<DesktopEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
     install_media_frame_waker(proxy.clone());
-    let storage_proxy = proxy.clone();
     trust::site_storage::set_wake(move || {
-        let _ = storage_proxy.send_event(DesktopEvent::BrowserWake);
+        let _ = proxy.send_event(DesktopEvent::BrowserWake(None));
     });
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("trust-desktop-net")
         .build()?;
-    let browser = BrowserController::new(
-        runtime.handle().clone(),
-        move || {
-            let _ = proxy.send_event(DesktopEvent::BrowserWake);
-        },
-        CssSize::new(960.0, 640.0),
-    );
     let mut app = DesktopApp::new(
-        browser,
         runtime.handle().clone(),
         event_loop.create_proxy(),
         options.renderer,
@@ -10252,7 +10596,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
     let result = event_loop.run_app(&mut app);
     drop(app);
-    trust::js::shutdown_page_threads();
+    // The pages unloaded as the browser ended: let their unload handlers
+    // and beacons finish.
+    trust::js::shutdown_page_threads_after(trust::js::PAGE_END_GRACE);
     if let Err(error) = trust::site_storage::shutdown() {
         eprintln!("trust: {error}");
     }
@@ -10263,6 +10609,30 @@ fn main() -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl DesktopApp {
+        /// An app whose first tab uses `browser`, as a test configured it.
+        fn for_test(
+            browser: BrowserController,
+            runtime: Handle,
+            event_proxy: EventLoopProxy<DesktopEvent>,
+            renderer_preference: RendererPreference,
+            initial_navigation: Option<String>,
+        ) -> Self {
+            let mut tabs = tabs::TabSet::default();
+            let first = tabs.allocate_id();
+            Self::with_first_tab(
+                tabs,
+                first,
+                browser,
+                runtime,
+                event_proxy,
+                renderer_preference,
+                initial_navigation,
+            )
+        }
+    }
+    use trust::render::UnloadPromptButton;
     use trust::render::scene_damage;
     use trust::render::{ContextMenuGeometry, ContextMenuIcon, ContextMenuItem};
 
@@ -10471,7 +10841,7 @@ mod tests {
     /// composed as `draw` composes it.
     fn static_page_app(event_loop: &EventLoop<DesktopEvent>, html: &str) -> DesktopApp {
         let browser = BrowserController::new(Handle::current(), || {}, CssSize::new(640.0, 480.0));
-        let mut app = DesktopApp::new(
+        let mut app = DesktopApp::for_test(
             browser,
             Handle::current(),
             event_loop.create_proxy(),
@@ -10509,7 +10879,7 @@ mod tests {
         )
         .unwrap();
         let (document, layout) = DesktopPageAdapter::from_rendered(response.url, rendered);
-        app.page_layout = Some(PageLayoutCache {
+        app.tab.page_layout = Some(PageLayoutCache {
             generation: 1,
             revision: 1,
             rendered_revision: 1,
@@ -10520,7 +10890,7 @@ mod tests {
             layout,
             scroll_offsets: HashMap::new(),
         });
-        app.text_selection.document_generation = app.browser.document_generation();
+        app.tab.text_selection.document_generation = app.tab.browser.document_generation();
         recompose(&mut app);
         app.set_focus(FocusTarget::Page);
         app
@@ -10529,17 +10899,21 @@ mod tests {
     fn recompose(app: &mut DesktopApp) {
         let mut scene = desktop_chrome(
             app.metrics,
-            &app.browser.snapshot(),
-            &ChromeModel::default(),
+            &app.tab.browser.snapshot(),
+            &ChromeModel {
+                tab_strip_height: app.strip_height(),
+                ..ChromeModel::default()
+            },
         );
-        let page = app.page_layout.as_ref().unwrap();
+        let page = app.tab.page_layout.as_ref().unwrap();
         scene.append_page_with_selection(
             &page.layout.paint,
             CssPoint::default(),
             0.0,
             &HashMap::new(),
-            app.text_selection.paint.as_ref(),
+            app.tab.text_selection.paint.as_ref(),
         );
+        app.paint_tab_strip(&mut scene);
         app.paint_page_context_menu(&mut scene);
         app.scene = Some(scene);
     }
@@ -10581,6 +10955,505 @@ mod tests {
         static_page_text_selection_gestures_and_copy(&event_loop);
         the_context_menu_offers_page_actions_and_takes_keys_and_pointer(&event_loop);
         the_context_menu_repaints_only_itself(&event_loop);
+        the_strip_repaints_only_itself(&event_loop);
+        tabs_open_switch_close_and_reopen(&event_loop);
+        the_strip_switches_closes_and_reorders_tabs(&event_loop);
+        links_open_in_new_tabs(&event_loop);
+        pages_open_tabs_for_new_targets(&event_loop).await;
+        pages_that_ask_keep_their_tab_or_the_browser_open(&event_loop).await;
+        popups_are_tabs_of_their_openers_group(&event_loop).await;
+    }
+
+    async fn popups_are_tabs_of_their_openers_group(event_loop: &EventLoop<DesktopEvent>) {
+        // HTML #window-open-steps in a user agent with tabs: the popup is a
+        // tab of its own in front, whose Documents run in its opener's page
+        // engine, its next one from the network included
+        // (`js::spawn_page_in`); it reaches its opener (#dom-opener), keeps
+        // its target name, and its window.close() closes its tab
+        // (#definitely-close-a-top-level-traversable), showing the opener's.
+        const PAGE: &str = "<button id=go style='position:fixed;left:0;top:0;width:200px;\
+             height:40px'>Go</button><script>\
+             document.getElementById('go').onclick = () => window.open('/login', 'login', 'popup');\
+             window.addEventListener('message', e => { document.title = 'got ' + e.data; });\
+             setInterval(() => {}, 1000);</script>";
+        const LOGIN: &str = "<title>Login</title><script>\
+             opener.postMessage('token ' + window.name + ' ' + locationbar.visible, '*');\
+             setTimeout(() => window.close(), 400);</script>";
+        static PAGES: [(&str, &str); 2] = [("/page", PAGE), ("/login", LOGIN)];
+        let (base, log) = serve_pages(&PAGES).await;
+        let mut browser =
+            BrowserController::new(Handle::current(), || {}, CssSize::new(640.0, 480.0));
+        browser.set_new_traversables_available(true);
+        let mut app = DesktopApp::for_test(
+            browser,
+            Handle::current(),
+            event_loop.create_proxy(),
+            RendererPreference::Cpu,
+            None,
+        );
+        app.clipboard = None;
+        app.metrics =
+            ViewportMetrics::from_physical(PhysicalSize::new(640, 480), ScaleFactor::new(1.0));
+        app.set_focus(FocusTarget::Page);
+        let source = app.tab.id;
+        app.navigate(format!("{base}/page"));
+        wait_for_app(&mut app, "the live page", |app| {
+            app.tab.browser.page_is_live()
+        })
+        .await;
+        for pressed in [true, false] {
+            app.dispatch(UserAction::PagePointerButton {
+                actor: None,
+                position: CssPoint::new(10.0, 10.0),
+                pressed,
+                button: 0,
+                metadata: Default::default(),
+            });
+        }
+        wait_for_app(&mut app, "the popup's tab", |app| app.tabs.order.len() == 2).await;
+        let popup = app.tab.id;
+        assert_ne!(popup, source, "the popup is in front");
+        wait_for_app(&mut app, "the popup's Document", |app| {
+            app.tab.browser.title().as_deref() == Some("Login")
+        })
+        .await;
+        assert_eq!(app.tab.browser.address(), format!("{base}/login"));
+        assert!(
+            app.tab.browser.in_shared_group(),
+            "the popup shares its opener's group"
+        );
+        let referer = log
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(path, _)| path == "/login")
+            .map(|(_, referer)| referer.clone());
+        assert_eq!(referer, Some(Some(format!("{base}/page"))));
+        wait_for_app(&mut app, "the opener's message", |app| {
+            match app.tabs.hidden(source) {
+                Some(tabs::Hidden::Awake(tab)) => {
+                    tab.browser.title().as_deref() == Some("got token login false")
+                }
+                _ => false,
+            }
+        })
+        .await;
+        wait_for_app(&mut app, "the popup's window.close()", |app| {
+            app.tabs.order.len() == 1
+        })
+        .await;
+        assert_eq!(app.tab.id, source, "the opener's tab is shown again");
+        assert!(
+            app.tab.browser.page_is_live(),
+            "the opener keeps its Document"
+        );
+    }
+
+    async fn pages_that_ask_keep_their_tab_or_the_browser_open(
+        event_loop: &EventLoop<DesktopEvent>,
+    ) {
+        // HTML #definitely-close-a-top-level-traversable and
+        // #steps-to-fire-beforeunload: closing a tab, or quitting, first asks
+        // a page that listens for beforeunload; one the user has used asks
+        // the user, in front, and staying keeps it open. Leaving unloads it.
+        const PAGE: &str = "<button id=b style='position:fixed;left:0;top:0;width:200px;\
+             height:40px'>Edit</button><script>\
+             addEventListener('beforeunload', e => e.preventDefault());\
+             addEventListener('unload', () => navigator.sendBeacon('/unloaded'));\
+             </script>";
+        static PAGES: [(&str, &str); 2] = [("/page", PAGE), ("/unloaded", "")];
+        let (base, log) = serve_pages(&PAGES).await;
+        let browser = tabs::new_controller(
+            &Handle::current(),
+            &event_loop.create_proxy(),
+            tabs::TabId(900),
+        );
+        let mut app = DesktopApp::for_test(
+            browser,
+            Handle::current(),
+            event_loop.create_proxy(),
+            RendererPreference::Cpu,
+            None,
+        );
+        app.clipboard = None;
+        app.metrics =
+            ViewportMetrics::from_physical(PhysicalSize::new(640, 480), ScaleFactor::new(1.0));
+        app.set_focus(FocusTarget::Page);
+        let asking = app.tab.id;
+        app.navigate(format!("{base}/page"));
+        wait_for_app(&mut app, "the live page", |app| {
+            app.tab.browser.unload_needs_check()
+        })
+        .await;
+        // The user uses the page: it has sticky activation.
+        for pressed in [true, false] {
+            app.dispatch(UserAction::PagePointerButton {
+                actor: None,
+                position: CssPoint::new(10.0, 10.0),
+                pressed,
+                button: 0,
+                metadata: Default::default(),
+            });
+        }
+        app.open_blank_tab();
+        assert_ne!(app.tab.id, asking);
+        let key = |key: Key| KeyInput {
+            key,
+            code: String::new(),
+            location: 0,
+            state: KeyState::Pressed,
+            modifiers: Default::default(),
+            repeat: false,
+            composing: false,
+        };
+
+        // Closing the background tab brings it to the front with the question.
+        app.close_tab(asking);
+        wait_for_app(&mut app, "the question", |app| app.unload_prompt.is_some()).await;
+        assert_eq!(app.tab.id, asking, "the page that asks is shown");
+        assert!(app.unload_prompt_key(&key(Key::Escape)));
+        wait_for_app(&mut app, "the answer", |app| app.leaving.is_empty()).await;
+        assert_eq!(app.tabs.order.len(), 2, "staying keeps the tab");
+        assert!(app.unload_prompt.is_none());
+
+        // Quitting asks again; staying cancels it.
+        app.request_quit();
+        wait_for_app(&mut app, "the question", |app| app.unload_prompt.is_some()).await;
+        let stay = center(app.unload_prompt.as_ref().unwrap().geometry.stay);
+        click(&mut app, stay, MouseButton::Left);
+        wait_for_app(&mut app, "the quit to end", |app| app.quitting.is_none()).await;
+        assert!(!app.exit_requested);
+
+        // Closing it and leaving closes the tab, and the page unloads.
+        app.close_tab(asking);
+        wait_for_app(&mut app, "the question", |app| app.unload_prompt.is_some()).await;
+        assert_eq!(
+            app.unload_prompt.as_ref().unwrap().state.focused,
+            UnloadPromptButton::Leave
+        );
+        app.unload_prompt_key(&key(Key::Enter));
+        wait_for_app(&mut app, "the tab to close", |app| {
+            app.tabs.order.len() == 1
+        })
+        .await;
+        assert!(app.tabs.order.iter().all(|&id| id != asking));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(path, _)| path == "/unloaded")
+        {
+            assert!(Instant::now() < deadline, "the page never unloaded");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // The last tab, without a page that asks, quits at once.
+        app.close_tab(app.tab.id);
+        assert!(app.exit_requested);
+    }
+
+    /// Each request a test server answered: its path and Referer.
+    type RequestLog = Arc<Mutex<Vec<(String, Option<String>)>>>;
+
+    /// Serve `pages` (path, HTML) over HTTP/1.1 on loopback, recording each
+    /// request's path and `Referer`.
+    async fn serve_pages(pages: &'static [(&'static str, &'static str)]) -> (String, RequestLog) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let log: RequestLog = Arc::default();
+        let record = log.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let record = record.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut bytes = [0; 4096];
+                    while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                        match stream.read(&mut bytes).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(count) => request.extend_from_slice(&bytes[..count]),
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&request).into_owned();
+                    let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+                    let referer = head.lines().find_map(|line| {
+                        line.split_once(':')
+                            .filter(|(name, _)| name.eq_ignore_ascii_case("referer"))
+                            .map(|(_, value)| value.trim().to_string())
+                    });
+                    record.lock().unwrap().push((path.clone(), referer));
+                    let body = pages
+                        .iter()
+                        .find(|(page, _)| *page == path)
+                        .map_or("", |(_, body)| body);
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\
+                         Cache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        (base, log)
+    }
+
+    /// Process `app`'s browser events, every tab's, until `done` holds.
+    async fn wait_for_app(app: &mut DesktopApp, what: &str, done: impl Fn(&DesktopApp) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !done(app) {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            app.process_browser_events();
+            // No event loop runs to deliver the tabs' wakes.
+            for id in app.tabs.order.clone() {
+                app.tabs.wake(id);
+            }
+            app.service_background_tabs();
+        }
+    }
+
+    async fn pages_open_tabs_for_new_targets(event_loop: &EventLoop<DesktopEvent>) {
+        // HTML #the-rules-for-choosing-a-navigable in a user agent that
+        // creates new top-level traversables: an activated `_blank`
+        // hyperlink opens a tab in front, after the page's own, navigated
+        // from the page's Document; the page's tab keeps its Document.
+        const PAGE: &str = "<a id=go href='/next' target=_blank style='position:fixed;\
+             left:0;top:0;width:200px;height:40px;display:block'>Go</a>\
+             <script>setInterval(() => {}, 1000);</script>";
+        static PAGES: [(&str, &str); 2] = [("/page", PAGE), ("/next", "<title>Next</title>")];
+        let (base, log) = serve_pages(&PAGES).await;
+        let mut browser =
+            BrowserController::new(Handle::current(), || {}, CssSize::new(640.0, 480.0));
+        browser.set_new_traversables_available(true);
+        let mut app = DesktopApp::for_test(
+            browser,
+            Handle::current(),
+            event_loop.create_proxy(),
+            RendererPreference::Cpu,
+            None,
+        );
+        app.clipboard = None;
+        app.metrics =
+            ViewportMetrics::from_physical(PhysicalSize::new(640, 480), ScaleFactor::new(1.0));
+        app.set_focus(FocusTarget::Page);
+        let source = app.tab.id;
+        app.navigate(format!("{base}/page"));
+        wait_for_app(&mut app, "the live page", |app| {
+            app.tab.browser.page_is_live()
+        })
+        .await;
+        for pressed in [true, false] {
+            app.dispatch(UserAction::PagePointerButton {
+                actor: None,
+                position: CssPoint::new(10.0, 10.0),
+                pressed,
+                button: 0,
+                metadata: Default::default(),
+            });
+        }
+        wait_for_app(&mut app, "the new tab", |app| app.tabs.order.len() == 2).await;
+        assert_ne!(app.tab.id, source, "the new tab is in front");
+        assert_eq!(app.tabs.order, [source, app.tab.id]);
+        wait_for_app(&mut app, "the target's title", |app| {
+            app.tab.browser.title().as_deref() == Some("Next")
+        })
+        .await;
+        assert_eq!(app.tab.browser.address(), format!("{base}/next"));
+        let referer = log
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(path, _)| path == "/next")
+            .map(|(_, referer)| referer.clone());
+        assert_eq!(referer, Some(Some(format!("{base}/page"))));
+        match app.tabs.hidden(source) {
+            Some(tabs::Hidden::Awake(tab)) => {
+                assert_eq!(tab.browser.address(), format!("{base}/page"));
+                assert!(tab.browser.page_is_live(), "the opener keeps its Document");
+            }
+            _ => panic!("the source tab is awake in the background"),
+        }
+    }
+
+    /// The window's chrome over a page-less tab, composed as `draw` would.
+    fn recompose_chrome(app: &mut DesktopApp) {
+        let mut scene = desktop_chrome(
+            app.metrics,
+            &app.tab.browser.snapshot(),
+            &ChromeModel {
+                tab_strip_height: app.strip_height(),
+                ..ChromeModel::default()
+            },
+        );
+        if let Some(page) = &app.tab.page_layout {
+            scene.append_page(&page.layout.paint, CssPoint::default());
+        }
+        app.paint_tab_strip(&mut scene);
+        app.paint_page_context_menu(&mut scene);
+        app.scene = Some(scene);
+    }
+
+    fn center(rect: CssRect) -> CssPoint {
+        CssPoint::new(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0)
+    }
+
+    fn click(app: &mut DesktopApp, at: CssPoint, button: MouseButton) {
+        app.pointer = at;
+        app.handle_pointer_button(ElementState::Pressed, button);
+        app.handle_pointer_button(ElementState::Released, button);
+    }
+
+    fn tabs_open_switch_close_and_reopen(event_loop: &EventLoop<DesktopEvent>) {
+        let mut app = static_page_app(event_loop, "<p>First tab</p>");
+        let first = app.tab.id;
+        assert_eq!(app.tabs.order, vec![first]);
+        // Ctrl+T: a blank tab at the end of the strip, shown, with COMMAND
+        // open for its address.
+        app.run_tab_shortcut(tabs::TabShortcut::New);
+        let second = app.tab.id;
+        assert_ne!(second, first);
+        assert_eq!(app.tabs.order, vec![first, second]);
+        assert_eq!(app.tab.focus, FocusTarget::Command);
+        // The first tab waits in the background without its presentation.
+        assert!(matches!(
+            app.tabs.hidden(first),
+            Some(tabs::Hidden::Awake(tab)) if tab.page_layout.is_none()
+        ));
+        // Ctrl+Tab and Ctrl+Shift+Tab wrap around the strip.
+        app.run_tab_shortcut(tabs::TabShortcut::Next);
+        assert_eq!(app.tab.id, first);
+        assert_eq!(app.tab.focus, FocusTarget::Page, "each tab keeps its focus");
+        app.run_tab_shortcut(tabs::TabShortcut::Previous);
+        assert_eq!(app.tab.id, second);
+        app.run_tab_shortcut(tabs::TabShortcut::Select(0));
+        assert_eq!(app.tab.id, first);
+        app.run_tab_shortcut(tabs::TabShortcut::Last);
+        assert_eq!(app.tab.id, second);
+        // Ctrl+W shows the closed tab's neighbor; Ctrl+Shift+T reopens it
+        // where it was.
+        app.run_tab_shortcut(tabs::TabShortcut::Close);
+        assert_eq!(app.tabs.order, vec![first]);
+        assert_eq!(app.tab.id, first);
+        app.run_tab_shortcut(tabs::TabShortcut::Reopen);
+        assert_eq!(app.tabs.order.len(), 2);
+        assert_eq!(app.tabs.order[1], app.tab.id);
+        // Closing the last tab ends the browser.
+        app.close_tab(app.tab.id);
+        assert!(!app.exit_requested);
+        app.close_tab(app.tab.id);
+        assert!(app.exit_requested);
+    }
+
+    fn the_strip_switches_closes_and_reorders_tabs(event_loop: &EventLoop<DesktopEvent>) {
+        let mut app = static_page_app(event_loop, "<p>Strip</p>");
+        app.open_blank_tab();
+        app.open_blank_tab();
+        let order = app.tabs.order.clone();
+        recompose_chrome(&mut app);
+        let geometry = app.strip_geometry();
+        // A press shows a tab.
+        click(&mut app, center(geometry.tabs[0]), MouseButton::Left);
+        assert_eq!(app.tab.id, order[0]);
+        // Dragged past its neighbor's middle, a tab takes its place.
+        app.pointer = center(geometry.tabs[0]);
+        app.handle_pointer_button(ElementState::Pressed, MouseButton::Left);
+        let mut at = app.pointer;
+        for _ in 0..12 {
+            at.x += geometry.tabs[0].width / 10.0;
+            app.pointer_moved(None, at);
+        }
+        app.handle_pointer_button(ElementState::Released, MouseButton::Left);
+        assert_eq!(app.tabs.order, vec![order[1], order[0], order[2]]);
+        assert_eq!(app.tab.id, order[0], "a dragged tab stays shown");
+        // The middle button closes a tab; the close button does too.
+        let geometry = app.strip_geometry();
+        click(&mut app, center(geometry.tabs[2]), MouseButton::Middle);
+        assert_eq!(app.tabs.order, vec![order[1], order[0]]);
+        let close = app.strip_geometry().close_button(0).unwrap();
+        click(&mut app, center(close), MouseButton::Left);
+        assert_eq!(app.tabs.order, vec![order[0]]);
+        // The new-tab button opens a blank tab.
+        let new_tab = center(app.strip_geometry().new_tab);
+        click(&mut app, new_tab, MouseButton::Left);
+        assert_eq!(app.tabs.order.len(), 2);
+        assert_eq!(app.tab.focus, FocusTarget::Command);
+        // A press on the window buttons acts only on its release over them.
+        app.pointer = center(app.strip_geometry().close);
+        app.handle_pointer_button(ElementState::Pressed, MouseButton::Left);
+        app.pointer = center(app.strip_geometry().new_tab);
+        app.handle_pointer_button(ElementState::Released, MouseButton::Left);
+        assert!(!app.exit_requested);
+        let close_window = center(app.strip_geometry().close);
+        click(&mut app, close_window, MouseButton::Left);
+        assert!(
+            app.exit_requested,
+            "the window's close button ends the browser"
+        );
+        // `TRUST_DESKTOP_TABS_PREVIEW=DIR` writes the composed frame.
+        if let Some(dir) = std::env::var_os("TRUST_DESKTOP_TABS_PREVIEW") {
+            app.tabs.order.insert(0, order[1]);
+            recompose_chrome(&mut app);
+            let frame = trust::render::vello_cpu::VelloCpuRenderer::new()
+                .render_rgba(app.scene.as_ref().unwrap())
+                .unwrap();
+            trust::render::headless::write_png(
+                &frame,
+                std::path::Path::new(&dir).join("desktop-tabs.png"),
+            )
+            .unwrap();
+        }
+    }
+
+    fn links_open_in_new_tabs(event_loop: &EventLoop<DesktopEvent>) {
+        let mut app = static_page_app(
+            event_loop,
+            "<body style='margin:8px;font:16px/20px monospace'>\
+             <p><a href='https://example.test/next'>Next page</a></p></body>",
+        );
+        let first = app.tab.id;
+        let link = text_at(&app, "Next page", 2);
+        // The context menu on a link offers to open or copy it.
+        click(&mut app, link, MouseButton::Right);
+        let menu = app.context_menu.as_ref().expect("a context menu");
+        assert_eq!(menu.items[0].label, "Open in New Tab");
+        assert_eq!(menu.items[1].label, "Copy Link");
+        assert_eq!(
+            menu.link.as_ref().map(|(_, address)| address.as_str()),
+            Some("https://example.test/next")
+        );
+        app.activate_context_menu_item(0);
+        assert_eq!(app.tabs.order.len(), 2);
+        assert_eq!(app.tab.id, first, "a link opens in a background tab");
+        let opened = app.tabs.order[1];
+        let address = match app.tabs.hidden(opened) {
+            Some(tabs::Hidden::Awake(tab)) => tab.browser.address(),
+            _ => panic!("the new tab is awake"),
+        };
+        assert_eq!(address, "https://example.test/next");
+        // Ctrl+click and the middle button open further tabs after it, in
+        // the order they were opened.
+        recompose(&mut app);
+        app.modifiers = ModifiersState::CONTROL;
+        click(&mut app, link, MouseButton::Left);
+        app.modifiers = ModifiersState::empty();
+        assert_eq!(app.tab.id, first);
+        assert_eq!(app.tabs.order.len(), 3);
+        click(&mut app, link, MouseButton::Middle);
+        assert_eq!(app.tabs.order.len(), 4);
+        assert_eq!(app.tabs.order[0], first);
+        assert_eq!(app.tabs.order[1], opened);
+        // Ctrl+Shift+click opens the link in front.
+        app.modifiers = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        click(&mut app, link, MouseButton::Left);
+        app.modifiers = ModifiersState::empty();
+        assert_eq!(app.tabs.order.len(), 5);
+        assert_ne!(app.tab.id, first);
+        assert_eq!(
+            app.tabs.order[4], app.tab.id,
+            "after the tabs opened before it"
+        );
     }
 
     fn static_page_text_selection_gestures_and_copy(event_loop: &EventLoop<DesktopEvent>) {
@@ -10603,7 +11476,7 @@ mod tests {
         // Drag from "brave" to the middle of the next paragraph.
         let at = text_at(&app, "Hello brave world", 6);
         press(&mut app, at);
-        assert!(!app.text_selection.selects(), "a press only collapses");
+        assert!(!app.tab.text_selection.selects(), "a press only collapses");
         app.pointer = text_at(&app, "Second paragraph", 6);
         assert!(app.extend_selection_gesture().is_some());
         release(&mut app);
@@ -10625,7 +11498,7 @@ mod tests {
         );
         release(&mut app);
         // Shift+click moves the focus from the same anchor.
-        app.text_selection.clicks = None;
+        app.tab.text_selection.clicks = None;
         app.modifiers = ModifiersState::SHIFT;
         let at = text_at(&app, "Second paragraph", 6);
         press(&mut app, at);
@@ -10636,7 +11509,7 @@ mod tests {
             Some("Hello brave world\n\nSecond")
         );
         // A press in user-select:none text leaves the selection alone.
-        app.text_selection.clicks = None;
+        app.tab.text_selection.clicks = None;
         let at = text_at(&app, "Not this", 2);
         press(&mut app, at);
         release(&mut app);
@@ -10661,7 +11534,8 @@ mod tests {
     ) {
         let mut app = static_page_app(event_loop, "<p>Just a page</p>");
         // The browser's current page gives the bookmark item its address.
-        app.browser
+        app.tab
+            .browser
             .open_internal_gemtext("gemini://example.test/page", b"# Page".to_vec());
         app.pointer = CssPoint::new(120.0, 150.0);
         // Without a live page, the secondary click shows the menu at once.
@@ -10733,15 +11607,15 @@ mod tests {
         app.handle_pointer_button(ElementState::Pressed, MouseButton::Left);
         app.handle_pointer_button(ElementState::Released, MouseButton::Left);
         assert!(app.context_menu.is_none());
-        assert_eq!(app.focus, FocusTarget::Command, "Open COMMAND");
+        assert_eq!(app.tab.focus, FocusTarget::Command, "Open COMMAND");
         // Ctrl+L toggles COMMAND as Tab does: closing, then opening on the
         // page's address.
         app.toggle_command(true);
-        assert_eq!(app.focus, FocusTarget::Page);
-        app.command.set_text("draft");
+        assert_eq!(app.tab.focus, FocusTarget::Page);
+        app.tab.command.set_text("draft");
         app.toggle_command(true);
-        assert_eq!(app.focus, FocusTarget::Command);
-        assert_eq!(app.command.text(), app.browser.snapshot().address);
+        assert_eq!(app.tab.focus, FocusTarget::Command);
+        assert_eq!(app.tab.command.text(), app.tab.browser.snapshot().address);
     }
 
     fn the_context_menu_repaints_only_itself(event_loop: &EventLoop<DesktopEvent>) {
@@ -10774,6 +11648,39 @@ mod tests {
             scene_damage(&shown, &scene),
             SceneDamage::Partial(_)
         ));
+    }
+
+    fn the_strip_repaints_only_itself(event_loop: &EventLoop<DesktopEvent>) {
+        // Hovering the strip's controls touches only the strip's commands;
+        // the overlay painted after it keeps its place.
+        let mut app = static_page_app(event_loop, "<p>Just a page</p>");
+        app.open_blank_tab();
+        recompose_chrome(&mut app);
+        app.open_context_menu(CssPoint::new(200.0, 160.0), false);
+        recompose_chrome(&mut app);
+        let before = app.scene.clone().unwrap();
+        let overlay_len = before.primitives.len() - app.overlay_start;
+        let strip = app.strip_geometry();
+        app.pointer = center(strip.minimize);
+        app.redraw_pending = false;
+        app.strip_redraw_pending = false;
+        assert!(app.chrome_pointer_moved(app.pointer));
+        assert!(app.strip_redraw_pending && !app.redraw_pending);
+        let mut scene = app.scene.take().unwrap();
+        let rect = app.repaint_strip_in(&mut scene);
+        assert!(rect.height >= app.strip_height());
+        match scene_damage(&before, &scene) {
+            SceneDamage::Partial(damage) => assert!(
+                damage.y >= rect.y && damage.y + damage.height <= rect.y + rect.height,
+                "{damage:?} beyond the strip's damage {rect:?}"
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(scene.primitives.len() - app.overlay_start, overlay_len);
+        assert_eq!(
+            &scene.primitives[app.overlay_start..],
+            &before.primitives[before.primitives.len() - overlay_len..]
+        );
     }
 
     #[test]
@@ -10811,6 +11718,7 @@ mod tests {
             highlighted: Some(0),
             pressed: None,
             title: "HTTPS  /  example.test".into(),
+            link: None,
         };
         let update = build_accessibility_update(
             AccessibilityFrame {
@@ -10829,6 +11737,8 @@ mod tests {
                 terminal_text: None,
                 terminal_input: None,
                 context_menu: Some(&menu),
+                unload_prompt: None,
+                tab_strip: None,
             },
             true,
         );
@@ -10855,7 +11765,7 @@ mod tests {
         builder.with_any_thread(true).with_wayland();
         let event_loop = builder.build().unwrap();
         let browser = BrowserController::new(Handle::current(), || {}, CssSize::new(558.0, 625.0));
-        let mut app = DesktopApp::new(
+        let mut app = DesktopApp::for_test(
             browser,
             Handle::current(),
             event_loop.create_proxy(),
@@ -10912,11 +11822,11 @@ mod tests {
         let (document, layout) = DesktopPageAdapter::from_rendered(response.url, rendered);
         let mut scene = desktop_chrome(
             app.metrics,
-            &app.browser.snapshot(),
+            &app.tab.browser.snapshot(),
             &ChromeModel::default(),
         );
         scene.append_page(&layout.paint, CssPoint::default());
-        app.page_layout = Some(PageLayoutCache {
+        app.tab.page_layout = Some(PageLayoutCache {
             generation: 1,
             revision: 1,
             rendered_revision: 1,
@@ -10935,28 +11845,32 @@ mod tests {
         );
         app.handle_pointer_button(ElementState::Pressed, MouseButton::Left);
         app.handle_pointer_button(ElementState::Released, MouseButton::Left);
-        assert!(matches!(app.focus, FocusTarget::Form { .. }));
+        assert!(matches!(app.tab.focus, FocusTarget::Form { .. }));
         // A script can clear this field and focus the next one while the
         // native editor still shows its old draft. Presenting actor focus
         // must never send that stale draft back to the document.
-        let FocusTarget::Form { form, field } = app.focus else {
+        let FocusTarget::Form { form, field } = app.tab.focus else {
             unreachable!()
         };
-        app.form_editor.as_mut().unwrap().set_text("stale draft");
-        app.page_layout.as_mut().unwrap().document.forms[form].fields[field]
+        app.tab
+            .form_editor
+            .as_mut()
+            .unwrap()
+            .set_text("stale draft");
+        app.tab.page_layout.as_mut().unwrap().document.forms[form].fields[field]
             .value
             .clear();
-        let next = app.page_layout.as_ref().unwrap().document.forms[form]
+        let next = app.tab.page_layout.as_ref().unwrap().document.forms[form]
             .fields
             .iter()
             .position(|control| control.name == "next")
             .unwrap();
         app.present_form_focus(form, next);
         assert_eq!(
-            app.page_layout.as_ref().unwrap().document.forms[form].fields[field].value,
+            app.tab.page_layout.as_ref().unwrap().document.forms[form].fields[field].value,
             ""
         );
-        assert_eq!(app.focus, FocusTarget::Form { form, field: next });
+        assert_eq!(app.tab.focus, FocusTarget::Form { form, field: next });
     }
 
     #[test]
@@ -11418,7 +12332,7 @@ mod tests {
         terminal.line_editor.set_text("@ ab  more text");
         terminal.view.process(b"\x1b[?1000h");
         let browser = BrowserController::new(Handle::current(), || {}, CssSize::new(960.0, 600.0));
-        let mut app = DesktopApp::new(
+        let mut app = DesktopApp::for_test(
             browser,
             Handle::current(),
             event_loop.create_proxy(),
@@ -11428,11 +12342,14 @@ mod tests {
         app.clipboard = None;
         app.metrics =
             ViewportMetrics::from_physical(PhysicalSize::new(960, 600), ScaleFactor::new(1.0));
-        app.focus = FocusTarget::Page;
+        app.tab.focus = FocusTarget::Page;
         let mut scene = desktop_chrome(
             app.metrics,
-            &app.browser.snapshot(),
-            &ChromeModel::default(),
+            &app.tab.browser.snapshot(),
+            &ChromeModel {
+                tab_strip_height: app.strip_height(),
+                ..ChromeModel::default()
+            },
         );
         let rect = trust::terminal_view::terminal_input_rect(scene.content_viewport);
         terminal
@@ -11445,25 +12362,34 @@ mod tests {
             enabled: true,
         });
         let cell = terminal.view.cell_size().0;
-        app.terminal = Some(terminal);
+        app.tab.terminal = Some(terminal);
         app.scene = Some(scene);
         app.pointer = CssPoint::new(rect.x + 8.0 + cell * 3.0, rect.y + rect.height / 2.0);
         app.handle_pointer_button(ElementState::Pressed, MouseButton::Left);
-        assert_eq!(app.terminal.as_ref().unwrap().line_editor.selection(), 3..3);
-        assert!(app.terminal.as_ref().unwrap().line_input.selecting);
-        assert!(app.terminal.as_ref().unwrap().mouse_button.is_none());
+        assert_eq!(
+            app.tab.terminal.as_ref().unwrap().line_editor.selection(),
+            3..3
+        );
+        assert!(app.tab.terminal.as_ref().unwrap().line_input.selecting);
+        assert!(app.tab.terminal.as_ref().unwrap().mouse_button.is_none());
         app.pointer.x += cell * 4.0;
         app.move_terminal_input_pointer(true);
-        assert_eq!(app.terminal.as_ref().unwrap().line_editor.selection(), 3..7);
+        assert_eq!(
+            app.tab.terminal.as_ref().unwrap().line_editor.selection(),
+            3..7
+        );
         app.handle_pointer_button(ElementState::Released, MouseButton::Left);
-        assert!(!app.terminal.as_ref().unwrap().line_input.selecting);
+        assert!(!app.tab.terminal.as_ref().unwrap().line_input.selecting);
 
         // A remote drag that ends over the entry field must still send its
         // release, rather than leave the remote application holding a button.
-        app.terminal.as_mut().unwrap().mouse_button = Some(0);
+        app.tab.terminal.as_mut().unwrap().mouse_button = Some(0);
         app.handle_pointer_button(ElementState::Released, MouseButton::Left);
-        assert!(app.terminal.as_ref().unwrap().mouse_button.is_none());
-        assert_eq!(app.terminal.as_ref().unwrap().line_editor.selection(), 3..7);
+        assert!(app.tab.terminal.as_ref().unwrap().mouse_button.is_none());
+        assert_eq!(
+            app.tab.terminal.as_ref().unwrap().line_editor.selection(),
+            3..7
+        );
     }
 
     #[tokio::test]
@@ -11736,6 +12662,8 @@ mod tests {
                     terminal_text: Some("Welcome\nLogin:".into()),
                     terminal_input: Some(("private draft".into(), masked)),
                     context_menu: None,
+                    unload_prompt: None,
+                    tab_strip: None,
                 },
                 true,
             );
@@ -11849,6 +12777,8 @@ mod tests {
                 terminal_text: None,
                 terminal_input: None,
                 context_menu: None,
+                unload_prompt: None,
+                tab_strip: None,
             },
             true,
         );
@@ -11883,6 +12813,8 @@ mod tests {
                 terminal_text: None,
                 terminal_input: None,
                 context_menu: None,
+                unload_prompt: None,
+                tab_strip: None,
             },
             true,
         );
@@ -12361,32 +13293,36 @@ mod tests {
             }
             let browser =
                 BrowserController::new(Handle::current(), || {}, CssSize::new(200.0, 400.0));
-            let mut app = DesktopApp::new(
+            let mut app = DesktopApp::for_test(
                 browser,
                 Handle::current(),
                 event_loop.create_proxy(),
                 RendererPreference::Cpu,
                 None,
             );
-            app.browser
+            app.tab
+                .browser
                 .open_internal_gemtext("about:pointer-test", b"Initial page".to_vec());
-            app.focus = FocusTarget::Page;
+            app.tab.focus = FocusTarget::Page;
             let cache = protocol_pointer_cache(document);
             let hits: Vec<_> = protocol_pointer_hits(&cache).into_iter().filter(|hit| matches!(&hit.link, Some(Link::OneShot(url)) if url.scheme == trust::oneshot::Scheme::Finger)).collect();
             let first = &hits[0];
             let second = hits.iter().find(|hit| hit.node != first.node).unwrap();
             let point = CssPoint::new(second.rect.x + 2.0, second.rect.y + 2.0);
             app.scene = Some(protocol_pointer_scene(&cache));
-            app.protocol_page = Some(cache);
+            app.tab.protocol_page = Some(cache);
 
             // Exercise the same handler used by native motion and scene commits.
             app.protocol_pointer_selection = true;
             app.pointer_moved(None, point);
             assert_eq!(
-                app.protocol_page.as_ref().unwrap().selected,
+                app.tab.protocol_page.as_ref().unwrap().selected,
                 Some(second.node - 1)
             );
-            assert_eq!(app.link_preview, second.link.as_ref().unwrap().to_string());
+            assert_eq!(
+                app.tab.link_preview,
+                second.link.as_ref().unwrap().to_string()
+            );
             assert!(app.handle_gopherus_key(&KeyInput {
                 key: Key::ArrowUp,
                 code: "ArrowUp".into(),
@@ -12398,10 +13334,13 @@ mod tests {
             }));
             app.pointer_moved(None, point);
             assert_eq!(
-                app.protocol_page.as_ref().unwrap().selected,
+                app.tab.protocol_page.as_ref().unwrap().selected,
                 Some(first.node - 1)
             );
-            assert_eq!(app.link_preview, first.link.as_ref().unwrap().to_string());
+            assert_eq!(
+                app.tab.link_preview,
+                first.link.as_ref().unwrap().to_string()
+            );
 
             app.protocol_pointer_selection = true;
             app.pointer_moved(None, CssPoint::new(first.rect.x + 2.0, first.rect.y + 2.0));
@@ -12409,18 +13348,18 @@ mod tests {
             app.pointer_moved(None, point);
             app.handle_pointer_button(ElementState::Released, MouseButton::Left);
             assert!(
-                !app.browser.snapshot().loading,
+                !app.tab.browser.snapshot().loading,
                 "release on another row must not navigate"
             );
 
             app.handle_pointer_button(ElementState::Pressed, MouseButton::Left);
             assert!(
-                !app.browser.snapshot().loading,
+                !app.tab.browser.snapshot().loading,
                 "press alone must not navigate"
             );
             app.handle_pointer_button(ElementState::Released, MouseButton::Left);
             assert!(
-                app.browser.snapshot().loading,
+                app.tab.browser.snapshot().loading,
                 "native click must start the request without an HTML layout"
             );
             let (mut socket, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
@@ -12436,15 +13375,15 @@ mod tests {
             socket.write_all(b"Arrived\r\n").await.unwrap();
             socket.shutdown().await.unwrap();
             tokio::time::timeout(Duration::from_secs(2), async {
-                while app.browser.snapshot().loading {
-                    app.browser.process_async_events();
+                while app.tab.browser.snapshot().loading {
+                    app.tab.browser.process_async_events();
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             })
             .await
             .unwrap();
             assert_eq!(
-                app.browser.current_page().unwrap().target(),
+                app.tab.browser.current_page().unwrap().target(),
                 second.link.as_ref().unwrap()
             );
         }

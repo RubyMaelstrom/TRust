@@ -1652,7 +1652,7 @@ impl Dom {
                     scoped.scopes
                 );
             }
-            pending.roots.borrow_mut().insert(DOCUMENT, true);
+            pending.roots.borrow_mut().insert(self.document(), true);
         }
         let mut roots = std::mem::take(&mut *pending.roots.borrow_mut());
         #[cfg(test)]

@@ -28,6 +28,10 @@ const SHADOW_OFFSET: f32 = 6.0;
 /// The pictogram drawn beside an item, in the menu's line style.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ContextMenuIcon {
+    /// A tab with a plus: open the link in a new tab.
+    NewTab,
+    /// Two chain links: copy the link's address.
+    Link,
     Copy,
     Reload,
     Command,
@@ -123,90 +127,7 @@ pub fn paint_context_menu(
     highlighted: Option<usize>,
     title: &str,
 ) {
-    let panel = geometry.panel;
-    let (right, bottom) = (panel.x + panel.width, panel.y + panel.height);
-    let corners = [
-        CssPoint::new(panel.x + 8.0, panel.y),
-        CssPoint::new(right - 16.0, panel.y),
-        CssPoint::new(right, panel.y + 16.0),
-        CssPoint::new(right, bottom - 8.0),
-        CssPoint::new(right - 8.0, bottom),
-        CssPoint::new(panel.x, bottom),
-        CssPoint::new(panel.x, panel.y + 8.0),
-    ];
-    // A static, soft drop shadow following the chamfered outline: no
-    // animation timer or continuous redraw.
-    primitives.push(Primitive::Shadow {
-        shape: PaintShape::Polygon {
-            points: corners.to_vec(),
-            evenodd: false,
-        },
-        color: PaintColor::Rgba(0, 0, 0, 110),
-        offset: CssPoint::new(0.0, SHADOW_OFFSET),
-        blur_radius: SHADOW_BLUR,
-        spread: 0.0,
-        inset: false,
-    });
-    let mut outline = vec![PathElement::MoveTo(corners[0])];
-    outline.extend(
-        corners[1..]
-            .iter()
-            .map(|&corner| PathElement::LineTo(corner)),
-    );
-    outline.push(PathElement::Close);
-    let outline = PaintShape::Path(outline);
-    primitives.push(Primitive::Fill {
-        shape: outline.clone(),
-        brush: PaintBrush::Solid(SURFACE),
-    });
-    primitives.push(Primitive::Stroke {
-        shape: outline,
-        brush: PaintBrush::Solid(EDGE),
-        style: StrokeStyle::solid(1.0),
-    });
-    // Everything below lies inside the chamfered outline, so the menu needs
-    // no clip scope: without one, scene damage stays the menu's rectangle.
-    fill(
-        primitives,
-        CssRect::new(panel.x + 8.0, panel.y, 64.0, 2.0),
-        UI_PINK,
-    );
-    fill(
-        primitives,
-        CssRect::new(right - 84.0, bottom - 1.0, 68.0, 1.0),
-        UI_CYAN,
-    );
-    let mut traces = Vec::new();
-    for i in 0..3 {
-        let x = right - 44.0 + i as f32 * 8.0;
-        traces.extend([
-            PathElement::MoveTo(CssPoint::new(x, panel.y + 5.0)),
-            PathElement::LineTo(CssPoint::new(x + 8.0, panel.y + 13.0)),
-        ]);
-    }
-    primitives.push(Primitive::Stroke {
-        shape: PaintShape::Path(traces),
-        brush: PaintBrush::Solid(EDGE),
-        style: StrokeStyle::solid(2.0),
-    });
-
-    let badge = CssRect::new(panel.x + 10.0, panel.y + 9.0, 46.0, 16.0);
-    fill(primitives, badge, UI_PINK);
-    label(primitives, "PAGE", badge, 10.0, INSET, true);
-    label(
-        primitives,
-        title,
-        CssRect::new(
-            badge.x + badge.width + 9.0,
-            badge.y,
-            (panel.width - badge.width - 76.0).max(0.0),
-            badge.height,
-        ),
-        10.0,
-        MUTED,
-        false,
-    );
-
+    paint_menu_panel(primitives, geometry.panel, "PAGE", title);
     for (index, (item, row)) in items.iter().zip(&geometry.rows).enumerate() {
         if item.separated {
             fill(
@@ -279,6 +200,101 @@ pub fn paint_context_menu(
     }
 }
 
+/// The panel the context menu and the desktop's other popup chrome share:
+/// COMMAND's surface with a soft static shadow, an etched chamfered edge,
+/// its pink and cyan accents, and a header badge naming what it acts on.
+pub(super) fn paint_menu_panel(
+    primitives: &mut Vec<Primitive>,
+    panel: CssRect,
+    badge_text: &str,
+    title: &str,
+) {
+    let (right, bottom) = (panel.x + panel.width, panel.y + panel.height);
+    let corners = [
+        CssPoint::new(panel.x + 8.0, panel.y),
+        CssPoint::new(right - 16.0, panel.y),
+        CssPoint::new(right, panel.y + 16.0),
+        CssPoint::new(right, bottom - 8.0),
+        CssPoint::new(right - 8.0, bottom),
+        CssPoint::new(panel.x, bottom),
+        CssPoint::new(panel.x, panel.y + 8.0),
+    ];
+    // A static, soft drop shadow following the chamfered outline: no
+    // animation timer or continuous redraw.
+    primitives.push(Primitive::Shadow {
+        shape: PaintShape::Polygon {
+            points: corners.to_vec(),
+            evenodd: false,
+        },
+        color: PaintColor::Rgba(0, 0, 0, 110),
+        offset: CssPoint::new(0.0, SHADOW_OFFSET),
+        blur_radius: SHADOW_BLUR,
+        spread: 0.0,
+        inset: false,
+    });
+    let mut outline = vec![PathElement::MoveTo(corners[0])];
+    outline.extend(
+        corners[1..]
+            .iter()
+            .map(|&corner| PathElement::LineTo(corner)),
+    );
+    outline.push(PathElement::Close);
+    let outline = PaintShape::Path(outline);
+    primitives.push(Primitive::Fill {
+        shape: outline.clone(),
+        brush: PaintBrush::Solid(SURFACE),
+    });
+    primitives.push(Primitive::Stroke {
+        shape: outline,
+        brush: PaintBrush::Solid(EDGE),
+        style: StrokeStyle::solid(1.0),
+    });
+    // Everything below lies inside the chamfered outline, so the panel needs
+    // no clip scope: without one, scene damage stays the panel's rectangle.
+    fill(
+        primitives,
+        CssRect::new(panel.x + 8.0, panel.y, 64.0, 2.0),
+        UI_PINK,
+    );
+    fill(
+        primitives,
+        CssRect::new(right - 84.0, bottom - 1.0, 68.0, 1.0),
+        UI_CYAN,
+    );
+    let mut traces = Vec::new();
+    for i in 0..3 {
+        let x = right - 44.0 + i as f32 * 8.0;
+        traces.extend([
+            PathElement::MoveTo(CssPoint::new(x, panel.y + 5.0)),
+            PathElement::LineTo(CssPoint::new(x + 8.0, panel.y + 13.0)),
+        ]);
+    }
+    primitives.push(Primitive::Stroke {
+        shape: PaintShape::Path(traces),
+        brush: PaintBrush::Solid(EDGE),
+        style: StrokeStyle::solid(2.0),
+    });
+
+    let badge_width =
+        10.0 + crate::text::shape(badge_text, &command_text_style_with_size(10.0)).advance + 10.0;
+    let badge = CssRect::new(panel.x + 10.0, panel.y + 9.0, badge_width.max(46.0), 16.0);
+    fill(primitives, badge, UI_PINK);
+    label(primitives, badge_text, badge, 10.0, INSET, true);
+    label(
+        primitives,
+        title,
+        CssRect::new(
+            badge.x + badge.width + 9.0,
+            badge.y,
+            (panel.width - badge.width - 76.0).max(0.0),
+            badge.height,
+        ),
+        10.0,
+        MUTED,
+        false,
+    );
+}
+
 fn paint_icon(
     primitives: &mut Vec<Primitive>,
     icon: ContextMenuIcon,
@@ -297,6 +313,59 @@ fn paint_icon(
         });
     };
     match icon {
+        ContextMenuIcon::NewTab => {
+            // A tab's outline, its top chamfered as the strip draws it.
+            stroke(vec![
+                PathElement::MoveTo(at(1.0, 13.0)),
+                PathElement::LineTo(at(1.0, 4.0)),
+                PathElement::LineTo(at(2.5, 2.5)),
+                PathElement::LineTo(at(7.5, 2.5)),
+                PathElement::LineTo(at(9.5, 4.5)),
+                PathElement::LineTo(at(9.5, 6.0)),
+            ]);
+            stroke(vec![
+                PathElement::MoveTo(at(1.0, 13.0)),
+                PathElement::LineTo(at(6.5, 13.0)),
+            ]);
+            stroke(vec![
+                PathElement::MoveTo(at(10.5, 8.0)),
+                PathElement::LineTo(at(10.5, 13.5)),
+                PathElement::MoveTo(at(7.75, 10.75)),
+                PathElement::LineTo(at(13.25, 10.75)),
+            ]);
+        }
+        ContextMenuIcon::Link => {
+            // Two rounded links of a chain, joined on the diagonal.
+            let link = |cx: f32, cy: f32| {
+                let (hw, hh, r) = (4.25, 2.25, 2.25);
+                vec![
+                    PathElement::MoveTo(at(cx - hw + r, cy - hh)),
+                    PathElement::LineTo(at(cx + hw - r, cy - hh)),
+                    PathElement::CurveTo(
+                        at(cx + hw + 0.25, cy - hh),
+                        at(cx + hw + 0.25, cy + hh),
+                        at(cx + hw - r, cy + hh),
+                    ),
+                    PathElement::LineTo(at(cx - hw + r, cy + hh)),
+                    PathElement::CurveTo(
+                        at(cx - hw - 0.25, cy + hh),
+                        at(cx - hw - 0.25, cy - hh),
+                        at(cx - hw + r, cy - hh),
+                    ),
+                ]
+            };
+            let mut path = Vec::new();
+            for (cx, cy) in [(4.75, 9.5), (9.25, 4.5)] {
+                // Each link is drawn around its own center, tilted by
+                // offsetting the second; the strokes cross between them.
+                path.extend(link(cx, cy));
+            }
+            stroke(path);
+            stroke(vec![
+                PathElement::MoveTo(at(5.5, 8.5)),
+                PathElement::LineTo(at(8.5, 5.5)),
+            ]);
+        }
         ContextMenuIcon::Copy => {
             stroke(vec![
                 PathElement::MoveTo(at(4.5, 4.5)),
@@ -392,13 +461,14 @@ fn paint_icon(
     }
 }
 
-fn fill(primitives: &mut Vec<Primitive>, rect: CssRect, color: PaintColor) {
+pub(super) fn fill(primitives: &mut Vec<Primitive>, rect: CssRect, color: PaintColor) {
     if rect.width > 0.0 && rect.height > 0.0 {
         primitives.push(Primitive::FillRect { rect, color });
     }
 }
 
-fn label(
+/// One line of chrome text in `rect`, cut at its width.
+pub(super) fn label(
     primitives: &mut Vec<Primitive>,
     text: &str,
     rect: CssRect,

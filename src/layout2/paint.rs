@@ -400,7 +400,7 @@ impl TerminalPaintModel {
         images: &super::ImageSizes,
     ) {
         if dom
-            .flat_descendants(crate::dom::DOCUMENT)
+            .flat_descendants(dom.document())
             .into_iter()
             .any(|id| matches!(dom.tag_name(id), Some("video" | "audio")))
             || !super::page_declares_video(dom)

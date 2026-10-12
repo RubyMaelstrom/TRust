@@ -41,6 +41,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     const setLayoutViewport = g.__dom_set_viewport;
     delete g.__dom_set_viewport;
     const storageContextId = Number(cfg.hostSettingsContext) || 0;
+    const storageShed = Number(cfg.storageShed) || 0;
     const storageOpaque = !!cfg.cookieOpaque;
     const documentReferrers = new WeakMap(), frameReferrers = new WeakMap();
     // A frame's navigation response `Referrer-Policy` (HTML #creating-a-policy-
@@ -103,6 +104,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // properties would let a page read another origin's Window or forge the
     // node a platform operation acts on (HTML #origin).
     const nodeIds = __platform_slots("nodes", privateSlots());
+    // The arena id of this Realm's top-level traversable's Document: 0 for
+    // the engine's first traversable, another for each traversable a page
+    // opened (`__traversable_create`), whose Documents have their own arena.
+    const topDocumentId = __dom_top_document();
     const internalSlots = __platform_slots("internals", privateSlots());
     const noInternals = Object.freeze(Object.create(null));
     // Web IDL #dfn-attribute-getter: a regular attribute's getter throws a
@@ -111,6 +116,33 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // duck-typing probes such as testharness's is_node() can tell them apart.
     function requireNodeReceiver(object) {
         if (nodeIds.get(object) === undefined) throw new TypeError("Illegal invocation");
+    }
+    // HTML #document.title on setting: the SVG document element's first SVG
+    // title child (created as its first child), else the title element
+    // (created in the head; without either, nothing changes), gets the value
+    // by DOM #string-replace-all.
+    function setDocumentTitle(doc, value) {
+        const root = doc.documentElement;
+        let element = null;
+        if (root && root.namespaceURI === "http://www.w3.org/2000/svg" && root.localName === "svg") {
+            for (let child = root.firstChild; child; child = child.nextSibling) {
+                if (child.namespaceURI === "http://www.w3.org/2000/svg" && child.localName === "title") {
+                    element = child;
+                    break;
+                }
+            }
+            if (!element) {
+                element = doc.createElementNS("http://www.w3.org/2000/svg", "title");
+                root.insertBefore(element, root.firstChild);
+            }
+        } else if (root && root.namespaceURI === "http://www.w3.org/1999/xhtml") {
+            const title = __dom_title_element(nodeIds.get(doc));
+            const head = doc.head;
+            if (title === null && !head) return;
+            if (title !== null) element = wrap(title);
+            else element = head.appendChild(doc.createElementNS("http://www.w3.org/1999/xhtml", "title"));
+        } else return;
+        element.textContent = value;
     }
     // DOM #dom-node-nodetype for a Node wrapper (an Attr has no arena node).
     function nodeTypeOf(node) {
@@ -187,6 +219,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             const container = internalsFor(frame);
             if (!container.navigableRecord) container.navigableRecord = {closed: false};
             childTrust.adoptNavigableRecord(container.navigableRecord);
+            childTrust.setTimerThrottleFrom(timerThrottleFrom);
             childWindowTrusts.add(childTrust);
             childActivationWindows.add(childWindow);
             childRenderingFrames.set(childTrust, nodeIds.get(frame));
@@ -194,12 +227,52 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             renderingChildrenCache = [];
         }
     };
+    // The records of this Agent's top-level traversables (HTML
+    // #top-level-traversable), which its browsing context group's Windows
+    // share: each traversable's target name, opener, popup state and
+    // navigable record live with the traversable across its Documents and
+    // their Realms. Keyed by the host's traversable id (`cfg.traversableId`,
+    // 0 for the engine's first); reached only through this private slot.
+    const traversableRecords = __platform_slots("traversables", new Map());
+    const mapGet = Map.prototype.get, mapSet = Map.prototype.set;
+    const mapDelete = Map.prototype.delete, mapValues = Map.prototype.values;
+    // This Realm's top-level traversable's record, when its Window is the
+    // traversable's (a child navigable's Window has none).
+    const traversableRecord = cfg.parentWindow ? null : (() => {
+        const id = Number(cfg.traversableId) || 0;
+        let record = messageApply(mapGet, traversableRecords, [id]);
+        if (!record) {
+            record = Object.create(null);
+            record.id = id;
+            // HTML #nav-target: the target name it was created with.
+            record.name = typeof cfg.targetName === "string" ? cfg.targetName : "";
+            // HTML #opener-browsing-context: the Window of the Document that
+            // created it (an auxiliary browsing context), until disowned.
+            record.opener = cfg.openerWindow || null;
+            // HTML #is-popup.
+            record.popup = cfg.isPopup === true;
+            // HTML #is-created-by-web-content, which makes it script-closable.
+            record.createdByWebContent = cfg.initialAboutBlank === true;
+            // HTML #dom-window-closed, shared with every Window it hosts.
+            record.navigable = {closed: false, closing: false};
+            messageApply(mapSet, traversableRecords, [id, record]);
+        }
+        // HTML #resetBCName: a Document of another origin clears the target
+        // name, unless this is an auxiliary browsing context with an opener.
+        if (cfg.resetTargetName === true && !record.opener) record.name = "";
+        record.window = g;
+        record.trust = trust;
+        return record;
+    })();
     // HTML #dom-window-closed: this Window's browsing context is null (its
-    // navigable was destroyed: its iframe removed) or its top-level
-    // traversable's "is closing" is true (#dom-window-close). Navigation
-    // keeps the browsing context, so it does not close the Window it
-    // replaces; the record is the navigable's.
-    let navigableRecord = {closed: false, closing: false};
+    // navigable was destroyed: its iframe removed, its traversable closed) or
+    // its top-level traversable's "is closing" is true (#dom-window-close).
+    // Navigation keeps the browsing context, so it does not close the Window
+    // it replaces; the record is the navigable's.
+    let navigableRecord = traversableRecord ? traversableRecord.navigable : {closed: false, closing: false};
+    // HTML #is-initial-about:blank for this top-level traversable's Document:
+    // an auxiliary browsing context's first, which a navigation replaces.
+    const initialAboutBlank = !cfg.parentWindow && cfg.initialAboutBlank === true;
     trust.adoptNavigableRecord = function (record) { navigableRecord = record; };
     trust.navigableClosed = function () { return navigableRecord.closed || navigableRecord.closing === true; };
     trust.detachChildWindow = function (childWindow) {
@@ -225,7 +298,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             // Only navigable containers can contribute a child Document.
             // Filter natively before crossing into JS: ordinary input edits
             // also advance the DOM epoch, without changing the frame list.
-            for (const id of __dom_rendering_frames(realmRootFrame ? nodeIds.get(realmRootFrame) : 0)) {
+            for (const id of __dom_rendering_frames(realmRootFrame ? nodeIds.get(realmRootFrame) : topDocumentId)) {
                 const child = byFrame.get(id);
                 if (child) children.push(child);
             }
@@ -238,6 +311,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // author callbacks. A callback may retire a later Window (or an ancestor);
     // the retained predicate prevents delivering into that retired subtree.
     trust.collectRenderingDocuments = function (records, active) {
+        // HTML #update-the-rendering ("filter non-renderable documents"): a
+        // hidden Document gets no rendering update, nor do its descendants'.
+        if (documentVisibility === "hidden") return;
         records.push([trust, active]);
         for (const child of renderingChildren()) {
             const frame = childRenderingFrames.get(child);
@@ -1711,6 +1787,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     let topNavigableName = "";
     function navigableName(frame, value, write = false) {
         if (!frame) {
+            // A top-level traversable's target name stays with it across
+            // its Documents.
+            if (traversableRecord) {
+                if (write) traversableRecord.name = value;
+                return traversableRecord.name;
+            }
             if (write) topNavigableName = value;
             return topNavigableName;
         }
@@ -1800,6 +1882,316 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // Whether this child navigable's Document is in the focus chain. A
     // top-level Document always is while its window has focus.
     let inFocusChain = !cfg.parentWindow;
+    // HTML #page-visibility: this Document's visibility state. A Document
+    // starts with its traversable's system visibility state
+    // (#set-the-initial-visibility-state); the traversable's changes update
+    // it as tasks (#update-the-visibility-state).
+    let documentVisibility = cfg.hidden === true ? "hidden" : "visible";
+    // HTML #system-focus of the top-level traversable, which a top-level
+    // Document's focus follows (#has-focus-steps).
+    let systemFocused = cfg.systemFocus !== false;
+    if (!cfg.parentWindow) __dom_system_focus(systemFocused);
+    // HTML #timers ("optionally, wait a further implementation-defined
+    // length of time"): timers due from this agent time on are aligned to
+    // whole seconds (`timerDue`); null while timers run on time.
+    let timerThrottleFrom = null;
+    function topTrust() {
+        return cfg.topWindow ? trustOf(cfg.topWindow) : trust;
+    }
+    trust.visibilityState = function () { return documentVisibility; };
+    // HTML #page-visibility: the traversable's system visibility state
+    // changed. For each inclusive descendant navigable, queue a task on the
+    // user interaction task source to update its Document's visibility state.
+    trust.systemVisibilityChanged = function (hidden) {
+        // New child navigables start with the traversable's current state.
+        cfg.hidden = !!hidden;
+        const state = hidden ? "hidden" : "visible";
+        controlSelectionTasks.push({frame: null, fn() { updateVisibilityState(state); }});
+        for (const childTrust of childWindowTrusts) childTrust.systemVisibilityChanged(hidden);
+        if (!cfg.parentWindow) updateTimerThrottle();
+    };
+    // HTML #update-the-visibility-state.
+    function updateVisibilityState(state) {
+        if (documentVisibility === state) return;
+        documentVisibility = state;
+        if (trust.queueVisibilityStateEntry) trust.queueVisibilityStateEntry(state);
+        dispatch(g.document, createTrustedEvent(Event, "visibilitychange",
+            { bubbles: true, cancelable: false }), false);
+    }
+    // The visibility state of `doc`: this Realm's Document, a child
+    // navigable's (through its Window), or "hidden" for a Document without a
+    // navigable, whose state is never set from its initial value.
+    function visibilityStateOf(doc) {
+        if (doc === g.document) return documentVisibility;
+        const frame = internalsOf(doc).frame;
+        const child = frame && internalsOf(frame).contentRealmWindow;
+        return child ? trustOf(child).visibilityState() : "hidden";
+    }
+    // Page Lifecycle #dom-document-wasdiscarded: only the top-level Document
+    // that replaced a discarded one.
+    function wasDiscardedOf(doc) {
+        return doc === g.document && !cfg.parentWindow && cfg.wasDiscarded === true;
+    }
+    // HTML #unloading-documents for this Realm's Document: whether its page
+    // is showing (pageshow and pagehide pair up), and its unload counter,
+    // which makes navigation (#navigate), document.open() and
+    // document.write() ignore requests from beforeunload, pagehide and
+    // unload handlers.
+    let pageShowing = false;
+    let unloadCounter = 0;
+    trust.unloading = function () { return unloadCounter > 0; };
+    // The event loop's termination nesting level, which the top-level
+    // Realm keeps for every Realm of the page.
+    function enterTermination(delta) {
+        const top = topTrust();
+        top.terminationNesting = (top.terminationNesting || 0) + delta;
+    }
+    function terminating() {
+        return (topTrust().terminationNesting || 0) > 0;
+    }
+    // HTML #fire-a-page-transition-event at this Realm's Window.
+    function firePageTransitionEvent(type, persisted) {
+        dispatch(g, createTrustedEvent(PageTransitionEvent, type,
+            { persisted, bubbles: true, cancelable: true }), false, true);
+    }
+    // HTML #the-end, after the load event: the page is showing.
+    function showPage() {
+        pageShowing = true;
+        firePageTransitionEvent("pageshow", false);
+    }
+    // HTML #steps-to-fire-beforeunload for this Realm's Document: whether
+    // it asks the user to confirm that they want to unload it. An earlier
+    // Document's request (`promptShown`) means no second one.
+    function fireBeforeUnload(promptShown) {
+        unloadCounter++;
+        enterTermination(1);
+        let event = null, notCanceled = true;
+        try {
+            event = createTrustedEvent(BeforeUnloadEvent, "beforeunload", { cancelable: true });
+            notCanceled = dispatch(g, event, false);
+        } catch (e) {
+            trust.errors.push("beforeunload: " + ((e && e.message) || e));
+        } finally {
+            enterTermination(-1);
+            unloadCounter--;
+        }
+        return !promptShown && event !== null
+            && currentTime() >= topWindowState.lastActivation
+            && (!notCanceled || event.returnValue !== "");
+    }
+    // HTML #checking-if-unloading-is-canceled's beforeunload events, at
+    // this Realm's Document and then its descendants' in tree order:
+    // whether one of them asks the user to confirm unloading. TRust asks
+    // once every event has fired; no Document can tell the difference.
+    trust.fireBeforeUnloadTree = function (promptShown = false) {
+        if (fireBeforeUnload(promptShown)) promptShown = true;
+        for (const child of renderingChildren())
+            if (child.fireBeforeUnloadTree(promptShown)) promptShown = true;
+        return promptShown;
+    };
+    // Whether checking if unloading is canceled can find anything to ask:
+    // a beforeunload listener or handler at this Realm's Window or its
+    // descendants'.
+    trust.hasBeforeUnloadListeners = function () {
+        if (hasBeforeUnloadListener()) return true;
+        for (const child of childWindowTrusts)
+            if (child.hasBeforeUnloadListeners()) return true;
+        return false;
+    };
+    function hasBeforeUnloadListener() {
+        return hasWindowListener("beforeunload");
+    }
+    function hasWindowListener(type) {
+        return lsFor(g, type).length > 0 || implicitEventHandler(g, type) !== null;
+    }
+    // Whether a Document of this Realm or its descendants' listens for the
+    // end of its life: unload, pagehide or beforeunload at its Window,
+    // visibilitychange or freeze at itself. Such a page keeps its resident
+    // Realm, so that they still run when it ends (HTML
+    // #unloading-documents, Page Lifecycle #freeze-steps).
+    trust.hasLifecycleListeners = function () {
+        if (hasWindowListener("beforeunload") || hasWindowListener("pagehide")
+            || hasWindowListener("unload") || lsFor(g.document, "visibilitychange").length > 0
+            || lsFor(g.document, "freeze").length > 0) return true;
+        for (const child of childWindowTrusts)
+            if (child.hasLifecycleListeners()) return true;
+        return false;
+    };
+    // HTML #unload-a-document-and-its-descendants: the child navigables'
+    // Documents first, then this Realm's. TRust keeps no Document alive in
+    // session history (no back/forward cache), so none stays salvageable.
+    trust.unloadTree = function () {
+        for (const child of renderingChildren()) {
+            try { child.unloadTree(); } catch (e) {}
+        }
+        unloadDocument();
+    };
+    // HTML #destroy-a-document-and-its-descendants for a top-level Realm's
+    // Document, which its traversable's next Document replaces or which goes
+    // with its traversable (`closing`: its Windows report `closed`, and the
+    // group forgets the traversable). The host has aborted its fetches; its
+    // child navigables are destroyed, its tasks, timers, animation frames
+    // and observers discarded and its Window's settings released.
+    trust.destroyTopLevelDocument = function (closing) {
+        if (cfg.parentWindow) return;
+        if (closing) {
+            navigableRecord.closed = true;
+            if (traversableRecord)
+                messageApply(mapDelete, traversableRecords, [traversableRecord.id]);
+        }
+        try { destroyFrameNavigablesIn(g.document); } catch (e) {}
+        internalsFor(g.document).destroyed = true;
+        retireWindowState(null, topWindowState);
+        try { rejectInactiveImageDecodes(); } catch (e) {}
+    };
+    // HTML #unload-a-document.
+    function unloadDocument() {
+        enterTermination(1);
+        unloadCounter++;
+        try {
+            if (pageShowing) {
+                pageShowing = false;
+                firePageTransitionEvent("pagehide", false);
+                updateVisibilityState("hidden");
+            }
+            dispatch(g, createTrustedEvent(Event, "unload", {}), false, true);
+        } catch (e) {
+            trust.errors.push("unload: " + ((e && e.message) || e));
+        } finally {
+            enterTermination(-1);
+        }
+        // The unloading document cleanup steps end with the Document: the
+        // host destroys it, its timers, WebSockets and EventSources with it.
+        unloadCounter--;
+    }
+    // Page Lifecycle #change-the-frozenness-of-a-top-level-document, to
+    // true: the freeze steps for this Realm's Document, then its
+    // descendants'. The user agent discards the page right after.
+    trust.freezeTree = function () {
+        freezeDocument();
+        for (const child of renderingChildren()) {
+            try { child.freezeTree(); } catch (e) {}
+        }
+    };
+    // Page Lifecycle #freeze-steps, without resuming frozen media: a
+    // discarded page does not resume.
+    function freezeDocument() {
+        try {
+            dispatch(g.document, createTrustedEvent(Event, "freeze", {}), false);
+        } catch (e) {
+            trust.errors.push("freeze: " + ((e && e.message) || e));
+        }
+        pauseMediaForFreeze(g.document);
+    }
+    // A hidden page that makes no sound has its timers aligned to whole
+    // seconds of the agent clock once it has been hidden for ten seconds, so
+    // a background tab wakes at most once a second. Alignment is monotone:
+    // timers still complete in the order HTML #run-steps-after-a-timeout's
+    // step 2 requires, and selection keeps their nominal order.
+    function timerDue(t) {
+        if (timerThrottleFrom === null) return t.at;
+        const agentAt = t.at + agentTimeOffset;
+        if (agentAt < timerThrottleFrom) return t.at;
+        return Math.ceil(agentAt / 1000) * 1000 - agentTimeOffset;
+    }
+    function updateTimerThrottle() {
+        const throttled = cfg.hidden === true && !audibleSources.size;
+        if (throttled === (timerThrottleFrom !== null)) return;
+        trust.setTimerThrottleFrom(throttled ? currentTime() + agentTimeOffset + 10000 : null);
+    }
+    trust.setTimerThrottleFrom = function (from) {
+        timerThrottleFrom = from;
+        for (const childTrust of childWindowTrusts) childTrust.setTimerThrottleFrom(from);
+    };
+    // What the frontend presents beside the page (top-level Window only):
+    // whether it makes sound (media elements playing audibly, running audio
+    // contexts) and whether the user has unsubmitted form edits in it.
+    const audibleSources = new Set();
+    let audibleReported = false, userEdits = false, userEditsReported = false;
+    // And whether closing it or navigating away must first ask the page
+    // (HTML #checking-if-unloading-is-canceled): it listens for beforeunload.
+    let beforeUnloadReported = false;
+    trust.noteAudible = function (source, audible) {
+        const before = audibleSources.size > 0;
+        if (audible) audibleSources.add(source);
+        else audibleSources.delete(source);
+        if (before !== audibleSources.size > 0) updateTimerThrottle();
+    };
+    trust.noteUserEdits = function (edits) { userEdits = !!edits; };
+    function noteUserEdits(edits) { topTrust().noteUserEdits(edits); }
+    trust.takeTraversableChanges = function () {
+        let changes = 0;
+        const audible = audibleSources.size > 0;
+        if (audible !== audibleReported) {
+            audibleReported = audible;
+            changes |= 1 | (audible ? 2 : 0);
+        }
+        if (userEdits !== userEditsReported) {
+            userEditsReported = userEdits;
+            changes |= 4 | (userEdits ? 8 : 0);
+        }
+        const beforeUnload = trust.hasBeforeUnloadListeners();
+        if (beforeUnload !== beforeUnloadReported) {
+            beforeUnloadReported = beforeUnload;
+            changes |= 16 | (beforeUnload ? 32 : 0);
+        }
+        // Bit 6: close this traversable (#definitely-close-a-top-level-
+        // traversable); bit 7: show it (#dom-window-focus).
+        if (closeRequested) {
+            closeRequested = false;
+            changes |= 64;
+        }
+        if (focusRequested) {
+            focusRequested = false;
+            changes |= 128;
+        }
+        return changes;
+    };
+    // HTML #focus-update-steps for a change of the top-level traversable's
+    // system focus. Losing it runs them with an empty new chain: blur along
+    // the current focus chain, innermost first, ending at the Window.
+    // Gaining it focuses the chain from the Window inward. Each Document
+    // keeps its focused area; what `:focus` matches follows the system
+    // focus (#selector-focus).
+    trust.systemFocusChanged = function (focused) {
+        if (systemFocused === !!focused) return;
+        const chain = [];
+        trust.collectFocusChain(chain);
+        systemFocused = !!focused;
+        __dom_system_focus(systemFocused);
+        if (!systemFocused) {
+            for (const [entryTrust, element] of chain) entryTrust.fireFocusChainEntry(element, "blur");
+        } else {
+            for (let i = chain.length - 1; i >= 0; i--) chain[i][0].fireFocusChainEntry(chain[i][1], "focus");
+        }
+    };
+    // This Document's part of the current focus chain, innermost first:
+    // a focused child navigable's chain and its container, or the focused
+    // element, then this Document (its Window gets the event).
+    trust.collectFocusChain = function (out) {
+        activeElementFor(g.document);
+        if (focusedArea) {
+            const child = internalsOf(focusedArea).contentRealmWindow;
+            if (child) trustOf(child).collectFocusChain(out);
+            out.push([trust, focusedArea]);
+        }
+        out.push([trust, null]);
+    };
+    trust.fireFocusChainEntry = function (element, type) {
+        if (!element) {
+            chainFocusWindow(type);
+            return;
+        }
+        if (!element.isConnected) return;
+        if (type === "blur") {
+            commitTextControl(element);
+            focusEvent(element, "blur", null, false);
+            focusEvent(element, "focusout", null, true);
+        } else {
+            focusEvent(element, "focus", null, false);
+            focusEvent(element, "focusin", null, true);
+        }
+    };
     function documentHasFocus(doc) {
         if (doc === g.document) return trust.documentFocused();
         const frame = internalsOf(doc).frame;
@@ -2080,7 +2472,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // area of a parent Document that has focus.
     trust.documentFocused = function () {
         const parent = cfg.parentWindow && trustOf(cfg.parentWindow);
-        if (!parent) return true;
+        if (!parent) return systemFocused;
         return parent.documentFocused() && parent.focusedChildWindow() === g;
     };
     trust.focusedChildWindow = function () {
@@ -2193,7 +2585,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             record.nodeId = __dom_node_identity(target);
             record.id = record.nodeId !== null ? record.nodeId
                 : target === topWindowState.listenerTarget
-                    ? (realmRootFrame ? nodeIds.get(realmRootFrame) : 0) : null;
+                    ? (realmRootFrame ? nodeIds.get(realmRootFrame) : topDocumentId) : null;
         }
         const connected = record.id !== null
             && (record.nodeId === null || __dom_is_connected(record.nodeId));
@@ -4736,6 +5128,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (frame === realmRootFrame) trust.setDocumentReadiness('complete');
             else internalsFor(frame).trustReadyState = "complete";
             try { runInFrame(frame, function () { trust.fire(g, "load", false); }); } catch (e) {}
+            // HTML #the-end: this Realm's Document is showing. (A scoped
+            // frame sharing this Realm has no page lifecycle of its own.)
+            if (frame === realmRootFrame) {
+                try { showPage(); } catch (e) {}
+            }
             // The iframe element is an EventTarget in its node document's
             // Realm. Queue its load-event steps only after the child Window
             // load task has run, so the intervening event-loop checkpoint is
@@ -5305,6 +5702,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (trust.activeParserWasAborted) return;
         trust.setDocumentReadiness("complete");
         trust.fire(g.window, "load", false);
+        showPage();
     };
     // Lazy realization when a script reads a frame's contentDocument before the
     // load sweep (or for a frame inserted after load). The de-dup guards keep a
@@ -5352,6 +5750,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // hyperlink default, so removing/reparenting the clicked subtree during a
     // listener does not erase or replace the selected activation target.
     let pendingClickHyperlink = null;
+    let pendingClickNewTab = null;
     function hasClickActivation(node) {
         if (!node || node.nodeType !== 1 || node.namespaceURI !== HTML_NS) return false;
         const tag = node.localName;
@@ -5597,6 +5996,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (record) nativePointerPosition = null;
         const context = { record, handled: false };
         const allowed = dispatch(t, ev, false, false, context);
+        // The user's preference to follow a hyperlink in a new top-level
+        // traversable (HTML #following-hyperlinks-2): Ctrl (or Meta) for a
+        // tab in the background, with Shift (or Shift alone) one in front.
+        if (record) pendingClickNewTab = trusted && (ev.ctrlKey || ev.metaKey || ev.shiftKey)
+            ? { foreground: ev.shiftKey } : null;
         // UI Events #event-type-dblclick: the second click precedes dblclick,
         // even if its click default action was canceled.
         if (record && trusted && ev.detail === 2)
@@ -6364,9 +6768,17 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 dispatch(target, menu, false);
                 if (selects) __context_menu_result(!menu.defaultPrevented);
             }
-            if (button !== 0 && clickTarget) dispatch(clickTarget,integralPointerEvent("auxclick", {
-                ...init, isPrimary:false, pressure:0
-            }),false);
+            if (button !== 0 && clickTarget) {
+                const aux = integralPointerEvent("auxclick", {...init, isPrimary:false, pressure:0});
+                dispatch(clickTarget, aux, false);
+                // The middle button's default action on a hyperlink is the
+                // user's preference to follow it in a new tab (HTML
+                // #following-hyperlinks-2), in front with Shift.
+                if (button === 1 && !aux.defaultPrevented) {
+                    const anchor = hyperlinkActivationTarget(clickTarget);
+                    if (anchor) followHyperlink(anchor, { foreground: !!init.shiftKey });
+                }
+            }
         }
         return canceled;
     };
@@ -6760,7 +7172,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             .includes(inputTypeOf(el));
     }
     function textDirection(text) {
-        const direction = __dom_input(0, "text-direction", text);
+        const direction = __dom_input(topDocumentId, "text-direction", text);
         return direction === "rtl" || direction === "ltr" ? direction : null;
     }
     function containedTextDirection(element, canExcludeRoot) {
@@ -7016,7 +7428,47 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const record = formSubmissionRecord(form, submitter, entries, method, parsed[0], enctype, encoding);
         const scheme = parsed[0].slice(0, parsed[0].indexOf(":")).toLowerCase();
         if (scheme === "http" || scheme === "https") {
+            // The user's edits leave with the submission.
+            noteUserEdits(false);
             slots.preparedSubmission = record;
+            // HTML #form-submission-algorithm: the rules for choosing a
+            // navigable for the form's target (the submitter's formtarget,
+            // else the form's, else the document's base target). A new
+            // top-level traversable gets the submission instead.
+            const target = elementTarget(form, submitter && submitter !== form
+                ? submitter.getAttribute("formtarget") : null);
+            const keyword = asciiLower(target);
+            const named = keyword !== "" && keyword !== "_blank" && keyword !== "_self"
+                && keyword !== "_parent" && keyword !== "_top";
+            const namedTraversable = named && !frameNamed(form.ownerDocument, target)
+                ? trust.namedTraversable(target) : null;
+            const requestsNew = keyword === "_blank" || namedTraversable === undefined;
+            const choice = requestsNew ? newTraversableChoice(form) : "existing";
+            if (choice === "blocked") return {handled: true};
+            // HTML #navigate: nothing navigates the unloading Document's
+            // navigable.
+            if (choice !== "new" && unloadCounter > 0) return {handled: true};
+            if (choice === "new") {
+                // The submission navigates the new top-level traversable:
+                // without noopener an auxiliary browsing context of this
+                // group (`[..., its id]`), else one the frontend creates.
+                const targetName = keyword === "_blank" ? "" : target;
+                const noopener = elementNoopener(form, target);
+                const record = noopener ? null : createAuxiliaryTraversable(targetName, false);
+                newTraversableRequests.push([parsed[0], "", trust.resourceClientContext(nodeIds.get(form)),
+                    targetName, noopener || !record, true,
+                    nodeIds.get(form), submitter && submitter !== form ? nodeIds.get(submitter) : -1,
+                    record ? record.id : -1]);
+                return {handled: true};
+            }
+            if (namedTraversable && namedTraversable.record && !namedTraversable.frame) {
+                // Another top-level traversable of the group, by name: its
+                // frontend runs the submission (`[..., its id]`).
+                newTraversableRequests.push([parsed[0], "", trust.resourceClientContext(nodeIds.get(form)),
+                    target, false, true, nodeIds.get(form),
+                    submitter && submitter !== form ? nodeIds.get(submitter) : -1, namedTraversable.record.id]);
+                return {handled: true};
+            }
             if (plan) trust.queueFormSubmit(nodeIds.get(form), submitter && submitter !== form ? nodeIds.get(submitter) : null);
             return {handled: true, planned: true};
         }
@@ -7468,6 +7920,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (multiple !== !!toggle) return false;
         setOptionSelectedness(select, option, multiple ? !optionSelectedness(option) : true, true);
         sendSelectUpdateNotifications(select);
+        noteUserEdits(true);
         return true;
     };
     // HTML #send-select-update-notifications: an element task on the user
@@ -7534,7 +7987,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (editable) el.textContent = value;
             else if (el.localName === "textarea") __dom_input(elementIdentity(el), "raw-set", value);
             else __dom_input(elementIdentity(el),"user",value);
-            if (textControl) valueLastChangedByUser.add(el);
+            if (textControl) {
+                valueLastChangedByUser.add(el);
+                noteUserEdits(true);
+            }
             if (textControl && controlSelection(el,false) !== null)
                 setControlSelection(el,start == null ? value.length : start,end == null ? value.length : end,direction || 0,false);
             dispatch(el,createTrustedEvent(InputEvent,"input",init),false);
@@ -7571,6 +8027,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // HTML #common-input-element-events: a committed number edit, and
         // #send-select-update-notifications for a select, set the control's
         // user validity before its change event.
+        if (changed) noteUserEdits(true);
         if (changed && (tag === "select" || (tag === "input" && type === "number"))) setUserValidity(el, true);
         if (changed && tag === "input" && type === "number") {
             dispatch(el, createTrustedEvent(Event, "input", {bubbles:true, composed:true}), false);
@@ -7592,6 +8049,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (el.type !== "number" || !__dom_input(id, "mutable", null)) return false;
         const changed = __dom_input(id, direction < 0 ? "down" : "up", 1);
         if (changed) {
+            noteUserEdits(true);
             __dom_input(id, "user", __dom_input(id, "get", null));
             setUserValidity(el, true);
             dispatch(el, createTrustedEvent(Event, "input", {bubbles:true, composed:true}), false);
@@ -10189,6 +10647,16 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     function sendVolume(element, state) {
         mediaControl(element, state, "volume", state.volume, mediaMuted(element, state));
+        noteMediaAudible(element, state);
+    }
+    // Whether the element makes sound for the frontend's audio indication:
+    // it plays (not paused or ended) unmuted at a non-zero volume, and its
+    // resource has an audio track or has not yet said which tracks it has.
+    function noteMediaAudible(element, state) {
+        const audible = state.player >= 0 && !state.paused && !state.ended && state.error === null
+            && !mediaMuted(element, state) && state.volume > 0
+            && (state.readyState < HAVE_METADATA || state.mediaTracks.some(track => track.kind === "audio"));
+        topTrust().noteAudible(element, audible);
     }
     function setShowPoster(element, state, value) {
         if (state.showPoster === value) return;
@@ -10203,6 +10671,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         mediaControl(element, state, "close");
         mediaPlayers.delete(state.player);
         state.player = -1;
+        noteMediaAudible(element, state);
     }
     // #take-pending-play-promises
     function takePlayPromises(state) {
@@ -10243,6 +10712,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     // #playing-the-media-resource: whether the player should run.
     function syncPlaying(element, state) {
+        noteMediaAudible(element, state);
         if (state.player < 0) return;
         mediaControl(element, state, state.paused || state.ended ? "pause" : "play");
         updateControls(element, state);
@@ -10566,6 +11036,16 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         return state.textTracks || (state.textTracks = createTrackList(TextTrackList,
             () => mediaTextTracks(state.element, state)));
     }
+    // Page Lifecycle #freeze-steps 3-4: pause the playing media elements of
+    // `doc`'s tree, shadow trees included. Their pause tasks would run when
+    // the Document resumes; TRust discards a frozen page instead.
+    function pauseMediaForFreeze(doc) {
+        for (const element of [...mediaPlayers.values()]) {
+            const state = mediaStates.get(element);
+            if (state && !state.paused && element.getRootNode({ composed: true }) === doc)
+                internalPauseSteps(element, state);
+        }
+    }
     // #internal-pause-steps
     function internalPauseSteps(element, state) {
         state.canAutoplay = false;
@@ -10629,6 +11109,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             return;
         }
         state.ended = true;
+        noteMediaAudible(element, state);
         if (Number.isFinite(state.duration)) state.position = state.duration;
         if (!state.paused) notePlayed(state, state.playedFrom === null ? state.position : state.playedFrom, state.position);
         state.playedFrom = null;
@@ -14957,6 +15438,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                     }
                     break;
                 }
+                case "audible":
+                    // The context's output makes sound, or fell silent.
+                    topTrust().noteAudible(context, a === 1);
+                    break;
                 case "running": case "suspended": case "closed": {
                     const done = apply(mapGet, state.tokens, [a]);
                     apply(mapDelete, state.tokens, [a]);
@@ -18755,7 +19240,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 !internalsOf(this).frame.isConnected || internalsOf(this).frame.ownerDocument.location === null) return null;
             return trust.__activeFrame === internalsOf(this).frame ? g.location : internalsOf(this).frame.contentWindow.location;
         }
-        return nodeIds.get(this) === 0 ? g.location : null;
+        return nodeIds.get(this) === topDocumentId ? g.location : null;
     }
     function setDocumentLocation(value) {
         if (!(this instanceof Document)) throw new TypeError("Expected a Document");
@@ -18803,7 +19288,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // (hot path). A DETACHED document (a `DOMParser` result, `__id !== 0`)
         // scopes to its OWN subtree instead — `__dom_doc_element` only knows the
         // live tree's root.
-        get documentElement() { return nodeIds.get(this) === 0 ? wrap(__dom_doc_element()) : this.firstElementChild; }
+        get documentElement() { return nodeIds.get(this) === topDocumentId ? wrap(__dom_doc_element()) : this.firstElementChild; }
         // SVG 2 #__svg__SVGDocument__rootElement (partial interface Document):
         // the document element when it is an SVG svg element, otherwise null.
         get rootElement() {
@@ -18850,19 +19335,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // stable FontFaceSet.  Its setlike collection is independent per
         // Document, including detached documents created by DOMParser.
         get fonts() { return internalsFor(this).fonts || (internalsFor(this).fonts = new FontFaceSet()); }
-        get title() { const t = this.querySelector("title"); return t ? t.textContent : ""; }
-        // HTML §the title element: setting with no <title> CREATES one in the
-        // head (the old setter silently dropped the write); no head → no-op.
-        set title(v) {
-            let t = this.querySelector("title");
-            if (!t) {
-                const head = this.querySelector("head");
-                if (!head) return;
-                t = this.createElement("title");
-                head.appendChild(t);
-            }
-            t.textContent = String(v);
-        }
+        // HTML #document.title.
+        get title() { return __dom_document_title(nodeIds.get(this)); }
+        set title(value) { setDocumentTitle(this, String(value)); }
         get cookie() {
             const slot = cookieDocuments.get(this);
             if (!slot || !/^https?:/i.test(slot[3])) return "";
@@ -18883,7 +19358,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // it (GitHub's behaviors bundle: "Unable to get document domain").
         get domain() { return internalsFor(this).domain !== undefined ? internalsFor(this).domain : g.location.hostname; }
         set domain(v) { internalsFor(this).domain = String(v); }
-        get defaultView() { return nodeIds.get(this) === 0 ? g : null; }
+        get defaultView() { return nodeIds.get(this) === topDocumentId ? g : null; }
         // DOM #dom-documentorshadowroot-customelementregistry.
         get customElementRegistry() {
             if (nodeIds.get(this) === undefined) throw new TypeError("Illegal invocation");
@@ -18931,6 +19406,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (oldId === -3) throw new TypeError("Illegal invocation");
             if (oldId === -4) throw new DOMException("The node is a document", "NotSupportedError");
             if (oldId === -5) throw new DOMException("The node is a shadow root", "HierarchyRequestError");
+            // Step 3: a DocumentFragment whose host is non-null (a template's
+            // contents) is returned without being adopted.
+            if (oldId === -6) return node;
             if (oldId < 0) throw new TypeError("The node is not valid");
             syncWrapperSubtreeRetention(nodeIds.get(node));
             if (oldDocument !== this) ceAdopt(node, oldDocument, this);
@@ -19134,7 +19612,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         getElementById(i) {
             // `__dom_get_by_id` scans the LIVE tree; a detached parsed document
             // (`__id !== 0`) must scan its own subtree instead.
-            if (nodeIds.get(this) !== 0) {
+            if (nodeIds.get(this) !== topDocumentId) {
                 for (const e of this.querySelectorAll("[id]")) if (e.id === String(i)) return e;
                 return null;
             }
@@ -19160,10 +19638,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // `visibilityState === "visible"` (or skip work while `prerendering`),
         // so leaving these undefined makes such pages wait forever for a state
         // they never see. (YouTube's kevlar gates feed work on visibility.)
-        get visibilityState() { return "visible"; }
-        get hidden() { return false; }
+        // HTML #dom-document-visibilitystate / #dom-document-hidden.
+        get visibilityState() { return visibilityStateOf(this); }
+        get hidden() { return visibilityStateOf(this) === "hidden"; }
         get prerendering() { return false; }
-        get wasDiscarded() { return false; }
+        get wasDiscarded() { return wasDiscardedOf(this); }
         get visibilityStates() { return ["visible"]; }
         write(...text) { documentWrite(this, text, false); }
         writeln(...text) { documentWrite(this, text, true); }
@@ -19216,8 +19695,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             return trust.__activeFrame === internalsOf(this).frame ? g : internalsOf(this).frame.contentWindow;
         }
         get readyState() { return internalsFor(internalsOf(this).frame).trustReadyState || "complete"; }
-        get title() { const t = this.querySelector("title"); return t ? t.textContent : ""; }
-        set title(v) { let t = this.querySelector("title"); if (!t) { t = this.createElement("title"); this.head.appendChild(t); } t.textContent = String(v); }
+        // HTML #document.title.
+        get title() { return __dom_document_title(nodeIds.get(this)); }
+        set title(value) { setDocumentTitle(this, String(value)); }
         get URL() { return documentURLs.get(this); }
         get documentURI() { return this.URL; }
         get referrer() { return documentReferrers.get(this) || ""; }
@@ -19256,7 +19736,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // The native arena is shared, but the Document operation and reaction
         // boundary are identical to the top-level implementation.
         importNode(node, options) { return Document.prototype.importNode.call(this, node, options); }
-        createEvent(t) { return wrap(0).createEvent(t); }
+        createEvent(t) { return wrap(topDocumentId).createEvent(t); }
         // DOM #dom-document-createrange: a new live range with (this, 0) as
         // its start and end.
         createRange() { return newRangeFor(this, this, 0, this, 0); }
@@ -19298,13 +19778,13 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
 
         const frame = doc && internalsOf(doc).frame || null;
         // DOMParser-created/detached Documents have no associated viewport.
-        if (!frame && nodeIds.get(doc) !== 0) return [];
+        if (!frame && nodeIds.get(doc) !== topDocumentId) return [];
         const width = frame ? frameViewportDimension(frame, "width") : windowViewportDimension("width");
         const height = frame ? frameViewportDimension(frame, "height") : windowViewportDimension("height");
         if (x < 0 || y < 0 || x > width || y > height) return [];
 
         const ids = __dom_elements_from_point(
-            frame ? nodeIds.get(frame) : 0, x, y, +(g.scrollX || 0), +(g.scrollY || 0)
+            frame ? nodeIds.get(frame) : topDocumentId, x, y, +(g.scrollX || 0), +(g.scrollY || 0)
         );
         const result = [];
         for (const id of ids || []) {
@@ -19324,9 +19804,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     function pointerHitTest(x, y, fallback) {
         const doc = g.document;
         const frame = doc && internalsOf(doc).frame || null;
-        if (!doc || (!frame && nodeIds.get(doc) !== 0)) return fallback;
+        if (!doc || (!frame && nodeIds.get(doc) !== topDocumentId)) return fallback;
         const ids = __dom_elements_from_point(
-            frame ? nodeIds.get(frame) : 0, x, y, +(g.scrollX || 0), +(g.scrollY || 0)
+            frame ? nodeIds.get(frame) : topDocumentId, x, y, +(g.scrollX || 0), +(g.scrollY || 0)
         );
         return ids && ids.length ? ids[0] : fallback;
     }
@@ -19477,6 +19957,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             return;
         }
 
+        // Without an insertion point, HTML #document-write-steps return
+        // while the Document is unloading.
+        if (doc === g.document && unloadCounter > 0) return;
         const host = doc.body || doc.documentElement;
         if (host) host.insertAdjacentHTML("beforeend", markup);
     }
@@ -19497,7 +19980,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const inherited = owner === realmRootFrame ? cfg.aboutBaseURL : frameAboutBaseURLs.get(owner);
         const fallback = /^about:(?:blank|srcdoc)(?:[?#]|$)/.test(documentURL) && inherited
             ? inherited : documentURL;
-        const doc = owner ? frameDocument(owner) : wrap(0);
+        const doc = owner ? frameDocument(owner) : wrap(topDocumentId);
         let bases = [];
         try { bases = doc.querySelectorAll("base[href]"); } catch (e) {}
         for (let i = 0; i < bases.length; i++) {
@@ -19525,7 +20008,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     function nodeBaseHref(node) {
         const document = node && __dom_owner_document(node);
         if (document && typeof document === "object" && internalsOf(document).frame) return document.baseURI;
-        if (document && typeof document === "object" && nodeIds.get(document) !== 0 && documentURLs.get(document) !== undefined)
+        if (document && typeof document === "object" && nodeIds.get(document) !== topDocumentId && documentURLs.get(document) !== undefined)
             return detachedDocumentBaseURL(document);
         const owner = frameOwnerForNode(node);
         return (owner || null) === (trust.__activeFrame || null)
@@ -19568,9 +20051,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         }
         let anchor = pendingClickHyperlink;
         pendingClickHyperlink = null;
+        const newTab = pendingClickNewTab;
+        pendingClickNewTab = null;
         if (!anchor) anchor = hyperlinkActivationTarget(wrap(nodeId));
         if (!anchor) return null;
-        return followHyperlink(anchor);
+        return followHyperlink(anchor, newTab);
     };
     // HTML #hyperlink-referrer-policy: "no-referrer" for a noreferrer link,
     // else the state of its referrerpolicy attribute (#referrer-policy-attributes).
@@ -19589,7 +20074,83 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         trust.hyperlinkNavigation = null;
         return navigation;
     };
-    function followHyperlink(anchor) {
+    // HTML #get-an-element's-target: the element's own `target`, else the
+    // first base element's with one; a value with a tab or newline and a
+    // "<" (a dangling-markup injection) is "_blank".
+    function elementTarget(element, target = null) {
+        if (target === null) {
+            target = element.getAttribute("target");
+            if (target === null) {
+                const document = element.ownerDocument;
+                const base = document && document.querySelector("base[target]");
+                target = base ? base.getAttribute("target") : null;
+            }
+        }
+        if (target === null) return "";
+        target = String(target);
+        if (/[\t\n\r]/.test(target) && target.includes("<")) return "_blank";
+        return target;
+    }
+    // HTML #get-an-element's-noopener steps 1-2. Step 3 (a blob: URL whose
+    // entry's origin is not same site with the top-level origin) is the
+    // host's, which resolves the entry for the navigation.
+    function elementNoopener(element, target) {
+        const rel = element.getAttribute("rel");
+        const types = rel === null ? [] : asciiLower(rel).split(/[\t\n\f\r ]+/);
+        if (types.includes("noopener") || types.includes("noreferrer")) return true;
+        return !types.includes("opener") && asciiLower(target) === "_blank";
+    }
+    trust.topLevelName = function () { return navigableName(null); };
+    // A frame of `document` named `name`, which its navigations target.
+    function frameNamed(document, name) {
+        let frames = [];
+        try { frames = document.querySelectorAll("iframe, frame"); } catch (e) {}
+        for (let i = 0; i < frames.length; i++)
+            if (frames[i].getAttribute("name") === name) return frames[i];
+        return null;
+    }
+    // Navigations the page asks to happen in a new top-level traversable
+    // (HTML #the-rules-for-choosing-a-navigable, "a new top-level
+    // traversable is being requested"), and hyperlinks the user asked to
+    // follow in one, for the host: [URL, referrer policy, source settings
+    // context, target name, noopener, foreground, form, submitter].
+    const newTraversableRequests = [];
+    trust.takeNewTraversables = function () {
+        const requests = newTraversableRequests.splice(0);
+        for (const childTrust of childWindowTrusts) {
+            const child = childTrust.takeNewTraversables();
+            for (const request of child) requests.push(request);
+        }
+        return requests;
+    };
+    trust.takeNewTraversablesJSON = function () {
+        const requests = trust.takeNewTraversables();
+        return requests.length ? JSON.stringify(requests) : null;
+    };
+    // HTML #the-rules-for-choosing-a-navigable when a new top-level
+    // traversable is requested from `element`'s navigable: "blocked" by the
+    // popup blocker without transient activation; else "new" where the
+    // frontend can create one (tabs), consuming the activation; else
+    // "current", as a user agent configured to choose currentNavigable.
+    const newTraversablesSupported = cfg.newTraversables === true;
+    function newTraversableChoice(element) {
+        const state = windowStateForNode(element.ownerDocument || element);
+        if (!hasTransientActivation(state)) {
+            trust.logs.push("[warn] TRust blocked a popup: no user activation");
+            return "blocked";
+        }
+        if (!newTraversablesSupported) return "current";
+        consumeUserActivationEverywhere();
+        return "new";
+    }
+    // Whether the Document of `frame`'s content navigable is unloading.
+    function navigableUnloading(frame) {
+        if (frame === realmRootFrame) return unloadCounter > 0;
+        const child = internalsOf(frame).contentRealmWindow;
+        const control = child && trustOf(child);
+        return !!(control && control !== trust && control.unloading());
+    }
+    function followHyperlink(anchor, newTab = null) {
         const raw = anchor.getAttribute("href");
         // Presence, not non-emptiness, creates the hyperlink. `href=""`
         // resolves to the document's current base URL.
@@ -19602,8 +20163,16 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const url = String(parsed[0] || "");
         if (!url || /^javascript:/i.test(url)) return null;
 
-        const rawTarget = String(anchor.getAttribute("target") || "");
+        const rawTarget = elementTarget(anchor);
         const keyword = rawTarget.toLowerCase();
+        // The user asked for a new tab: a fresh top-level traversable with
+        // the hyperlink's document as its navigation's source.
+        if (newTab && newTraversablesSupported) {
+            if (parsed[1] === "blob:" && blobURLAPI) blobURLAPI.hold(url);
+            newTraversableRequests.push([url, hyperlinkReferrerPolicy(anchor),
+                trust.resourceClientContext(nodeIds.get(anchor)), "", true, !!newTab.foreground, -1, -1]);
+            return null;
+        }
         let destination;
         if (!rawTarget || keyword === "_self") {
             destination = subject;
@@ -19612,9 +20181,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         } else if (keyword === "_top") {
             destination = null;
         } else if (keyword === "_blank") {
-            // TRust currently presents one top-level traversable. Opening a
-            // fresh auxiliary context therefore degrades to that traversable.
-            destination = null;
+            destination = "new";
         } else {
             destination = undefined;
             let frames = [];
@@ -19625,9 +20192,48 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                     break;
                 }
             }
-            // A non-keyword name with no existing familiar navigable requests
-            // a new top-level traversable. Use the single available one.
-            if (destination === undefined) destination = null;
+            // A name no familiar navigable has requests a new one; another
+            // top-level traversable of the group (or a navigable in one) may
+            // have it.
+            if (destination === undefined) {
+                const named = trust.namedTraversable(rawTarget);
+                destination = named === undefined ? "new"
+                    : named === null ? null
+                    : named.frame ? named.frame : {traversable: named.record};
+            }
+        }
+        if (destination === "new") {
+            const choice = newTraversableChoice(anchor);
+            if (choice === "blocked") return null;
+            if (choice === "current") destination = subject;
+        }
+        // HTML #navigate: a navigable whose Document is unloading does not
+        // navigate.
+        if (destination === null ? topTrust().unloading()
+            : destination !== "new" && (destination.traversable
+                ? destination.traversable.trust.unloading() : navigableUnloading(destination))) return null;
+        if (destination === "new") {
+            if (parsed[1] === "blob:" && blobURLAPI) blobURLAPI.hold(url);
+            // HTML #get-an-element's-noopener (step 3: a blob: URL of
+            // another site's entry).
+            const noopener = elementNoopener(anchor, rawTarget) ||
+                (parsed[1] === "blob:" && !!blobURLAPI && blobURLAPI.crossSite(url));
+            const targetName = keyword === "_blank" ? "" : rawTarget;
+            if (!noopener && newTraversablesSupported) {
+                // An auxiliary browsing context of this group, which the
+                // hyperlink then navigates (replacing its initial about:blank).
+                const record = createAuxiliaryTraversable(targetName, false);
+                if (record) record.trust.navigateTopLevel(url, true, g, hyperlinkReferrerPolicy(anchor));
+                return null;
+            }
+            newTraversableRequests.push([url, hyperlinkReferrerPolicy(anchor),
+                trust.resourceClientContext(nodeIds.get(anchor)), targetName, true, true, -1, -1]);
+            return null;
+        }
+        if (destination && destination.traversable) {
+            if (parsed[1] === "blob:" && blobURLAPI) blobURLAPI.hold(url);
+            destination.traversable.trust.navigateTopLevel(url, false, g, hyperlinkReferrerPolicy(anchor));
+            return null;
         }
         if (!destination) {
             if (!realmRootFrame && url.includes("#") && withoutHash(url) === withoutHash(locState.href)) {
@@ -19807,7 +20413,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // cross-origin case deliberately omits it, matching WindowProxy's
         // restricted property surface.
         if (sameOrigin) parent.document = targetFrame ? frameDocument(targetFrame) :
-            (topFrameState && topFrameState.document) || wrap(0);
+            (topFrameState && topFrameState.document) || wrap(topDocumentId);
         const nextParent = targetFrame && frameParentFrame(targetFrame);
         parent.parent = nextParent
             ? makeParentWindow(frameLocationObject(nextParent, parentLocation), targetFrame,
@@ -20710,13 +21316,13 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (!document) return null;
         const frame = internalsOf(document).frame;
         if (frame) return customElementRegistryForWindow(windowStateForFrame(frame), frame === realmRootFrame ? null : frame);
-        if (!realmRootFrame && nodeIds.get(document) === 0) return customElementRegistryForWindow(topWindowState, null);
+        if (!realmRootFrame && nodeIds.get(document) === topDocumentId) return customElementRegistryForWindow(topWindowState, null);
         return null;
     }
     // DOM's Document custom element registry.
     function documentRegistry(document) {
         if (!document) return null;
-        if (internalsOf(document).frame || (!realmRootFrame && nodeIds.get(document) === 0))
+        if (internalsOf(document).frame || (!realmRootFrame && nodeIds.get(document) === topDocumentId))
             return documentGlobalRegistry(document);
         return registryFromCode(__dom_custom_registry("document", nodeIds.get(document), null), document);
     }
@@ -22107,6 +22713,13 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (!styleSheetWaits.size) return;
         for (const [element, wait] of Array.from(styleSheetWaits)) {
             if (wait.queued) continue;
+            // An element that left this Document (for another traversable's,
+            // whose Realm takes its style block updates) updated its style
+            // block: the removed sheet's load is not fired here.
+            if (!element.isConnected || element.ownerDocument !== g.document) {
+                styleSheetWaits.delete(element);
+                continue;
+            }
             const state = criticalSubresourceState(element);
             if (state === "pending") continue;
             if (!wait.fire) { styleSheetWaits.delete(element); continue; }
@@ -27634,8 +28247,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     });
     g.DOMTokenList = DOMTokenList;
     g.DOMStringMap = DOMStringMap;
-    g.document = realmRootFrame ? frameDocument(realmRootFrame) : wrap(0);
-    cookieDocuments.set(g.document, [realmRootFrame ? nodeIds.get(realmRootFrame) : 0, Number(cfg.hostSettingsContext) || 0, !!cfg.cookieOpaque, String(cfg.url)]);
+    g.document = realmRootFrame ? frameDocument(realmRootFrame) : wrap(topDocumentId);
+    cookieDocuments.set(g.document, [realmRootFrame ? nodeIds.get(realmRootFrame) : topDocumentId, Number(cfg.hostSettingsContext) || 0, !!cfg.cookieOpaque, String(cfg.url)]);
     pointerDefine(Element.prototype, "requestPointerLock", {
         value:requestPointerLock, writable:true, enumerable:true, configurable:true,
     });
@@ -27695,6 +28308,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const p = settings ? __url_parse(domString(u), settings.apiBaseURL(), settings.documentEncoding())
             : encodingParseURL(domString(u), baseHref(), g.document);
         if (!p) throw new DOMException("Invalid navigation URL.", "SyntaxError");
+        // HTML #navigate: while the navigable's Document is unloading (its
+        // beforeunload, pagehide or unload handlers run), nothing navigates.
+        if (unloadCounter > 0) return;
         const old = locState.href;
         // Only the hash setter suppresses an unchanged fragment (HTML
         // §7.2.4, location.hash). href/assign/replace must still navigate.
@@ -27724,7 +28340,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             // navigation. A child navigable's Document (its own Realm, or a
             // scoped one sharing this Realm) has no frontend scroll to wait
             // for: apply its target element now.
-            if (realmRootFrame || nodeIds.get(g.document) !== 0) trust.takeScrollFragment();
+            if (realmRootFrame || nodeIds.get(g.document) !== topDocumentId) trust.takeScrollFragment();
         } else if (!hashOnly) {
             trust.navigation = p[0];
             const initiator = windowMessageSlots && windowMessageState(incumbent);
@@ -27738,8 +28354,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (p[1] === "blob:" && blobURLAPI) blobURLAPI.hold(p[0]);
             trust.navigationReload = false;
             // navigate-convert-to-replace: same-origin, equal-URL navigation
-            // with automatic history handling replaces the current entry.
-            trust.navigationReplace = !!replace || old === p[0];
+            // with automatic history handling replaces the current entry, as
+            // does any navigation away from an initial about:blank Document
+            // (HTML #navigate).
+            trust.navigationReplace = !!replace || old === p[0] || initialAboutBlank;
         }
     };
     const updateLoc = (u) => {
@@ -29819,12 +30437,26 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // (Permissions Policy), so a top-level or same-origin child Document is
     // allowed; a cross-origin child needs transient activation. Focusing a
     // child navigable makes its container the parent's focused area.
-    g.focus = { focus() {
+    g.focus = makeCallbackAPI(function (source, receiver, args, incumbent) {
+        const target = receiver === undefined || receiver === null ? g : receiver;
+        const control = target === g ? trust : trustOf(target);
+        if (!control || typeof control.focusWindow !== "function")
+            throw new TypeError("Illegal Window invocation");
+        control.focusWindow(incumbent);
+    }, "focus", 0);
+    trust.focusWindow = function (incumbent) {
         if (navigableRecord.closed) return;
         const parent = cfg.parentWindow;
         if (parent && !sameOriginWindow(parent) && !hasTransientActivation(activeWindowState())) return;
         joinParentChain();
-    } }.focus;
+        // A top-level traversable: the frontend is encouraged to show it. It
+        // does so when the asking Window's user just interacted with it, so
+        // that a page cannot pull itself or another to the front.
+        if (!parent && traversableRecord) {
+            const state = incumbent === undefined || incumbent === null ? null : windowMessageState(incumbent);
+            if (state && state.transientActivation()) focusRequested = true;
+        }
+    };
     // HTML #dom-window-blur: "The blur() method steps are to do nothing."
     g.blur = { blur() {} }.blur;
     // HTML #dom-window-close, run on the Window whose navigable is
@@ -29856,12 +30488,13 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             hasTransientActivation: hasTransientActivation(topWindowState),
             sandboxingFlags: topLevelSandboxingFlags,
         };
-        // 6. HTML #script-closable: TRust creates no top-level traversable
-        // for web content (window.open() opens nothing), so only a session
-        // history of one entry qualifies. Until the frontend has reported the
-        // session history, the traversable is not known to be closable.
-        const history = jointSessionHistory();
-        if (!history || history.length !== 1) return;
+        // 6. HTML #script-closable: created by web content (window.open, a
+        // named target), or with a session history of one entry. Until the
+        // frontend has reported the session history, only the first is known.
+        if (!(traversableRecord && traversableRecord.createdByWebContent)) {
+            const history = jointSessionHistory();
+            if (!history || history.length !== 1) return;
+        }
         const source = incumbentNavigable(incumbent);
         if (!source || !familiarWithThisTraversable(source)) return;
         if (!allowedBySandboxingToNavigateThis(source, sourceSnapshotParams)) return;
@@ -29884,12 +30517,33 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // HTML #familiar-with: whether the incumbent's browsing context A is
     // familiar with this top-level browsing context B.
     function familiarWithThisTraversable(a) {
+        return familiarWithTraversable(a, g, traversableRecord, []);
+    }
+    // HTML #familiar-with, A's Window state `a` and B a top-level browsing
+    // context: the Window `window` of the traversable `record`.
+    function familiarWithTraversable(a, window, record, seen) {
+        const b = windowMessageState(window);
         // 1. Their active documents are same origin.
-        if (a.originKey === messageWindowState.originKey) return true;
+        if (b && a.originKey === b.originKey) return true;
         // 2. A's top-level browsing context is B.
-        if (topOfWindowState(a).window === g) return true;
-        // 3. B is not an auxiliary browsing context (TRust creates none), and
-        // 4. a top-level B has no ancestor browsing context.
+        if (topOfWindowState(a).window === window) return true;
+        // 3. B is an auxiliary browsing context and A is familiar with B's
+        // opener browsing context.
+        const opener = record && !seen.includes(record) ? record.opener : null;
+        if (opener && !windowClosed(opener)) {
+            seen.push(record);
+            const openerState = windowMessageState(opener);
+            if (openerState && a.originKey === openerState.originKey) return true;
+            if (openerState && topOfWindowState(a).window === topOfWindowState(openerState).window)
+                return true;
+            for (let state = openerState && openerState.parent(); state; state = state.parent())
+                if (state.originKey === a.originKey) return true;
+            const control = trustOf(topOfWindowState(openerState || a).window);
+            const openerRecord = control && control.traversableRecord ? control.traversableRecord() : null;
+            if (openerRecord && familiarWithTraversable(a, openerRecord.window, openerRecord, seen))
+                return true;
+        }
+        // 4. A top-level B has no ancestor browsing context.
         return false;
     }
     // HTML #allowed-to-navigate, with source the incumbent's navigable and
@@ -29906,22 +30560,30 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 return false;
             return true;
         }
-        // 4. target is a top-level traversable: TRust has no one permitted
-        // sandboxed navigator (only an auxiliary browsing context's opener
-        // could be one).
+        // 4. target is a top-level traversable: TRust enforces no sandboxing
+        // flags on a top-level Document, so no one permitted sandboxed
+        // navigator is needed.
         return !flags.navigation;
     }
-    // HTML #definitely-close-a-top-level-traversable would check whether
-    // unloading is canceled, then unload and destroy thisTraversable. TRust
-    // has a single top-level traversable and no tabs or pop-ups yet (they
-    // await the tabs design), and destroying it would quit the browser. So it
-    // stays open: the page log gets a warning, and since nothing is closing
-    // any more, "is closing" (and so `closed`) returns to false.
+    // HTML #definitely-close-a-top-level-traversable: the frontend checks if
+    // unloading is canceled, unloads the traversable's Documents and
+    // destroys it, exactly as when its user closes it (a tab). A frontend
+    // presenting a single top-level traversable, which is the browser
+    // itself, keeps it: the page log gets a warning, and since nothing is
+    // closing any more, "is closing" (and so `closed`) returns to false.
+    let closeRequested = false, focusRequested = false;
     function definitelyCloseThisTraversable() {
+        if (newTraversablesSupported) {
+            closeRequested = true;
+            return;
+        }
         navigableRecord.closing = false;
         log("warn")("window.close(): TRust does not close its only top-level browsing context " +
             "(closing it would quit the browser); the page stays open");
     }
+    // The frontend did not close the traversable after all (its unload was
+    // canceled): it is no longer closing.
+    trust.closeRequestDeclined = function () { navigableRecord.closing = false; };
     // HTML #dom-window-stop: if this Window's navigable is null, return;
     // otherwise stop loading it (#nav-stop), which the host runs: its ongoing
     // navigation ends and its active Document and their descendants' are
@@ -29949,26 +30611,41 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     let windowStatus = "";
     Object.defineProperty(g, "status", {configurable: true, enumerable: true,
         get() { return windowStatus; }, set(value) { windowStatus = domString(value); }});
-    // HTML #dom-opener: a Window whose browsing context was not created by
-    // window.open() (TRust never creates auxiliary contexts) has a null
-    // opener browsing context. Setting null clears it; any other value
-    // replaces the attribute with an ordinary data property.
+    // HTML #dom-opener: the WindowProxy of this top-level traversable's
+    // opener browsing context, unless it was disowned (setting null) or is
+    // gone. Any other value replaces the attribute with an ordinary data
+    // property.
     Object.defineProperty(g, "opener", {configurable: true, enumerable: true,
-        get() { return null; },
-        set(value) {
-            if (value === null) return;
+        get: { opener() {
+            const record = traversableRecord;
+            if (!record || navigableRecord.closed || record.disowned) return null;
+            const opener = record.opener;
+            if (!opener || windowClosed(opener)) return null;
+            return windowProxyFor(opener);
+        } }.opener,
+        set: { opener(value) {
+            if (value === null) {
+                if (traversableRecord && !navigableRecord.closed) traversableRecord.disowned = true;
+                return;
+            }
             Object.defineProperty(g, "opener", {value, writable: true, enumerable: true, configurable: true});
-        }});
+        } }.opener});
     // HTML #dom-originagentcluster: TRust keys agent clusters by site and
     // honours no Origin-Agent-Cluster request, so this Window's agent
     // cluster is not origin-keyed.
     Object.defineProperty(g, "originAgentCluster", {configurable: true, enumerable: true,
         get() { return false; }});
     // HTML #barprop: visible is the negation of the top-level browsing
-    // context's "is popup", which TRust never sets (no popups are created).
+    // context's "is popup" (true for a browsing context gone).
     class BarProp {
         constructor() { throw new TypeError("Illegal constructor"); }
-        get visible() { if (!internalsOf(this).barProp) throw new TypeError("Illegal invocation"); return true; }
+        get visible() {
+            if (!internalsOf(this).barProp) throw new TypeError("Illegal invocation");
+            if (navigableRecord.closed) return true;
+            const top = topTrust();
+            const record = top && top.traversableRecord ? top.traversableRecord() : null;
+            return !(record && record.popup);
+        }
     }
     Object.defineProperty(BarProp.prototype, "visible", {enumerable: true});
     Object.defineProperty(BarProp.prototype, Symbol.toStringTag, {value: "BarProp", configurable: true});
@@ -30024,24 +30701,377 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     g.scroll = g.scrollTo = function (x, y) { return windowScroll(x, y, false, arguments.length); };
     g.scrollBy = function (x, y) { return windowScroll(x, y, true, arguments.length); };
-    // window.open: open a new browsing context. A single-view TUI has none, so
-    // this is a no-op that returns a minimal stub window (NEVER null — page
-    // code routinely chains `window.open(...).focus()`) and never throws. A
-    // missing `window.open` was an UNCAUGHT TypeError that aborted click
-    // handlers mid-flow (erome's age gate calls `window.open(url)` then
-    // `location.href = ...`; the throw killed the navigation). We deliberately
-    // don't navigate the current view for a programmatic popup — ad/popunder
-    // scripts abuse it — so flows that fall back to `location.href` proceed.
-    g.open = function (url) {
-        const u = url === undefined ? "" : String(url);
-        return {
-            closed: false, name: "",
-            focus() {}, blur() {}, print() {}, close() { this.closed = true; },
-            postMessage() {}, moveTo() {}, resizeTo() {}, scroll() {}, scrollTo() {},
-            location: { href: u, assign() {}, replace() {}, reload() {}, toString() { return u; } },
-            document: g.document, opener: g,
-        };
+    // HTML #windowproxy for a top-level traversable of this browsing context
+    // group: one object per traversable in this Realm, which follows the
+    // traversable's active Window across its navigations: the Window itself
+    // while it is same origin with this Realm, its cross-origin view
+    // otherwise (#cross-origin-objects). A closed traversable's keeps its
+    // last Window, whose `closed` is true.
+    const traversableProxies = new WeakMap();
+    function traversableWindowProxy(record) {
+        if (!record) return null;
+        if (record.window === g) return g;
+        let proxy = messageApply(messageWeakGet, traversableProxies, [record]);
+        if (proxy) return proxy;
+        const current = () => windowForRealm(record.window);
+        // Methods read through the proxy run with their Window as `this`.
+        const callables = new WeakMap();
+        function scoped(target, value) {
+            if (typeof value !== "function" || target !== record.window) return value;
+            let wrapped = messageApply(messageWeakGet, callables, [value]);
+            if (wrapped) return wrapped;
+            wrapped = new ProxyConstructor(value, {
+                apply(fn, thisArg, args) {
+                    return Reflect.apply(fn, thisArg === proxy ? record.window : thisArg, args);
+                },
+                construct(fn, args, newTarget) {
+                    return Reflect.construct(fn, args, newTarget === wrapped ? fn : newTarget);
+                },
+            });
+            messageApply(messageWeakSet, callables, [value, wrapped]);
+            return wrapped;
+        }
+        proxy = new ProxyConstructor(createObject(null), {
+            get(_, key) {
+                const target = current();
+                const value = Reflect.get(target, key);
+                // A Window it hands out (self, opener, top, …) is this
+                // Realm's WindowProxy of that Window.
+                const state = value !== null && typeof value === "object" ? windowMessageState(value) : null;
+                if (state) return windowProxyFor(state.window);
+                return scoped(target, value);
+            },
+            set(_, key, value) { return Reflect.set(current(), key, value); },
+            has(_, key) { return Reflect.has(current(), key); },
+            deleteProperty(_, key) { return Reflect.deleteProperty(current(), key); },
+            defineProperty(_, key, descriptor) {
+                // WindowProxy #windowproxy-defineownproperty: never a
+                // non-configurable property of the proxy itself.
+                return Reflect.defineProperty(current(), key, descriptor) && descriptor.configurable !== false;
+            },
+            getOwnPropertyDescriptor(_, key) {
+                const descriptor = Reflect.getOwnPropertyDescriptor(current(), key);
+                // WindowProxy #windowproxy-getownproperty reports every
+                // property configurable.
+                if (descriptor) descriptor.configurable = true;
+                return descriptor;
+            },
+            ownKeys() { return Reflect.ownKeys(current()); },
+            getPrototypeOf() { return Reflect.getPrototypeOf(current()); },
+            setPrototypeOf(_, prototype) { return Reflect.setPrototypeOf(current(), prototype); },
+            isExtensible() { return true; },
+            preventExtensions() { return false; },
+        });
+        messageApply(messageWeakSet, traversableProxies, [record, proxy]);
+        messageApply(weakSetAdd, ownWindowFacades, [proxy]);
+        messageApply(messageWeakSet, windowMessageSlots, [proxy, {
+            resolve() { return windowMessageState(record.window); }
+        }]);
+        return proxy;
+    }
+    // A Window as this Realm holds it: another top-level traversable's own
+    // stable proxy for its top-level Window, else (this traversable's
+    // Windows, and child navigables') the Window or its cross-origin view.
+    function windowProxyFor(window) {
+        if (!window) return null;
+        const control = trustOf(window);
+        const record = control && typeof control.traversableRecord === "function"
+            ? control.traversableRecord() : null;
+        if (!record) return windowForRealm(window);
+        const top = topTrust();
+        const own = top && typeof top.traversableRecord === "function" ? top.traversableRecord() : null;
+        return record === own ? windowForRealm(window) : traversableWindowProxy(record);
+    }
+    trust.traversableRecord = function () { return traversableRecord; };
+    // Whether a browsing context's Window is no longer active: its navigable
+    // was destroyed or its traversable closed.
+    function windowClosed(window) {
+        const control = window && trustOf(window);
+        return !control || typeof control.navigableClosed !== "function" || control.navigableClosed();
+    }
+    // HTML #familiar-with: whether this Window's browsing context (A) is
+    // familiar with the browsing context whose Window is `window` (B), whose
+    // top-level traversable's record is `record`.
+    function familiarWithWindow(window, record, seen = []) {
+        const own = messageWindowState, other = windowMessageState(window);
+        // 1. Their active documents are same origin.
+        if (other && other.originKey === own.originKey) return true;
+        // 2. A's top-level browsing context is B.
+        if (topTrust() === trustOf(window)) return true;
+        // 3. B is an auxiliary browsing context and A is familiar with its
+        // opener browsing context.
+        if (record && record.window === window && record.opener && !seen.includes(record)) {
+            seen.push(record);
+            const opener = record.opener;
+            const control = trustOf(opener);
+            const openerRecord = control && control.traversableRecord ? control.traversableRecord() : null;
+            if (!windowClosed(opener) && familiarWithWindow(opener, openerRecord, seen)) return true;
+        }
+        // 4. An ancestor browsing context of B has A's active document's
+        // origin.
+        for (let state = other && other.parent(); state; state = state.parent())
+            if (state.originKey === own.originKey) return true;
+        return false;
+    }
+    // HTML #find-a-navigable-by-target-name (the second choice of subtrees:
+    // the inclusive ancestor navigables of the current Document) beyond this
+    // Window's own Document: this top-level traversable when the name is its
+    // own (`null`), a familiar top-level traversable of the group or a named
+    // navigable in one (`{record, frame}`, frame null for the traversable),
+    // else undefined.
+    trust.namedTraversable = function (name) {
+        const top = topTrust();
+        if (top.topLevelName() === name) return null;
+        const ownRecord = top.traversableRecord ? top.traversableRecord() : null;
+        for (const record of messageApply(mapValues, traversableRecords, [])) {
+            if (record === ownRecord || record.navigable.closed) continue;
+            const control = record.trust;
+            if (record.name === name && familiarWithWindow(record.window, record))
+                return {record, frame: null};
+            const frame = control && typeof control.descendantNavigableNamed === "function"
+                ? control.descendantNavigableNamed(name) : null;
+            const child = frame && frame.contentWindow;
+            if (frame && (!child || familiarWithWindow(windowMessageState(child)
+                ? windowMessageState(child).window : record.window, record)))
+                return {record, frame};
+        }
+        return undefined;
     };
+    // The navigable container in this Realm's Document, or a Document of a
+    // child navigable, whose navigable has target name `name`.
+    trust.descendantNavigableNamed = function (name) {
+        let frames = [];
+        try { frames = g.document.querySelectorAll("iframe, frame"); } catch (e) {}
+        for (let i = 0; i < frames.length; i++) {
+            const frame = frames[i];
+            if (navigableName(frame) === name) return frame;
+            const child = internalsOf(frame).contentRealmWindow;
+            const control = child && trustOf(child);
+            const nested = control && control !== trust && typeof control.descendantNavigableNamed === "function"
+                ? control.descendantNavigableNamed(name) : null;
+            if (nested) return nested;
+        }
+        return null;
+    };
+    // HTML #navigate for this Realm's top-level traversable, requested by a
+    // Document of the group (`source`, the incumbent Window): a navigation
+    // the host starts for the traversable's frontend. Its initial
+    // about:blank Document is replaced (HTML #navigate step 13).
+    trust.navigateTopLevel = function (url, replace, source, referrerPolicy) {
+        if (cfg.parentWindow || navigableRecord.closed) return;
+        navigateLoc(url, false, !!replace, source, source, referrerPolicy || "");
+    };
+    // HTML #creating-a-new-auxiliary-browsing-context for this Window's
+    // browsing context: a new top-level traversable of this browsing context
+    // group with target name `name` (empty for _blank), whose initial
+    // about:blank Window the host creates in this Agent. Returns its record.
+    function createAuxiliaryTraversable(name, popup) {
+        const created = __traversable_create(cfg, g, name, !!popup,
+            trust.now ? trust.now() : 0, documentBaseURL(realmRootFrame));
+        const control = created && trustOf(created);
+        return control && typeof control.traversableRecord === "function" ? control.traversableRecord() : null;
+    }
+    // HTML #concept-window-open-features-tokenize.
+    function featureSeparator(c) {
+        return c === "=" || c === "," || c === " " || c === "\t" || c === "\n" || c === "\f" || c === "\r";
+    }
+    function tokenizeFeatures(features) {
+        const tokenized = new Map();
+        let position = 0;
+        const length = features.length;
+        while (position < length) {
+            let name = "", value = "";
+            while (position < length && featureSeparator(features[position])) position++;
+            while (position < length && !featureSeparator(features[position])) name += features[position++];
+            name = asciiLower(name);
+            // #normalizing-the-feature-name.
+            if (name === "screenx") name = "left";
+            else if (name === "screeny") name = "top";
+            else if (name === "innerwidth") name = "width";
+            else if (name === "innerheight") name = "height";
+            while (position < length && features[position] !== "=") {
+                if (features[position] === "," || !featureSeparator(features[position])) break;
+                position++;
+            }
+            if (position < length && featureSeparator(features[position])) {
+                while (position < length && featureSeparator(features[position])) {
+                    if (features[position] === ",") break;
+                    position++;
+                }
+                while (position < length && !featureSeparator(features[position])) value += features[position++];
+            }
+            if (name !== "") tokenized.set(name, value);
+        }
+        return tokenized;
+    }
+    // HTML #concept-window-open-features-parse-boolean.
+    function parseBooleanFeature(value) {
+        if (value === "") return true;
+        const lower = asciiLower(value);
+        if (lower === "yes" || lower === "true") return true;
+        // Rules for parsing integers: leading whitespace, sign, digits.
+        const match = /^[\t\n\f\r ]*([+-]?)(\d+)/.exec(value);
+        if (!match) return false;
+        return Number(match[2]) !== 0;
+    }
+    // HTML #popup-window-is-requested.
+    function popupWindowRequested(tokenized) {
+        if (tokenized.size === 0) return false;
+        if (tokenized.has("popup")) return parseBooleanFeature(tokenized.get("popup"));
+        const flag = (name) => tokenized.has(name) ? parseBooleanFeature(tokenized.get(name)) : false;
+        const location = flag("location"), toolbar = flag("toolbar");
+        if (!location && !toolbar) return true;
+        if (!flag("menubar")) return true;
+        if (!flag("resizable") && tokenized.has("resizable")) return true;
+        if (!flag("scrollbars")) return true;
+        if (!flag("status")) return true;
+        return false;
+    }
+    // HTML #window-open-steps.
+    function windowOpenSteps(url, target, features) {
+        // 1. A Document unloading cannot open anything.
+        if (terminating()) return null;
+        // 2. sourceDocument: the entry global object's associated Document.
+        const sourceDocument = g.document;
+        // 3-4. Encoding-parse the URL relative to sourceDocument.
+        let urlRecord = null;
+        if (url !== "") {
+            urlRecord = encodingParseForNode(url, sourceDocument);
+            if (!urlRecord) throw new DOMException("Invalid URL: " + url, "SyntaxError");
+        }
+        // 5.
+        if (target === "") target = "_blank";
+        // 6.
+        const tokenized = tokenizeFeatures(features);
+        // 7-8.
+        let noreferrer = tokenized.has("noreferrer") ? parseBooleanFeature(tokenized.get("noreferrer")) : false;
+        // 9. #get-noopener-for-window-open.
+        let noopener = (urlRecord && urlRecord[1] === "blob:" && blobURLAPI && blobURLAPI.crossSite(urlRecord[0]))
+            || (tokenized.has("noopener") ? parseBooleanFeature(tokenized.get("noopener")) : false);
+        // 10.
+        tokenized.delete("noopener");
+        tokenized.delete("noreferrer");
+        // 11-12.
+        let referrerPolicy = "";
+        if (noreferrer) {
+            noopener = true;
+            referrerPolicy = "no-referrer";
+        }
+        // 13. The rules for choosing a navigable, given target, the current
+        // navigable and noopener.
+        const keyword = asciiLower(target);
+        let chosen = null, windowType = "existing";
+        if (keyword === "_self") chosen = {kind: "self"};
+        else if (keyword === "_parent") chosen = cfg.parentWindow ? {kind: "parent"} : {kind: "self"};
+        else if (keyword === "_top") chosen = cfg.parentWindow ? {kind: "top"} : {kind: "self"};
+        else if (keyword !== "_blank") {
+            const frame = frameNamedInDocument(g.document, target);
+            if (frame) chosen = {kind: "frame", frame};
+            else {
+                const named = trust.namedTraversable(target);
+                if (named === null) chosen = cfg.parentWindow ? {kind: "top"} : {kind: "self"};
+                else if (named && named.frame) chosen = {kind: "frame", frame: named.frame};
+                else if (named) chosen = {kind: "traversable", record: named.record};
+            }
+        }
+        if (!chosen) {
+            // A new top-level traversable is requested.
+            const choice = newTraversableChoice(sourceDocument);
+            if (choice === "blocked") return null;
+            if (choice === "current") chosen = {kind: "self"};
+            else {
+                windowType = "new";
+                const targetName = keyword === "_blank" ? "" : target;
+                if (noopener) {
+                    // A new browsing context group, which the frontend
+                    // creates and navigates; no Window reaches it.
+                    const requestURL = urlRecord ? urlRecord[0] : "about:blank";
+                    if (urlRecord && urlRecord[1] === "blob:" && blobURLAPI) blobURLAPI.hold(requestURL);
+                    newTraversableRequests.push([requestURL, referrerPolicy,
+                        activeWindowState().hostSettingsContext, targetName, true, true, -1, -1]);
+                    return null;
+                }
+                const record = createAuxiliaryTraversable(targetName, popupWindowRequested(tokenized));
+                if (!record) return null;
+                chosen = {kind: "traversable", record};
+            }
+        }
+        if (windowType === "new") {
+            // 14.1-14.2: is popup and the browsing context features were
+            // set when the traversable was created.
+            const record = chosen.record;
+            // 14.3-14.5. about:blank (matching about:blank) needs only the
+            // URL and history update steps: the initial Document stays.
+            if (urlRecord && !/^about:blank(?:[?#]|$)/i.test(urlRecord[0]))
+                record.trust.navigateTopLevel(urlRecord[0], true, g, referrerPolicy);
+        } else {
+            // 15.1. Navigate the chosen navigable, if there is a URL.
+            if (urlRecord) navigateChosen(chosen, urlRecord, referrerPolicy);
+            // 15.2. The opener browsing context of an existing traversable is
+            // set when noopener is false.
+            if (!noopener && chosen.kind === "traversable" && !chosen.record.opener)
+                chosen.record.opener = g;
+        }
+        // 17. With noopener, only _self, _parent and _top return a WindowProxy.
+        if (noopener && keyword !== "_self" && keyword !== "_parent" && keyword !== "_top") return null;
+        // 18. The target's active WindowProxy.
+        switch (chosen.kind) {
+            case "self": return g;
+            case "parent": return g.parent;
+            case "top": return g.top;
+            case "frame": return chosen.frame.contentWindow;
+            default: return traversableWindowProxy(chosen.record);
+        }
+    }
+    // A frame of `document` (or of its descendants' Documents) whose
+    // navigable has target name `name`.
+    function frameNamedInDocument(document, name) {
+        if (document !== g.document) return frameNamed(document, name);
+        return trust.descendantNavigableNamed(name);
+    }
+    // HTML #navigate the navigable `chosen` names to the parsed URL
+    // `urlRecord`, with sourceDocument this Window's Document.
+    function navigateChosen(chosen, urlRecord, referrerPolicy) {
+        const url = urlRecord[0];
+        if (urlRecord[1] === "blob:" && blobURLAPI) blobURLAPI.hold(url);
+        switch (chosen.kind) {
+            case "self":
+                navigateLoc(url, false, false, g, g, referrerPolicy);
+                return;
+            case "parent":
+            case "top": {
+                const window = chosen.kind === "parent" ? cfg.parentWindow : cfg.topWindow;
+                const control = window && trustOf(window);
+                if (control && typeof control.navigateFromDocument === "function")
+                    control.navigateFromDocument(url, g, referrerPolicy);
+                return;
+            }
+            case "frame":
+                try {
+                    chosen.frame.removeAttribute("srcdoc");
+                    chosen.frame.setAttribute("src", url);
+                } catch (e) {
+                    trust.errors.push("window.open: " + ((e && e.message) || e));
+                }
+                return;
+            default:
+                chosen.record.trust.navigateTopLevel(url, false, g, referrerPolicy);
+        }
+    }
+    // HTML #navigate for this Window's navigable, from another Document of
+    // the group (`source`).
+    trust.navigateFromDocument = function (url, source, referrerPolicy) {
+        if (navigableRecord.closed) return;
+        navigateLoc(url, false, false, source, source, referrerPolicy || "");
+    };
+    // HTML #dom-open: the window open steps. TRust's frontends without
+    // tabs choose the current navigable for a new top-level traversable.
+    const stringToWellFormed = String.prototype.toWellFormed;
+    g.open = { open(url = "", target = "_blank", features = "") {
+        return windowOpenSteps(url === undefined ? "" : messageApply(stringToWellFormed, `${url}`, []),
+            target === undefined ? "_blank" : domString(target),
+            features === undefined || features === null ? "" : domString(features));
+    } }.open;
     // DOM Range §4.2 / Selection API §3: keep live boundary points and one
     // Selection per Document. Rich editing hosts use the same Range object
     // that scripts read through getRangeAt(), so native insertion and editor
@@ -33743,8 +34773,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     windowMessageSlots = messaging[0];
     g.postMessage = messaging[1];
     const messageOrigin = (__url_parse(cfg.url, null) || [])[8] || "null";
+    // HTML #determining-the-origin: an initial about:blank Document has its
+    // creator's origin, a child navigable's parent's or an auxiliary
+    // browsing context's opener's.
+    const creatorWindow = cfg.parentWindow || (cfg.initialAboutBlank ? cfg.openerWindow : null);
     const inheritedMessageState = (cfg.url === "about:blank" || cfg.url === "about:srcdoc")
-        && cfg.parentWindow ? windowMessageState(cfg.parentWindow) : null;
+        && creatorWindow ? windowMessageState(creatorWindow) : null;
     const messageWindowState = {
         window: g,
         captureEvent,
@@ -33801,6 +34835,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             }
         },
         apiBaseURL() { return documentBaseURL(realmRootFrame); },
+        // HTML #transient-activation of this Window.
+        transientActivation() { return hasTransientActivation(activeWindowState()); },
         // The associated Document's character encoding, the query encoding
         // of HTML #encoding-parsing-a-url relative to this Window.
         documentEncoding() { return documentQueryEncoding(g.document); },
@@ -33860,11 +34896,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                     if (traceChallengeMessage) traceChallengeMessage("messageerror", wire, origin,
                         messageWindowState.origin, sourceFrameId, messageWindowState.frameId);
                     dispatch(g, createTrustedEvent(MessageEvent, "messageerror",
-                        { origin, source: windowForRealm(source) }), false);
+                        { origin, source: windowProxyFor(source) }), false);
                     return;
                 }
                 const event = createTrustedEvent(MessageEvent, "message", {
-                    data: packet.data, origin, source: windowForRealm(source),
+                    data: packet.data, origin, source: windowProxyFor(source),
                     ports: Object.freeze(packet.ports)
                 });
                 internalsFor(event).windowTargetSet = true; internalsFor(event).frameTarget = frame;
@@ -34128,9 +35164,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     for (const C of [HTMLElement, SVGElement, MathMLElement])
         installHandlerProps(C.prototype, ELEMENT_DOCUMENT_HANDLER_TYPES);
     installHandlerProps(Document.prototype,
-        ELEMENT_DOCUMENT_HANDLER_TYPES.concat(["readystatechange", "visibilitychange", "pointerlockchange", "pointerlockerror"]));
+        ELEMENT_DOCUMENT_HANDLER_TYPES.concat(["readystatechange", "visibilitychange", "pointerlockchange", "pointerlockerror", "freeze", "resume"]));
     installHandlerProps(FrameDocument.prototype,
-        ELEMENT_DOCUMENT_HANDLER_TYPES.concat(["readystatechange", "visibilitychange", "pointerlockchange", "pointerlockerror"]));
+        ELEMENT_DOCUMENT_HANDLER_TYPES.concat(["readystatechange", "visibilitychange", "pointerlockchange", "pointerlockerror", "freeze", "resume"]));
     // HTML #windoweventhandlers: body and frameset elements expose the
     // Window's event handlers (the window-reflecting body element event
     // handler set maps them to the Window, see eventHandlerTarget).
@@ -36379,7 +37415,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // object's map belongs to its creating environment's checked origin,
         // not the caller, a mutable <base> URL, or a later host settings token.
         // Keep this private key with the API object even after frame removal.
-        const bucket = kind + ":" + origin;
+        // sessionStorage belongs to this top-level traversable's storage shed
+        // (Storage #traversable-storage-shed).
+        const bucket = kind === "session" ? "session:" + storageShed + ":" + origin : kind + ":" + origin;
         const target = Object.create(Storage.prototype);
         // HTML #the-storage-interface and Web IDL #js-legacy-platform-objects:
         // named access and the methods share ONE map. Prototype members mask
@@ -36850,14 +37888,26 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         for (const childTrust of childWindowTrusts) childTrust.deferRenderingUntil(absMs);
     };
     function animationFrameDeadline() {
+        // A hidden Document has no rendering opportunity: its callbacks wait.
+        if (documentVisibility === "hidden") return null;
         return animationFrames.deadline === null ? null
             : Math.max(animationFrames.deadline, renderingNotBefore);
     }
     function ownNextDeadline() {
         let best = animationFrameDeadline();
-        for (const t of timers.q) if (best === null || t.at < best) best = t.at;
+        for (const t of timers.q) {
+            const due = timerDue(t);
+            if (best === null || due < best) best = due;
+        }
         return best;
     }
+    // Animation frame callbacks keep a page resident while it is hidden.
+    trust.hasAnimationFrameCallbacks = function () {
+        if (animationFrames.q.length) return true;
+        for (const childTrust of childWindowTrusts)
+            if (childTrust.hasAnimationFrameCallbacks()) return true;
+        return false;
+    };
     trust.nextDeadline = function () {
         const own = ownNextDeadline();
         let best = own === null ? null : own + agentTimeOffset;
@@ -36883,7 +37933,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const frameDeadline = animationFrameDeadline();
         if (frameDeadline === null) return false;
         for (const timer of timers.q)
-            if (timer.at < frameDeadline) return false;
+            if (timerDue(timer) < frameDeadline) return false;
         return true;
     };
     trust.nextTimerInfo = function () {
@@ -36892,7 +37942,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (!best || timer.at < best.at || (timer.at === best.at && timer.id < best.id)) best = timer;
         }
         let info = best ? { id: best.id, nesting: best.nesting, wait: best.wait } : null;
-        let deadline = best ? best.at + agentTimeOffset : null;
+        let deadline = best ? timerDue(best) + agentTimeOffset : null;
         for (const childTrust of childWindowTrusts) {
             const childDeadline = childTrust.nextDeadline();
             if (childDeadline !== null && (deadline === null || childDeadline < deadline)) {
@@ -36935,7 +37985,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const localAbsMs = Math.max(currentTime(), absMs - agentTimeOffset);
         let task = null;
         for (const t of timers.q) {
-            if (t.at > localAbsMs) continue;
+            if (timerDue(t) > localAbsMs) continue;
             if (!task || t.at < task.at || (t.at === task.at && t.id < task.id)) task = t;
         }
         const frameDeadline = animationFrameDeadline();
@@ -42471,6 +43521,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // A top-level navigation's URL parse resolved its entry: the host holds
         // it for the navigation fetch (Fetch #scheme-fetch, not partitioned).
         function hold(url) { __blob_url("navigate", `${url}`, null, null); }
+        // HTML #get-noopener-for-window-open step 1: whether the URL's entry's
+        // environment's origin is not same site with the top-level origin.
+        function crossSite(url) { return __blob_url("noopener", `${url}`, null, null) === true; }
         // HTML #fetch-a-single-module-script for a blob: URL: whether this
         // environment obtains a Blob whose type is a JavaScript MIME type.
         function moduleScript(url) { return __blob_url("module", `${url}`, null, null) === true; }
@@ -42502,7 +43555,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         };
         for (const name of ["createObjectURL", "revokeObjectURL"])
             define(URLCtor, name, { value: statics[name], writable: true, enumerable: true, configurable: true });
-        adapter.register({ resolve, read, hold, moduleScript });
+        adapter.register({ resolve, read, hold, moduleScript, crossSite });
     })(globalThis);
     /*__BLOB_URL_END__*/
     /*__FETCH_BEGIN__*/
@@ -51774,7 +52827,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     const read = WeakMap.prototype.get.bind(slots), write = WeakMap.prototype.set.bind(slots);
     const apply = Reflect.apply, define = Object.defineProperty, create = Object.create;
     const setPrototype = Object.setPrototypeOf, descriptor = Object.getOwnPropertyDescriptor;
-    const ownKeys = Reflect.ownKeys, freeze = Object.freeze, sort = Array.prototype.sort;
+    const ownKeys = Reflect.ownKeys, freeze = Object.freeze, sort = Array.prototype.sort,
+        splice = Array.prototype.splice;
     const mapGet = Function.prototype.call.bind(Map.prototype.get);
     const mapSet = Function.prototype.call.bind(Map.prototype.set);
     const mapDelete = Function.prototype.call.bind(Map.prototype.delete);
@@ -51818,7 +52872,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     function requireEntry(value) {
         const state = read(value);
         if (!state || (state.kind !== 'mark' && state.kind !== 'measure' &&
-            state.kind !== 'resource' && state.kind !== 'navigation'))
+            state.kind !== 'resource' && state.kind !== 'navigation' &&
+            state.kind !== 'visibility-state'))
             throw new TypeErrorCtor('Illegal PerformanceEntry invocation');
         return state;
     }
@@ -52015,6 +53070,16 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         constructor() { throw new TypeErrorCtor('Illegal constructor'); }
         toJSON() { return resourceJSON(this); }
     }
+    // HTML #the-visibilitystateentry-interface: a Document's visibility
+    // state changes, from the moment it becomes active. Its name, entryType,
+    // startTime and duration shadow PerformanceEntry's.
+    class VisibilityStateEntry extends PerformanceEntry {
+        constructor() { throw new TypeErrorCtor('Illegal constructor'); }
+        get name() { return requireKind(this,'visibility-state').name; }
+        get entryType() { requireKind(this,'visibility-state'); return 'visibility-state'; }
+        get startTime() { return requireKind(this,'visibility-state').startTime; }
+        get duration() { requireKind(this,'visibility-state'); return 0; }
+    }
     class PerformanceNavigationTiming extends PerformanceResourceTiming {
         constructor() { throw new TypeErrorCtor('Illegal constructor'); }
         get type() { return requireKind(this,'navigation').type; }
@@ -52129,8 +53194,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // the browser/worker's dedicated task source, never an author timer.
     // Navigation Timing is Window-only; the supported list and observe()
     // filtering must agree in every global, including workers.
-    const supportedTypes = freeze(worker ? ['mark','measure','resource'] : ['mark','measure','navigation','resource']);
-    const supported = type => type === 'mark' || type === 'measure' || type === 'resource' || (!worker && type === 'navigation');
+    const supportedTypes = freeze(worker ? ['mark','measure','resource']
+        : ['mark','measure','navigation','resource','visibility-state']);
+    const supported = type => type === 'mark' || type === 'measure' || type === 'resource' ||
+        (!worker && (type === 'navigation' || type === 'visibility-state'));
     function observerOptions(value) {
         const input = dictionary(value);
         const bufferedValue = input == null ? undefined : input.buffered;
@@ -52260,7 +53327,28 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         [PerformanceMark,'PerformanceMark'],[PerformanceMeasure,'PerformanceMeasure'],
         [PerformanceResourceTiming,'PerformanceResourceTiming'],
         [PerformanceObserver,'PerformanceObserver'],[PerformanceObserverEntryList,'PerformanceObserverEntryList']]) installInterface(C,name);
-    if (!worker) installInterface(PerformanceNavigationTiming,'PerformanceNavigationTiming');
+    if (!worker) {
+        installInterface(PerformanceNavigationTiming,'PerformanceNavigationTiming');
+        installInterface(VisibilityStateEntry,'VisibilityStateEntry');
+        // Performance Timeline #queue-a-performanceentry with the entry
+        // type's buffer limit (50, as engines register it): the Document's
+        // visibility state entries (HTML #update-the-visibility-state, at
+        // the current time, and #set-the-initial-visibility-state at 0).
+        owner.visibilityEntries = 0;
+        host.queueVisibilityStateEntry = function (visibility, at) {
+            const entry = create(VisibilityStateEntry.prototype);
+            const startTime = at === 0 ? 0 : owner.now();
+            write(entry,{kind:'visibility-state',name:visibility === 'hidden' ? 'hidden' : 'visible',
+                startTime,duration:0});
+            notifyEntry(owner,entry);
+            if (owner.visibilityEntries < 50) {
+                owner.visibilityEntries++;
+                append(owner.entries,entry);
+            }
+        };
+        if (typeof host.visibilityState === 'function')
+            host.queueVisibilityStateEntry(host.visibilityState(), 0);
+    }
     define(PerformanceEntry,'length',{value:0}); define(PerformanceMark,'length',{value:1});
     for (const name of ['mark','measure']) define(Performance.prototype[name],'length',{value:1});
     for (const name of ['clearMarks','clearMeasures']) define(Performance.prototype[name],'length',{value:0});
@@ -52307,7 +53395,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         for (const name of resourceStrings) state[name] = data[name] || '';
         for (const name of navigationNumbers) state[name] = data[name] || 0;
         state.initiatorType = 'navigation'; state.renderBlockingStatus = 'non-blocking';
-        write(entry,state); owner.navigation = entry; append(owner.entries,entry);
+        // Navigation Timing's entry exists from navigation start, before
+        // the Document and its initial visibility state entry: first in
+        // the timeline among entries at time zero.
+        write(entry,state); owner.navigation = entry; apply(splice,owner.entries,[0,0,entry]);
         for (const name of timingNames) owner.legacyTiming[name] = 0;
         owner.legacyTiming.navigationStart = floor(owner.timeOrigin);
         owner.legacyTiming.domLoading = floor(owner.timeOrigin + owner.now());

@@ -5,7 +5,7 @@
 //! function lengths cannot drift.
 
 use crate::dom::custom_registry::CeRegistry as CustomElementRegistryRef;
-use crate::dom::{AdoptError, DOCUMENT, Dom, NodeData, SelectorList};
+use crate::dom::{AdoptError, Dom, NodeData, SelectorList};
 use lumen::bytecode::Tier;
 use lumen::embed::{
     Ctx, EvalError, HostGc, HostGcVisitor, HostRetainedMemoryVisitor, NativeFn, NativeGcId,
@@ -204,6 +204,7 @@ enum LumenHostTask {
     /// A network `@font-face` source the page's font sets awaited (`None`
     /// when it could not be fetched).
     FontDone {
+        traversable: TraversableId,
         url: String,
         bytes: Option<Vec<u8>>,
     },
@@ -215,10 +216,16 @@ enum LumenHostTask {
     /// (CSS Cascade 4 #fetch-an-import). `url` is the import whose fetch
     /// completed; no sheets means it failed.
     StyleImportsDone {
+        traversable: TraversableId,
         url: String,
         sheets: Vec<crate::http::PageSheet>,
     },
-    ParserResourceTiming(LumenResourceTiming),
+    /// A speculative parser fetch of traversable `traversable`'s Document
+    /// finished (`http::prefetch_page_scripts`).
+    ParserResourceTiming {
+        traversable: TraversableId,
+        timing: LumenResourceTiming,
+    },
     ImageDone {
         id: usize,
         result: Option<image_host::LoadedImage>,
@@ -271,6 +278,11 @@ enum LumenHostTask {
     },
     ResourceDone {
         context: u64,
+        /// The traversable whose count of load-delaying fetches (or of
+        /// preloads) this fetch joined: its Document's when the element was
+        /// prepared, which the element may have left for another traversable
+        /// of the group since.
+        traversable: TraversableId,
         node_id: usize,
         name: String,
         kind: LumenResourceKind,
@@ -794,7 +806,9 @@ struct HostState {
     geom_cache: Rc<RefCell<LumenGeomCache>>,
     images: Rc<RefCell<crate::layout2::ImageSizes>>,
     /// Compressed bytes behind element image request records, by record token
-    /// (`image_host`), and each element's current request's token.
+    /// (`image_host`), and each element's current request's token: one map
+    /// for every traversable's elements, whose identities are unique across
+    /// the group's arenas and which may move between them.
     image_payloads: HashMap<u64, image_host::ImagePayload>,
     element_image_payloads: HashMap<usize, u64>,
     next_image_payload: u64,
@@ -905,6 +919,9 @@ struct HostState {
     platform_controls: Option<Value>,
     platform_nodes: Option<Value>,
     platform_internals: Option<Value>,
+    /// The Agent's top-level traversable records (its Windows' `opener`,
+    /// `name`, named targets, `closed`), shared by every Window Realm.
+    platform_traversables: Option<Value>,
     live_ranges: live_range_host::Registry,
     geometry: geometry_host::Registry,
     /// Streaming TextDecoder state for non-UTF-8 encodings.
@@ -926,9 +943,156 @@ struct HostState {
     wasm_module_slots: Option<Value>,
     /// Child Window Realms share this Agent; dedicated workers inherit its cluster.
     agent_cluster: u64,
+    /// The host settings context of the selected traversable's top-level
+    /// Window: 0 for the Agent's first, whose Window is the default Realm.
+    top_context: u64,
+    /// The top-level traversables of this Agent's browsing context group.
+    traversables: Traversables,
     /// Unit-test instrumentation; zero-sized outside `cfg(test)`.
     #[cfg_attr(not(test), allow(dead_code))]
     test_hooks: TestHooks,
+}
+
+/// A top-level traversable of this Agent's browsing context group (HTML
+/// #top-level-traversable). The Agent's first is `TraversableId(0)`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+struct TraversableId(u32);
+
+/// The top-level traversables of an Agent's browsing context group (HTML
+/// #browsing-context-group-set): one Window Agent runs the Documents of all
+/// of them, each in its own arena. HostState holds the selected one's
+/// fields; host calls select the one they address (`routed_host_call`).
+#[derive(Default)]
+struct Traversables {
+    selected: TraversableId,
+    parked: Vec<(TraversableId, TraversableHost)>,
+    /// The Window Realms (host settings contexts) of every traversable but
+    /// the first, their child navigables' included.
+    contexts: HashMap<u64, TraversableId>,
+    next: u32,
+    /// The engine's default Realm, Window context 0, while its Document is
+    /// active (the engine pins it).
+    default_realm: Option<Value>,
+    /// Auxiliary browsing contexts pages created that the page actor has
+    /// yet to give a frontend (`host_create_auxiliary_traversable`).
+    created: Vec<CreatedTraversable>,
+}
+
+/// A top-level traversable a page created (HTML
+/// #creating-a-new-auxiliary-browsing-context), until the page actor adopts it.
+struct CreatedTraversable {
+    id: TraversableId,
+    /// The traversable of the Document that created it, whose frontend
+    /// presents it.
+    creator: TraversableId,
+    name: String,
+    popup: bool,
+    storage_shed: u64,
+}
+
+/// HostState's fields that belong to one top-level traversable: its
+/// Documents' arena, presentation and parser, and what its frontend has yet
+/// to learn. Shared state (realms, network, workers, storage, platform
+/// slots) stays in HostState for every traversable.
+struct TraversableHost {
+    dom: Rc<RefCell<Dom>>,
+    base: url::Url,
+    viewport: Cell<crate::layout2::Viewport>,
+    device_pixel_ratio: Cell<f32>,
+    screen_position: Cell<(i32, i32)>,
+    geom_cache: Rc<RefCell<LumenGeomCache>>,
+    images: Rc<RefCell<crate::layout2::ImageSizes>>,
+    pending_document_images: usize,
+    parser: ParserProgress,
+    selection_dirty: bool,
+    selection_serial: u32,
+    selection_report: Option<(u64, crate::js::SelectionReport)>,
+    context_menus: Vec<bool>,
+    fullscreen_requests: Vec<(u64, bool)>,
+    file_picker_requests: Vec<crate::js::FilePickerRequest>,
+    clipboard_requests: Vec<(u64, String)>,
+    history_traversals: Vec<(u64, i32)>,
+    navigation_blob: Option<(String, Arc<crate::blob_url_store::BlobUrlEntry>)>,
+    in_flight_imports: std::collections::HashSet<String>,
+    top_context: u64,
+    pending_resources: usize,
+    pending_preloads: usize,
+    pending_module_evaluations: usize,
+    modules_skipped: usize,
+}
+
+impl TraversableHost {
+    /// A traversable whose top-level Window is host settings context
+    /// `top_context`, presenting `dom`.
+    fn new(
+        dom: Rc<RefCell<Dom>>,
+        base: url::Url,
+        viewport: crate::layout2::Viewport,
+        device_pixel_ratio: f32,
+        top_context: u64,
+    ) -> Self {
+        Self {
+            dom,
+            base,
+            viewport: Cell::new(viewport),
+            device_pixel_ratio: Cell::new(device_pixel_ratio),
+            screen_position: Cell::new((0, 0)),
+            geom_cache: Rc::new(RefCell::new(LumenGeomCache::empty())),
+            images: Default::default(),
+            pending_document_images: 0,
+            parser: ParserProgress::default(),
+            selection_dirty: false,
+            selection_serial: 0,
+            selection_report: None,
+            context_menus: Vec::new(),
+            fullscreen_requests: Vec::new(),
+            file_picker_requests: Vec::new(),
+            clipboard_requests: Vec::new(),
+            history_traversals: Vec::new(),
+            navigation_blob: None,
+            in_flight_imports: Default::default(),
+            top_context,
+            pending_resources: 0,
+            pending_preloads: 0,
+            pending_module_evaluations: 0,
+            modules_skipped: 0,
+        }
+    }
+
+    /// Exchange these fields with HostState's own.
+    fn swap_with(&mut self, state: &mut HostState) {
+        macro_rules! swap {
+            ($($field:ident),* $(,)?) => {
+                $(std::mem::swap(&mut self.$field, &mut state.$field);)*
+            };
+        }
+        swap!(
+            dom,
+            base,
+            viewport,
+            device_pixel_ratio,
+            screen_position,
+            geom_cache,
+            images,
+            pending_document_images,
+            parser,
+            selection_dirty,
+            selection_serial,
+            selection_report,
+            context_menus,
+            fullscreen_requests,
+            file_picker_requests,
+            clipboard_requests,
+            history_traversals,
+            navigation_blob,
+            in_flight_imports,
+            top_context,
+            pending_resources,
+            pending_preloads,
+            pending_module_evaluations,
+            modules_skipped,
+        );
+    }
 }
 
 #[derive(Default)]
@@ -1044,6 +1208,7 @@ impl HostState {
             platform_controls: None,
             platform_nodes: None,
             platform_internals: None,
+            platform_traversables: None,
             live_ranges: live_range_host::Registry::default(),
             geometry: geometry_host::Registry::default(),
             text_decoders: Default::default(),
@@ -1057,8 +1222,165 @@ impl HostState {
             window_message_slots: None,
             wasm_module_slots: None,
             agent_cluster: NEXT_CLUSTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            top_context: 0,
+            traversables: Traversables::default(),
             test_hooks: TestHooks::default(),
         }
+    }
+
+    /// Make `traversable`'s fields HostState's own (`Traversables`),
+    /// parking the selected one's. Returns the previously selected one.
+    fn select_traversable(&mut self, traversable: TraversableId) -> TraversableId {
+        let previous = self.traversables.selected;
+        if previous == traversable {
+            return previous;
+        }
+        let Some(index) = self
+            .traversables
+            .parked
+            .iter()
+            .position(|(id, _)| *id == traversable)
+        else {
+            return previous;
+        };
+        let (_, mut slot) = self.traversables.parked.swap_remove(index);
+        slot.swap_with(self);
+        self.traversables.parked.push((previous, slot));
+        self.traversables.selected = traversable;
+        previous
+    }
+
+    /// The Window Realm of settings context `context`, if its Document is
+    /// active: a Realm created for it, or the engine's default Realm.
+    fn window_realm(&self, context: u64) -> Option<Value> {
+        self.window_realms.get(&context).cloned().or_else(|| {
+            (context == 0)
+                .then(|| self.traversables.default_realm.clone())
+                .flatten()
+        })
+    }
+
+    /// Release the host state of Window `context`, whose Document is gone
+    /// (HTML #destroy-a-document: its fetches, ports, databases, audio,
+    /// blob URLs and dedicated workers go with it).
+    fn release_window_settings(&mut self, context: u64) {
+        self.import_maps.remove(&context);
+        self.window_realms.remove(&context);
+        if context == 0 {
+            self.traversables.default_realm = None;
+        }
+        self.traversables.contexts.remove(&context);
+        self.message_ports.release(Some(context));
+        self.indexed_db.release(Some(context));
+        self.webaudio.release_realm(context);
+        // File API #lifeTime: the Window's entries go away with its Document.
+        self.blobs
+            .remove_environment(self.blob_agent, Some(context));
+        self.window_request_urls.remove(&context);
+        self.window_cookie_contexts.remove(&context);
+        self.forget_realm_origin(context);
+        if let Some(network) = self.network.as_mut() {
+            network
+                .pending_fetches
+                .retain(|_, pending| pending.context != context);
+            // HTML #unload-a-document aborts the Document's fetches
+            // (Fetch #fetch-controller-abort): stop its response bodies'
+            // transfers, which may otherwise never end (event streams).
+            network.body_streams.retain(|_, stream| {
+                let keep = stream.context != context;
+                if !keep {
+                    stream.flow.cancel();
+                }
+                keep
+            });
+        }
+        if let Some(workers) = self.workers.as_mut() {
+            // Removing the sole owner closes these dedicated workers. Dropping
+            // their handles interrupts execution; late queued replies are inert.
+            workers
+                .workers
+                .retain(|_, worker| worker.context != context);
+        }
+    }
+
+    /// Every traversable's arena, the selected one's first.
+    fn arenas(&self) -> impl Iterator<Item = &Rc<RefCell<Dom>>> {
+        std::iter::once(&self.dom).chain(self.traversables.parked.iter().map(|(_, slot)| &slot.dom))
+    }
+
+    /// Forget a discarded traversable, which is not the selected one: its
+    /// arena, presentation state and Window Realms, and the media players
+    /// of its elements (HTML #destroy-a-document: its media stop).
+    fn forget_traversable(&mut self, traversable: TraversableId) {
+        let Some(index) = self
+            .traversables
+            .parked
+            .iter()
+            .position(|(id, _)| *id == traversable)
+        else {
+            return;
+        };
+        let (_, slot) = self.traversables.parked.swap_remove(index);
+        {
+            let dom = slot.dom.borrow();
+            self.media.release_elements(|node| dom.is_valid(node));
+            // The bytes of its elements' current image requests.
+            let image_payloads = &mut self.image_payloads;
+            self.element_image_payloads.retain(|node, token| {
+                let gone = dom.is_valid(*node);
+                if gone {
+                    image_payloads.remove(token);
+                }
+                !gone
+            });
+        }
+        let contexts: Vec<u64> = self
+            .traversables
+            .contexts
+            .iter()
+            .filter(|(_, owner)| **owner == traversable)
+            .map(|(&context, _)| context)
+            .collect();
+        for context in contexts {
+            self.traversables.contexts.remove(&context);
+            self.window_realms.remove(&context);
+            self.window_request_urls.remove(&context);
+            self.window_cookie_contexts.remove(&context);
+            self.import_maps.remove(&context);
+            self.forget_realm_origin(context);
+        }
+    }
+
+    /// The traversable whose arena holds `node`, if any does.
+    fn traversable_of_node(&self, node: usize) -> Option<TraversableId> {
+        if self.dom.borrow().is_valid(node) {
+            return Some(self.traversables.selected);
+        }
+        self.traversables
+            .parked
+            .iter()
+            .find(|(_, slot)| slot.dom.borrow().is_valid(node))
+            .map(|(id, _)| *id)
+    }
+
+    /// The traversable a Window Realm (host settings context) belongs to.
+    /// Whether Window `context` is a top-level traversable's: the selected
+    /// one's or a parked one's.
+    fn is_top_level_context(&self, context: u64) -> bool {
+        context == self.top_context
+            || self
+                .traversables
+                .parked
+                .iter()
+                .any(|(_, slot)| slot.top_context == context)
+    }
+
+    fn traversable_of_context(&self, context: u64) -> TraversableId {
+        self.traversables
+            .contexts
+            .get(&context)
+            .copied()
+            .unwrap_or_default()
     }
 
     fn forget_realm_origin(&mut self, context: u64) {
@@ -1139,26 +1461,37 @@ impl HostState {
         if let Some(network) = self.network.as_ref() {
             let page = self
                 .window_request_urls
-                .get(&0)
+                .get(&self.top_context)
                 .unwrap_or(&self.base)
                 .clone();
-            let cookie_context = self.window_cookie_contexts.get(&0).map_or_else(
-                || crate::http::CookieContext::subresource(&page),
-                |(_, _, c)| c.clone(),
-            );
+            let cookie_context = self
+                .window_cookie_contexts
+                .get(&self.top_context)
+                .map_or_else(
+                    || crate::http::CookieContext::subresource(&page),
+                    |(_, _, c)| c.clone(),
+                );
             let handle = network.handle.clone();
             let cache = network.cache.clone();
             let fetched = network.fetched.clone();
-            let import_map = self.import_maps.get(&0).cloned().unwrap_or_default();
+            let import_map = self
+                .import_maps
+                .get(&self.top_context)
+                .cloned()
+                .unwrap_or_default();
             let origin = self
                 .realm_origins
-                .get(&0)
+                .get(&self.top_context)
                 .cloned()
                 .unwrap_or_else(|| page.origin());
             let environment = ModuleFetchEnvironment {
                 blobs: self.blobs.clone(),
                 storage_key: blob_storage_key(&origin),
-                referrer_policy: self.referrer_policies.get(&0).copied().unwrap_or_default(),
+                referrer_policy: self
+                    .referrer_policies
+                    .get(&self.top_context)
+                    .copied()
+                    .unwrap_or_default(),
             };
             engine.set_module_loader(move |specifier, referrer| {
                 module_dependency_loader(
@@ -1189,35 +1522,48 @@ impl HostState {
         if let Some(network) = self.network.as_ref() {
             let page = self
                 .window_request_urls
-                .get(&0)
+                .get(&self.top_context)
                 .unwrap_or(&self.base)
                 .clone();
             let origin = self
                 .realm_origins
-                .get(&0)
+                .get(&self.top_context)
                 .cloned()
                 .unwrap_or_else(|| page.origin());
             let loader = LumenDynamicModuleLoader {
-                context: 0,
-                cookie_context: self.window_cookie_contexts.get(&0).map_or_else(
-                    || crate::http::CookieContext::subresource(&page),
-                    |(_, _, context)| context.clone(),
-                ),
+                context: self.top_context,
+                cookie_context: self
+                    .window_cookie_contexts
+                    .get(&self.top_context)
+                    .map_or_else(
+                        || crate::http::CookieContext::subresource(&page),
+                        |(_, _, context)| context.clone(),
+                    ),
                 environment: ModuleFetchEnvironment {
                     blobs: self.blobs.clone(),
                     storage_key: blob_storage_key(&origin),
-                    referrer_policy: self.referrer_policies.get(&0).copied().unwrap_or_default(),
+                    referrer_policy: self
+                        .referrer_policies
+                        .get(&self.top_context)
+                        .copied()
+                        .unwrap_or_default(),
                 },
                 page,
                 events: events.clone(),
-                import_map: self.import_maps.get(&0).cloned().unwrap_or_default(),
+                import_map: self
+                    .import_maps
+                    .get(&self.top_context)
+                    .cloned()
+                    .unwrap_or_default(),
                 network: Some(LumenDynamicModuleNetwork {
                     handle: network.handle.clone(),
                     cache: network.cache.clone(),
                     fetched: network.fetched.clone(),
                 }),
             };
-            self.early_imports.borrow_mut().insert(0, loader);
+            self.early_imports
+                .borrow_mut()
+                .insert(self.top_context, loader);
         }
         let early_imports = self.early_imports.clone();
         engine.set_async_dynamic_module_loader_with_context(
@@ -1358,6 +1704,7 @@ impl RetainedMemory for HostState {
             platform_controls,
             platform_nodes,
             platform_internals,
+            platform_traversables,
             live_ranges,
             geometry,
             text_decoders,
@@ -1371,6 +1718,8 @@ impl RetainedMemory for HostState {
             window_message_slots,
             wasm_module_slots,
             agent_cluster: _,
+            top_context: _,
+            traversables,
             test_hooks: _,
         } = self;
 
@@ -1402,23 +1751,27 @@ impl RetainedMemory for HostState {
             visitor.value(&owner.value);
         }
 
-        match dom.try_borrow() {
-            Ok(dom_value) => {
-                let (retained_bytes, opaque, unavailable) = dom_value.retained_memory();
-                report_rc_payload(
-                    visitor,
-                    "trust.dom-arena",
-                    dom,
-                    std::mem::size_of_val(dom.as_ref()).saturating_add(retained_bytes),
-                );
-                if opaque {
-                    visitor.opaque_storage();
+        // Every traversable's arena: the selected one's, then the parked.
+        for dom in std::iter::once(dom).chain(traversables.parked.iter().map(|(_, slot)| &slot.dom))
+        {
+            match dom.try_borrow() {
+                Ok(dom_value) => {
+                    let (retained_bytes, opaque, unavailable) = dom_value.retained_memory();
+                    report_rc_payload(
+                        visitor,
+                        "trust.dom-arena",
+                        dom,
+                        std::mem::size_of_val(dom.as_ref()).saturating_add(retained_bytes),
+                    );
+                    if opaque {
+                        visitor.opaque_storage();
+                    }
+                    for _ in 0..unavailable {
+                        visitor.unavailable();
+                    }
                 }
-                for _ in 0..unavailable {
-                    visitor.unavailable();
-                }
+                Err(_) => visitor.unavailable(),
             }
-            Err(_) => visitor.unavailable(),
         }
 
         report_rc_payload(
@@ -1861,10 +2214,18 @@ impl RetainedMemory for HostState {
         if let Some(value) = element_slots {
             visitor.value(value);
         }
-        for value in [platform_controls, platform_nodes, platform_internals]
-            .into_iter()
-            .flatten()
+        for value in [
+            platform_controls,
+            platform_nodes,
+            platform_internals,
+            platform_traversables,
+        ]
+        .into_iter()
+        .flatten()
         {
+            visitor.value(value);
+        }
+        if let Some(value) = &traversables.default_realm {
             visitor.value(value);
         }
         if let Some(value) = pointer_event_slots {
@@ -1957,16 +2318,30 @@ impl HostGc for HostState {
         // Prove sweeping can borrow exclusively BEFORE discounting any JS owner. A successful
         // shared borrow would still allow an external reader to block the later native sweep,
         // leaving discounted dead wrappers in a live registry after their JS fields were cleared.
-        let Ok(dom) = self.dom.try_borrow_mut() else {
-            return;
+        // Every traversable's arena (`Traversables`) traces its nodes as its own native owner;
+        // node identities are unique across them.
+        let mut arenas = Vec::with_capacity(1 + self.traversables.parked.len());
+        for arena in self.arenas() {
+            let Ok(dom) = arena.try_borrow_mut() else {
+                return;
+            };
+            arenas.push((Rc::as_ptr(arena) as usize, dom));
+        }
+        let (owner, dom) = (arenas[0].0, &arenas[0].1);
+        let owner_of = |node: usize| {
+            arenas
+                .iter()
+                .find(|(_, dom)| dom.is_valid(node))
+                .map(|(owner, _)| *owner)
         };
-        let owner = Rc::as_ptr(&self.dom) as usize;
-        let id = |id| NativeGcId {
+        let node_id = |owner, id| NativeGcId {
             domain: "trust.dom",
             owner,
             id,
         };
-        let minor = visitor.is_minor()
+        // Young generations are an arena's own: a group's arenas collect fully.
+        let minor = arenas.len() == 1
+            && visitor.is_minor()
             && visitor.native_old_generation("trust.dom", owner, dom.first_young_gc_id());
         if !minor && std::env::var_os("LUMEN_GC_DUMP").is_some() {
             let mut roots = std::collections::BTreeMap::<usize, usize>::new();
@@ -1992,28 +2367,46 @@ impl HostGc for HostState {
                 self.window_realms.len()
             );
         }
-        if minor {
-            dom.visit_gc_young_edges(|from, to| visitor.native_edge(id(from), id(to)));
-        } else {
-            dom.visit_gc_edges(|from, to| visitor.native_edge(id(from), id(to)));
-        }
-        dom.visit_gc_roots(|node| {
-            if !minor || dom.is_young_gc_node(node) {
-                visitor.native_root(id(node));
+        for (owner, dom) in &arenas {
+            let owner = *owner;
+            if minor {
+                dom.visit_gc_young_edges(|from, to| {
+                    visitor.native_edge(node_id(owner, from), node_id(owner, to))
+                });
+            } else {
+                dom.visit_gc_edges(|from, to| {
+                    visitor.native_edge(node_id(owner, from), node_id(owner, to))
+                });
             }
-        });
-        dom.visit_gc_pending_allocations(|node| visitor.native_root(id(node)));
+            dom.visit_gc_roots(|node| {
+                if minor {
+                    if dom.is_young_gc_node(node) {
+                        visitor.native_root(node_id(owner, node));
+                    }
+                } else if dom.is_valid(node) {
+                    visitor.native_root(node_id(owner, node));
+                } else if let Some(holder) = owner_of(node) {
+                    // A record about a node that moved to another arena
+                    // (`Dom::transplant_subtree`) roots it there.
+                    visitor.native_root(node_id(holder, node));
+                }
+            });
+            dom.visit_gc_pending_allocations(|node| visitor.native_root(node_id(owner, node)));
+        }
         for &node in self.dom_gc.pending_resources.borrow().keys() {
-            if !minor || dom.is_young_gc_node(node) {
-                visitor.native_root(id(node));
+            if let Some(owner) = owner_of(node)
+                && (!minor || dom.is_young_gc_node(node))
+            {
+                visitor.native_root(node_id(owner, node));
             }
         }
         let mut trace_entry = |entry: &DomGcOwner| {
             visitor.internal(&entry.value);
             for &node in &entry.nodes {
-                if !dom.is_valid(node) {
+                let Some(owner) = owner_of(node) else {
                     continue;
-                }
+                };
+                let id = |node| node_id(owner, node);
                 match entry.kind {
                     DomGcOwnerKind::Wrapper => {
                         visitor.js_to_native(&entry.value, id(node));
@@ -2055,72 +2448,99 @@ impl HostGc for HostState {
         if !self.dom_gc.traced.replace(false) {
             return;
         }
-        let Ok(mut dom) = self.dom.try_borrow_mut() else {
-            return;
-        };
-        let owner = Rc::as_ptr(&self.dom) as usize;
-        let live = |id| {
-            native_is_live(NativeGcId {
-                domain: "trust.dom",
-                owner,
-                id,
-            })
-        };
+        // Every traversable's arena, as `trace_gc` traced them.
+        let handles: Vec<Rc<RefCell<Dom>>> = self.arenas().cloned().collect();
+        let mut arenas = Vec::with_capacity(handles.len());
+        for handle in &handles {
+            let Ok(dom) = handle.try_borrow_mut() else {
+                return;
+            };
+            arenas.push((Rc::as_ptr(handle) as usize, dom));
+        }
         let minor = self.dom_gc.traced_minor.get();
-        let wrappers = &mut self.dom_gc.wrappers;
-        let mut retain_entry = |identity: usize, entry: &mut DomGcOwner| {
-            if !is_live(&entry.value) {
-                if matches!(entry.kind, DomGcOwnerKind::Wrapper) {
-                    for node in &entry.nodes {
-                        if wrappers.get(node) == Some(&identity) {
-                            wrappers.remove(node);
+        {
+            let live = |id: usize| {
+                arenas
+                    .iter()
+                    .find(|(_, dom)| dom.is_valid(id))
+                    .is_some_and(|(owner, _)| {
+                        native_is_live(NativeGcId {
+                            domain: "trust.dom",
+                            owner: *owner,
+                            id,
+                        })
+                    })
+            };
+            let wrappers = &mut self.dom_gc.wrappers;
+            let mut retain_entry = |identity: usize, entry: &mut DomGcOwner| {
+                if !is_live(&entry.value) {
+                    if matches!(entry.kind, DomGcOwnerKind::Wrapper) {
+                        for node in &entry.nodes {
+                            if wrappers.get(node) == Some(&identity) {
+                                wrappers.remove(node);
+                            }
                         }
                     }
+                    return false;
                 }
-                return false;
-            }
-            entry.nodes.retain(|&node| {
-                let keep = live(node);
-                if !keep && wrappers.get(&node) == Some(&identity) {
-                    wrappers.remove(&node);
+                entry.nodes.retain(|&node| {
+                    let keep = live(node);
+                    if !keep && wrappers.get(&node) == Some(&identity) {
+                        wrappers.remove(&node);
+                    }
+                    keep
+                });
+                !entry.nodes.is_empty()
+            };
+            if minor {
+                for identity in &self.dom_gc.young_owners {
+                    if self
+                        .dom_gc
+                        .owners
+                        .get_mut(identity)
+                        .is_some_and(|entry| !retain_entry(*identity, entry))
+                    {
+                        self.dom_gc.owners.remove(identity);
+                    }
                 }
-                keep
-            });
-            !entry.nodes.is_empty()
-        };
-        if minor {
-            for identity in &self.dom_gc.young_owners {
-                if self
-                    .dom_gc
+            } else {
+                self.dom_gc
                     .owners
-                    .get_mut(identity)
-                    .is_some_and(|entry| !retain_entry(*identity, entry))
-                {
-                    self.dom_gc.owners.remove(identity);
+                    .retain(|&identity, entry| retain_entry(identity, entry));
+                self.dom_gc
+                    .documents
+                    .retain(|_, identity| self.dom_gc.owners.contains_key(identity));
+            }
+        }
+        let mut removed = Vec::new();
+        for (index, (owner, dom)) in arenas.iter_mut().enumerate() {
+            let owner = *owner;
+            let live = |id| {
+                native_is_live(NativeGcId {
+                    domain: "trust.dom",
+                    owner,
+                    id,
+                })
+            };
+            let swept = if minor {
+                dom.sweep_gc_young_nodes(&live)
+            } else {
+                dom.sweep_gc_nodes(&live)
+            };
+            for node in &swept {
+                self.dom_gc.documents.remove(node);
+                self.dom_gc.wrappers.remove(node);
+                self.dom_gc.listener_nodes.remove(node);
+                if let Some(token) = self.element_image_payloads.remove(node) {
+                    self.image_payloads.remove(&token);
                 }
             }
-        } else {
-            self.dom_gc
-                .owners
-                .retain(|&identity, entry| retain_entry(identity, entry));
-            self.dom_gc
-                .documents
-                .retain(|_, identity| self.dom_gc.owners.contains_key(identity));
-        }
-        let removed = if minor {
-            dom.sweep_gc_young_nodes(&live)
-        } else {
-            dom.sweep_gc_nodes(&live)
-        };
-        for node in &removed {
-            self.dom_gc.documents.remove(node);
-            self.dom_gc.wrappers.remove(node);
-            self.dom_gc.listener_nodes.remove(node);
-            if let Some(token) = self.element_image_payloads.remove(node) {
-                self.image_payloads.remove(&token);
+            dom.finish_gc_generation();
+            if index == 0 {
+                removed = swept;
             }
         }
-        dom.finish_gc_generation();
+        let dom = &arenas[0].1;
         self.dom_gc.young_owners.clear();
         if self.dom_gc.documents.capacity() > self.dom_gc.documents.len().saturating_mul(4).max(64)
         {
@@ -2583,6 +3003,7 @@ mod desktop {
             document_encoding: env.document_encoding,
             content_type: env.content_type.clone(),
             fullscreen_supported: env.fullscreen_supported,
+            traversable: env.traversable,
             referrer_policy: env.referrer_policy,
             referrer: env.referrer.clone(),
         };
@@ -2656,7 +3077,10 @@ mod desktop {
             let _ = render_with_observers(&mut page);
         }
         page.outcome.elapsed = page.started.elapsed();
-        let output = page.dom.borrow().serialize(DOCUMENT);
+        let output = {
+            let dom = page.dom.borrow();
+            dom.serialize(dom.document())
+        };
         (output, std::mem::take(&mut page.outcome))
     }
 
@@ -2746,22 +3170,269 @@ mod desktop {
         /// Native edits run their input events and microtasks in order, but
         /// acknowledge presentation only after the next rendering opportunity.
         pending_form_acknowledgements: Vec<usize>,
-        /// The frontend's window cannot be seen (`PageCmd::Occluded`).
-        occluded: bool,
+        /// HTML #page-visibility: the traversable's system visibility state
+        /// is "hidden" (`PageCmd::SystemVisibility`). Its Documents get no
+        /// rendering opportunities (HTML #update-the-rendering).
+        hidden: bool,
+        /// HTML #system-focus (`PageCmd::SystemFocus`).
+        system_focus: bool,
+        /// The top-level Document's title as last reported, and the DOM
+        /// epoch it was read at (`PageEvt::Title`).
+        reported_title: Option<String>,
+        title_epoch: u64,
+        /// HTML #the-end has run for the top-level Document (its load event).
+        lifecycle_complete: bool,
+        /// The next rendering opportunity this traversable's Documents wait
+        /// for, how rendering was last paced, and its CSS animations' cadence
+        /// (see the event loop).
+        render_deadline: Option<Instant>,
+        last_render_opportunity: Instant,
+        render_not_before: Instant,
+        animation_schedule: AnimationSchedule,
+        /// An interaction taken from the queue ahead of its turn (see the
+        /// primary release in the event loop); it is the head of the
+        /// interaction queue.
+        interaction_lookahead: Option<PageCmd>,
         task_trace: Option<ActorTaskTrace>,
         engine_metrics: Option<lumen::PerformanceMetricsSampler>,
+        /// The top-level traversables of this Agent's browsing context group
+        /// (`Traversables` in HostState): the fields above from `dom` to
+        /// `interaction_lookahead` are the selected one's.
+        traversables: Vec<TraversableSlot>,
+        selected: usize,
+        /// The selected traversable's top-level Realm, entered while it is
+        /// selected; the engine's default Realm is never entered.
+        realm_entry: Option<lumen::RealmEntry>,
+        /// The group's shared handle state (`GroupShared`), and whether it has
+        /// ever had more than one traversable: until then a page whose
+        /// frontend goes away ends at once, as it always has. A one-shot
+        /// transform has no group.
+        group: Option<Arc<crate::js::GroupShared>>,
+        group_formed: bool,
+        /// The group's requests (`GroupCmd`): new Documents for its
+        /// traversables and released traversables.
+        group_commands: Option<tokio::sync::mpsc::UnboundedReceiver<crate::js::GroupCmd>>,
+        /// Whose turn it is first when several traversables have work of the
+        /// same kind.
+        rotation: usize,
     }
 
+    /// The fields of `LumenPage` that belong to a top-level traversable that
+    /// is not selected (`select_traversable` exchanges them).
+    struct TraversablePage {
+        dom: Rc<RefCell<Dom>>,
+        base: url::Url,
+        outcome: Outcome,
+        started: Instant,
+        last_render: Option<crate::http::RenderedPage>,
+        last_sent_focus: Option<usize>,
+        last_sent_editable_state: Option<crate::js::EditableState>,
+        #[cfg(test)]
+        last_diagnostic_render: Option<String>,
+        live_regions: HashSet<usize>,
+        live_boundaries: HashSet<usize>,
+        boundary_render: HashMap<usize, String>,
+        render_environment_dirty: bool,
+        render_pending: bool,
+        pending_form_acknowledgements: Vec<usize>,
+        hidden: bool,
+        system_focus: bool,
+        reported_title: Option<String>,
+        title_epoch: u64,
+        lifecycle_complete: bool,
+        render_deadline: Option<Instant>,
+        last_render_opportunity: Instant,
+        render_not_before: Instant,
+        animation_schedule: AnimationSchedule,
+        interaction_lookahead: Option<PageCmd>,
+    }
+
+    macro_rules! traversable_page_fields {
+        ($swap:ident) => {
+            $swap!(
+                dom,
+                base,
+                outcome,
+                started,
+                last_render,
+                last_sent_focus,
+                last_sent_editable_state,
+                live_regions,
+                live_boundaries,
+                boundary_render,
+                render_environment_dirty,
+                render_pending,
+                pending_form_acknowledgements,
+                hidden,
+                system_focus,
+                reported_title,
+                title_epoch,
+                lifecycle_complete,
+                render_deadline,
+                last_render_opportunity,
+                render_not_before,
+                animation_schedule,
+                interaction_lookahead,
+            )
+        };
+    }
+
+    impl TraversablePage {
+        /// A traversable presenting `dom`, before its Document has rendered.
+        fn new(dom: Rc<RefCell<Dom>>, base: url::Url, hidden: bool, system_focus: bool) -> Self {
+            let now = Instant::now();
+            Self {
+                dom,
+                base,
+                outcome: Outcome::default(),
+                started: now,
+                last_render: None,
+                last_sent_focus: None,
+                last_sent_editable_state: None,
+                #[cfg(test)]
+                last_diagnostic_render: None,
+                live_regions: HashSet::new(),
+                live_boundaries: HashSet::new(),
+                boundary_render: HashMap::new(),
+                render_environment_dirty: false,
+                render_pending: false,
+                pending_form_acknowledgements: Vec::new(),
+                hidden,
+                system_focus,
+                // The frontend presents a Document without a title by its
+                // address; only a title it has is news.
+                reported_title: Some(String::new()),
+                title_epoch: u64::MAX,
+                lifecycle_complete: false,
+                render_deadline: None,
+                last_render_opportunity: now,
+                render_not_before: now,
+                animation_schedule: AnimationSchedule::default(),
+                interaction_lookahead: None,
+            }
+        }
+
+        /// Exchange these fields with LumenPage's own.
+        fn swap_with(&mut self, page: &mut LumenPage) {
+            macro_rules! swap {
+                ($($field:ident),* $(,)?) => {
+                    $(std::mem::swap(&mut self.$field, &mut page.$field);)*
+                };
+            }
+            traversable_page_fields!(swap);
+            #[cfg(test)]
+            std::mem::swap(
+                &mut self.last_diagnostic_render,
+                &mut page.last_diagnostic_render,
+            );
+        }
+    }
+
+    /// A top-level traversable of the page actor's browsing context group.
+    struct TraversableSlot {
+        id: TraversableId,
+        /// Its top-level Window's global, which the actor enters while it
+        /// works for the traversable; `None` for the engine's default Realm.
+        realm: Option<Value>,
+        /// Its active Document's frontend; `None` once that Document has
+        /// unloaded, until the frontend's navigation brings the next one
+        /// (`GroupCmd::Load`).
+        channels: Option<TraversableChannels>,
+        /// Whether a frontend still holds the traversable
+        /// (`crate::js::TraversableLink`); it is discarded once it neither
+        /// is held nor has a Document's frontend.
+        linked: bool,
+        /// The `LumenPage` fields of a traversable that is not selected.
+        parked: Option<TraversablePage>,
+    }
+
+    /// The actor ends of one Document's frontend channels.
+    struct TraversableChannels {
+        cmds: tokio::sync::mpsc::Receiver<PageCmd>,
+        interactions: tokio::sync::mpsc::Receiver<PageCmd>,
+        hover: tokio::sync::watch::Receiver<PageHover>,
+        events: tokio::sync::mpsc::Sender<PageEvt>,
+    }
+
+    impl TraversableChannels {
+        fn input_waiting(&self) -> bool {
+            !self.interactions.is_empty() || self.hover.has_changed().unwrap_or(false)
+        }
+    }
+
+    /// Make the traversable at `index` the selected one: LumenPage's and
+    /// HostState's fields become its own, and its top-level Realm is
+    /// entered. Returns the index of the previously selected one.
+    fn select_traversable(page: &mut LumenPage, index: usize) -> usize {
+        let previous = page.selected;
+        if previous == index || index >= page.traversables.len() {
+            return previous;
+        }
+        if let Some(entry) = page.realm_entry.take() {
+            page.engine.leave_realm(entry);
+        }
+        let mut incoming = page.traversables[index]
+            .parked
+            .take()
+            .expect("a traversable that is not selected is parked");
+        incoming.swap_with(page);
+        page.traversables[previous].parked = Some(incoming);
+        page.selected = index;
+        let id = page.traversables[index].id;
+        let top_context = page.engine.ctx().host_mut::<HostState>().map(|state| {
+            state.select_traversable(id);
+            state.top_context
+        });
+        if let Some(realm) = page.traversables[index].realm.clone() {
+            match page.engine.enter_realm(&realm) {
+                Ok(entry) => page.realm_entry = Some(entry),
+                Err(_) => page
+                    .outcome
+                    .errors
+                    .push(String::from("top-level traversable: its Realm is gone")),
+            }
+        }
+        // Static module graphs load with the selected traversable's settings
+        // (its Document's URL, cookies and referrer policy).
+        if let Some(context) = top_context {
+            install_context_module_loader(&mut page.engine, context);
+        }
+        previous
+    }
+
+    /// The selected traversable.
+    fn selected_id(page: &LumenPage) -> TraversableId {
+        page.traversables
+            .get(page.selected)
+            .map_or_else(TraversableId::default, |slot| slot.id)
+    }
+
+    /// The index of the traversable `id`, if the group still has it.
+    fn traversable_index(page: &LumenPage, id: TraversableId) -> Option<usize> {
+        page.traversables.iter().position(|slot| slot.id == id)
+    }
+
+    /// The selected traversable's Document frontend's event sender.
+    fn selected_events(page: &LumenPage) -> Option<tokio::sync::mpsc::Sender<PageEvt>> {
+        page.traversables
+            .get(page.selected)
+            .and_then(|slot| slot.channels.as_ref())
+            .map(|channels| channels.events.clone())
+    }
+
+    /// The event loop's next turn, with the index of the traversable it is
+    /// for.
     enum Wake {
-        Interaction(Option<PageCmd>),
-        Cmd(Option<PageCmd>),
-        Hover(Option<PageHover>),
+        Interaction(usize, Option<PageCmd>),
+        Cmd(usize, Option<PageCmd>),
+        Hover(usize, Option<PageHover>),
         Host(Option<LumenHostTask>),
-        Platform,
-        Idle(f64),
-        Timer,
-        Render,
-        Lifecycle,
+        Group(crate::js::GroupCmd),
+        Platform(usize),
+        Idle(usize, f64),
+        Timer(usize),
+        Render(usize),
+        Lifecycle(usize),
         Maintenance,
     }
 
@@ -2775,6 +3446,9 @@ mod desktop {
         pub(super) interactions: tokio::sync::mpsc::Receiver<PageCmd>,
         pub(super) hover: tokio::sync::watch::Receiver<PageHover>,
         pub(super) events: tokio::sync::mpsc::Sender<PageEvt>,
+        /// The engine's browsing context group (`crate::js::GroupShared`).
+        pub(super) group: Arc<crate::js::GroupShared>,
+        pub(super) group_commands: tokio::sync::mpsc::UnboundedReceiver<crate::js::GroupCmd>,
     }
 
     /// Spawn the production Lumen resident realm behind the actor contract
@@ -2793,6 +3467,7 @@ mod desktop {
         env: PageEnv,
     ) -> (PageHandle, tokio::sync::mpsc::Receiver<PageEvt>) {
         let cache = env.cache.clone();
+        let blobs = env.blobs.clone();
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
         let (interaction_tx, interaction_rx) = tokio::sync::mpsc::channel(16);
         let (hover_tx, hover_rx) = tokio::sync::watch::channel(PageHover {
@@ -2802,6 +3477,23 @@ mod desktop {
             metadata: crate::js::PointerMetadata::default(),
         });
         let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
+        // The engine's browsing context group, whose first traversable the
+        // document's handle holds. Built per engine: its link keeps that
+        // engine's interrupt.
+        let group_for = |interrupt: &Arc<lumen::RuntimeInterrupt>| {
+            let life = crate::js::EngineLife::new(interrupt.clone(), cache.clone());
+            let (commands, receiver) = tokio::sync::mpsc::unbounded_channel();
+            let group = crate::js::GroupShared::new(commands, &life, cache.clone(), blobs.clone());
+            let link = group
+                .link(TraversableId::default().0)
+                .expect("the new engine's life is held here");
+            (group, receiver, link)
+        };
+        let interrupt = spare.as_ref().map_or_else(
+            || Arc::new(lumen::RuntimeInterrupt::default()),
+            super::page_spare::SpareEngine::interrupt,
+        );
+        let (group, group_commands, link) = group_for(&interrupt);
         let mut start = PageStart {
             html,
             env,
@@ -2809,27 +3501,32 @@ mod desktop {
             interactions: interaction_rx,
             hover: hover_rx,
             events: event_tx,
+            group,
+            group_commands,
         };
+        let mut link = link;
         if let Some(spare) = spare {
             match spare.claim(start, &cache) {
-                Ok(interrupt) => {
+                Ok(_) => {
                     return (
-                        PageHandle::from_lumen_parts(
-                            cmd_tx,
-                            interaction_tx,
-                            hover_tx,
-                            cache,
-                            interrupt,
-                        ),
+                        PageHandle::from_lumen_parts(cmd_tx, interaction_tx, hover_tx, link),
                         event_rx,
                     );
                 }
                 // The spare's thread is gone (it can only have failed); the
-                // document takes the ordinary cold path.
-                Err(returned) => start = *returned,
+                // document takes the ordinary cold path, with a group of its
+                // own engine (the spare's is released unheard).
+                Err(returned) => {
+                    start = *returned;
+                    let (group, group_commands, cold_link) =
+                        group_for(&Arc::new(lumen::RuntimeInterrupt::default()));
+                    start.group = group;
+                    start.group_commands = group_commands;
+                    link = cold_link;
+                }
             }
         }
-        let interrupt = Arc::new(lumen::RuntimeInterrupt::default());
+        let interrupt = link.interrupt();
         let actor_interrupt = interrupt.clone();
         let spawned = crate::page_threads::spawn(
             page_thread_builder(),
@@ -2845,7 +3542,7 @@ mod desktop {
             // to take its existing CSS-only fallback.
         }
         (
-            PageHandle::from_lumen_parts(cmd_tx, interaction_tx, hover_tx, cache, interrupt),
+            PageHandle::from_lumen_parts(cmd_tx, interaction_tx, hover_tx, link),
             event_rx,
         )
     }
@@ -2867,16 +3564,19 @@ mod desktop {
         let PageStart {
             html,
             env,
-            mut cmds,
-            mut interactions,
-            mut hover,
+            cmds,
+            interactions,
+            hover,
             events,
+            group,
+            group_commands,
         } = start;
         let (host_tx, mut host_rx) = tokio::sync::mpsc::unbounded_channel();
         // A no-network realm does not retain the sender in HostState. Keep the
         // lane open anyway: a closed `recv()` is immediately ready and would
         // otherwise win the actor select before lifecycle/timer/input work.
-        let _host_keepalive = host_tx.clone();
+        // The group's later Documents queue their parser's tasks on it too.
+        let host_tasks = host_tx.clone();
         let mut page = match load_page(
             &html,
             env,
@@ -2892,23 +3592,26 @@ mod desktop {
                 return;
             }
         };
+        page.group = Some(group);
+        page.group_commands = Some(group_commands);
+        page.traversables[0].channels = Some(TraversableChannels {
+            cmds,
+            interactions,
+            hover,
+            events: events.clone(),
+        });
 
         // HTML's parser task has completed through DOMContentLoaded. Expose a
         // rendering opportunity before the separately queued load task; slow
         // dynamically prepared resources can therefore delay load without
         // hiding the interactive document shell.
-        let (mut shell, mut rendered, mut has_interaction) = render_with_observers(&mut page);
+        let (mut shell, mut rendered, mut has_interaction) = render_for_frontend(&mut page);
         page.last_render = Some(rendered.clone());
         #[cfg(test)]
         {
             page.last_diagnostic_render = Some(crate::js::render_canonical(&shell));
         }
-        let mut lifecycle_complete = false;
         let mut lifecycle_submission = None;
-        // HTML leaves selection among task queues to the user agent. Alternate a ready normal
-        // browser-command lane with page-owned work so neither a continuously due timer nor a
-        // continuously replenished frontend queue can exclude the other task sources.
-        let mut prefer_command = true;
 
         // A truly inert document does not need a resident realm. Complete its load task first so
         // a load handler can still create controls, timers, workers, observers, or navigation;
@@ -2918,13 +3621,13 @@ mod desktop {
             prepare_unbounded_task(&interrupt);
             let _ = call_trust(&mut page, "completeDocumentLoad", &[], "load event");
             checkpoint(&mut page, "load event");
-            lifecycle_complete = true;
+            page.lifecycle_complete = true;
             if let Some((url, replace)) = take_navigation(&mut page) {
                 let _ = send_navigation(&mut page, &events, url, replace);
                 return;
             }
             lifecycle_submission = take_form_submit(&mut page);
-            (shell, rendered, has_interaction) = render_with_observers(&mut page);
+            (shell, rendered, has_interaction) = render_for_frontend(&mut page);
             page.last_render = Some(rendered.clone());
             #[cfg(test)]
             {
@@ -2957,58 +3660,820 @@ mod desktop {
         {
             return;
         }
-        if let Some((form, submitter, submission)) = lifecycle_submission {
-            // A form submission navigates (HTML #form-submission-algorithm).
-            abort_for_navigation(&mut page);
-            let _ = events.blocking_send(PageEvt::SubmitForm {
-                form,
-                submitter,
-                submission,
-            });
+        if let Some((form, submitter, submission)) = lifecycle_submission
+            && send_submission(&mut page, &events, form, submitter, submission).is_some()
+        {
             return;
         }
+        drop(events);
+        run_event_loop(&mut page, &host_tasks, &mut host_rx, &interrupt);
+        if let Some(entry) = page.realm_entry.take() {
+            page.engine.leave_realm(entry);
+        }
+    }
 
+    /// A request of the group's frontends (`crate::js::GroupCmd`).
+    fn run_group_command(
+        page: &mut LumenPage,
+        command: crate::js::GroupCmd,
+        host_tasks: &tokio::sync::mpsc::UnboundedSender<LumenHostTask>,
+        host_rx: &mut tokio::sync::mpsc::UnboundedReceiver<LumenHostTask>,
+        interrupt: &Arc<lumen::RuntimeInterrupt>,
+    ) {
+        match command {
+            crate::js::GroupCmd::Release { traversable } => {
+                let Some(index) = traversable_index(page, TraversableId(traversable)) else {
+                    return;
+                };
+                page.traversables[index].linked = false;
+                // A traversable whose Document still has a frontend waits for
+                // it to go (its channels close with the handle).
+                if page.group_formed && page.traversables[index].channels.is_none() {
+                    prepare_unbounded_task(interrupt);
+                    discard_traversable(page, index);
+                }
+            }
+            crate::js::GroupCmd::Load(load) => {
+                prepare_unbounded_task(interrupt);
+                load_traversable_document(page, *load, host_tasks, host_rx);
+            }
+        }
+    }
+
+    /// HTML #destroy-a-document-and-its-descendants for the selected
+    /// traversable's active Document, which its next Document replaces or
+    /// which goes with its traversable (`closing`: its Windows report
+    /// `closed`). Its fetches are aborted, its child navigables destroyed,
+    /// its timers, tasks and observers discarded and its Window's settings
+    /// released; its media stop.
+    fn destroy_active_document(page: &mut LumenPage, closing: bool) {
+        let context = page
+            .engine
+            .ctx()
+            .host_mut::<HostState>()
+            .map_or(0, |state| state.top_context);
+        abort_document(page.engine.ctx(), context);
+        let _ = call_trust(
+            page,
+            "destroyTopLevelDocument",
+            &[Value::Bool(closing)],
+            "destroy document",
+        );
+        checkpoint(page, "destroy document");
+        if let Some(state) = page.engine.ctx().host_mut::<HostState>() {
+            let dom = state.dom.clone();
+            let dom = dom.borrow();
+            state.media.release_elements(|node| dom.is_valid(node));
+            // The default Realm's Window releases no settings of its own
+            // (`__dom_release_job_context` keeps context 0).
+            if context == 0 {
+                state.release_window_settings(0);
+            }
+        }
+    }
+
+    /// HTML #destroy-a-top-level-traversable for the traversable at `index`:
+    /// its active Document is destroyed (its Windows report `closed` from
+    /// now on) and the group forgets it.
+    fn discard_traversable(page: &mut LumenPage, index: usize) {
+        if index >= page.traversables.len() {
+            return;
+        }
+        select_traversable(page, index);
+        destroy_active_document(page, true);
+        let id = page.traversables[index].id;
+        if page.traversables.len() > 1 {
+            select_traversable(page, if index == 0 { 1 } else { 0 });
+        } else if let Some(entry) = page.realm_entry.take() {
+            page.engine.leave_realm(entry);
+        }
+        page.traversables.remove(index);
+        if page.selected > index {
+            page.selected -= 1;
+        }
+        if let Some(state) = page.engine.ctx().host_mut::<HostState>() {
+            state.forget_traversable(id);
+        }
+        if let Some(group) = &page.group {
+            group.set_members(page.traversables.len());
+        }
+    }
+
+    /// HTML #navigate's end for a traversable of the group whose frontend
+    /// fetched its next Document (`GroupCmd::Load`; HTML keeps a navigable
+    /// in its browsing context group): its previous Document unloads (unless
+    /// it already has) and is destroyed, and the new one is created in a new
+    /// Window Realm of this engine, parsed, and shown to the frontend exactly
+    /// as a new page actor's first Document is. A group keeps every
+    /// Document of its traversables resident, inert or not.
+    fn load_traversable_document(
+        page: &mut LumenPage,
+        load: crate::js::GroupLoad,
+        host_tasks: &tokio::sync::mpsc::UnboundedSender<LumenHostTask>,
+        host_rx: &mut tokio::sync::mpsc::UnboundedReceiver<LumenHostTask>,
+    ) {
+        let crate::js::GroupLoad {
+            traversable,
+            html,
+            env,
+            cmds,
+            interactions,
+            hover,
+            events,
+        } = load;
+        // A traversable the group no longer has: dropping `events` tells the
+        // frontend, which falls back as for a page actor that failed.
+        let Some(index) = traversable_index(page, TraversableId(traversable)) else {
+            return;
+        };
+        let id = page.traversables[index].id;
+        select_traversable(page, index);
+        if page.traversables[index].channels.take().is_some() {
+            let _ = call_trust(page, "unloadTree", &[], "unload");
+            checkpoint(page, "unload");
+        }
+        destroy_active_document(page, false);
+
+        // HTML #initialise-the-document-object, in the group's arena family.
+        let ids = page.dom.borrow_mut().share_identities();
+        let parsed = parse_navigation_document(&html, &env, Some(ids));
+        let ParsedDocument {
+            dom,
+            viewport,
+            response_url,
+            base,
+            parser_watermark,
+            scripts,
+            referrer_policy,
+            document_creation_time,
+        } = parsed;
+        {
+            let mut dom = dom.borrow_mut();
+            dom.set_doc_url(Some(base.clone()));
+            // Its script-created nodes join the joint DOM/JavaScript heap.
+            dom.enable_gc_allocation_leases();
+        }
+        // HTML #resetBCName: another origin's Document clears the target
+        // name of a top-level traversable that is not an auxiliary browsing
+        // context with an opener (the platform checks the opener).
+        let previous_origin = page.engine.ctx().host_mut::<HostState>().map(|state| {
+            let top = state.top_context;
+            realm_origin(state, top)
+        });
+        let reset_target_name =
+            previous_origin.is_some_and(|origin| origin != response_url.origin());
+        let Some(context) = page.engine.ctx().host_mut::<HostState>().map(|state| {
+            let context = state.next_window_context;
+            state.next_window_context = context.saturating_add(1);
+            let mut fresh = TraversableHost::new(
+                dom.clone(),
+                base.clone(),
+                viewport,
+                env.device_pixel_ratio,
+                context,
+            );
+            fresh.screen_position.set(env.screen_position);
+            // The previous Document's presentation state goes with it.
+            fresh.swap_with(state);
+            state.traversables.contexts.insert(context, id);
+            // HTML #document-base-url affects resolution, never the
+            // initiating environment's identity (see `load_page`).
+            state
+                .window_request_urls
+                .insert(context, response_url.clone());
+            state.referrer_policies.insert(context, referrer_policy);
+            context
+        }) else {
+            return;
+        };
+        let mut fresh =
+            TraversablePage::new(dom, base, env.traversable.hidden, env.traversable.focused);
+        fresh.swap_with(page);
+        drop(fresh);
+
+        // The new Document's Window, in its own Realm of this Agent.
+        if let Some(entry) = page.realm_entry.take() {
+            page.engine.leave_realm(entry);
+        }
+        let config = format!(
+            "{}globalThis.__trust_cfg.hostSettingsContext = {context}; globalThis.__trust_cfg.agentTimeOffset = {}; globalThis.__trust_cfg.traversableId = {}; globalThis.__trust_cfg.resetTargetName = {reset_target_name};",
+            main_window_config(
+                &response_url,
+                &env.referrer,
+                viewport,
+                env.device_pixel_ratio,
+                env.navigation_timing
+                    .as_ref()
+                    .map_or(serde_json::Value::Null, |timing| {
+                        let mut data = timing.navigation_data(response_url.as_str());
+                        data["legacy:domLoading"] =
+                            serde_json::json!(document_creation_time.floor());
+                        data
+                    }),
+                env.last_modified,
+                env.fullscreen_supported,
+                !env.terminal_presentation,
+                MainWindowTraces::from_environment(),
+                env.traversable,
+            ),
+            agent_time(page),
+            id.0,
+        );
+        match create_top_level_realm(&mut page.engine, context, &config) {
+            Ok((realm, entry)) => {
+                page.traversables[index].realm = Some(realm);
+                page.realm_entry = Some(entry);
+            }
+            Err(error) => {
+                page.outcome.errors.push(error);
+                return;
+            }
+        }
+        eval_main_page_diagnostic_init(
+            &mut page.engine,
+            std::env::var("TRUST_LUMEN_DIAGNOSTIC_INIT").ok().as_deref(),
+            &mut page.outcome.errors,
+        );
+        for timing in &env.resource_timings {
+            record_resource_timing_ref(page.engine.ctx(), timing);
+        }
+        page.traversables[index].channels = Some(TraversableChannels {
+            cmds,
+            interactions,
+            hover,
+            events: events.clone(),
+        });
+        if let Some(state) = page.engine.ctx().host_mut::<HostState>() {
+            state.parser = ParserProgress {
+                active: true,
+                watermark: parser_watermark,
+                ..ParserProgress::default()
+            };
+        }
+        install_context_module_loader(&mut page.engine, context);
+        if !run_document_parser(
+            page,
+            &html,
+            &env,
+            host_tasks,
+            host_rx,
+            Some(&events),
+            scripts,
+            parser_watermark,
+        ) {
+            page.traversables[index].channels = None;
+            return;
+        }
+        // The shell's rendering opportunity before the load task, as for a
+        // page actor's first Document.
+        let (shell, rendered, _) = render_for_frontend(page);
+        page.last_render = Some(rendered.clone());
+        #[cfg(test)]
+        {
+            page.last_diagnostic_render = Some(crate::js::render_canonical(&shell));
+        }
+        let mut outcome = std::mem::take(&mut page.outcome);
+        outcome.elapsed = page.started.elapsed();
+        outcome.rendered = Some(Box::new(rendered));
+        outcome.referrer_policy = top_level_referrer_policy(page);
+        if events
+            .blocking_send(PageEvt::Updated {
+                html: shell,
+                outcome,
+            })
+            .is_err()
+        {
+            page.traversables[index].channels = None;
+        }
+    }
+
+    /// Give each auxiliary browsing context that a page created during the
+    /// last task (`host_create_auxiliary_traversable`) its place in the event
+    /// loop and its frontend: its initial `about:blank` Document's first
+    /// rendering is its own frontend's first event, and its opener's frontend
+    /// learns of it (`PageEvt::OpenAuxiliary`), which presents it.
+    fn adopt_created_traversables(page: &mut LumenPage) {
+        let created = match page.engine.ctx().host_mut::<HostState>() {
+            Some(state) if !state.traversables.created.is_empty() => {
+                std::mem::take(&mut state.traversables.created)
+            }
+            _ => return,
+        };
+        let Some(group) = page.group.clone() else {
+            return;
+        };
+        for created in created {
+            let parts = page.engine.ctx().host_mut::<HostState>().and_then(|state| {
+                let (_, host) = state
+                    .traversables
+                    .parked
+                    .iter()
+                    .find(|(id, _)| *id == created.id)?;
+                let realm = state.window_realms.get(&host.top_context).cloned()?;
+                Some((host.dom.clone(), host.base.clone(), realm))
+            });
+            let Some((dom, base, realm)) = parts else {
+                continue;
+            };
+            // HTML #completely-finish-loading ran for the initial about:blank.
+            let mut parked = TraversablePage::new(dom, base, false, page.system_focus);
+            parked.lifecycle_complete = true;
+            let (cmd_tx, cmds) = tokio::sync::mpsc::channel(16);
+            let (interaction_tx, interactions) = tokio::sync::mpsc::channel(16);
+            let (hover_tx, hover) = tokio::sync::watch::channel(PageHover {
+                node: None,
+                x: 0.0,
+                y: 0.0,
+                metadata: crate::js::PointerMetadata::default(),
+            });
+            let (events, event_rx) = tokio::sync::mpsc::channel(16);
+            page.traversables.push(TraversableSlot {
+                id: created.id,
+                realm: Some(realm),
+                channels: Some(TraversableChannels {
+                    cmds,
+                    interactions,
+                    hover,
+                    events: events.clone(),
+                }),
+                linked: true,
+                parked: Some(parked),
+            });
+            page.group_formed = true;
+            group.set_members(page.traversables.len());
+            let Some(link) = group.link(created.id.0) else {
+                // No frontend keeps the engine: the traversable goes again
+                // once its channels close below.
+                continue;
+            };
+            let index = page.traversables.len() - 1;
+            let previous = select_traversable(page, index);
+            let (shell, rendered, _) = render_for_frontend(page);
+            page.last_render = Some(rendered.clone());
+            #[cfg(test)]
+            {
+                page.last_diagnostic_render = Some(crate::js::render_canonical(&shell));
+            }
+            let mut outcome = std::mem::take(&mut page.outcome);
+            outcome.elapsed = page.started.elapsed();
+            outcome.rendered = Some(Box::new(rendered));
+            let _ = events.blocking_send(PageEvt::Updated {
+                html: shell,
+                outcome,
+            });
+            select_traversable(page, previous);
+            let auxiliary = crate::js::AuxiliaryTraversable {
+                handle: PageHandle::from_lumen_parts(cmd_tx, interaction_tx, hover_tx, link),
+                events: event_rx,
+                name: created.name,
+                popup: created.popup,
+                storage_shed: created.storage_shed,
+            };
+            // Without its opener's frontend nobody presents it: dropping it
+            // releases the traversable, which is then discarded.
+            if let Some(opener) = traversable_index(page, created.creator)
+                .and_then(|index| page.traversables[index].channels.as_ref())
+                .map(|channels| channels.events.clone())
+            {
+                let _ = opener.blocking_send(PageEvt::OpenAuxiliary(Box::new(auxiliary)));
+            }
+        }
+    }
+
+    /// The Agent's clock, which every Window Realm's timers are kept in
+    /// (`trust.now()` of any traversable's top-level Realm).
+    fn agent_time(page: &mut LumenPage) -> f64 {
+        trust_number(page, "now").unwrap_or(0.0)
+    }
+
+    /// A new Window Realm in the engine for a top-level traversable of the
+    /// group (HTML #create-a-new-browsing-context-and-document): rooted as
+    /// Window `context` before its platform bootstrap reads `config` (a
+    /// `main_window_config` script). It is entered on return.
+    fn create_top_level_realm(
+        engine: &mut lumen::Engine,
+        context: u64,
+        config: &str,
+    ) -> Result<(Value, lumen::RealmEntry), String> {
+        // Realm creation and bootstrap form one publication: no collection
+        // may see a partially initialized set of intrinsics.
+        engine.ctx().suspend_gc();
+        let realm = engine.ctx().create_embed_realm();
+        if let Some(state) = engine.ctx().host_mut::<HostState>() {
+            state.window_realms.insert(context, realm.clone());
+        }
+        let installed = engine.ctx().with_embed_realm(&realm, |realm_ctx| {
+            realm_ctx.set_host_job_context(context);
+            for &(name, len, host_fn) in LUMEN_HOST_FUNCTIONS {
+                realm_ctx.define_embed_global(name, len, host_fn);
+            }
+        });
+        let created = match installed {
+            Err(_) => Err(String::from("Window Realm: it could not be created")),
+            Ok(()) => match engine.enter_realm(&realm) {
+                Err(_) => Err(String::from("Window Realm: it could not be entered")),
+                Ok(entry) => match eval(engine, config, "TRust configuration")
+                    .and_then(|()| eval_platform_prelude(engine))
+                {
+                    Ok(()) => Ok((realm, entry)),
+                    Err(error) => {
+                        engine.leave_realm(entry);
+                        Err(error)
+                    }
+                },
+            },
+        };
+        engine.ctx().resume_gc();
+        if created.is_err()
+            && let Some(state) = engine.ctx().host_mut::<HostState>()
+        {
+            state.window_realms.remove(&context);
+            state.window_request_urls.remove(&context);
+            state.forget_realm_origin(context);
+        }
+        created
+    }
+
+    /// What one traversable's Documents could do in a turn of the event loop
+    /// (`plan_turn`).
+    struct TurnPlan {
+        index: usize,
+        deadline: Option<f64>,
+        timer_due: bool,
+        animation_wake: Option<Instant>,
+        render_due: bool,
+        platform_ready: bool,
+        idle_deadline: Option<f64>,
+        load_ready: bool,
+    }
+
+    /// The selected traversable's runnable work at Agent time `now`, arming
+    /// or dropping its rendering deadline on the way.
+    fn plan_turn(
+        page: &mut LumenPage,
+        index: usize,
+        now: f64,
+        interaction_burst: bool,
+    ) -> TurnPlan {
+        let deadline = trust_number(page, "nextDeadline");
+        let timer_due = deadline.is_some_and(|deadline| deadline <= now);
+        if page.dom.borrow().css_transition_work_pending()
+            || page.dom.borrow().css_animation_events_pending()
+            || trust_bool(page, "hasRenderingUpdate")
+        {
+            page.render_pending = true;
+        }
+        // CSS Animations 1 #animations: running style-origin animations
+        // need rendering opportunities only while they can be seen.
+        let mut schedule = std::mem::take(&mut page.animation_schedule);
+        let animation_wake = css_animation_wake(page, &mut schedule);
+        page.animation_schedule = schedule;
+        let animation_due = animation_wake.is_some_and(|at| at <= Instant::now());
+        if !page.render_pending && !animation_due {
+            // An animation frame queued before the animation became
+            // throttled (scrolled away, occluded) is no longer needed.
+            page.render_deadline = None;
+        }
+        if page.hidden {
+            // HTML #update-the-rendering: a hidden Document has no
+            // rendering opportunity; its rendering waits until shown.
+            page.render_deadline = None;
+        } else if (page.render_pending || animation_due)
+            && (page.render_deadline.is_none() || interaction_burst)
+        {
+            // Input need not wait an extra frame after its task finishes.
+            // Promote an already queued background rendering deadline too.
+            // Keep the ordinary-task coalescing interval for background
+            // messages/resources (HTML #event-loop-processing-model).
+            page.render_deadline = Some(if interaction_burst {
+                page.last_render_opportunity + RENDER_INTERVAL
+            } else {
+                (Instant::now() + RENDER_INTERVAL).max(page.render_not_before)
+            });
+        }
+        let render_due = page
+            .render_deadline
+            .is_some_and(|deadline| deadline <= Instant::now());
+        let platform_ready = trust_bool(page, "hasPlatformTask");
+        let idle_deadline = if !platform_ready && trust_bool(page, "hasIdleRequest") {
+            let end = deadline.map_or(now + 50.0, |deadline| deadline.min(now + 50.0));
+            (end > now).then_some(end)
+        } else {
+            None
+        };
+        let load_ready = !page.lifecycle_complete
+            && pending_resources(page) == 0
+            && !trust_bool(page, "loadEventDelayed");
+        TurnPlan {
+            index,
+            deadline,
+            timer_due,
+            animation_wake,
+            render_due,
+            platform_ready,
+            idle_deadline,
+            load_ready,
+        }
+    }
+
+    /// The traversables in this turn's order: whose turn is first rotates,
+    /// so that one traversable's stream of work cannot exclude another's.
+    fn turn_order(page: &LumenPage) -> impl Iterator<Item = usize> + Clone + use<> {
+        let count = page.traversables.len();
+        let first = page.rotation % count.max(1);
+        (0..count).map(move |offset| (first + offset) % count)
+    }
+
+    /// The traversable at `index`'s queued interaction, the one taken ahead
+    /// of its turn first.
+    fn take_interaction(page: &mut LumenPage, index: usize) -> Option<PageCmd> {
+        let lookahead = if index == page.selected {
+            page.interaction_lookahead.take()
+        } else {
+            page.traversables
+                .get_mut(index)?
+                .parked
+                .as_mut()?
+                .interaction_lookahead
+                .take()
+        };
+        lookahead.or_else(|| {
+            page.traversables
+                .get_mut(index)?
+                .channels
+                .as_mut()?
+                .interactions
+                .try_recv()
+                .ok()
+        })
+    }
+
+    fn take_any_interaction(
+        page: &mut LumenPage,
+        order: impl Iterator<Item = usize>,
+    ) -> Option<(usize, PageCmd)> {
+        for index in order {
+            if let Some(command) = take_interaction(page, index) {
+                return Some((index, command));
+            }
+        }
+        None
+    }
+
+    fn take_any_hover(
+        page: &mut LumenPage,
+        order: impl Iterator<Item = usize>,
+    ) -> Option<(usize, PageHover)> {
+        for index in order {
+            let Some(channels) = page.traversables[index].channels.as_mut() else {
+                continue;
+            };
+            if channels.hover.has_changed().unwrap_or(false) {
+                return Some((index, *channels.hover.borrow_and_update()));
+            }
+        }
+        None
+    }
+
+    /// A queued browser command: the group's first (a Document the
+    /// frontend's navigation brought), then each traversable's in turn.
+    fn take_any_command(page: &mut LumenPage, order: impl Iterator<Item = usize>) -> Option<Wake> {
+        if let Some(command) = page
+            .group_commands
+            .as_mut()
+            .and_then(|commands| commands.try_recv().ok())
+        {
+            return Some(Wake::Group(command));
+        }
+        for index in order {
+            let Some(channels) = page.traversables[index].channels.as_mut() else {
+                continue;
+            };
+            if let Ok(command) = channels.cmds.try_recv() {
+                return Some(Wake::Cmd(index, Some(command)));
+            }
+        }
+        None
+    }
+
+    /// Whether a frontend has input waiting for any traversable.
+    fn input_waiting(page: &LumenPage) -> bool {
+        page.interaction_lookahead.is_some()
+            || page.traversables.iter().any(|slot| {
+                slot.parked
+                    .as_ref()
+                    .is_some_and(|parked| parked.interaction_lookahead.is_some())
+                    || slot
+                        .channels
+                        .as_ref()
+                        .is_some_and(TraversableChannels::input_waiting)
+            })
+    }
+
+    /// The rendering deadline of the traversable at `index`.
+    fn render_deadline_of(page: &LumenPage, index: usize) -> Option<Instant> {
+        if index == page.selected {
+            page.render_deadline
+        } else {
+            page.traversables
+                .get(index)?
+                .parked
+                .as_ref()?
+                .render_deadline
+        }
+    }
+
+    /// What woke a parked actor (`wait_for_work`).
+    enum Ready {
+        Interaction(usize, Option<PageCmd>),
+        Hover(usize, bool),
+        Host(Option<LumenHostTask>),
+        Cmd(usize, Option<PageCmd>),
+        Group(Option<crate::js::GroupCmd>),
+        Timeout,
+    }
+
+    /// Park until a frontend, the network or the group has work, or `wait`
+    /// passes. Input is preferred, then host tasks, then commands, as the
+    /// event loop's own selection does.
+    async fn wait_for_work(
+        traversables: &mut [TraversableSlot],
+        host_rx: &mut tokio::sync::mpsc::UnboundedReceiver<LumenHostTask>,
+        mut group_commands: Option<&mut tokio::sync::mpsc::UnboundedReceiver<crate::js::GroupCmd>>,
+        wait: Option<Duration>,
+    ) -> Ready {
+        type HoverChange<'a> = std::pin::Pin<
+            Box<dyn Future<Output = Result<(), tokio::sync::watch::error::RecvError>> + 'a>,
+        >;
+        struct Lane<'a> {
+            index: usize,
+            cmds: &'a mut tokio::sync::mpsc::Receiver<PageCmd>,
+            interactions: &'a mut tokio::sync::mpsc::Receiver<PageCmd>,
+            hover: HoverChange<'a>,
+        }
+        let mut lanes: Vec<Lane<'_>> = traversables
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(index, slot)| {
+                let TraversableChannels {
+                    cmds,
+                    interactions,
+                    hover,
+                    ..
+                } = slot.channels.as_mut()?;
+                Some(Lane {
+                    index,
+                    cmds,
+                    interactions,
+                    hover: Box::pin(hover.changed()),
+                })
+            })
+            .collect();
+        let mut sleep = std::pin::pin!(sleep_or_pending(wait));
+        std::future::poll_fn(|cx| {
+            use std::task::Poll;
+            for lane in &mut lanes {
+                if let Poll::Ready(command) = lane.interactions.poll_recv(cx) {
+                    return Poll::Ready(Ready::Interaction(lane.index, command));
+                }
+            }
+            for lane in &mut lanes {
+                if let Poll::Ready(changed) = lane.hover.as_mut().poll(cx) {
+                    return Poll::Ready(Ready::Hover(lane.index, changed.is_ok()));
+                }
+            }
+            if let Poll::Ready(task) = host_rx.poll_recv(cx) {
+                return Poll::Ready(Ready::Host(task));
+            }
+            for lane in &mut lanes {
+                if let Poll::Ready(command) = lane.cmds.poll_recv(cx) {
+                    return Poll::Ready(Ready::Cmd(lane.index, command));
+                }
+            }
+            if let Some(commands) = group_commands.as_deref_mut()
+                && let Poll::Ready(command) = commands.poll_recv(cx)
+            {
+                return Poll::Ready(Ready::Group(command));
+            }
+            if sleep.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(Ready::Timeout);
+            }
+            Poll::Pending
+        })
+        .await
+    }
+
+    /// Finish the selected traversable's turn (`finish_internal_task`).
+    fn finish_selected(page: &mut LumenPage) -> bool {
+        match selected_events(page) {
+            Some(events) => finish_internal_task(page, &events),
+            None => true,
+        }
+    }
+
+    /// Finish the turn for every traversable with a Document frontend but
+    /// `except`, whose turn its task finished: the Windows of a browsing
+    /// context group reach each other's Documents synchronously, so any task
+    /// may have changed any of them. Returns those whose frontend went away.
+    fn finish_traversables(page: &mut LumenPage, except: Option<usize>) -> Vec<usize> {
+        let mut ended = Vec::new();
+        for index in 0..page.traversables.len() {
+            if Some(index) == except || page.traversables[index].channels.is_none() {
+                continue;
+            }
+            select_traversable(page, index);
+            if !finish_selected(page) {
+                ended.push(index);
+            }
+        }
+        ended
+    }
+
+    /// Run a host task with the traversable it belongs to selected.
+    fn dispatch_page_host_task(page: &mut LumenPage, task: LumenHostTask) {
+        if page.traversables.len() > 1 {
+            let target = page
+                .engine
+                .ctx()
+                .host_mut::<HostState>()
+                .and_then(|state| host_task_traversable(state, &task));
+            if let Some(index) = target.and_then(|id| traversable_index(page, id)) {
+                select_traversable(page, index);
+            }
+        }
+        if let Err(error) = dispatch_host_task(&mut page.engine, task) {
+            page.outcome.errors.push(error);
+        }
+    }
+
+    /// The frontend of the Document of the traversable at `index` went away:
+    /// it unloaded, or its frontend let it go. Whether the actor goes on.
+    fn end_document_frontend(page: &mut LumenPage, index: usize) -> bool {
+        // An engine that never had a second traversable ends with its first
+        // Document's frontend, as a page actor always has; so does one whose
+        // engine failed.
+        if !page.group_formed || page.outcome.panicked {
+            return false;
+        }
+        let Some(slot) = page.traversables.get_mut(index) else {
+            return true;
+        };
+        slot.channels = None;
+        if !slot.linked {
+            discard_traversable(page, index);
+        }
+        !page.traversables.is_empty()
+    }
+
+    /// The resident page actor's event loop (HTML #event-loop-processing-
+    /// model) over the top-level traversables of its browsing context group:
+    /// one Agent, one event loop, each traversable's Documents with their own
+    /// frontend, rendering opportunities and lifecycle.
+    fn run_event_loop(
+        page: &mut LumenPage,
+        host_tasks: &tokio::sync::mpsc::UnboundedSender<LumenHostTask>,
+        host_rx: &mut tokio::sync::mpsc::UnboundedReceiver<LumenHostTask>,
+        interrupt: &Arc<lumen::RuntimeInterrupt>,
+    ) {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
             .expect("trust Lumen page actor runtime");
         let wall_origin = Instant::now();
-        let mut virtual_origin = trust_number(&mut page, "now").unwrap_or(0.0);
+        let mut virtual_origin = trust_number(page, "now").unwrap_or(0.0);
+        // HTML leaves selection among task queues to the user agent. Alternate a ready normal
+        // browser-command lane with page-owned work so neither a continuously due timer nor a
+        // continuously replenished frontend queue can exclude the other task sources.
+        let mut prefer_command = true;
         // Rotate background sources independently of input and rendering.
         // Resetting this preference on every key/frame lets a stream of short
         // timers consume every service opportunity before ready networking.
         let mut prefer_timer = false;
         let mut prefer_platform = false;
         let mut deferred_host_task = None;
-        let mut render_deadline = None;
-        let mut last_render_opportunity = Instant::now();
-        let mut render_not_before = last_render_opportunity;
+        page.last_render_opportunity = Instant::now();
+        page.render_not_before = page.last_render_opportunity;
         let mut input_burst_budget = INPUT_BURST_BUDGET;
         let mut interaction_burst_started: Option<Instant> = None;
         let mut background_service: Option<(Instant, usize)> = None;
         let mut task_gc_defer_until: Option<Instant> = None;
-        let mut animation_schedule = AnimationSchedule::default();
         // Whether anything happened since the actor last asked whether the
         // document has become inert (see `retire_if_inert`).
         let mut retirement_check_due = true;
+        let mut plans: Vec<TurnPlan> = Vec::with_capacity(1);
 
-        // An interaction taken from the queue ahead of its turn (see the
-        // primary release below); it is the head of the interaction queue.
-        let mut interaction_lookahead: Option<PageCmd> = None;
         'event_loop: loop {
             if matches!(
                 interrupt.current_reason(),
                 Some(lumen::InterruptReason::Cancelled)
-            ) {
+            ) || page.traversables.is_empty()
+            {
                 break;
             }
             if task_gc_defer_until.is_some_and(|until| until <= Instant::now()) {
                 task_gc_defer_until = None;
             }
-            let defer_task_gc = task_gc_defer_until.is_some()
-                || interaction_lookahead.is_some()
-                || !interactions.is_empty()
-                || hover.has_changed().unwrap_or(false);
+            let defer_task_gc = task_gc_defer_until.is_some() || input_waiting(page);
             page.engine.defer_task_garbage_collection(defer_task_gc);
             if !defer_task_gc && page.engine.has_pending_task_garbage_collection() {
                 let started = Instant::now();
@@ -3021,57 +4486,69 @@ mod desktop {
                 }
             }
             let elapsed = wall_origin.elapsed().as_secs_f64() * 1000.0;
-            let observed_now = trust_number(&mut page, "now").unwrap_or(virtual_origin + elapsed);
+            let observed_now = trust_number(page, "now").unwrap_or(virtual_origin + elapsed);
             let now = observed_now.max(virtual_origin + elapsed);
             virtual_origin = now - elapsed;
-            let deadline = trust_number(&mut page, "nextDeadline");
-            let timer_due = deadline.is_some_and(|deadline| deadline <= now);
-            if page.dom.borrow().css_transition_work_pending()
-                || page.dom.borrow().css_animation_events_pending()
-                || trust_bool(&mut page, "hasRenderingUpdate")
-            {
-                page.render_pending = true;
-            }
-            // CSS Animations 1 #animations: running style-origin animations
-            // need rendering opportunities only while they can be seen.
-            let animation_wake = css_animation_wake(&mut page, &mut animation_schedule);
-            let animation_due = animation_wake.is_some_and(|at| at <= Instant::now());
-            if !page.render_pending && !animation_due {
-                // An animation frame queued before the animation became
-                // throttled (scrolled away, occluded) is no longer needed.
-                render_deadline = None;
-            }
-            if (page.render_pending || animation_due)
-                && (render_deadline.is_none() || interaction_burst_started.is_some())
-            {
-                // Input need not wait an extra frame after its task finishes.
-                // Promote an already queued background rendering deadline too.
-                // Keep the ordinary-task coalescing interval for background
-                // messages/resources (HTML #event-loop-processing-model).
-                let origin = if interaction_burst_started.is_some() {
-                    last_render_opportunity
-                } else {
-                    Instant::now()
-                };
-                render_deadline = Some(if interaction_burst_started.is_some() {
-                    origin + RENDER_INTERVAL
-                } else {
-                    (origin + RENDER_INTERVAL).max(render_not_before)
-                });
-            }
-            let render_due = render_deadline.is_some_and(|deadline| deadline <= Instant::now());
-            let platform_ready = trust_bool(&mut page, "hasPlatformTask");
-            let idle_deadline = if !platform_ready && trust_bool(&mut page, "hasIdleRequest") {
-                let end = deadline.map_or(now + 50.0, |deadline| deadline.min(now + 50.0));
-                (end > now).then_some(end)
-            } else {
-                None
-            };
-            let load_ready = !lifecycle_complete
-                && pending_resources(&mut page) == 0
-                && !trust_bool(&mut page, "loadEventDelayed");
 
-            let mut immediate = None;
+            // Each traversable with an active Document's frontend: its
+            // timers, rendering, tasks and load (HTML #event-loop-processing-
+            // model is the Agent's; the Documents are each traversable's).
+            page.rotation = page.rotation.wrapping_add(1);
+            plans.clear();
+            for index in turn_order(page) {
+                if page.traversables[index].channels.is_none() {
+                    continue;
+                }
+                select_traversable(page, index);
+                plans.push(plan_turn(
+                    page,
+                    index,
+                    now,
+                    interaction_burst_started.is_some(),
+                ));
+            }
+            let timer_plan = plans
+                .iter()
+                .filter(|plan| plan.deadline.is_some())
+                .min_by(|a, b| {
+                    a.deadline
+                        .partial_cmp(&b.deadline)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+            let deadline = timer_plan.and_then(|plan| plan.deadline);
+            let timer_due = timer_plan.is_some_and(|plan| plan.timer_due);
+            let timer_index = timer_plan.map_or(0, |plan| plan.index);
+            let render_index = plans
+                .iter()
+                .find(|plan| plan.render_due)
+                .map(|plan| plan.index);
+            let platform_index = plans
+                .iter()
+                .find(|plan| plan.platform_ready)
+                .map(|plan| plan.index);
+            let load_index = plans
+                .iter()
+                .find(|plan| plan.load_ready)
+                .map(|plan| plan.index);
+            // An idle period ends before any traversable's next timer.
+            let idle = plans
+                .iter()
+                .find_map(|plan| plan.idle_deadline.map(|end| (plan.index, end)))
+                .map(|(index, end)| (index, deadline.map_or(end, |deadline| end.min(deadline))))
+                .filter(|(_, end)| *end > now);
+
+            // A Document whose frontend has gone (its commands drained): the
+            // event loop may never park while others keep it busy, so look
+            // for it every turn, before anything else.
+            let mut immediate = page
+                .traversables
+                .iter()
+                .position(|slot| {
+                    slot.channels.as_ref().is_some_and(|channels| {
+                        channels.cmds.is_closed() && channels.cmds.is_empty()
+                    })
+                })
+                .map(|index| Wake::Cmd(index, None));
             // User interaction retains priority and FIFO order, but a stream
             // of already queued native keys must leave rendering/timers able
             // to run. HTML #event-loop-processing-model permits this bounded
@@ -3084,54 +4561,60 @@ mod desktop {
                 count == 0 || (count < 8 && started.elapsed() < BACKGROUND_SERVICE_BUDGET)
             }) || interaction_burst_started
                 .is_some_and(|started| started.elapsed() >= input_burst_budget);
-            if !yield_interactions
-                && let Some(command) =
-                    next_interaction(&mut interaction_lookahead, &mut interactions)
+            if immediate.is_some() {
+                // That Document's frontend leaving comes first.
+            } else if !yield_interactions
+                && let Some((index, command)) = take_any_interaction(page, turn_order(page))
             {
-                immediate = Some(Wake::Interaction(Some(command)));
-            } else if !yield_interactions && hover.has_changed().unwrap_or(false) {
-                immediate = Some(Wake::Hover(Some(*hover.borrow_and_update())));
+                immediate = Some(Wake::Interaction(index, Some(command)));
+            } else if !yield_interactions
+                && let Some((index, hover)) = take_any_hover(page, turn_order(page))
+            {
+                immediate = Some(Wake::Hover(index, Some(hover)));
             // HTML §8.1.7 lets a user agent choose among runnable task queues while preserving
             // FIFO order within each task source. Browser-state changes such as a viewport resize
             // must be selected promptly: putting this bounded queue behind every already-due
             // author timer lets a busy page starve its own resize task forever.
-            } else if prefer_command && let Ok(command) = cmds.try_recv() {
-                immediate = Some(Wake::Cmd(Some(command)));
-            } else if render_due {
-                immediate = Some(Wake::Render);
-            } else if platform_ready && prefer_platform && (!timer_due || !prefer_timer) {
+            } else if prefer_command && let Some(wake) = take_any_command(page, turn_order(page)) {
+                immediate = Some(wake);
+            } else if let Some(index) = render_index {
+                immediate = Some(Wake::Render(index));
+            } else if let Some(index) = platform_index
+                && prefer_platform
+                && (!timer_due || !prefer_timer)
+            {
                 // HTML #event-loop-processing-model permits queue selection
                 // policy, but a stream of ready resource completions must not
                 // starve posted messages or other runnable platform tasks.
-                immediate = Some(Wake::Platform);
+                immediate = Some(Wake::Platform(index));
             } else if let Some(task) = deferred_host_task
                 .take()
                 .or_else(|| host_rx.try_recv().ok())
             {
                 if timer_due && prefer_timer {
                     deferred_host_task = Some(task);
-                    immediate = Some(Wake::Timer);
+                    immediate = Some(Wake::Timer(timer_index));
                 } else {
                     immediate = Some(Wake::Host(Some(task)));
                 }
-            } else if load_ready {
-                immediate = Some(Wake::Lifecycle);
-            } else if platform_ready && (!timer_due || !prefer_timer) {
-                immediate = Some(Wake::Platform);
+            } else if let Some(index) = load_index {
+                immediate = Some(Wake::Lifecycle(index));
+            } else if let Some(index) = platform_index
+                && (!timer_due || !prefer_timer)
+            {
+                immediate = Some(Wake::Platform(index));
             } else if timer_due {
-                immediate = Some(Wake::Timer);
-            } else if let Ok(command) = cmds.try_recv() {
+                immediate = Some(Wake::Timer(timer_index));
+            } else if let Some(wake) = take_any_command(page, turn_order(page)) {
                 // No page-owned source was runnable, so drain the command lane
                 // without manufacturing an idle turn solely for alternation.
-                immediate = Some(Wake::Cmd(Some(command)));
-            } else if let Some(command) =
-                next_interaction(&mut interaction_lookahead, &mut interactions)
-            {
-                immediate = Some(Wake::Interaction(Some(command)));
-            } else if hover.has_changed().unwrap_or(false) {
-                immediate = Some(Wake::Hover(Some(*hover.borrow_and_update())));
-            } else if let Some(deadline) = idle_deadline {
-                immediate = Some(Wake::Idle(deadline));
+                immediate = Some(wake);
+            } else if let Some((index, command)) = take_any_interaction(page, turn_order(page)) {
+                immediate = Some(Wake::Interaction(index, Some(command)));
+            } else if let Some((index, hover)) = take_any_hover(page, turn_order(page)) {
+                immediate = Some(Wake::Hover(index, Some(hover)));
+            } else if let Some((index, deadline)) = idle {
+                immediate = Some(Wake::Idle(index, deadline));
             }
 
             // HTML #rendering-opportunity: after an expensive frame the
@@ -3139,31 +4622,48 @@ mod desktop {
             // is runnable, keeping the reservation would only idle the event
             // loop and halve the frame rate, so end it; tasks that arrive later
             // keep their preference over the next frame.
-            if immediate.is_none() && render_not_before > Instant::now() {
-                render_not_before = Instant::now();
-                let _ = call_trust(
-                    &mut page,
-                    "deferRenderingUntil",
-                    &[Value::Num(now)],
-                    "rendering opportunity",
-                );
-                continue 'event_loop;
+            if immediate.is_none() {
+                let mut released = false;
+                for plan in &plans {
+                    select_traversable(page, plan.index);
+                    if page.render_not_before > Instant::now() {
+                        page.render_not_before = Instant::now();
+                        let _ = call_trust(
+                            page,
+                            "deferRenderingUntil",
+                            &[Value::Num(now)],
+                            "rendering opportunity",
+                        );
+                        released = true;
+                    }
+                }
+                if released {
+                    continue 'event_loop;
+                }
             }
             let timer_wait = deadline
                 .map(|deadline| Duration::from_secs_f64(((deadline - now).max(0.0)) / 1000.0));
-            let render_wait = match (
-                render_deadline,
-                animation_wake.filter(|at| *at > Instant::now()),
-            ) {
-                (Some(deadline), Some(wake)) => Some(deadline.min(wake)),
-                (deadline, wake) => deadline.or(wake),
-            }
-            .map(|deadline| deadline.saturating_duration_since(Instant::now()));
+            let render_wake = plans
+                .iter()
+                .filter_map(|plan| {
+                    let wake = plan.animation_wake.filter(|at| *at > Instant::now());
+                    match (render_deadline_of(page, plan.index), wake) {
+                        (Some(deadline), Some(wake)) => Some(deadline.min(wake)),
+                        (deadline, wake) => deadline.or(wake),
+                    }
+                    .map(|at| (at, plan.index))
+                })
+                .min_by_key(|(at, _)| *at);
+            let render_wait =
+                render_wake.map(|(at, _)| at.saturating_duration_since(Instant::now()));
+            let render_wake_index = render_wake.map_or(0, |(_, index)| index);
             let (mut wait, mut timeout_wake) = match (timer_wait, render_wait) {
-                (Some(timer), Some(render)) if render < timer => (Some(render), Wake::Render),
-                (Some(timer), _) => (Some(timer), Wake::Timer),
-                (None, Some(render)) => (Some(render), Wake::Render),
-                (None, None) => (None, Wake::Timer),
+                (Some(timer), Some(render)) if render < timer => {
+                    (Some(render), Wake::Render(render_wake_index))
+                }
+                (Some(timer), _) => (Some(timer), Wake::Timer(timer_index)),
+                (None, Some(render)) => (Some(render), Wake::Render(render_wake_index)),
+                (None, None) => (None, Wake::Maintenance),
             };
             // One maintenance wake ends the hint even on an otherwise quiet
             // document. No polling or repeated idle collections are needed.
@@ -3180,43 +4680,68 @@ mod desktop {
             // that was inert at load does, so that a frontend learns no
             // further render can arrive. Classifying only once, at load,
             // kept every page with any work then (a zero-delay timer, a
-            // selectionchange task) resident forever.
+            // selectionchange task) resident forever. A group's traversables
+            // keep their Windows for each other while there are several.
             if immediate.is_none()
                 && wait.is_none()
                 && retirement_check_due
-                && lifecycle_complete
-                && !page.render_pending
-                && deferred_host_task.is_none()
+                && page.traversables.len() == 1
+                && page.traversables[0].channels.is_some()
             {
-                retirement_check_due = false;
-                if let Some(event) = retire_if_inert(&mut page) {
-                    let _ = events.blocking_send(event);
-                    return;
+                select_traversable(page, 0);
+                if page.lifecycle_complete && !page.render_pending && deferred_host_task.is_none() {
+                    retirement_check_due = false;
+                    if let Some(event) = retire_if_inert(page) {
+                        if let Some(events) = selected_events(page) {
+                            let _ = events.blocking_send(event);
+                        }
+                        return;
+                    }
                 }
             }
-            let wake = immediate.unwrap_or_else(|| {
-                // Lumen's forced host collection is an idle hook, not a task-
-                // boundary hook. A future timer/animation-frame deadline means
-                // the realm still has active work; allocation-triggered task
-                // checks retain responsibility there. Forcing a full tracing
-                // collection before every 16 ms animation sleep made a large
-                // YouTube heap consume a core while callbacks made no DOM
-                // changes. Collect only before a genuinely indefinite park.
-                if wait.is_none() && !defer_task_gc {
-                    page.engine.collect_garbage_at_idle();
-                }
-                interrupt.set_deadline(None);
-                runtime.block_on(async {
-                    tokio::select! {
-                        biased;
-                        command = interactions.recv() => Wake::Interaction(command),
-                        changed = hover.changed() => Wake::Hover(changed.ok().map(|()| *hover.borrow_and_update())),
-                        task = host_rx.recv() => Wake::Host(task),
-                        command = cmds.recv() => Wake::Cmd(command),
-                        () = sleep_or_pending(wait) => timeout_wake,
+            let wake = match immediate {
+                Some(wake) => wake,
+                None => {
+                    // Lumen's forced host collection is an idle hook, not a task-
+                    // boundary hook. A future timer/animation-frame deadline means
+                    // the realm still has active work; allocation-triggered task
+                    // checks retain responsibility there. Forcing a full tracing
+                    // collection before every 16 ms animation sleep made a large
+                    // YouTube heap consume a core while callbacks made no DOM
+                    // changes. Collect only before a genuinely indefinite park.
+                    if wait.is_none() && !defer_task_gc {
+                        page.engine.collect_garbage_at_idle();
                     }
-                })
-            });
+                    interrupt.set_deadline(None);
+                    let ready = runtime.block_on(wait_for_work(
+                        &mut page.traversables,
+                        host_rx,
+                        page.group_commands.as_mut(),
+                        wait,
+                    ));
+                    match ready {
+                        Ready::Interaction(index, command) => Wake::Interaction(index, command),
+                        Ready::Hover(index, changed) => Wake::Hover(
+                            index,
+                            changed
+                                .then(|| {
+                                    page.traversables[index]
+                                        .channels
+                                        .as_mut()
+                                        .map(|channels| *channels.hover.borrow_and_update())
+                                })
+                                .flatten(),
+                        ),
+                        Ready::Host(task) => Wake::Host(task),
+                        Ready::Cmd(index, command) => Wake::Cmd(index, command),
+                        Ready::Group(command) => match command {
+                            Some(command) => Wake::Group(command),
+                            None => Wake::Maintenance,
+                        },
+                        Ready::Timeout => timeout_wake,
+                    }
+                }
+            };
 
             if !matches!(wake, Wake::Maintenance) {
                 retirement_check_due = true;
@@ -3228,14 +4753,14 @@ mod desktop {
             // scheduler forever.
             let background_service_was_active = background_service.is_some();
             match &wake {
-                Wake::Interaction(Some(_)) | Wake::Hover(Some(_)) => {
+                Wake::Interaction(_, Some(_)) | Wake::Hover(_, Some(_)) => {
                     task_gc_defer_until = Some(Instant::now() + INPUT_GC_QUIET_INTERVAL);
                     page.engine.defer_task_garbage_collection(true);
                     background_service = None;
                     interaction_burst_started.get_or_insert_with(Instant::now);
                     interrupt.begin_user_interaction();
                 }
-                Wake::Cmd(Some(command)) if command.is_user_interaction() => {
+                Wake::Cmd(_, Some(command)) if command.is_user_interaction() => {
                     task_gc_defer_until = Some(Instant::now() + INPUT_GC_QUIET_INTERVAL);
                     page.engine.defer_task_garbage_collection(true);
                     background_service = None;
@@ -3255,21 +4780,30 @@ mod desktop {
             if let Some(trace) = page.task_trace.as_mut() {
                 trace.turns += 1;
                 match &wake {
-                    Wake::Interaction(_) => trace.interactions += 1,
-                    Wake::Cmd(_) => trace.commands += 1,
-                    Wake::Hover(_) => trace.hovers += 1,
+                    Wake::Interaction(..) => trace.interactions += 1,
+                    Wake::Cmd(..) | Wake::Group(_) => trace.commands += 1,
+                    Wake::Hover(..) => trace.hovers += 1,
                     Wake::Host(_) => {}
-                    Wake::Platform => trace.platform_turns += 1,
-                    Wake::Idle(_) => trace.idle_turns += 1,
-                    Wake::Timer => trace.timer_turns += 1,
-                    Wake::Render => {}
-                    Wake::Lifecycle => trace.lifecycle_turns += 1,
+                    Wake::Platform(_) => trace.platform_turns += 1,
+                    Wake::Idle(..) => trace.idle_turns += 1,
+                    Wake::Timer(_) => trace.timer_turns += 1,
+                    Wake::Render(_) => {}
+                    Wake::Lifecycle(_) => trace.lifecycle_turns += 1,
                     Wake::Maintenance => {}
                 }
             }
 
+            // The traversable whose task ran, whose frontend went away, and
+            // whether the others need their turns finished.
+            let mut handled = None;
+            let mut ended = Vec::new();
+            let mut finish_others = true;
             match wake {
-                Wake::Maintenance => {}
+                Wake::Maintenance => finish_others = false,
+                Wake::Group(command) => {
+                    finish_others = false;
+                    run_group_command(page, command, host_tasks, host_rx, interrupt);
+                }
                 // UI Events #handle-native-mouse-click: the platform calls it
                 // "immediately after handle native mouse up for mouseups that
                 // generate clicks". The actor decides that from its own hit
@@ -3277,50 +4811,63 @@ mod desktop {
                 // task, with one rendering update. The frontend's own focus of
                 // the pressed control, sent with the release, rides along;
                 // anything else keeps its turn at the head of the queue.
-                Wake::Interaction(Some(PageCmd::PointerButton {
-                    node,
-                    pressed: false,
-                    x,
-                    y,
-                    button: 0,
-                    metadata,
-                })) => {
-                    prepare_interaction(&mut page, &interrupt);
-                    run_pointer_button(&mut page, node, false, x, y, 0, metadata);
-                    checkpoint(&mut page, "pointer button");
-                    let mut next = next_interaction(&mut interaction_lookahead, &mut interactions);
+                Wake::Interaction(
+                    index,
+                    Some(PageCmd::PointerButton {
+                        node,
+                        pressed: false,
+                        x,
+                        y,
+                        button: 0,
+                        metadata,
+                    }),
+                ) => {
+                    select_traversable(page, index);
+                    handled = Some(index);
+                    prepare_interaction(page, interrupt);
+                    run_pointer_button(page, node, false, x, y, 0, metadata);
+                    checkpoint(page, "pointer button");
+                    let mut next = take_interaction(page, index);
                     while let Some(PageCmd::Focus(focus)) = next {
-                        run_focus(&mut page, focus);
-                        next = next_interaction(&mut interaction_lookahead, &mut interactions);
+                        run_focus(page, focus);
+                        next = take_interaction(page, index);
                     }
-                    interaction_lookahead = next;
-                    if !finish_pointer_release(&mut page, &events) {
-                        break;
-                    }
-                    prefer_command = false;
-                }
-                Wake::Interaction(Some(command)) | Wake::Cmd(Some(command)) => {
-                    if !dispatch_command(&mut page, command, &events, &interrupt) {
-                        break;
+                    page.interaction_lookahead = next;
+                    match selected_events(page) {
+                        Some(events) if finish_pointer_release(page, &events) => {}
+                        _ => ended.push(index),
                     }
                     prefer_command = false;
                 }
-                Wake::Hover(Some(hover)) => {
-                    if !dispatch_command(
-                        &mut page,
-                        PageCmd::Hover {
-                            node: hover.node,
-                            x: hover.x,
-                            y: hover.y,
-                            metadata: hover.metadata,
-                        },
-                        &events,
-                        &interrupt,
-                    ) {
-                        break;
+                Wake::Interaction(index, Some(command)) | Wake::Cmd(index, Some(command)) => {
+                    select_traversable(page, index);
+                    handled = Some(index);
+                    match selected_events(page) {
+                        Some(events) if dispatch_command(page, command, &events, interrupt) => {}
+                        _ => ended.push(index),
+                    }
+                    prefer_command = false;
+                }
+                Wake::Hover(index, Some(hover)) => {
+                    select_traversable(page, index);
+                    handled = Some(index);
+                    let command = PageCmd::Hover {
+                        node: hover.node,
+                        x: hover.x,
+                        y: hover.y,
+                        metadata: hover.metadata,
+                    };
+                    match selected_events(page) {
+                        Some(events) if dispatch_command(page, command, &events, interrupt) => {}
+                        _ => ended.push(index),
                     }
                 }
-                Wake::Interaction(None) | Wake::Cmd(None) | Wake::Hover(None) => break,
+                Wake::Interaction(index, None)
+                | Wake::Cmd(index, None)
+                | Wake::Hover(index, None) => {
+                    finish_others = false;
+                    ended.push(index);
+                }
                 Wake::Host(Some(task)) => {
                     // HTML permits one rendering opportunity after several selected tasks. Keep
                     // each host completion's mandatory microtask checkpoint, but coalesce a
@@ -3333,13 +4880,11 @@ mod desktop {
                         if let Some(trace) = page.task_trace.as_mut() {
                             trace.host_tasks += 1;
                         }
-                        prepare_unbounded_task(&interrupt);
-                        if let Err(error) = dispatch_host_task(&mut page.engine, task) {
-                            page.outcome.errors.push(error);
-                        }
-                        checkpoint(&mut page, "host task");
+                        prepare_unbounded_task(interrupt);
+                        dispatch_page_host_task(page, task);
+                        checkpoint(page, "host task");
                         next = host_rx.try_recv().ok();
-                        if trust_bool(&mut page, "hasPlatformTask") {
+                        if trust_bool(page, "hasPlatformTask") {
                             break;
                         }
                     }
@@ -3347,24 +4892,26 @@ mod desktop {
                     // channel. Preserve it for the next event-loop turn instead of dropping
                     // the completion at the fairness boundary.
                     deferred_host_task = next;
-                    if !finish_internal_task(&mut page, &events) {
-                        break;
-                    }
+                    // A host task may belong to any traversable.
+                    ended = finish_traversables(page, None);
+                    finish_others = false;
                     prefer_timer = true;
                     prefer_command = true;
                     prefer_platform = true;
                 }
                 Wake::Host(None) => break,
-                Wake::Platform => {
+                Wake::Platform(index) => {
+                    select_traversable(page, index);
+                    handled = Some(index);
                     prefer_platform = false;
-                    prepare_unbounded_task(&interrupt);
+                    prepare_unbounded_task(interrupt);
                     if page.task_trace.is_some() {
-                        let queues = call_trust(&mut page, "taskQueueState", &[], "task trace")
+                        let queues = call_trust(page, "taskQueueState", &[], "task trace")
                             .map(|value| value_string(&mut page.engine, &value))
                             .unwrap_or_else(|| String::from("unavailable"));
                         eprintln!("lumen: platform task begin queues={queues}");
                     }
-                    let ran = call_trust(&mut page, "runPlatformTask", &[], "platform task")
+                    let ran = call_trust(page, "runPlatformTask", &[], "platform task")
                         .is_some_and(|value| page.engine.ctx().to_boolean(&value));
                     if page.task_trace.is_some() {
                         eprintln!("lumen: platform task end ran={ran}");
@@ -3372,41 +4919,45 @@ mod desktop {
                     if ran && let Some(trace) = page.task_trace.as_mut() {
                         trace.platform_tasks += 1;
                     }
-                    checkpoint(&mut page, "platform task");
-                    if !finish_internal_task(&mut page, &events) {
-                        break;
+                    checkpoint(page, "platform task");
+                    if !finish_selected(page) {
+                        ended.push(index);
                     }
                     prefer_timer = true;
                     prefer_command = true;
                 }
-                Wake::Idle(deadline) => {
-                    prepare_unbounded_task(&interrupt);
+                Wake::Idle(index, deadline) => {
+                    select_traversable(page, index);
+                    handled = Some(index);
+                    prepare_unbounded_task(interrupt);
                     let _ = call_trust(
-                        &mut page,
+                        page,
                         "startIdlePeriod",
                         &[Value::Num(deadline)],
                         "start idle period",
                     );
-                    let ran = call_trust(&mut page, "runPlatformTask", &[], "idle task")
+                    let ran = call_trust(page, "runPlatformTask", &[], "idle task")
                         .is_some_and(|value| page.engine.ctx().to_boolean(&value));
                     if ran && let Some(trace) = page.task_trace.as_mut() {
                         trace.platform_tasks += 1;
                     }
-                    checkpoint(&mut page, "idle task");
-                    if !finish_internal_task(&mut page, &events) {
-                        break;
+                    checkpoint(page, "idle task");
+                    if !finish_selected(page) {
+                        ended.push(index);
                     }
                     prefer_timer = true;
                     prefer_command = true;
                 }
-                Wake::Timer => {
-                    prepare_unbounded_task(&interrupt);
+                Wake::Timer(index) => {
+                    select_traversable(page, index);
+                    handled = Some(index);
+                    prepare_unbounded_task(interrupt);
                     let real_now = virtual_origin + wall_origin.elapsed().as_secs_f64() * 1000.0;
-                    let animation_frame = trust_bool(&mut page, "nextDeadlineIsAnimationFrame");
+                    let animation_frame = trust_bool(page, "nextDeadlineIsAnimationFrame");
                     let _animation_sample =
                         animation_frame.then(|| CssAnimationSample::new(page.engine.ctx()));
                     if page.task_trace.is_some() {
-                        let queues = call_trust(&mut page, "taskQueueState", &[], "task trace")
+                        let queues = call_trust(page, "taskQueueState", &[], "task trace")
                             .map(|value| value_string(&mut page.engine, &value))
                             .unwrap_or_else(|| String::from("unavailable"));
                         eprintln!(
@@ -3416,14 +4967,14 @@ mod desktop {
                     let timer_started = Instant::now();
                     let ran = if animation_frame {
                         call_trust(
-                            &mut page,
+                            page,
                             "runRenderingFrame",
                             &[Value::Num(real_now)],
                             "animation frame",
                         )
                         .is_some_and(|v| v.as_num_opt().is_some_and(|n| n > 0.0))
                     } else {
-                        dispatch_timer_task(&mut page, real_now, "timer task")
+                        dispatch_timer_task(page, real_now, "timer task")
                     };
                     if page.task_trace.is_some() {
                         eprintln!(
@@ -3434,27 +4985,28 @@ mod desktop {
                     if ran && let Some(trace) = page.task_trace.as_mut() {
                         trace.timer_tasks += 1;
                     }
-                    checkpoint(&mut page, "timer task");
+                    checkpoint(page, "timer task");
                     // requestAnimationFrame callbacks are step 14 of the same
                     // HTML rendering update whose style/layout and observer
                     // steps follow them. Ordinary timer tasks merely request a
                     // future rendering opportunity when they mutate the page.
-                    let finished = if animation_frame {
+                    let finished = match selected_events(page) {
                         // The platform already ran scroll steps before rAF.
                         // Scrolls requested by those callbacks notify on the
                         // next opportunity, not again at this frame's tail.
-                        finish_task_maybe_render(&mut page, &events, false, true, false)
-                    } else {
-                        finish_internal_task(&mut page, &events)
+                        Some(events) if animation_frame => {
+                            finish_task_maybe_render(page, &events, false, true, false)
+                        }
+                        Some(events) => finish_internal_task(page, &events),
+                        None => false,
                     };
                     if !finished {
-                        break;
-                    }
-                    if animation_frame {
-                        last_render_opportunity = Instant::now();
+                        ended.push(index);
+                    } else if animation_frame {
+                        page.last_render_opportunity = Instant::now();
                         input_burst_budget = rendering_input_budget(timer_started);
-                        render_not_before = defer_expensive_rendering(&mut page, timer_started);
-                        render_deadline = None;
+                        page.render_not_before = defer_expensive_rendering(page, timer_started);
+                        page.render_deadline = None;
                         rearm_background_service_after_render(
                             &mut background_service,
                             background_service_was_active,
@@ -3465,62 +5017,85 @@ mod desktop {
                     prefer_timer = false;
                     prefer_command = true;
                 }
-                Wake::Lifecycle => {
-                    lifecycle_complete = true;
-                    prepare_unbounded_task(&interrupt);
-                    let _ = call_trust(&mut page, "completeDocumentLoad", &[], "load event");
-                    checkpoint(&mut page, "load event");
+                Wake::Lifecycle(index) => {
+                    select_traversable(page, index);
+                    handled = Some(index);
+                    page.lifecycle_complete = true;
+                    prepare_unbounded_task(interrupt);
+                    let _ = call_trust(page, "completeDocumentLoad", &[], "load event");
+                    checkpoint(page, "load event");
                     // HTML §13.2.7 runs the readiness/load steps as their own task. It can
                     // produce a render, navigation, submission, or error, but `Settled` is
                     // TRust's acknowledgement for a frontend command. Exposing one for this
                     // internal lifecycle task can overtake the next click already queued by
                     // the frontend and make that click appear to have done nothing.
-                    if !finish_internal_task(&mut page, &events) {
-                        break 'event_loop;
+                    if !finish_selected(page) {
+                        ended.push(index);
                     }
                     prefer_timer = true;
                     prefer_command = true;
                 }
-                Wake::Render => {
+                Wake::Render(index) => {
+                    select_traversable(page, index);
+                    handled = Some(index);
                     let render_started = Instant::now();
-                    render_deadline = None;
-                    prepare_unbounded_task(&interrupt);
+                    page.render_deadline = None;
+                    prepare_unbounded_task(interrupt);
                     let _animation_sample = CssAnimationSample::new(page.engine.ctx());
                     let now = virtual_origin + wall_origin.elapsed().as_secs_f64() * 1000.0;
                     let _ = call_trust(
-                        &mut page,
+                        page,
                         "runRenderingFrame",
                         &[Value::Num(now)],
                         "animation frame",
                     );
-                    checkpoint(&mut page, "animation frame");
-                    if !finish_task_maybe_render(&mut page, &events, false, true, false) {
-                        break;
-                    }
-                    last_render_opportunity = Instant::now();
-                    animation_schedule.last_frame = Some(last_render_opportunity);
-                    if diag_frame_enabled() {
-                        eprintln!(
-                            "DIAGFRAMEACTOR total={:.2}ms animated={}",
-                            render_started.elapsed().as_secs_f64() * 1000.,
-                            page.dom.borrow().css_animation_frame_targets().len(),
+                    checkpoint(page, "animation frame");
+                    let rendered = match selected_events(page) {
+                        Some(events) => finish_task_maybe_render(page, &events, false, true, false),
+                        None => false,
+                    };
+                    if !rendered {
+                        ended.push(index);
+                    } else {
+                        page.last_render_opportunity = Instant::now();
+                        page.animation_schedule.last_frame = Some(page.last_render_opportunity);
+                        if diag_frame_enabled() {
+                            eprintln!(
+                                "DIAGFRAMEACTOR total={:.2}ms animated={}",
+                                render_started.elapsed().as_secs_f64() * 1000.,
+                                page.dom.borrow().css_animation_frame_targets().len(),
+                            );
+                        }
+                        input_burst_budget = rendering_input_budget(render_started);
+                        page.render_not_before = defer_expensive_rendering(page, render_started);
+                        // Rendering must leave time for the other task sources,
+                        // including multiple already-ready short callbacks.
+                        rearm_background_service_after_render(
+                            &mut background_service,
+                            background_service_was_active,
                         );
                     }
-                    input_burst_budget = rendering_input_budget(render_started);
-                    render_not_before = defer_expensive_rendering(&mut page, render_started);
-                    // Rendering must leave time for the other task sources,
-                    // including multiple already-ready short callbacks.
-                    rearm_background_service_after_render(
-                        &mut background_service,
-                        background_service_was_active,
-                    );
                     prefer_command = true;
                 }
             }
-            if !page.render_pending && !animation_due {
-                render_deadline = None;
+            // A task may have opened auxiliary browsing contexts; their
+            // first turns come after their frontends learn of them.
+            adopt_created_traversables(page);
+            if finish_others && page.traversables.len() > 1 {
+                for index in finish_traversables(page, handled) {
+                    if !ended.contains(&index) {
+                        ended.push(index);
+                    }
+                }
             }
-            report_task_trace(&mut page);
+            // Later indices first: discarding a traversable moves those after it.
+            ended.sort_unstable_by(|a, b| b.cmp(a));
+            for index in ended {
+                if !end_document_frontend(page, index) {
+                    break 'event_loop;
+                }
+            }
+            report_task_trace(page);
             // Ordinary tasks have no wall-clock deadline. Clear an explicit
             // diagnostic deadline before the host returns to scheduling;
             // navigation and cancellation use separate interrupt state.
@@ -3562,13 +5137,19 @@ mod desktop {
         page: &mut LumenPage,
         schedule: &mut AnimationSchedule,
     ) -> Option<Instant> {
+        if page.hidden {
+            // Hidden Documents get no rendering opportunities, so nothing
+            // samples their animations until they are shown.
+            schedule.key = None;
+            return None;
+        }
         let targets = page.dom.borrow().css_animation_frame_targets();
         let mut wake = None;
         if !targets.is_empty() {
             // The terminal's cell compositor paints no CSS colors, shadows
             // or backgrounds: a paint-only animation can never change a cell
             // there, so it is sampled only with other rendering updates.
-            let visible_paint = !page.terminal_presentation && !page.occluded;
+            let visible_paint = !page.terminal_presentation && !page.hidden;
             let scroll = if visible_paint && targets.iter().any(|target| target.paint_only) {
                 (
                     trust_number(page, "windowScrollX").unwrap_or(0.0),
@@ -3732,90 +5313,23 @@ mod desktop {
         interrupt: Arc<lumen::RuntimeInterrupt>,
         warm: Option<lumen::Engine>,
     ) -> Result<LumenPage, Outcome> {
-        // A terminal page actor lays its document out in the terminal's cell
-        // font for its whole life (CSSOM View geometry then agrees with the
-        // painted cells); a graphical one never does. Set it either way: page
-        // threads outlive one navigation.
-        crate::text::set_cell_metrics(
-            env.terminal_presentation
-                .then(|| crate::http::terminal_cell_metrics(env.cell_px))
-                .flatten(),
-        );
         let mut outcome = Outcome::default();
-        let viewport = crate::layout2::Viewport::new(
-            f32::from(env.viewport.0) * f32::from(env.cell_px.0.max(1)),
-            f32::from(env.viewport.1) * f32::from(env.cell_px.1.max(1)),
-        );
-        let document_creation_time = crate::performance::now_ms();
-        // The decoded document is Rust text; the DOM keeps engine text (see `dom_text_in`).
-        // HTML #loading-a-document: an XML MIME type (application/xhtml+xml
-        // included) loads an XML document through the XML parser (#read-xml).
-        let dom = Rc::new(RefCell::new(
-            if crate::js::is_xml_mime_type(&env.content_type) {
-                Dom::parse_xml_page(&dom_text_in(html), &env.content_type)
-            } else {
-                Dom::parse_document(&dom_text_in(html))
-            },
-        ));
-        {
-            let mut dom = dom.borrow_mut();
-            dom.set_viewport_px(viewport.width, viewport.height);
-            dom.set_device_pixel_ratio(env.device_pixel_ratio);
-            dom.set_doc_url(url::Url::parse(&env.url).ok());
-            dom.set_document_encoding(DOCUMENT, env.document_encoding);
-            // Graphical frontends play media inline; the terminal offers an
-            // external player instead.
-            dom.set_inline_media(!env.terminal_presentation);
-            if !env.sheets.is_empty() {
-                let sheets: Vec<crate::http::PageSheet> = env
-                    .sheets
-                    .iter()
-                    .map(|sheet| crate::http::PageSheet {
-                        text: dom_text_in(&sheet.text).into_owned(),
-                        ..sheet.clone()
-                    })
-                    .collect();
-                dom.attach_external_sheets(&sheets);
-            }
-            dom.note_fetched_imports();
-        }
-        // Every node the tree builder created has an identity below this
-        // (identities are monotonic and never recycled); scripts' come later.
-        let parser_watermark = dom.borrow().live_ids().max().map_or(0, |id| id + 1);
-        let scripts: Vec<_> = dom
-            .borrow()
-            .scripts()
-            .into_iter()
-            .map(|(_, _, _, node)| node)
-            .collect();
-        if scripts.is_empty()
-            && !env.scripted_frames
-            && !crate::js::needs_live_dom(&dom.borrow())
-            && (env.terminal_presentation || !crate::js::has_media_elements(&dom.borrow()))
-        {
+        let parsed = parse_navigation_document(html, &env, None);
+        if parsed.inert(&env) {
             // HTML #meta-referrer: the parsed document's referrer metadata.
-            outcome.referrer_policy = Some(
-                dom.borrow()
-                    .parsed_referrer_meta_policy(DOCUMENT)
-                    .unwrap_or(env.referrer_policy),
-            );
+            outcome.referrer_policy = Some(parsed.referrer_policy);
             return Err(outcome);
         }
-
-        let response_url = url::Url::parse(&env.url)
-            .unwrap_or_else(|_| url::Url::parse(DEFAULT_URL).expect("default URL parses"));
-        let base = {
-            let dom = dom.borrow();
-            dom.descendants(DOCUMENT)
-                .into_iter()
-                .find_map(|node| {
-                    (dom.tag_name(node) == Some("base"))
-                        .then(|| dom.attr(node, "href"))
-                        .flatten()
-                        .and_then(|href| response_url.join(href.trim()).ok())
-                })
-                .unwrap_or_else(|| response_url.clone())
-        };
+        let ParsedDocument {
+            dom,
+            viewport,
+            response_url,
+            base,
+            parser_watermark,
+            scripts,
+            referrer_policy,
+            document_creation_time,
+        } = parsed;
         dom.borrow_mut().set_doc_url(Some(base.clone()));
 
         interrupt.set_deadline(None);
@@ -3827,12 +5341,6 @@ mod desktop {
         // Windows: otherwise a relative base is applied twice to images,
         // and a remote page's <base href=file:...> could grant file access.
         state.window_request_urls.insert(0, response_url.clone());
-        // HTML #policy-container-referrer-policy: the response's, then each parser-inserted
-        // `<meta name=referrer>` in tree order (#meta-referrer).
-        let referrer_policy = dom
-            .borrow()
-            .parsed_referrer_meta_policy(DOCUMENT)
-            .unwrap_or(env.referrer_policy);
         state.referrer_policies.insert(0, referrer_policy);
         state.storage = env.storage.clone().unwrap_or_default();
         state.blobs = env.blobs.clone();
@@ -3868,6 +5376,7 @@ mod desktop {
         let engine_clock = clock.clone();
         engine.set_wall_clock(move || engine_clock.now_ms());
         state.configure_module_loading(&mut engine);
+        state.traversables.default_realm = Some(engine.global_this());
         engine
             .ctx()
             .op_state()
@@ -3903,6 +5412,7 @@ mod desktop {
             env.fullscreen_supported,
             !env.terminal_presentation,
             MainWindowTraces::from_environment(),
+            env.traversable,
         );
         if let Err(error) = eval(&mut engine, &config, "TRust configuration") {
             outcome.errors.push(error);
@@ -3947,10 +5457,187 @@ mod desktop {
             render_environment_dirty: false,
             render_pending: false,
             pending_form_acknowledgements: Vec::new(),
-            occluded: false,
+            hidden: env.traversable.hidden,
+            system_focus: env.traversable.focused,
+            // The frontend presents a Document without a title by its
+            // address; only a title it has is news.
+            reported_title: Some(String::new()),
+            title_epoch: u64::MAX,
+            lifecycle_complete: false,
+            render_deadline: None,
+            last_render_opportunity: started,
+            render_not_before: started,
+            animation_schedule: AnimationSchedule::default(),
+            interaction_lookahead: None,
             task_trace: ActorTaskTrace::enabled(),
             engine_metrics: lumen::PerformanceMetricsSampler::from_env(),
+            // The page actor gives the first traversable its frontend.
+            traversables: vec![TraversableSlot {
+                id: TraversableId::default(),
+                realm: None,
+                channels: None,
+                linked: true,
+                parked: None,
+            }],
+            selected: 0,
+            realm_entry: None,
+            group: None,
+            group_formed: false,
+            group_commands: None,
+            rotation: 0,
         };
+        if !run_document_parser(
+            &mut page,
+            html,
+            &env,
+            &host_tasks,
+            host_rx,
+            events,
+            scripts,
+            parser_watermark,
+        ) {
+            return Err(std::mem::take(&mut page.outcome));
+        }
+        Ok(page)
+    }
+
+    /// A navigation's Document as the tree builder left it, before any of
+    /// its scripts ran (HTML #initialise-the-document-object).
+    struct ParsedDocument {
+        dom: Rc<RefCell<Dom>>,
+        viewport: crate::layout2::Viewport,
+        response_url: url::Url,
+        base: url::Url,
+        /// Every node the tree builder created has an identity below this
+        /// (identities are monotonic and never recycled); scripts' come later.
+        parser_watermark: usize,
+        scripts: Vec<usize>,
+        /// HTML #policy-container-referrer-policy: the response's, then each
+        /// parser-inserted `<meta name=referrer>` in tree order (#meta-referrer).
+        referrer_policy: crate::referrer_policy::ReferrerPolicy,
+        document_creation_time: f64,
+    }
+
+    impl ParsedDocument {
+        /// Whether the Document needs no resident realm: nothing in it runs
+        /// script or keeps changing.
+        fn inert(&self, env: &PageEnv) -> bool {
+            let dom = self.dom.borrow();
+            self.scripts.is_empty()
+                && !env.scripted_frames
+                && !crate::js::needs_live_dom(&dom)
+                && (env.terminal_presentation || !crate::js::has_media_elements(&dom))
+        }
+    }
+
+    /// Parse a navigation's response into a new arena: the group's identity
+    /// source `ids` when the Document joins a browsing context group's other
+    /// traversables in their engine.
+    fn parse_navigation_document(
+        html: &str,
+        env: &PageEnv,
+        ids: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    ) -> ParsedDocument {
+        // A terminal page actor lays its document out in the terminal's cell
+        // font for its whole life (CSSOM View geometry then agrees with the
+        // painted cells); a graphical one never does. Set it either way: page
+        // threads outlive one navigation.
+        crate::text::set_cell_metrics(
+            env.terminal_presentation
+                .then(|| crate::http::terminal_cell_metrics(env.cell_px))
+                .flatten(),
+        );
+        let viewport = crate::layout2::Viewport::new(
+            f32::from(env.viewport.0) * f32::from(env.cell_px.0.max(1)),
+            f32::from(env.viewport.1) * f32::from(env.cell_px.1.max(1)),
+        );
+        let document_creation_time = crate::performance::now_ms();
+        // The decoded document is Rust text; the DOM keeps engine text (see `dom_text_in`).
+        // HTML #loading-a-document: an XML MIME type (application/xhtml+xml
+        // included) loads an XML document through the XML parser (#read-xml).
+        let dom = Rc::new(RefCell::new(
+            if crate::js::is_xml_mime_type(&env.content_type) {
+                Dom::parse_xml_page_in_group(&dom_text_in(html), &env.content_type, ids)
+            } else {
+                Dom::parse_document_in_group(&dom_text_in(html), ids)
+            },
+        ));
+        {
+            let mut dom = dom.borrow_mut();
+            dom.set_viewport_px(viewport.width, viewport.height);
+            dom.set_device_pixel_ratio(env.device_pixel_ratio);
+            dom.set_doc_url(url::Url::parse(&env.url).ok());
+            let document = dom.document();
+            dom.set_document_encoding(document, env.document_encoding);
+            // Graphical frontends play media inline; the terminal offers an
+            // external player instead.
+            dom.set_inline_media(!env.terminal_presentation);
+            if !env.sheets.is_empty() {
+                let sheets: Vec<crate::http::PageSheet> = env
+                    .sheets
+                    .iter()
+                    .map(|sheet| crate::http::PageSheet {
+                        text: dom_text_in(&sheet.text).into_owned(),
+                        ..sheet.clone()
+                    })
+                    .collect();
+                dom.attach_external_sheets(&sheets);
+            }
+            dom.note_fetched_imports();
+        }
+        let parser_watermark = dom.borrow().live_ids().max().map_or(0, |id| id + 1);
+        let scripts: Vec<_> = dom
+            .borrow()
+            .scripts()
+            .into_iter()
+            .map(|(_, _, _, node)| node)
+            .collect();
+        let response_url = url::Url::parse(&env.url)
+            .unwrap_or_else(|_| url::Url::parse(DEFAULT_URL).expect("default URL parses"));
+        let base = {
+            let dom = dom.borrow();
+            dom.descendants(dom.document())
+                .into_iter()
+                .find_map(|node| {
+                    (dom.tag_name(node) == Some("base"))
+                        .then(|| dom.attr(node, "href"))
+                        .flatten()
+                        .and_then(|href| response_url.join(href.trim()).ok())
+                })
+                .unwrap_or_else(|| response_url.clone())
+        };
+        let referrer_policy = dom
+            .borrow()
+            .parsed_referrer_meta_policy(dom.borrow().document())
+            .unwrap_or(env.referrer_policy);
+        ParsedDocument {
+            dom,
+            viewport,
+            response_url,
+            base,
+            parser_watermark,
+            scripts,
+            referrer_policy,
+            document_creation_time,
+        }
+    }
+
+    /// HTML #the-end's way there for a navigation's Document: the parser runs
+    /// its scripts, links, images and media in token order, waiting for
+    /// blocking scripts while the event loop's other tasks run, then its
+    /// deferred scripts, through DOMContentLoaded. False when the frontend
+    /// went away while the parser waited.
+    #[allow(clippy::too_many_arguments)]
+    fn run_document_parser(
+        page: &mut LumenPage,
+        html: &str,
+        env: &PageEnv,
+        host_tasks: &tokio::sync::mpsc::UnboundedSender<LumenHostTask>,
+        host_rx: &mut tokio::sync::mpsc::UnboundedReceiver<LumenHostTask>,
+        events: Option<&tokio::sync::mpsc::Sender<PageEvt>>,
+        scripts: Vec<usize>,
+        parser_watermark: usize,
+    ) -> bool {
         // HTML #prepare-the-script-element / #the-end. Fetch readiness and
         // execution order are separate: async scripts run on completion;
         // blocking scripts suspend the parser while other task sources run;
@@ -3959,13 +5646,18 @@ mod desktop {
         // arrived (`http::prefetch_parser_scripts`); its timing reports are
         // taken now, before any parser script can run, and later ones queue
         // as tasks. Requests already made are not repeated.
+        let traversable = selected_id(page);
+        let host_tasks = host_tasks.clone();
         let report: Arc<dyn Fn(crate::performance::ResourceTiming) + Send + Sync> =
             Arc::new(move |timing| {
-                let _ = host_tasks.send(LumenHostTask::ParserResourceTiming(timing));
+                let _ = host_tasks.send(LumenHostTask::ParserResourceTiming {
+                    traversable,
+                    timing,
+                });
             });
         env.cache.forward_speculative_timings(report.clone());
-        crate::http::prefetch_page_scripts(html, &env, report);
-        let mut tasks = ParserTasks::new(host_rx, events, &mut page);
+        crate::http::prefetch_page_scripts(html, env, report);
+        let mut tasks = ParserTasks::new(host_rx, events, page);
         let mut deferred = Vec::new();
         // HTML #active-parser: the Document has one until "the end" (or until
         // window.stop() aborts it, `abort_active_parser`).
@@ -3989,7 +5681,7 @@ mod desktop {
             std::collections::VecDeque<usize>,
         ) = {
             let dom = page.dom.borrow();
-            let subtree = dom.shadow_including_subtree(DOCUMENT);
+            let subtree = dom.shadow_including_subtree(dom.document());
             // HTML #the-style-element: the parser's style elements run
             // "update a style block" when popped, in token order too.
             let mut links: Vec<_> = subtree
@@ -4003,7 +5695,7 @@ mod desktop {
                 .filter(|&node| {
                     dom.tag_name(node) == Some("img")
                         && dom.namespace_uri(node) == Some("http://www.w3.org/1999/xhtml")
-                        && dom.owner_document(node) == Some(DOCUMENT)
+                        && dom.owner_document(node) == Some(dom.document())
                 })
                 .collect();
             images.sort_unstable();
@@ -4016,10 +5708,10 @@ mod desktop {
         let mut parser_media: std::collections::VecDeque<usize> = {
             let dom = page.dom.borrow();
             let mut media: Vec<_> = dom
-                .shadow_including_subtree(DOCUMENT)
+                .shadow_including_subtree(dom.document())
                 .into_iter()
                 .filter(|&node| {
-                    dom.is_media_element(node) && dom.owner_document(node) == Some(DOCUMENT)
+                    dom.is_media_element(node) && dom.owner_document(node) == Some(dom.document())
                 })
                 .collect();
             media.sort_unstable();
@@ -4032,7 +5724,7 @@ mod desktop {
                     .map(|&id| Value::Num(id as f64))
                     .collect(),
             );
-            let _ = call_trust(&mut page, "parserMediaCreated", &[ids], "parser media");
+            let _ = call_trust(page, "parserMediaCreated", &[ids], "parser media");
         }
         // The parser owns its pending script list independently of the live DOM.
         // An earlier script may detach a later entry while this native list still
@@ -4058,7 +5750,7 @@ mod desktop {
         let mut queue: std::collections::VecDeque<(usize, bool)> =
             scripts.into_iter().map(|node| (node, false)).collect();
         while let Some((node, written)) = queue.pop_front() {
-            if parser_aborted(&mut page) {
+            if parser_aborted(page) {
                 break;
             }
             if !written {
@@ -4066,9 +5758,9 @@ mod desktop {
                 if let Some(state) = page.engine.ctx().host_mut::<HostState>() {
                     state.parser.position = Some(node);
                 }
-                process_parser_links(&mut page, &mut parser_links, Some(node));
-                process_parser_images(&mut page, &mut parser_images, Some(node));
-                process_parser_media(&mut page, &mut parser_media, Some(node));
+                process_parser_links(page, &mut parser_links, Some(node));
+                process_parser_images(page, &mut parser_images, Some(node));
+                process_parser_media(page, &mut parser_media, Some(node));
             }
             // Earlier scripts may change a later element before the parser
             // prepares it. The speculative scanner is never authoritative.
@@ -4092,7 +5784,7 @@ mod desktop {
                 continue;
             }
             let prepared = call_trust(
-                &mut page,
+                page,
                 "prepareParserScript",
                 &[Value::Num(node as f64)],
                 "prepare script",
@@ -4121,8 +5813,8 @@ mod desktop {
                 ) {
                     page.outcome.errors.push(error);
                 }
-                checkpoint(&mut page, "inline parser script");
-                take_written_scripts(&mut page, &mut queue, &mut script_leases);
+                checkpoint(page, "inline parser script");
+                take_written_scripts(page, &mut queue, &mut script_leases);
                 continue;
             }
             let asynchronous = page.dom.borrow().attr(node, "async").is_some();
@@ -4171,46 +5863,46 @@ mod desktop {
                 continue;
             }
             if !asynchronous && !defer {
-                if !tasks.execute_when_ready(&mut page, node) {
-                    return Err(page.outcome);
+                if !tasks.execute_when_ready(page, node) {
+                    return false;
                 }
-                if parser_aborted(&mut page) {
+                if parser_aborted(page) {
                     // window.stop() ran while this script was pending: it
                     // never executes, nor does any script after it.
                     break;
                 }
-                take_written_scripts(&mut page, &mut queue, &mut script_leases);
+                take_written_scripts(page, &mut queue, &mut script_leases);
             }
         }
-        if parser_aborted(&mut page) {
+        if parser_aborted(page) {
             // HTML #abort-a-parser: the parser never reaches "the end", so
             // neither the deferred scripts nor DOMContentLoaded run.
-            abandon_parser_scripts(&mut page, deferred.iter().copied());
+            abandon_parser_scripts(page, deferred.iter().copied());
             for (_, task) in tasks.ready.drain() {
-                ParserTasks::dispatch(&mut page, task);
+                ParserTasks::dispatch(page, task);
             }
-            return Ok(page);
+            return true;
         }
         // The whole input has been consumed; "the end" stops the parser.
         if let Some(state) = page.engine.ctx().host_mut::<HostState>() {
             state.parser.position = None;
         }
-        process_parser_links(&mut page, &mut parser_links, None);
-        process_parser_images(&mut page, &mut parser_images, None);
-        process_parser_media(&mut page, &mut parser_media, None);
+        process_parser_links(page, &mut parser_links, None);
+        process_parser_images(page, &mut parser_images, None);
+        process_parser_media(page, &mut parser_media, None);
         if let Some(state) = page.engine.ctx().host_mut::<HostState>() {
             state.parser.active = false;
         }
-        let _ = call_trust(&mut page, "parserFinished", &[], "parser EOF");
-        checkpoint(&mut page, "parser EOF");
+        let _ = call_trust(page, "parserFinished", &[], "parser EOF");
+        checkpoint(page, "parser EOF");
         for node in deferred {
-            if !tasks.execute_when_ready(&mut page, node) {
-                return Err(page.outcome);
+            if !tasks.execute_when_ready(page, node) {
+                return false;
             }
         }
-        let _ = call_trust(&mut page, "fireDOMContentLoaded", &[], "DOMContentLoaded");
-        checkpoint(&mut page, "DOMContentLoaded");
-        Ok(page)
+        let _ = call_trust(page, "fireDOMContentLoaded", &[], "DOMContentLoaded");
+        checkpoint(page, "DOMContentLoaded");
+        true
     }
 
     /// Queue the scripts that the parser-blocking script just run left
@@ -4418,11 +6110,14 @@ mod desktop {
             }
         }
 
+        /// Run a host task while the parser waits. It may belong to another
+        /// traversable, whose Documents' tasks run meanwhile; the parser's
+        /// own is selected again afterwards.
         fn dispatch(page: &mut LumenPage, task: LumenHostTask) {
-            if let Err(error) = dispatch_host_task(&mut page.engine, task) {
-                page.outcome.errors.push(error);
-            }
+            let parsing = page.selected;
+            dispatch_page_host_task(page, task);
             checkpoint(page, "parser networking task");
+            select_traversable(page, parsing);
         }
 
         fn execute_when_ready(&mut self, page: &mut LumenPage, node: usize) -> bool {
@@ -4498,7 +6193,9 @@ mod desktop {
                         .build()
                         .expect("trust parser task runtime")
                 });
-                let wake = runtime.block_on(async {
+                // A host task (`None` once the frontend has gone), or the
+                // next timer's turn.
+                let wake: Option<Option<LumenHostTask>> = runtime.block_on(async {
                     tokio::select! {
                         biased;
                         () = async {
@@ -4506,12 +6203,12 @@ mod desktop {
                                 Some(events) => events.closed().await,
                                 None => std::future::pending::<()>().await,
                             }
-                        } => Wake::Host(None),
-                        task = self.receiver.recv() => Wake::Host(task),
-                        () = sleep_or_pending(wait) => Wake::Timer,
+                        } => Some(None),
+                        task = self.receiver.recv() => Some(task),
+                        () = sleep_or_pending(wait) => None,
                     }
                 });
-                if let Wake::Host(task) = wake {
+                if let Some(task) = wake {
                     self.prefer_page_task = true;
                     return task;
                 }
@@ -4561,7 +6258,7 @@ mod desktop {
         if crate::js::clickable_set_for_dom(&page.dom.borrow(), &listeners).1 {
             return None;
         }
-        let (shell, mut rendered, has_interaction) = render_with_observers(page);
+        let (shell, mut rendered, has_interaction) = render_for_frontend(page);
         if has_resident_work(page, has_interaction) {
             page.render_pending = true;
             return None;
@@ -4614,9 +6311,15 @@ mod desktop {
                         .workers
                         .as_ref()
                         .is_some_and(|workers| !workers.workers.is_empty())
+                    // Playback and audio rendering belong to the page.
+                    || state.media.has_players()
+                    || state.webaudio.has_contexts()
             });
         host_work
             || trust_number(page, "nextDeadline").is_some()
+            // A hidden Document's animation frame callbacks wait for its
+            // next rendering opportunity, outside the timer deadlines.
+            || trust_bool(page, "hasAnimationFrameCallbacks")
             || trust_bool(page, "hasPlatformTask")
             || trust_bool(page, "hasIdleRequest")
             || trust_bool(page, "hasScrollWork")
@@ -4626,6 +6329,7 @@ mod desktop {
             || trust_bool(page, "hasIntersectionObserver")
             || trust_bool(page, "hasRenderingUpdate")
             || trust_bool(page, "hasInitialFramesPending")
+            || trust_bool(page, "hasLifecycleListeners")
     }
 
     /// HTML §8.1.7.3 runs an ordinary selected task to completion before the
@@ -4782,8 +6486,8 @@ mod desktop {
                 let Some(context) = context else {
                     // A navigable's new Document whose Window is still being
                     // created takes its parser images itself; keep them.
-                    let document = dom.owner_document(id).unwrap_or(DOCUMENT);
-                    if document != DOCUMENT && dom.node(document).parent.is_some() {
+                    let document = dom.owner_document(id).unwrap_or(dom.document());
+                    if document != dom.document() && dom.node(document).parent.is_some() {
                         waiting.push((id, adopted));
                     }
                     continue;
@@ -4818,7 +6522,7 @@ mod desktop {
                 .engine
                 .ctx()
                 .host_mut::<HostState>()
-                .and_then(|state| state.window_realms.get(&context).cloned());
+                .and_then(|state| state.window_realm(context));
             if let Some(realm) = realm {
                 let result = page.engine.with_embed_realm(&realm, |engine| {
                     engine_call_trust(engine, "startCreatedImages", &[ids, adopted])
@@ -5072,7 +6776,7 @@ mod desktop {
         let paint = page
             .dom
             .borrow()
-            .hover_paint_subject_candidates_in(&[DOCUMENT]);
+            .hover_paint_subject_candidates_in(&[page.dom.borrow().document()]);
         {
             let mut dom = page.dom.borrow_mut();
             dom.set_hover_hosts(hover, complete_hover_hits);
@@ -5133,7 +6837,8 @@ mod desktop {
             )
         };
         let html = if cfg!(test) || std::env::var_os("TRUST_DUMP_RAW").is_some() {
-            page.dom.borrow().serialize_live(DOCUMENT, &clickable)
+            let dom = page.dom.borrow();
+            dom.serialize_live(dom.document(), &clickable)
         } else {
             String::new()
         };
@@ -5161,9 +6866,27 @@ mod desktop {
         if !rendered_html.is_empty() {
             return rendered_html;
         }
-        page.dom
-            .borrow()
-            .serialize_live(DOCUMENT, &std::collections::HashSet::new())
+        page.dom.borrow().serialize_live(
+            page.dom.borrow().document(),
+            &std::collections::HashSet::new(),
+        )
+    }
+
+    /// The page's rendering for its frontend. A hidden Document has no
+    /// rendering opportunity (HTML #update-the-rendering), so none of the
+    /// rendering update's script-observable steps run for it (resize and
+    /// intersection observation); its layout still starts loading the
+    /// resources it names, so the page is complete when shown.
+    fn render_for_frontend(page: &mut LumenPage) -> (String, crate::http::RenderedPage, bool) {
+        if !page.hidden {
+            return render_with_observers(page);
+        }
+        let rendered = extract_live(page);
+        start_font_fetches(page);
+        start_style_import_fetches(page);
+        start_svg_resource_fetches(page);
+        start_document_image_fetches(page, &rendered.1);
+        rendered
     }
 
     fn render_with_observers(page: &mut LumenPage) -> (String, crate::http::RenderedPage, bool) {
@@ -5259,7 +6982,7 @@ mod desktop {
                     .get(&request.handle)
                     .copied()
                     .filter(|&node| dom.is_valid(node))
-                    .unwrap_or(DOCUMENT);
+                    .unwrap_or(dom.document());
                 let initiator = match dom.tag_name(node) {
                     Some("img") => crate::page_images::ImageInitiator::Img,
                     Some("video") => crate::page_images::ImageInitiator::Video,
@@ -5405,6 +7128,7 @@ mod desktop {
         if requests.is_empty() {
             return;
         }
+        let traversable = selected_id(page);
         let Some((handle, cache, events)) =
             page.engine.ctx().host_mut::<HostState>().and_then(|state| {
                 let network = state.network.as_ref()?;
@@ -5425,7 +7149,11 @@ mod desktop {
             };
             let (owner, encoding) = {
                 let dom = page.dom.borrow();
-                let owner = if dom.is_valid(owner) { owner } else { DOCUMENT };
+                let owner = if dom.is_valid(owner) {
+                    owner
+                } else {
+                    dom.document()
+                };
                 (owner, dom.node_document_encoding(owner))
             };
             let client = element_request_client_url(page.engine.ctx(), owner);
@@ -5446,7 +7174,11 @@ mod desktop {
                 let sheets =
                     crate::http::fetch_imported_sheet(url, client, Vec::new(), encoding, referrer)
                         .await;
-                let _ = events.send(LumenHostTask::StyleImportsDone { url: key, sheets });
+                let _ = events.send(LumenHostTask::StyleImportsDone {
+                    traversable,
+                    url: key,
+                    sheets,
+                });
             });
         }
     }
@@ -5567,6 +7299,7 @@ mod desktop {
         if urls.is_empty() {
             return;
         }
+        let traversable = selected_id(page);
         let client = request_context_url(page.engine.ctx(), 0);
         let Some((handle, cache, events, source, policy)) =
             page.engine.ctx().host_mut::<HostState>().and_then(|state| {
@@ -5604,12 +7337,17 @@ mod desktop {
                         .filter(|(winner, _)| *winner == name)
                         .map(|(_, bytes)| bytes)
                         .filter(|_| failure.is_none_or(|end| std::time::Instant::now() <= end));
-                    let _ = events.send(LumenHostTask::FontDone { url: name, bytes });
+                    let _ = events.send(LumenHostTask::FontDone {
+                        traversable,
+                        url: name,
+                        bytes,
+                    });
                 });
                 continue;
             }
             if !crate::http::subresource_allowed(&client, &url) {
                 let _ = events.send(LumenHostTask::FontDone {
+                    traversable,
                     url: name,
                     bytes: None,
                 });
@@ -5628,7 +7366,11 @@ mod desktop {
                     .ok()
                     .filter(|response| (200..300).contains(&response.status))
                     .map(|response| response.body.clone());
-                let _ = events.send(LumenHostTask::FontDone { url: name, bytes });
+                let _ = events.send(LumenHostTask::FontDone {
+                    traversable,
+                    url: name,
+                    bytes,
+                });
             });
         }
     }
@@ -5733,7 +7475,8 @@ mod desktop {
         // released.
         if key == " " && !input.repeat {
             let mut dom = page.dom.borrow_mut();
-            let target = node.or_else(|| dom.focused_area(crate::dom::DOCUMENT));
+            let document = dom.document();
+            let target = node.or_else(|| dom.focused_area(document));
             if released {
                 dom.set_active_element(None);
             } else if let Some(target) = target.filter(|&target| dom.has_key_activation(target)) {
@@ -5825,15 +7568,10 @@ mod desktop {
             {
                 return false;
             }
-            // A form submission navigates (HTML #form-submission-algorithm).
-            abort_for_navigation(page);
-            return events
-                .blocking_send(PageEvt::SubmitForm {
-                    form,
-                    submitter: Some(submitter),
-                    submission,
-                })
-                .is_ok();
+            if let Some(sent) = send_submission(page, events, form, Some(submitter), submission) {
+                return sent;
+            }
+            return finish_internal_task(page, events);
         }
         let state = if node.is_some() {
             node.and_then(|node| {
@@ -5928,6 +7666,30 @@ mod desktop {
                 stop_loading_navigable(page.engine.ctx(), 0);
                 checkpoint(page, "stop loading");
                 finish_task_with_ack(page, events, false)
+            }
+            PageCmd::CheckUnload { request } => {
+                prepare_interaction(page, interrupt);
+                let Some(proceed) = check_unload(page, events) else {
+                    return false;
+                };
+                events
+                    .blocking_send(PageEvt::UnloadChecked { request, proceed })
+                    .is_ok()
+                    && finish_internal_task(page, events)
+            }
+            PageCmd::Unload => {
+                // The last task: the Documents unload, then the page ends.
+                prepare_unbounded_task(interrupt);
+                let _ = call_trust(page, "unloadTree", &[], "unload");
+                checkpoint(page, "unload");
+                false
+            }
+            PageCmd::Discard => {
+                // Page Lifecycle: freeze, then discard without unloading.
+                prepare_unbounded_task(interrupt);
+                let _ = call_trust(page, "freezeTree", &[], "freeze");
+                checkpoint(page, "freeze");
+                false
             }
             PageCmd::Copy => {
                 // Clipboard API #copy-action, user-initiated: the prelude
@@ -6393,10 +8155,42 @@ mod desktop {
                 // Moving a client window does not resize or relayout its DOM.
                 true
             }
-            PageCmd::Occluded(occluded) => {
-                // Only frame scheduling changes; nothing is rendered.
-                page.occluded = occluded;
-                true
+            PageCmd::SystemVisibility(hidden) => {
+                if page.hidden == hidden {
+                    return true;
+                }
+                // HTML #page-visibility: queue the Documents' visibility
+                // updates on the user interaction task source; a Document
+                // shown again gets its rendering opportunity at once.
+                page.hidden = hidden;
+                let _ = call_trust(
+                    page,
+                    "systemVisibilityChanged",
+                    &[Value::Bool(hidden)],
+                    "system visibility",
+                );
+                if !hidden {
+                    page.render_pending = true;
+                }
+                finish_internal_task(page, events)
+            }
+            PageCmd::SystemFocus(focused) => {
+                if page.system_focus == focused {
+                    return true;
+                }
+                // HTML #focus-update-steps for the traversable's current
+                // focus chain: blur as it loses system focus, focus as it
+                // gains it.
+                page.system_focus = focused;
+                prepare_unbounded_task(interrupt);
+                let _ = call_trust(
+                    page,
+                    "systemFocusChanged",
+                    &[Value::Bool(focused)],
+                    "system focus",
+                );
+                checkpoint(page, "system focus");
+                finish_internal_task(page, events)
             }
             PageCmd::Viewport(viewport) => {
                 let viewport = crate::layout2::Viewport::new(viewport.width, viewport.height);
@@ -6578,13 +8372,6 @@ mod desktop {
         (!unchanged).then_some(report)
     }
 
-    fn next_interaction(
-        lookahead: &mut Option<PageCmd>,
-        interactions: &mut tokio::sync::mpsc::Receiver<PageCmd>,
-    ) -> Option<PageCmd> {
-        lookahead.take().or_else(|| interactions.try_recv().ok())
-    }
-
     /// The frontend's focus of `node` (the document viewport when `None`).
     fn run_focus(page: &mut LumenPage, node: Option<usize>) {
         let _ = call_trust(
@@ -6653,7 +8440,8 @@ mod desktop {
         let pending = call_trust(page, "pointerClickPending", &[], "pointer click")
             .is_some_and(|value| page.engine.ctx().to_boolean(&value));
         if pending {
-            run_click(page, events, DOCUMENT)
+            let document = page.dom.borrow().document();
+            run_click(page, events, document)
         } else {
             finish_task_with_ack(page, events, false)
         }
@@ -6693,15 +8481,10 @@ mod desktop {
             return false;
         }
         if let Some((form, submitter, submission)) = click_submit {
-            // A form submission navigates (HTML #form-submission-algorithm).
-            abort_for_navigation(page);
-            return events
-                .blocking_send(PageEvt::SubmitForm {
-                    form,
-                    submitter: Some(submitter),
-                    submission,
-                })
-                .is_ok();
+            if let Some(sent) = send_submission(page, events, form, Some(submitter), submission) {
+                return sent;
+            }
+            return finish_task_with_ack(page, events, true);
         }
         true
     }
@@ -6862,6 +8645,13 @@ mod desktop {
         render_now: bool,
         run_scroll_steps: bool,
     ) -> bool {
+        // Auxiliary browsing contexts the task created get their frontends
+        // before anything is sent to them (a form submitted to one).
+        adopt_created_traversables(page);
+        // HTML #update-the-rendering: a hidden Document's rendering waits
+        // for a rendering opportunity it gets only once shown.
+        let render_now = render_now && !page.hidden;
+        let run_scroll_steps = run_scroll_steps && !page.hidden;
         let _animation_sample = render_now.then(|| CssAnimationSample::new(page.engine.ctx()));
         if page.outcome.panicked {
             let errors = std::mem::take(&mut page.outcome.errors);
@@ -6888,6 +8678,14 @@ mod desktop {
                 .set_doc_url(url::Url::parse(&url).ok());
             if events
                 .blocking_send(PageEvt::HistoryUpdate { url, replace })
+                .is_err()
+            {
+                return false;
+            }
+        }
+        for request in take_new_traversables(page) {
+            if events
+                .blocking_send(PageEvt::OpenTraversable(Box::new(request)))
                 .is_err()
             {
                 return false;
@@ -7215,18 +9013,73 @@ mod desktop {
             }
             sent_primary = true;
         }
-        if let Some((form, submitter, submission)) = submission {
-            // A form submission navigates (HTML #form-submission-algorithm).
-            abort_for_navigation(page);
-            return events
-                .blocking_send(PageEvt::SubmitForm {
-                    form,
-                    submitter,
-                    submission,
-                })
-                .is_ok();
+        if !report_traversable_state(page, events) {
+            return false;
+        }
+        if let Some((form, submitter, submission)) = submission
+            && let Some(sent) = send_submission(page, events, form, submitter, submission)
+        {
+            return sent;
         }
         sent_primary || !acknowledge_settle || events.blocking_send(PageEvt::Settled).is_ok()
+    }
+
+    /// Tell the frontend what it presents of the traversable beside the
+    /// page: the top-level Document's title (HTML #document.title, read
+    /// only when the DOM changed), and whether the page is audible or holds
+    /// unsubmitted user edits (`takeTraversableChanges`: bit 0 and 1 for a
+    /// changed audibility and its value, bit 2 and 3 for user edits, 4 and 5
+    /// for beforeunload listeners), and the page's requests to close (bit 6)
+    /// or show (bit 7) its traversable.
+    fn report_traversable_state(
+        page: &mut LumenPage,
+        events: &tokio::sync::mpsc::Sender<PageEvt>,
+    ) -> bool {
+        let epoch = page.dom.borrow().epoch();
+        if epoch != page.title_epoch {
+            page.title_epoch = epoch;
+            let title = {
+                let dom = page.dom.borrow();
+                dom.document_title_of(dom.document())
+            };
+            if page.reported_title.as_deref() != Some(title.as_str()) {
+                page.reported_title = Some(title.clone());
+                if events.blocking_send(PageEvt::Title(title)).is_err() {
+                    return false;
+                }
+            }
+        }
+        let changes = trust_number(page, "takeTraversableChanges").unwrap_or(0.0) as u32;
+        if changes & 1 != 0
+            && events
+                .blocking_send(PageEvt::Audible(changes & 2 != 0))
+                .is_err()
+        {
+            return false;
+        }
+        if changes & 4 != 0
+            && events
+                .blocking_send(PageEvt::UserEdits(changes & 8 != 0))
+                .is_err()
+        {
+            return false;
+        }
+        if changes & 16 != 0
+            && events
+                .blocking_send(PageEvt::BeforeUnloadListeners(changes & 32 != 0))
+                .is_err()
+        {
+            return false;
+        }
+        // HTML #definitely-close-a-top-level-traversable and #dom-window-focus
+        // are the frontend's.
+        if changes & 64 != 0 && events.blocking_send(PageEvt::CloseTraversable).is_err() {
+            return false;
+        }
+        if changes & 128 != 0 && events.blocking_send(PageEvt::FocusTraversable).is_err() {
+            return false;
+        }
+        true
     }
 
     enum NavigationKind {
@@ -7276,6 +9129,104 @@ mod desktop {
         }
         let initiator = navigation_initiator(page, &url, &policy, context);
         Some((url, NavigationAction { kind, initiator }))
+    }
+
+    /// The new top-level traversables the page requested (HTML
+    /// #the-rules-for-choosing-a-navigable) or the user asked for, each with
+    /// its source Document's request context; a form's carries its prepared
+    /// submission. HTML #get-an-element's-noopener step 3 is decided here,
+    /// where the navigation's `blob:` entry is resolved: an entry whose
+    /// origin is not same site with the top-level origin forces noopener.
+    fn take_new_traversables(page: &mut LumenPage) -> Vec<crate::js::NewTraversable> {
+        let Some(value) = call_trust(page, "takeNewTraversablesJSON", &[], "new traversables")
+            .filter(|value| !value_is_nullish(value))
+        else {
+            return Vec::new();
+        };
+        let Some(json) = value_to_string(page, &value) else {
+            return Vec::new();
+        };
+        // [URL, referrer policy, source settings context, target name,
+        // noopener, foreground, form, submitter, auxiliary traversable]; the
+        // last only for a form submitted to a traversable of this group.
+        let Ok(requests) = serde_json::from_str::<Vec<Vec<serde_json::Value>>>(&json) else {
+            return Vec::new();
+        };
+        let top_level = page.base.clone();
+        let mut opened = Vec::new();
+        for request in requests {
+            let text = |index: usize| {
+                request
+                    .get(index)
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            let number = |index: usize| {
+                request
+                    .get(index)
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(-1.0)
+            };
+            let flag = |index: usize| {
+                request
+                    .get(index)
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+            };
+            let (url, policy, context, name) = (text(0), text(1), number(2), text(3));
+            let (noopener, foreground, form, submitter) = (flag(4), flag(5), number(6), number(7));
+            let auxiliary = number(8);
+            let context = if context.is_finite() && context >= 0.0 {
+                context as u64
+            } else {
+                0
+            };
+            let submission = if form >= 0.0 {
+                let submitter = (submitter >= 0.0).then_some(submitter as usize);
+                match form_submission(page, form as usize, submitter) {
+                    Ok(Some(submission)) => Some(submission),
+                    Ok(None) => continue,
+                    Err(error) => {
+                        page.outcome.errors.push(error);
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+            // A form submitted to a traversable of this group: its own
+            // frontend runs the submission (HTML #form-submission-algorithm's
+            // navigation of the chosen navigable).
+            if auxiliary >= 0.0 {
+                if let Some(events) = traversable_index(page, TraversableId(auxiliary as u32))
+                    .and_then(|index| page.traversables[index].channels.as_ref())
+                    .map(|channels| channels.events.clone())
+                {
+                    let _ = events.blocking_send(PageEvt::SubmitForm {
+                        form: form as usize,
+                        submitter: (submitter >= 0.0).then_some(submitter as usize),
+                        submission,
+                    });
+                }
+                continue;
+            }
+            let initiator = navigation_initiator(page, &url, &policy, context);
+            let cross_site_blob = initiator
+                .as_ref()
+                .and_then(|initiator| initiator.blob.as_ref())
+                .and_then(|entry| url::Url::parse(&entry.origin).ok())
+                .is_some_and(|origin| !crate::site_storage::same_site(&origin, &top_level));
+            opened.push(crate::js::NewTraversable {
+                url,
+                initiator,
+                name,
+                noopener: noopener || cross_site_blob,
+                foreground,
+                submission,
+            });
+        }
+        opened
     }
 
     /// HTML #following-hyperlinks-2: the hyperlink a click followed, as
@@ -7373,13 +9324,91 @@ mod desktop {
         url: String,
         action: NavigationAction,
     ) -> bool {
-        abort_for_navigation(page);
+        match leave_for_navigation(page, events) {
+            Leave::Canceled => return finish_task_with_ack(page, events, true),
+            Leave::Closed => return false,
+            Leave::Proceed => {}
+        }
         let event = match action.kind {
             NavigationKind::Replace => PageEvt::Replace(url, action.initiator),
             NavigationKind::Reload => PageEvt::Reload(url),
             NavigationKind::New => PageEvt::Navigate(url, action.initiator),
         };
         events.blocking_send(event).is_ok()
+    }
+
+    /// A form submission navigates the top-level navigable (HTML
+    /// #form-submission-algorithm): leave its Document, then hand the
+    /// submission to the frontend. Whether the actor goes on, or `None`
+    /// when unloading was canceled and the page stays.
+    fn send_submission(
+        page: &mut LumenPage,
+        events: &tokio::sync::mpsc::Sender<PageEvt>,
+        form: usize,
+        submitter: Option<usize>,
+        submission: Option<FormSubmission>,
+    ) -> Option<bool> {
+        match leave_for_navigation(page, events) {
+            Leave::Proceed => Some(
+                events
+                    .blocking_send(PageEvt::SubmitForm {
+                        form,
+                        submitter,
+                        submission,
+                    })
+                    .is_ok(),
+            ),
+            Leave::Canceled => None,
+            Leave::Closed => Some(false),
+        }
+    }
+
+    /// Whether a navigation of the top-level navigable leaves its Document.
+    enum Leave {
+        Proceed,
+        /// Checking if unloading is canceled said it is.
+        Canceled,
+        /// The frontend went away.
+        Closed,
+    }
+
+    /// HTML #navigate's parallel steps for a cross-document navigation the
+    /// page started: check if unloading is canceled, then abort the
+    /// Document and its descendants.
+    fn leave_for_navigation(
+        page: &mut LumenPage,
+        events: &tokio::sync::mpsc::Sender<PageEvt>,
+    ) -> Leave {
+        match check_unload(page, events) {
+            Some(true) => {
+                abort_for_navigation(page);
+                Leave::Proceed
+            }
+            Some(false) => Leave::Canceled,
+            None => Leave::Closed,
+        }
+    }
+
+    /// HTML #checking-if-unloading-is-canceled for the top-level
+    /// traversable's Document and its descendants': beforeunload fires at
+    /// each (`fireBeforeUnloadTree`), then, when one of them asks, the user
+    /// confirms that they want to leave while the page waits (HTML #pause).
+    /// Whether unloading continues; `None` once the frontend is gone.
+    fn check_unload(
+        page: &mut LumenPage,
+        events: &tokio::sync::mpsc::Sender<PageEvt>,
+    ) -> Option<bool> {
+        let ask = call_trust(page, "fireBeforeUnloadTree", &[], "beforeunload")
+            .is_some_and(|value| page.engine.ctx().to_boolean(&value));
+        checkpoint(page, "beforeunload");
+        if !ask {
+            return Some(true);
+        }
+        let (answer, reply) = tokio::sync::oneshot::channel();
+        events
+            .blocking_send(PageEvt::UnloadPrompt(crate::js::UnloadPrompt::new(answer)))
+            .ok()?;
+        Some(reply.blocking_recv().unwrap_or(true))
     }
 
     /// HTML #navigate: a cross-document navigation of the top-level
@@ -8099,7 +10128,10 @@ mod desktop {
                 ),
             ] {
                 let (_handle, mut events) = spawn_page(html.into(), PageEnv::bare(DEFAULT_URL));
-                let retired = tokio::time::timeout(Duration::from_secs(3), async {
+                // A resident page must stay so for a while; one that retires
+                // may take its (debug-build) startup first.
+                let wait = Duration::from_secs(if resident { 3 } else { 30 });
+                let retired = tokio::time::timeout(wait, async {
                     loop {
                         match events.recv().await {
                             Some(PageEvt::Static { .. }) => return true,
@@ -8513,24 +10545,28 @@ mod desktop {
             let (frames, _) =
                 css_animation_frames(far, false, Duration::from_millis(1500), vec![scroll]).await;
             assert!(frames >= 4, "scrolling into view did not resume: {frames}");
-            // An occluded window requests no paint-only frames, and the
+            // A hidden page (an occluded window or a background tab) gets no
+            // rendering opportunities, so it requests no frames; the
             // animation resumes (at its current time) once it is visible.
             let (frames, _) = css_animation_frames(
                 near,
                 false,
                 Duration::from_millis(700),
-                vec![PageCmd::Occluded(true)],
+                vec![PageCmd::SystemVisibility(true)],
             )
             .await;
-            assert_eq!(frames, 0, "an occluded window kept animating");
+            assert_eq!(frames, 0, "a hidden page kept animating");
             let (frames, _) = css_animation_frames(
                 near,
                 false,
                 Duration::from_millis(1000),
-                vec![PageCmd::Occluded(true), PageCmd::Occluded(false)],
+                vec![
+                    PageCmd::SystemVisibility(true),
+                    PageCmd::SystemVisibility(false),
+                ],
             )
             .await;
-            assert!(frames >= 4, "a visible window did not resume: {frames}");
+            assert!(frames >= 4, "a visible page did not resume: {frames}");
         }
 
         #[tokio::test]
@@ -11903,324 +13939,354 @@ pub(crate) use page_spare::{
     set_enabled as set_spare_engine_enabled, shutdown as shutdown_spare_engine,
 };
 
+thread_local! {
+    /// This page thread's Agent presents more than one top-level traversable
+    /// (`Traversables`): host calls find the one they address.
+    static SEVERAL_TRAVERSABLES: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The top-level traversable a host call addresses: the one whose arena
+/// holds the first of its node arguments (an arena id or a Node wrapper),
+/// else the calling Realm's. `None` while the Agent has only one.
+fn addressed_traversable(ctx: &mut Ctx, args: &[Value], nodes: &[usize]) -> Option<TraversableId> {
+    if !SEVERAL_TRAVERSABLES.with(Cell::get) {
+        return None;
+    }
+    let context = ctx.host_job_context();
+    let state = ctx.host::<HostState>()?;
+    for &index in nodes {
+        let node = match args.get(index) {
+            Some(value @ Value::Obj(_)) => state.dom_gc.node_identity(value),
+            Some(value) => value
+                .as_num_opt()
+                .filter(|number| number.is_finite() && *number >= 0.0 && number.fract() == 0.0)
+                .map(|number| number as usize),
+            None => None,
+        };
+        if let Some(traversable) = node.and_then(|node| state.traversable_of_node(node)) {
+            return Some(traversable);
+        }
+    }
+    Some(state.traversable_of_context(context))
+}
+
+/// Run `operation` with `target`'s fields selected in HostState, then
+/// select again the traversable that was.
+fn with_traversable<R>(
+    ctx: &mut Ctx,
+    target: Option<TraversableId>,
+    operation: impl FnOnce(&mut Ctx) -> R,
+) -> R {
+    let previous = target.and_then(|target| {
+        ctx.host_mut::<HostState>()
+            .map(|state| state.select_traversable(target))
+    });
+    let result = operation(ctx);
+    if let Some(previous) = previous
+        && let Some(state) = ctx.host_mut::<HostState>()
+    {
+        state.select_traversable(previous);
+    }
+    result
+}
+
+/// Every host function's entry: it runs with the traversable it addresses
+/// selected (`addressed_traversable`).
+fn routed_host_call(
+    ctx: &mut Ctx,
+    this: Value,
+    args: &[Value],
+    nodes: &[usize],
+    operation: NativeFn,
+) -> Result<Value, Value> {
+    let target = addressed_traversable(ctx, args, nodes);
+    with_traversable(ctx, target, |ctx| operation(ctx, this, args))
+}
+
 /// Lumen's implemented subset of the canonical TRust host boundary. Keep this declarative: tests
 /// compare every entry with `js_host_boundary::HOST_BOUNDARY_SIGNATURES`, while the table remains
-/// the single source used to install functions into each new realm.
-const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
-    ("__message_port_binding", 3, message_port_host::call),
-    ("__image_data_slots", 1, host_image_data_slots),
-    ("__image_binding", 2, image_host::call),
-    ("__image_bitmap_binding", 3, image_bitmap_host::call),
-    ("__wasm_module_binding", 1, host_wasm_module_binding),
-    ("__window_message_binding", 2, host_window_message_binding),
-    (
-        "__trace_challenge_message",
-        6,
-        challenge_message_trace::call,
-    ),
-    (
-        "__window_screen_coordinate",
-        1,
-        host_window_screen_coordinate,
-    ),
-    ("__callback_api", 3, host_callback_api),
-    ("__invoke_callback", 4, host_invoke_callback),
-    ("__permissions_binding", 2, host_permissions_binding),
-    ("__audio_context_binding", 2, host_audio_context_binding),
-    ("__history_binding", 2, host_history_binding),
-    ("__pointer_lock_state", 1, host_pointer_lock_state),
-    ("__navigator_binding", 1, host_navigator_binding),
-    ("__screen_binding", 1, host_screen_binding),
-    ("__dom_set_viewport", 2, host_set_viewport),
-    ("__performance_binding", 1, host_performance_binding),
-    ("__element_slots", 1, host_element_slots),
-    ("__platform_slots", 2, host_platform_slots),
-    ("__dom_register_wrapper", 2, host_register_dom_wrapper),
-    ("__dom_cached_wrapper", 1, host_cached_dom_wrapper),
-    (
-        "__dom_wrapper_cache_enabled",
-        0,
-        host_dom_wrapper_cache_enabled,
-    ),
-    ("__dom_wrapper_cache_state", 0, host_dom_wrapper_cache_state),
-    ("__dom_relative", 2, host_dom_relative),
-    ("__dom_traversal_enabled", 0, host_dom_traversal_enabled),
-    (
-        "__dom_install_live_collection",
-        4,
-        host_install_live_collection,
-    ),
-    (
-        "__dom_child_collection_length",
-        2,
-        host_child_collection_length,
-    ),
-    (
-        "__dom_install_query_collection",
-        6,
-        host_install_query_collection,
-    ),
-    ("__dom_node_identity", 1, host_node_identity),
-    ("__dom_observer_targets", 2, host_dom_observer_targets),
-    ("__live_range_register", 1, host_live_range_register),
-    ("__live_range_snapshot", 0, host_live_range_snapshot),
-    ("__pointer_event_slots", 1, host_pointer_event_slots),
-    ("__canvas_2d", 4, guarded_canvas_2d),
-    ("__offscreen_canvas", 5, canvas_host::offscreen_call),
-    ("__webgl", 4, guarded_webgl),
-    ("__dom_create_element", 2, guarded_create_element),
-    ("__dom_create_element_ns", 4, guarded_create_element_ns),
-    ("__dom_create_text", 2, guarded_create_text),
-    ("__dom_create_fragment", 1, guarded_create_fragment),
-    ("__dom_parse_document", 2, host_parse_document),
-    ("__dom_create_document", 1, host_create_document),
-    ("__dom_document_content_type", 1, host_document_content_type),
-    ("__dom_template_document", 1, host_template_document),
-    ("__dom_document_quirks", 1, host_document_quirks),
-    ("__dom_document_encoding", 1, host_document_encoding),
-    ("__document_decode", 4, host_document_decode),
-    ("__xhr_decode", 3, host_xhr_decode),
-    ("__html_char_ref", 2, host_html_char_ref),
-    ("__dom_pi_target", 1, guarded_pi_target),
-    ("__dom_create_comment", 2, guarded_create_comment),
-    ("__dom_create_cdata", 2, guarded_create_cdata),
-    (
-        "__dom_create_processing_instruction",
-        3,
-        guarded_create_processing_instruction,
-    ),
-    ("__dom_create_doctype", 4, guarded_create_doctype),
-    ("__dom_doctype", 1, guarded_doctype),
-    ("__dom_append", 2, guarded_append),
-    ("__dom_insert_before", 4, guarded_insert_before),
-    ("__dom_detach", 1, guarded_detach),
-    ("__dom_owner_document", 1, host_owner_document),
-    ("__dom_adopt", 2, guarded_adopt),
-    ("__dom_parent", 1, host_parent),
-    ("__dom_form_owner", 1, guarded_form_owner),
-    ("__dom_form_named_items", 1, guarded_form_named_items),
-    ("__dom_window_named_items", 1, guarded_window_named_items),
-    ("__dom_window_names_epoch", 0, host_window_names_epoch),
-    ("__dom_frame_owner", 1, host_frame_owner),
-    ("__dom_frame_document", 1, host_frame_document),
-    ("__dom_is_connected", 1, host_is_connected),
-    ("__dom_connected_many", 1, host_connected_many),
-    ("__dom_epoch", 0, host_dom_epoch),
-    (
-        "__dom_install_readonly_indexed",
-        3,
-        host_install_readonly_indexed,
-    ),
-    ("__dom_contains", 2, host_contains),
-    ("__dom_set_hover", 1, guarded_set_hover),
-    ("__dom_focus", 2, guarded_focus),
-    ("__dom_fragment_target", 2, host_fragment_target),
-    ("__dom_children", 1, host_children),
-    ("__dom_slot_assigned", 1, guarded_slot_assigned),
-    ("__dom_assigned_slot", 1, guarded_assigned_slot),
-    ("__dom_slot_assign", 2, guarded_slot_assign),
-    ("__dom_slot_check", 2, guarded_slot_check),
-    ("__dom_slot_signals", 1, host_slot_signals),
-    ("__dom_track_changes", 0, host_track_changes),
-    ("__dom_autofocus", 2, host_autofocus),
-    ("__dom_editable_model", 5, guarded_editable_model),
-    ("__dom_move_before", 5, guarded_move_before),
-    ("__dom_custom_registry", 3, guarded_custom_registry),
-    ("__dom_next", 1, host_next),
-    ("__dom_prev", 1, host_prev),
-    ("__dom_node_type", 1, host_node_type),
-    ("__dom_tag", 1, host_tag),
-    ("__dom_html_uppercased", 1, host_html_uppercased),
-    ("__dom_namespace", 1, host_namespace),
-    ("__dom_element_name", 1, host_element_name),
-    ("__dom_get_attr", 2, guarded_get_attr),
-    ("__dom_input", 3, guarded_input),
-    ("__dom_set_attr", 3, guarded_set_attr),
-    ("__dom_remove_attr", 2, guarded_remove_attr),
-    ("__dom_attr_names", 1, guarded_attr_names),
-    ("__dom_attr_ns", 6, guarded_attr_ns),
-    ("__dom_text", 1, guarded_text),
-    ("__dom_set_text", 2, guarded_set_text),
-    ("__dom_inner_html", 1, guarded_inner_html),
-    ("__dom_set_inner_html", 4, guarded_set_inner_html),
-    ("__dom_outer_html", 1, guarded_outer_html),
-    ("__dom_xml_serialize", 1, guarded_xml_serialize),
-    ("__dom_insert_adjacent", 4, guarded_insert_adjacent),
-    ("__dom_query", 3, guarded_query),
-    ("__dom_elements_by_tag", 3, guarded_elements_by_tag),
-    ("__dom_elements_by_class", 3, guarded_elements_by_class),
-    ("__dom_matches", 2, guarded_matches),
-    ("__dom_get_by_id", 1, guarded_get_by_id),
-    ("__dom_upgrade_candidates", 3, guarded_upgrade_candidates),
-    ("__dom_ce_candidates", 2, guarded_ce_candidates),
-    ("__dom_listener_subtree", 1, host_listener_subtree),
-    ("__dom_note_listener_node", 1, host_note_listener_node),
-    ("__dom_rendering_frames", 1, host_rendering_frames),
-    ("__dom_has_frames", 1, host_has_frames),
-    ("__dom_slot_scope", 1, host_slot_scope),
-    ("__dom_insertion_effects", 2, host_insertion_effects),
-    ("__dom_removal_effects", 2, host_removal_effects),
-    ("__dom_clone", 4, guarded_clone),
-    ("__dom_doc_element", 0, guarded_doc_element),
-    ("__html_all_collection", 5, host_html_all_collection),
-    ("__url_parse", 2, host_url_parse),
-    ("__url_set", 3, host_url_set),
-    ("__form_encode", 3, host_form_encode),
-    ("__xpath", 4, host_xpath),
-    ("__dom_attach_shadow", 7, guarded_attach_shadow),
-    ("__dom_shadow_info", 1, host_shadow_info),
-    ("__dom_shadow_root", 1, guarded_shadow_root),
-    ("__dom_adopt_styles", 2, guarded_adopt_styles),
-    ("__css_parse", 1, host_css_parse),
-    ("__css_style", 3, host_css_style),
-    ("__css_sheet", 2, guarded_css_sheet),
-    ("__css_supports_selector", 1, host_css_supports_selector),
-    ("__css_supports_color", 1, host_css_supports_color),
-    ("__dom_template_content", 1, guarded_template_content),
-    ("__http_fetch", 5, host_http_fetch),
-    ("__http_navigate", 3, host_http_navigate),
-    ("__http_navigate_async", 4, host_http_navigate_async),
-    ("__http_fetch_async", 5, host_http_fetch_async),
-    ("__http_fetch_pull", 1, host_http_fetch_pull),
-    ("__http_fetch_cancel", 1, host_http_fetch_cancel),
-    ("__stop_loading", 0, host_stop_loading),
-    ("__dom_run_injected_script", 1, guarded_run_injected_script),
-    ("__dom_script_started", 1, guarded_script_started),
-    ("__dom_insertion_resources", 1, guarded_insertion_resources),
-    ("__dom_run_classic_script", 3, guarded_run_classic_script),
-    (
-        "__dom_fetch_classic_script",
-        1,
-        guarded_fetch_classic_script,
-    ),
-    ("__dom_allocate_job_context", 0, host_allocate_job_context),
-    ("__dom_create_window_realm", 9, guarded_create_window_realm),
-    ("__dom_set_job_context", 1, host_set_job_context),
-    ("__dom_release_job_context", 1, host_release_job_context),
-    (
-        "__dom_load_injected_stylesheet",
-        1,
-        guarded_load_injected_stylesheet,
-    ),
-    ("__dom_preload_link", 1, guarded_preload_link),
-    ("__ws_open", 2, host_ws_open),
-    ("__ws_send", 3, host_ws_send),
-    ("__ws_close", 3, host_ws_close),
-    ("__worker_spawn", 3, host_worker_spawn),
-    ("__worker_post", 2, host_worker_post),
-    ("__worker_terminate", 1, host_worker_terminate),
-    ("__worker_self_post", 1, host_worker_self_post),
-    ("__worker_self_close", 0, host_worker_self_close),
-    ("__dom_computed", 2, guarded_computed_style),
-    ("__dom_transition_events", 0, host_transition_events),
-    ("__dom_animation_events", 0, host_animation_events),
-    ("__dom_offset_style", 1, guarded_offset_style),
-    ("__image_current_src", 1, guarded_image_current_src),
-    ("__media_failed", 2, guarded_media_failed),
-    ("__media_can_play", 1, media_host::can_play_type),
-    ("__media_mse_supported", 1, media_host::mse_type_supported),
-    ("__media_load", 5, guarded_media_load),
-    ("__media_control", 5, guarded_media_control),
-    ("__media_attach", 3, guarded_media_attach),
-    ("__media_source", 5, media_host::media_source),
-    ("__media_capabilities", 6, media_host::media_capabilities),
-    ("__eme", 5, media_host::eme),
-    ("__match_media", 3, host_match_media),
-    ("__dom_rect", 1, guarded_rect),
-    ("__geometry_bind", 2, geometry_host::bind),
-    ("__geometry_parse_matrix", 1, geometry_host::parse_matrix),
-    ("__svg_geometry", 5, guarded_svg_geometry),
-    ("__dom_elements_from_point", 5, guarded_elements_from_point),
-    ("__dom_scroll_get", 2, guarded_scroll_get),
-    ("__dom_scroll_set", 3, guarded_scroll_set),
-    ("__dom_load_frame", 3, guarded_load_frame),
-    ("__cookie_get", 3, host_cookie_get),
-    ("__cookie_set", 4, host_cookie_set),
-    ("__clock_now", 0, host_clock_now),
-    ("__clock_set", 1, host_clock_set),
-    ("__storage_allowed", 1, host_storage_allowed),
-    ("__storage_get", 2, host_storage_get),
-    ("__storage_cas", 4, host_storage_cas),
-    ("__indexed_db", 2, indexed_db_host::call),
-    ("__storage_set", 3, host_storage_set),
-    ("__storage_remove", 2, host_storage_remove),
-    ("__storage_clear", 1, host_storage_clear),
-    ("__storage_key", 2, host_storage_key),
-    ("__storage_len", 1, host_storage_len),
-    ("__storage_manager", 2, host_storage_manager),
-    ("__clipboard_write", 2, host_clipboard_write),
-    ("__selection_changed", 0, host_selection_changed),
-    ("__dom_user_select", 1, guarded_user_select),
-    ("__context_menu_result", 1, host_context_menu_result),
-    ("__fullscreen_frontend", 2, host_fullscreen_frontend),
-    ("__file_picker", 4, host_file_picker),
-    ("__file_read", 3, host_file_read),
-    ("__file_expand", 1, host_file_expand),
-    ("__file_list", 1, host_file_list),
-    ("__blob_url", 4, host_blob_url),
-    ("__crypto_sha256_digest", 1, host_crypto_sha256_digest),
-    ("__crypto_digest", 2, host_crypto_digest),
-    ("__crypto_random_bytes", 1, host_crypto_random_bytes),
-    ("__crypto_operation", 2, host_crypto_operation),
-    ("__compression_context", 4, host_compression_context),
-    ("__classic_script_run", 2, host_classic_script_run),
-    ("__text_encode", 1, host_text_encode),
-    ("__text_decode_utf8", 3, host_text_decode_utf8),
-    ("__text_encoding_name", 1, host_text_encoding_name),
-    ("__text_decode", 6, host_text_decode),
-    ("__body_buffer", 1, host_body_buffer),
-    ("__base64_convert", 2, host_base64_convert),
-    ("__dom_popover", 2, guarded_popover),
-    ("__dom_marquee", 3, guarded_marquee),
-    ("__dom_dialog_modal", 2, guarded_dialog_modal),
-    ("__dom_fullscreen", 2, guarded_fullscreen),
-    ("__dom_top_layer", 1, guarded_top_layer),
-    ("__dom_top_layer_removals", 0, host_dom_top_layer_removals),
-    ("__dom_inert", 1, guarded_inert),
-    ("__dom_open_dialogs", 1, guarded_open_dialogs),
-    ("__wasm_validate", 1, lumen_wasm::host_validate),
-    ("__wasm_compile", 1, lumen_wasm::host_compile),
-    ("__wasm_module_imports", 1, lumen_wasm::host_module_imports),
-    ("__wasm_module_exports", 1, lumen_wasm::host_module_exports),
-    (
-        "__wasm_module_custom_sections",
-        2,
-        lumen_wasm::host_module_custom_sections,
-    ),
-    ("__wasm_instantiate", 3, lumen_wasm::host_instantiate),
-    (
-        "__wasm_instance_exports",
-        2,
-        lumen_wasm::host_instance_exports,
-    ),
-    ("__wasm_call_export", 2, lumen_wasm::host_call_export),
-    ("__wasm_function_cache", 2, lumen_wasm::host_function_cache),
-    ("__wasm_global_new", 3, lumen_wasm::host_global_new),
-    ("__wasm_global_get", 1, lumen_wasm::host_global_get),
-    ("__wasm_global_set", 2, lumen_wasm::host_global_set),
-    ("__wasm_memory_new", 2, lumen_wasm::host_memory_new),
-    ("__wasm_memory_size", 1, lumen_wasm::host_memory_size),
-    ("__wasm_memory_grow", 2, lumen_wasm::host_memory_grow),
-    ("__wasm_memory_buffer", 1, lumen_wasm::host_memory_buffer),
-    ("__wasm_table_new", 4, lumen_wasm::host_table_new),
-    ("__wasm_table_length", 1, lumen_wasm::host_table_length),
-    ("__wasm_table_get", 2, lumen_wasm::host_table_get),
-    ("__wasm_table_set", 3, lumen_wasm::host_table_set),
-    ("__wasm_table_grow", 3, lumen_wasm::host_table_grow),
-    (
-        "__wasm_exception_binding",
-        3,
-        lumen_wasm::host_exception_binding,
-    ),
-    ("__promise_is_handled", 1, host_promise_is_handled),
-    (
-        "__promise_mark_outstanding",
-        1,
-        host_promise_mark_outstanding,
-    ),
-    ("__promise_react", 3, host_promise_react),
-    ("__promise_resolved_with", 1, host_promise_resolved_with),
-];
+/// the single source used to install functions into each new realm. The node arguments of each
+/// function (an arena id or a Node wrapper) name the top-level traversable it addresses; a
+/// function without one addresses its calling Realm's (`routed_host_call`).
+macro_rules! host_functions {
+    ($(($name:literal, $len:literal, $function:path, [$($node:literal),*])),* $(,)?) => {
+        const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[$((
+            $name,
+            $len,
+            {
+                fn routed(ctx: &mut Ctx, this: Value, args: &[Value]) -> Result<Value, Value> {
+                    routed_host_call(ctx, this, args, &[$($node),*], $function)
+                }
+                routed as NativeFn
+            },
+        )),*];
+    };
+}
+
+host_functions! {
+    ("__message_port_binding", 3, message_port_host::call, []),
+    ("__image_data_slots", 1, host_image_data_slots, []),
+    ("__image_binding", 2, image_host::call, [1]),
+    ("__image_bitmap_binding", 3, image_bitmap_host::call, []),
+    ("__wasm_module_binding", 1, host_wasm_module_binding, []),
+    ("__window_message_binding", 2, host_window_message_binding, []),
+    ("__trace_challenge_message", 6, challenge_message_trace::call, []),
+    ("__window_screen_coordinate", 1, host_window_screen_coordinate, []),
+    ("__callback_api", 3, host_callback_api, []),
+    ("__invoke_callback", 4, host_invoke_callback, []),
+    ("__permissions_binding", 2, host_permissions_binding, []),
+    ("__audio_context_binding", 2, host_audio_context_binding, []),
+    ("__history_binding", 2, host_history_binding, []),
+    ("__pointer_lock_state", 1, host_pointer_lock_state, []),
+    ("__navigator_binding", 1, host_navigator_binding, []),
+    ("__screen_binding", 1, host_screen_binding, []),
+    ("__dom_set_viewport", 2, host_set_viewport, []),
+    ("__performance_binding", 1, host_performance_binding, []),
+    ("__element_slots", 1, host_element_slots, []),
+    ("__platform_slots", 2, host_platform_slots, []),
+    ("__dom_register_wrapper", 2, host_register_dom_wrapper, [0]),
+    ("__dom_cached_wrapper", 1, host_cached_dom_wrapper, [0]),
+    ("__dom_wrapper_cache_enabled", 0, host_dom_wrapper_cache_enabled, []),
+    ("__dom_wrapper_cache_state", 0, host_dom_wrapper_cache_state, []),
+    ("__dom_relative", 2, host_dom_relative, [0]),
+    ("__dom_traversal_enabled", 0, host_dom_traversal_enabled, []),
+    ("__dom_install_live_collection", 4, host_install_live_collection, [1]),
+    ("__dom_child_collection_length", 2, host_child_collection_length, [0]),
+    ("__dom_install_query_collection", 6, host_install_query_collection, [1]),
+    ("__dom_node_identity", 1, host_node_identity, [0]),
+    ("__dom_observer_targets", 2, host_dom_observer_targets, []),
+    ("__live_range_register", 1, host_live_range_register, []),
+    ("__live_range_snapshot", 0, host_live_range_snapshot, []),
+    ("__pointer_event_slots", 1, host_pointer_event_slots, []),
+    ("__canvas_2d", 4, guarded_canvas_2d, [0]),
+    ("__offscreen_canvas", 5, canvas_host::offscreen_call, []),
+    ("__webgl", 4, guarded_webgl, [0]),
+    ("__dom_create_element", 2, guarded_create_element, [1]),
+    ("__dom_create_element_ns", 4, guarded_create_element_ns, [3]),
+    ("__dom_create_text", 2, guarded_create_text, [1]),
+    ("__dom_create_fragment", 1, guarded_create_fragment, [0]),
+    ("__dom_parse_document", 2, host_parse_document, []),
+    ("__dom_create_document", 1, host_create_document, []),
+    ("__dom_document_content_type", 1, host_document_content_type, [0]),
+    ("__dom_template_document", 1, host_template_document, [0]),
+    ("__dom_document_quirks", 1, host_document_quirks, [0]),
+    ("__dom_document_encoding", 1, host_document_encoding, [0]),
+    ("__document_decode", 4, host_document_decode, []),
+    ("__xhr_decode", 3, host_xhr_decode, []),
+    ("__html_char_ref", 2, host_html_char_ref, []),
+    ("__dom_pi_target", 1, guarded_pi_target, [0]),
+    ("__dom_create_comment", 2, guarded_create_comment, [1]),
+    ("__dom_create_cdata", 2, guarded_create_cdata, [1]),
+    ("__dom_create_processing_instruction", 3, guarded_create_processing_instruction, [2]),
+    ("__dom_create_doctype", 4, guarded_create_doctype, [3]),
+    ("__dom_doctype", 1, guarded_doctype, [0]),
+    ("__dom_append", 2, guarded_append, [0, 1]),
+    ("__dom_insert_before", 4, guarded_insert_before, [0, 1, 2]),
+    ("__dom_detach", 1, guarded_detach, [0]),
+    ("__dom_owner_document", 1, host_owner_document, [0]),
+    ("__dom_adopt", 2, guarded_adopt, [0, 1]),
+    ("__dom_parent", 1, host_parent, [0]),
+    ("__dom_form_owner", 1, guarded_form_owner, [0]),
+    ("__dom_form_named_items", 1, guarded_form_named_items, [0]),
+    ("__dom_window_named_items", 1, guarded_window_named_items, [0]),
+    ("__dom_window_names_epoch", 0, host_window_names_epoch, []),
+    ("__dom_frame_owner", 1, host_frame_owner, [0]),
+    ("__dom_frame_document", 1, host_frame_document, [0]),
+    ("__dom_is_connected", 1, host_is_connected, [0]),
+    ("__dom_connected_many", 1, host_connected_many, [0]),
+    ("__dom_epoch", 0, host_dom_epoch, []),
+    ("__dom_install_readonly_indexed", 3, host_install_readonly_indexed, []),
+    ("__dom_contains", 2, host_contains, [0, 1]),
+    ("__dom_set_hover", 1, guarded_set_hover, [0]),
+    ("__dom_focus", 2, guarded_focus, [0, 1]),
+    ("__dom_fragment_target", 2, host_fragment_target, [1]),
+    ("__dom_children", 1, host_children, [0]),
+    ("__dom_slot_assigned", 1, guarded_slot_assigned, [0]),
+    ("__dom_assigned_slot", 1, guarded_assigned_slot, [0]),
+    ("__dom_slot_assign", 2, guarded_slot_assign, [0]),
+    ("__dom_slot_check", 2, guarded_slot_check, [0]),
+    ("__dom_slot_signals", 1, host_slot_signals, []),
+    ("__dom_track_changes", 0, host_track_changes, []),
+    ("__dom_autofocus", 2, host_autofocus, [1]),
+    ("__dom_editable_model", 5, guarded_editable_model, [0, 1, 3]),
+    ("__dom_move_before", 5, guarded_move_before, [0, 1, 2]),
+    ("__dom_custom_registry", 3, guarded_custom_registry, [1]),
+    ("__dom_next", 1, host_next, [0]),
+    ("__dom_prev", 1, host_prev, [0]),
+    ("__dom_node_type", 1, host_node_type, [0]),
+    ("__dom_tag", 1, host_tag, [0]),
+    ("__dom_html_uppercased", 1, host_html_uppercased, [0]),
+    ("__dom_namespace", 1, host_namespace, [0]),
+    ("__dom_element_name", 1, host_element_name, [0]),
+    ("__dom_get_attr", 2, guarded_get_attr, [0]),
+    ("__dom_input", 3, guarded_input, [0]),
+    ("__dom_set_attr", 3, guarded_set_attr, [0]),
+    ("__dom_remove_attr", 2, guarded_remove_attr, [0]),
+    ("__dom_attr_names", 1, guarded_attr_names, [0]),
+    ("__dom_attr_ns", 6, guarded_attr_ns, [0]),
+    ("__dom_text", 1, guarded_text, [0]),
+    ("__dom_set_text", 2, guarded_set_text, [0]),
+    ("__dom_inner_html", 1, guarded_inner_html, [0]),
+    ("__dom_set_inner_html", 4, guarded_set_inner_html, [0, 3]),
+    ("__dom_outer_html", 1, guarded_outer_html, [0]),
+    ("__dom_xml_serialize", 1, guarded_xml_serialize, [0]),
+    ("__dom_insert_adjacent", 4, guarded_insert_adjacent, [0]),
+    ("__dom_query", 3, guarded_query, [0]),
+    ("__dom_elements_by_tag", 3, guarded_elements_by_tag, [0]),
+    ("__dom_elements_by_class", 3, guarded_elements_by_class, [0]),
+    ("__dom_matches", 2, guarded_matches, [0]),
+    ("__dom_get_by_id", 1, guarded_get_by_id, []),
+    ("__dom_upgrade_candidates", 3, guarded_upgrade_candidates, [0]),
+    ("__dom_ce_candidates", 2, guarded_ce_candidates, [0]),
+    ("__dom_listener_subtree", 1, host_listener_subtree, [0]),
+    ("__dom_note_listener_node", 1, host_note_listener_node, [0]),
+    ("__dom_rendering_frames", 1, host_rendering_frames, [0]),
+    ("__dom_has_frames", 1, host_has_frames, [0]),
+    ("__dom_slot_scope", 1, host_slot_scope, [0]),
+    ("__dom_insertion_effects", 2, host_insertion_effects, [0, 1]),
+    ("__dom_removal_effects", 2, host_removal_effects, [0, 1]),
+    ("__dom_clone", 4, guarded_clone, [0, 2]),
+    ("__dom_doc_element", 0, guarded_doc_element, []),
+    ("__dom_title_element", 1, guarded_title_element, [0]),
+    ("__dom_document_title", 1, guarded_document_title, [0]),
+    ("__dom_system_focus", 1, host_dom_system_focus, []),
+    ("__html_all_collection", 5, host_html_all_collection, []),
+    ("__url_parse", 2, host_url_parse, []),
+    ("__url_set", 3, host_url_set, []),
+    ("__form_encode", 3, host_form_encode, []),
+    ("__xpath", 4, host_xpath, []),
+    ("__dom_attach_shadow", 7, guarded_attach_shadow, [0]),
+    ("__dom_shadow_info", 1, host_shadow_info, [0]),
+    ("__dom_shadow_root", 1, guarded_shadow_root, [0]),
+    ("__dom_adopt_styles", 2, guarded_adopt_styles, [0]),
+    ("__css_parse", 1, host_css_parse, []),
+    ("__css_style", 3, host_css_style, []),
+    ("__css_sheet", 2, guarded_css_sheet, [0]),
+    ("__css_supports_selector", 1, host_css_supports_selector, []),
+    ("__css_supports_color", 1, host_css_supports_color, []),
+    ("__dom_template_content", 1, guarded_template_content, [0]),
+    ("__http_fetch", 5, host_http_fetch, []),
+    ("__http_navigate", 3, host_http_navigate, []),
+    ("__http_navigate_async", 4, host_http_navigate_async, []),
+    ("__http_fetch_async", 5, host_http_fetch_async, []),
+    ("__http_fetch_pull", 1, host_http_fetch_pull, []),
+    ("__http_fetch_cancel", 1, host_http_fetch_cancel, []),
+    ("__stop_loading", 0, host_stop_loading, []),
+    ("__dom_run_injected_script", 1, guarded_run_injected_script, [0]),
+    ("__dom_script_started", 1, guarded_script_started, [0]),
+    ("__dom_insertion_resources", 1, guarded_insertion_resources, [0]),
+    ("__dom_run_classic_script", 3, guarded_run_classic_script, [0]),
+    ("__dom_fetch_classic_script", 1, guarded_fetch_classic_script, [0]),
+    ("__dom_allocate_job_context", 0, host_allocate_job_context, []),
+    ("__dom_create_window_realm", 9, guarded_create_window_realm, [1]),
+    ("__traversable_create", 6, host_create_auxiliary_traversable, []),
+    ("__dom_top_document", 0, host_top_document, []),
+    ("__dom_set_job_context", 1, host_set_job_context, []),
+    ("__dom_release_job_context", 1, host_release_job_context, []),
+    ("__dom_load_injected_stylesheet", 1, guarded_load_injected_stylesheet, [0]),
+    ("__dom_preload_link", 1, guarded_preload_link, [0]),
+    ("__ws_open", 2, host_ws_open, []),
+    ("__ws_send", 3, host_ws_send, []),
+    ("__ws_close", 3, host_ws_close, []),
+    ("__worker_spawn", 3, host_worker_spawn, []),
+    ("__worker_post", 2, host_worker_post, []),
+    ("__worker_terminate", 1, host_worker_terminate, []),
+    ("__worker_self_post", 1, host_worker_self_post, []),
+    ("__worker_self_close", 0, host_worker_self_close, []),
+    ("__dom_computed", 2, guarded_computed_style, [0]),
+    ("__dom_transition_events", 0, host_transition_events, []),
+    ("__dom_animation_events", 0, host_animation_events, []),
+    ("__dom_offset_style", 1, guarded_offset_style, [0]),
+    ("__image_current_src", 1, guarded_image_current_src, [0]),
+    ("__media_failed", 2, guarded_media_failed, [0]),
+    ("__media_can_play", 1, media_host::can_play_type, []),
+    ("__media_mse_supported", 1, media_host::mse_type_supported, []),
+    ("__media_load", 5, guarded_media_load, [0]),
+    ("__media_control", 5, guarded_media_control, [0]),
+    ("__media_attach", 3, guarded_media_attach, [0]),
+    ("__media_source", 5, media_host::media_source, []),
+    ("__media_capabilities", 6, media_host::media_capabilities, []),
+    ("__eme", 5, media_host::eme, []),
+    ("__match_media", 3, host_match_media, []),
+    ("__dom_rect", 1, guarded_rect, [0]),
+    ("__geometry_bind", 2, geometry_host::bind, []),
+    ("__geometry_parse_matrix", 1, geometry_host::parse_matrix, []),
+    ("__svg_geometry", 5, guarded_svg_geometry, [0]),
+    ("__dom_elements_from_point", 5, guarded_elements_from_point, [0]),
+    ("__dom_scroll_get", 2, guarded_scroll_get, [0]),
+    ("__dom_scroll_set", 3, guarded_scroll_set, [0]),
+    ("__dom_load_frame", 3, guarded_load_frame, [0]),
+    ("__cookie_get", 3, host_cookie_get, []),
+    ("__cookie_set", 4, host_cookie_set, []),
+    ("__clock_now", 0, host_clock_now, []),
+    ("__clock_set", 1, host_clock_set, []),
+    ("__storage_allowed", 1, host_storage_allowed, []),
+    ("__storage_get", 2, host_storage_get, []),
+    ("__storage_cas", 4, host_storage_cas, []),
+    ("__indexed_db", 2, indexed_db_host::call, []),
+    ("__storage_set", 3, host_storage_set, []),
+    ("__storage_remove", 2, host_storage_remove, []),
+    ("__storage_clear", 1, host_storage_clear, []),
+    ("__storage_key", 2, host_storage_key, []),
+    ("__storage_len", 1, host_storage_len, []),
+    ("__storage_manager", 2, host_storage_manager, []),
+    ("__clipboard_write", 2, host_clipboard_write, []),
+    ("__selection_changed", 0, host_selection_changed, []),
+    ("__dom_user_select", 1, guarded_user_select, [0]),
+    ("__context_menu_result", 1, host_context_menu_result, []),
+    ("__fullscreen_frontend", 2, host_fullscreen_frontend, []),
+    ("__file_picker", 4, host_file_picker, []),
+    ("__file_read", 3, host_file_read, []),
+    ("__file_expand", 1, host_file_expand, []),
+    ("__file_list", 1, host_file_list, []),
+    ("__blob_url", 4, host_blob_url, []),
+    ("__crypto_sha256_digest", 1, host_crypto_sha256_digest, []),
+    ("__crypto_digest", 2, host_crypto_digest, []),
+    ("__crypto_random_bytes", 1, host_crypto_random_bytes, []),
+    ("__crypto_operation", 2, host_crypto_operation, []),
+    ("__compression_context", 4, host_compression_context, []),
+    ("__classic_script_run", 2, host_classic_script_run, []),
+    ("__text_encode", 1, host_text_encode, []),
+    ("__text_decode_utf8", 3, host_text_decode_utf8, []),
+    ("__text_encoding_name", 1, host_text_encoding_name, []),
+    ("__text_decode", 6, host_text_decode, []),
+    ("__body_buffer", 1, host_body_buffer, []),
+    ("__base64_convert", 2, host_base64_convert, []),
+    ("__dom_popover", 2, guarded_popover, [0]),
+    ("__dom_marquee", 3, guarded_marquee, [0]),
+    ("__dom_dialog_modal", 2, guarded_dialog_modal, [0]),
+    ("__dom_fullscreen", 2, guarded_fullscreen, [0]),
+    ("__dom_top_layer", 1, guarded_top_layer, [0]),
+    ("__dom_top_layer_removals", 0, host_dom_top_layer_removals, []),
+    ("__dom_inert", 1, guarded_inert, [0]),
+    ("__dom_open_dialogs", 1, guarded_open_dialogs, [0]),
+    ("__wasm_validate", 1, lumen_wasm::host_validate, []),
+    ("__wasm_compile", 1, lumen_wasm::host_compile, []),
+    ("__wasm_module_imports", 1, lumen_wasm::host_module_imports, []),
+    ("__wasm_module_exports", 1, lumen_wasm::host_module_exports, []),
+    ("__wasm_module_custom_sections", 2, lumen_wasm::host_module_custom_sections, []),
+    ("__wasm_instantiate", 3, lumen_wasm::host_instantiate, []),
+    ("__wasm_instance_exports", 2, lumen_wasm::host_instance_exports, []),
+    ("__wasm_call_export", 2, lumen_wasm::host_call_export, []),
+    ("__wasm_function_cache", 2, lumen_wasm::host_function_cache, []),
+    ("__wasm_global_new", 3, lumen_wasm::host_global_new, []),
+    ("__wasm_global_get", 1, lumen_wasm::host_global_get, []),
+    ("__wasm_global_set", 2, lumen_wasm::host_global_set, []),
+    ("__wasm_memory_new", 2, lumen_wasm::host_memory_new, []),
+    ("__wasm_memory_size", 1, lumen_wasm::host_memory_size, []),
+    ("__wasm_memory_grow", 2, lumen_wasm::host_memory_grow, []),
+    ("__wasm_memory_buffer", 1, lumen_wasm::host_memory_buffer, []),
+    ("__wasm_table_new", 4, lumen_wasm::host_table_new, []),
+    ("__wasm_table_length", 1, lumen_wasm::host_table_length, []),
+    ("__wasm_table_get", 2, lumen_wasm::host_table_get, []),
+    ("__wasm_table_set", 3, lumen_wasm::host_table_set, []),
+    ("__wasm_table_grow", 3, lumen_wasm::host_table_grow, []),
+    ("__wasm_exception_binding", 3, lumen_wasm::host_exception_binding, []),
+    ("__promise_is_handled", 1, host_promise_is_handled, []),
+    ("__promise_mark_outstanding", 1, host_promise_mark_outstanding, []),
+    ("__promise_react", 3, host_promise_react, []),
+    ("__promise_resolved_with", 1, host_promise_resolved_with, []),
+}
 
 fn install_host_boundary(engine: &mut lumen::Engine) {
     install_agent_host_hooks(engine);
@@ -12373,6 +14439,7 @@ fn host_platform_slots(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
         "controls" => &mut state.platform_controls,
         "nodes" => &mut state.platform_nodes,
         "internals" => &mut state.platform_internals,
+        "traversables" => &mut state.platform_traversables,
         _ => return Err(ctx.make_error("TypeError", "unknown platform slot")),
     };
     Ok(slot.get_or_insert(candidate).clone())
@@ -12696,7 +14763,7 @@ fn environment_referrer_source(state: &mut HostState, context: u64) -> Option<ur
     let document_url = state
         .window_cookie_contexts
         .get(&context)
-        .filter(|_| context != 0)
+        .filter(|_| !state.is_top_level_context(context))
         .map(|(_, url, _)| url.clone());
     match document_url {
         Some(url) if url.as_str() != "about:srcdoc" => Some(url),
@@ -12798,13 +14865,19 @@ fn realm_origin_ref(state: &mut HostState, context: u64) -> &url::Origin {
 /// zero and a navigable's Document to the newest Realm created for its container. Documents
 /// outside any navigable (DOMParser, templates, createDocument) have none.
 fn node_window_context(state: &HostState, dom: &Dom, node: usize) -> Option<u64> {
+    // A record may name a node that has since moved to another arena of the
+    // group (`Dom::transplant_subtree`): it has no Window here.
+    if !dom.is_valid(node) {
+        return None;
+    }
     let document = if matches!(dom.node(node).data, NodeData::Document) {
         node
     } else {
-        dom.owner_document(node)?
+        dom.owner_document(node)
+            .filter(|&document| dom.is_valid(document))?
     };
-    if document == DOCUMENT {
-        return Some(0);
+    if document == dom.document() {
+        return Some(state.top_context);
     }
     let container = dom.node(document).parent?;
     state.frame_contexts.get(&container).copied()
@@ -12996,6 +15069,8 @@ node_access_guards! {
     guarded_fetch_classic_script = host_fetch_classic_script, [0], Invalidate;
     guarded_load_injected_stylesheet = host_load_injected_stylesheet, [0], Invalidate;
     guarded_preload_link = host_preload_link, [0], Invalidate;
+    guarded_title_element = host_title_element, [0], Invalidate;
+    guarded_document_title = host_document_title, [0], Invalidate;
 }
 
 /// Detaching a navigable's Document is its container's operation (HTML #destroy-a-child-
@@ -13034,7 +15109,9 @@ fn guarded_canvas_operation(
     name: &str,
     operation: NativeFn,
 ) -> Result<Value, Value> {
-    if args.first().and_then(Value::as_num_opt) == Some(DOCUMENT as f64) {
+    // Identity 0 is a Document in every page's first arena and never a
+    // node of a later one: the prelude's agent-wide argument.
+    if args.first().and_then(Value::as_num_opt) == Some(0.0) {
         return operation(ctx, this, args);
     }
     guard_node_arguments(
@@ -13060,7 +15137,8 @@ fn guarded_webgl(ctx: &mut Ctx, this: Value, args: &[Value]) -> Result<Value, Va
 
 /// Operations that implicitly address the top-level Document.
 fn top_document_accessible(ctx: &mut Ctx, operation: &str) -> bool {
-    let checked = [Value::Num(DOCUMENT as f64)];
+    let document = host_dom(ctx).borrow().document();
+    let checked = [Value::Num(document as f64)];
     inaccessible_node_arguments(ctx, operation, &checked, &[0]) == 0
 }
 
@@ -13069,6 +15147,34 @@ fn guarded_get_by_id(ctx: &mut Ctx, this: Value, args: &[Value]) -> Result<Value
         return Ok(Value::Null);
     }
     host_get_by_id(ctx, this, args)
+}
+
+/// HTML #system-focus of the arena's top-level traversable: the focus
+/// selectors match only while it has system focus (HTML #selector-focus).
+fn host_dom_system_focus(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let focused = args.first().is_some_and(|value| ctx.to_boolean(value));
+    host_dom(ctx).borrow_mut().set_system_focus(focused);
+    Ok(Value::Undefined)
+}
+
+/// HTML #the-title-element-2 of the Document node in argument 0.
+fn host_title_element(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let dom = host_dom(ctx);
+    let dom = dom.borrow();
+    Ok(host_arg_node(&dom, args, 0)
+        .and_then(|document| dom.title_element_of(document))
+        .map_or(Value::Null, |title| Value::Num(title as f64)))
+}
+
+/// HTML #document.title on getting, for the Document node in argument 0.
+fn host_document_title(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let dom = host_dom(ctx);
+    let dom = dom.borrow();
+    Ok(Value::from_engine_text(
+        host_arg_node(&dom, args, 0)
+            .map(|document| dom.document_title_of(document))
+            .unwrap_or_default(),
+    ))
 }
 
 fn guarded_doc_element(ctx: &mut Ctx, this: Value, args: &[Value]) -> Result<Value, Value> {
@@ -13362,6 +15468,29 @@ fn native_live_collections_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("TRUST_NATIVE_LIVE_COLLECTIONS").as_deref() != Ok("0"))
 }
 
+/// The arena holding `node`: the selected traversable's, unless a parked
+/// one's holds it. Lumen calls a live collection's callbacks directly, not
+/// through `routed_host_call`.
+fn arena_holding(state: &HostState, node: usize) -> Rc<RefCell<Dom>> {
+    if !SEVERAL_TRAVERSABLES.with(Cell::get) || state.dom.borrow().is_valid(node) {
+        return state.dom.clone();
+    }
+    state
+        .traversables
+        .parked
+        .iter()
+        .find(|(_, slot)| slot.dom.borrow().is_valid(node))
+        .map_or_else(|| state.dom.clone(), |(_, slot)| slot.dom.clone())
+}
+
+/// The arena of a live query collection's key, which names its root.
+fn arena_of_query(state: &HostState, key: &str) -> Rc<RefCell<Dom>> {
+    match crate::dom::CollectionQuery::parse(key) {
+        Some((root, _)) => arena_holding(state, root),
+        None => state.dom.clone(),
+    }
+}
+
 fn live_collection_length(ctx: &Ctx, root: &Value, elements: bool) -> u32 {
     let Some(state) = ctx.host::<HostState>() else {
         return 0;
@@ -13369,8 +15498,7 @@ fn live_collection_length(ctx: &Ctx, root: &Value, elements: bool) -> u32 {
     let Some(root) = state.dom_gc.node_identity(root) else {
         return 0;
     };
-    state
-        .dom
+    arena_holding(state, root)
         .borrow()
         .child_collection_len(root, elements)
         .min(u32::MAX as usize) as u32
@@ -13402,7 +15530,8 @@ fn live_element_list_names(ctx: &Ctx, root: &Value) -> Vec<String> {
     let Some(root) = state.dom_gc.node_identity(root) else {
         return Vec::new();
     };
-    let dom = state.dom.borrow();
+    let arena = arena_holding(state, root);
+    let dom = arena.borrow();
     collection_supported_names(&dom, dom.child_iter(root))
 }
 
@@ -13477,7 +15606,8 @@ fn live_child_collection_get(
     let Some(root) = state.dom_gc.node_identity(&captures[0]) else {
         return Ok(Value::Null);
     };
-    let dom = state.dom.borrow();
+    let arena = arena_holding(state, root);
+    let dom = arena.borrow();
     let target = match args.first() {
         Some(Value::Num(index)) if index.is_finite() && *index >= 0.0 && index.fract() == 0.0 => {
             dom.child_collection_item(root, *index as usize, elements)
@@ -13545,7 +15675,19 @@ fn live_query_members(ctx: &Ctx, key: &Value) -> Option<Rc<[usize]>> {
         return None;
     };
     let state = ctx.host::<HostState>()?;
-    Some(state.dom.borrow().query_collection(key.as_str()))
+    Some(
+        arena_of_query(state, key.as_str())
+            .borrow()
+            .query_collection(key.as_str()),
+    )
+}
+
+/// The arena a live query collection's members are in.
+fn query_arena(ctx: &Ctx, key: &Value) -> Option<Rc<RefCell<Dom>>> {
+    let (Value::Str(key), Some(state)) = (key, ctx.host::<HostState>()) else {
+        return None;
+    };
+    Some(arena_of_query(state, key.as_str()))
 }
 
 fn live_query_length(ctx: &Ctx, key: &Value) -> u32 {
@@ -13553,11 +15695,10 @@ fn live_query_length(ctx: &Ctx, key: &Value) -> u32 {
 }
 
 fn live_query_names(ctx: &Ctx, key: &Value) -> Vec<String> {
-    let (Some(members), Some(state)) = (live_query_members(ctx, key), ctx.host::<HostState>())
-    else {
+    let (Some(members), Some(arena)) = (live_query_members(ctx, key), query_arena(ctx, key)) else {
         return Vec::new();
     };
-    collection_supported_names(&state.dom.borrow(), members.iter().copied())
+    collection_supported_names(&arena.borrow(), members.iter().copied())
 }
 
 /// Captures: membership key, wrapper callback, and the root wrapper, which
@@ -13576,8 +15717,8 @@ fn live_query_collection_get(
             members.get(*index as usize).copied()
         }
         Some(Value::Str(name)) if !name.is_empty() => {
-            let state = ctx.host::<HostState>().expect("DOM host");
-            collection_named_item(&state.dom.borrow(), members.iter().copied(), name.as_str())
+            let arena = query_arena(ctx, &captures[0]).expect("DOM host");
+            collection_named_item(&arena.borrow(), members.iter().copied(), name.as_str())
         }
         _ => None,
     };
@@ -13873,9 +16014,12 @@ fn cookie_context_for_id(ctx: &mut Ctx, id: u64) -> crate::http::CookieContext {
         return context.clone();
     }
     let mut context = crate::http::CookieContext::subresource(
-        state.window_request_urls.get(&0).unwrap_or(&state.base),
+        state
+            .window_request_urls
+            .get(&state.top_context)
+            .unwrap_or(&state.base),
     );
-    context.cross_site_ancestor = id != 0;
+    context.cross_site_ancestor = !state.is_top_level_context(id);
     context
 }
 
@@ -13982,15 +16126,21 @@ fn prepare_uncounted_client_request(
         None => crate::http::set_referrer(&mut request, page),
     }
     if let Some(context) = request.cookie_context.as_mut() {
-        context.top_level_site = state.window_cookie_contexts.get(&0).map_or_else(
-            || {
-                crate::http::CookieContext::subresource(
-                    state.window_request_urls.get(&0).unwrap_or(&state.base),
-                )
-                .top_level_site
-            },
-            |(_, _, owner)| owner.top_level_site.clone(),
-        );
+        context.top_level_site = state
+            .window_cookie_contexts
+            .get(&state.top_context)
+            .map_or_else(
+                || {
+                    crate::http::CookieContext::subresource(
+                        state
+                            .window_request_urls
+                            .get(&state.top_context)
+                            .unwrap_or(&state.base),
+                    )
+                    .top_level_site
+                },
+                |(_, _, owner)| owner.top_level_site.clone(),
+            );
         context.cross_site_ancestor = state
             .window_cookie_contexts
             .values()
@@ -14144,7 +16294,7 @@ fn record_resource_timing_in(
     let realm = engine
         .ctx()
         .host_mut::<HostState>()
-        .and_then(|state| state.window_realms.get(&context).cloned());
+        .and_then(|state| state.window_realm(context));
     let Some(realm) = realm else { return Ok(()) };
     engine
         .with_embed_realm(&realm, move |engine| {
@@ -14934,7 +17084,7 @@ fn call_trust_in_context(ctx: &mut Ctx, context: u64, name: &str) -> Option<Valu
     }
     let realm = ctx
         .host_mut::<HostState>()
-        .and_then(|state| state.window_realms.get(&context).cloned())?;
+        .and_then(|state| state.window_realm(context))?;
     ctx.with_embed_realm(&realm, |realm_ctx| {
         host_call_trust(realm_ctx, name, &[]).ok()
     })
@@ -14961,9 +17111,12 @@ fn abort_document(ctx: &mut Ctx, context: u64) -> bool {
     // belongs to the worker being created, as a navigation's fetch belongs
     // to its navigable, and HTML #run-a-worker continues.
     // (Step 3 concerns WebDriver BiDi, which TRust does not implement.)
-    // Step 4: the active parser, which only the top-level Document's
-    // `load_page` runs.
-    if context == 0 {
+    // Step 4: the active parser, which only a top-level Document's load
+    // runs.
+    if ctx
+        .host::<HostState>()
+        .is_some_and(|state| context == state.top_context)
+    {
         canceled |= abort_active_parser(ctx);
     }
     canceled
@@ -14978,10 +17131,11 @@ fn abort_document(ctx: &mut Ctx, context: u64) -> bool {
 /// top-level Document also cancels the browser's own subresource fetches and
 /// image requests (`PageCache::stop_loading`).
 fn abort_document_fetches(ctx: &mut Ctx, context: u64) -> bool {
-    let Some(network) = ctx
-        .host_mut::<HostState>()
-        .and_then(|state| state.network.as_mut())
-    else {
+    let Some(state) = ctx.host_mut::<HostState>() else {
+        return false;
+    };
+    let top_context = state.top_context;
+    let Some(network) = state.network.as_mut() else {
         return false;
     };
     let ids: Vec<usize> = network
@@ -15005,7 +17159,7 @@ fn abort_document_fetches(ctx: &mut Ctx, context: u64) -> bool {
             .filter_map(|id| network.body_streams.remove(id))
             .collect()
     };
-    let resources = context == 0 && network.cache.stop_loading();
+    let resources = context == top_context && network.cache.stop_loading();
     let canceled = resources || !pending.is_empty() || !streams.is_empty();
     for mut stream in streams {
         stream.flow.cancel();
@@ -15080,7 +17234,7 @@ fn run_in_context_realm(
     let realm = engine
         .ctx()
         .host_mut::<HostState>()
-        .and_then(|state| state.window_realms.get(&context).cloned());
+        .and_then(|state| state.window_realm(context));
     let Some(realm) = realm else {
         return Ok(());
     };
@@ -15198,6 +17352,14 @@ fn host_allocate_job_context(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Re
         ));
     }
     state.next_window_context = context.saturating_add(1);
+    // A child navigable's Window belongs to its parent's top-level traversable.
+    let creator = ctx.host_job_context();
+    if let Some(state) = ctx.host_mut::<HostState>() {
+        let traversable = state.traversable_of_context(creator);
+        if traversable != TraversableId::default() {
+            state.traversables.contexts.insert(context, traversable);
+        }
+    }
     Ok(Value::Num(context as f64))
 }
 
@@ -15233,9 +17395,10 @@ fn main_window_config(
     fullscreen_supported: bool,
     inline_media: bool,
     traces: MainWindowTraces,
+    traversable: crate::js::TraversableState,
 ) -> String {
     format!(
-        "globalThis.__trust_cfg = {{ url: {}, referrer: {}, ua: {}, navigatorMode: {}, platform: {}, language: {}, languages: [{}, {}], width: {}, height: {}, devicePixelRatio: {}, hardwareConcurrency: {}, globalPrivacyControl: {}, secureContext: {}, frameTrace: {}, challengeMessageTrace: {}, navigationTiming: {}, lastModified: {}, fullscreenSupported: {}, inlineMedia: {} }};",
+        "globalThis.__trust_cfg = {{ url: {}, referrer: {}, ua: {}, navigatorMode: {}, platform: {}, language: {}, languages: [{}, {}], width: {}, height: {}, devicePixelRatio: {}, hardwareConcurrency: {}, globalPrivacyControl: {}, secureContext: {}, frameTrace: {}, challengeMessageTrace: {}, navigationTiming: {}, lastModified: {}, fullscreenSupported: {}, inlineMedia: {}, hidden: {}, systemFocus: {}, wasDiscarded: {}, newTraversables: {}, storageShed: {} }};",
         json_string(response_url.as_str()),
         json_string(referrer),
         json_string(crate::http::user_agent()),
@@ -15258,6 +17421,11 @@ fn main_window_config(
         last_modified.map_or_else(|| String::from("null"), |time| time.to_string()),
         fullscreen_supported,
         inline_media,
+        traversable.hidden,
+        traversable.focused,
+        traversable.was_discarded,
+        traversable.new_traversables,
+        traversable.storage_shed,
     )
 }
 
@@ -15529,6 +17697,12 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
         state.realm_origins.insert(context, origin);
         state.frame_contexts.insert(frame_id, context);
         state.window_parents.insert(context, creator_context);
+        // A child navigable's Window belongs to its parent's top-level
+        // traversable, whose arena holds its Document.
+        let traversable = state.traversable_of_context(creator_context);
+        if traversable != TraversableId::default() {
+            state.traversables.contexts.insert(context, traversable);
+        }
         let mut cookie_context = crate::http::CookieContext::subresource(&client_url);
         cookie_context
             .top_level_site
@@ -15632,6 +17806,12 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
             "challengeMessageTrace",
             "fullscreenSupported",
             "inlineMedia",
+            "newTraversables",
+            "storageShed",
+            // A nested Document starts with its traversable's current system
+            // visibility state (HTML #set-the-initial-visibility-state),
+            // which the parent keeps in its configuration.
+            "hidden",
         ] {
             if let Ok(value) = realm_ctx.member_get(&source_config, name) {
                 realm_ctx.member_set(&config, name, value)?;
@@ -15700,6 +17880,229 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
     Ok(realm)
 }
 
+/// HTML #creating-a-new-auxiliary-browsing-context, for the window open
+/// steps and hyperlinks whose rules for choosing a navigable create a new
+/// top-level traversable with an opener: a traversable of this Agent's
+/// browsing context group, with its own arena, whose initial `about:blank`
+/// Document (HTML #create-a-new-browsing-context-and-document) has the
+/// creator's origin, URL as referrer, policy container and base URL. Its
+/// Window Realm's platform bootstrap reads its target name, whether it is a
+/// popup, its opener (the calling Realm's Window, `args[1]`) and a copy of
+/// the opener's session storage (HTML #copy-session-storage). Returns its
+/// Window; the page actor gives it a frontend after the running task.
+///
+/// Arguments: the creator Realm's configuration, its Window, the target
+/// name, whether a popup was requested, the Agent's time, and the creator
+/// Document's base URL.
+fn host_create_auxiliary_traversable(
+    ctx: &mut Ctx,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, Value> {
+    let source_config = args.first().cloned().unwrap_or(Value::Undefined);
+    let opener = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let name = host_arg_string(ctx, args, 2);
+    let popup = matches!(args.get(3), Some(Value::Bool(true)));
+    let agent_time = args
+        .get(4)
+        .and_then(Value::as_num_opt)
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .unwrap_or(0.0);
+    let creator_base = host_arg_usv(ctx, args, 5);
+    let creator_context = ctx.host_job_context();
+    let creator_url = request_client_url(ctx);
+    let shed = match ctx.member_get(&source_config, "storageShed")? {
+        value @ Value::Num(_) => value.as_num_opt().unwrap_or(0.0) as u64,
+        _ => 0,
+    };
+    let snapshot = platform_prelude_snapshot().map_err(|error| {
+        ctx.make_error(
+            "SyntaxError",
+            format!("compile TRust platform prelude: {error}"),
+        )
+    })?;
+    let Some(state) = ctx.host_mut::<HostState>() else {
+        return Err(ctx.make_error("InvalidStateError", "missing browser host state"));
+    };
+    let origin = realm_origin(state, creator_context);
+    let policy = environment_referrer_policy(state, creator_context);
+    let creator = state.traversable_of_context(creator_context);
+    let ids = state.dom.borrow_mut().share_identities();
+    let base = url::Url::parse(&creator_base).unwrap_or_else(|_| creator_url.clone());
+    // HTML #populate-with-html/head/body, in a quirks-mode Document.
+    let dom = Rc::new(RefCell::new(Dom::parse_document_in_group("", Some(ids))));
+    {
+        let viewport = state.viewport.get();
+        let creator_dom = state.dom.borrow();
+        let mut dom = dom.borrow_mut();
+        // Its script-created nodes join the joint DOM/JavaScript heap.
+        dom.enable_gc_allocation_leases();
+        dom.set_viewport_px(viewport.width, viewport.height);
+        dom.set_device_pixel_ratio(state.device_pixel_ratio.get());
+        dom.set_doc_url(Some(base.clone()));
+        dom.set_inline_media(creator_dom.inline_media());
+    }
+    state.traversables.next = state.traversables.next.max(1);
+    let id = TraversableId(state.traversables.next);
+    state.traversables.next += 1;
+    let context = state.next_window_context;
+    state.next_window_context = context.saturating_add(1);
+    let host = TraversableHost::new(
+        dom,
+        base,
+        state.viewport.get(),
+        state.device_pixel_ratio.get(),
+        context,
+    );
+    host.screen_position.set(state.screen_position.get());
+    state.traversables.parked.push((id, host));
+    state.traversables.contexts.insert(context, id);
+    // HTML #determining-the-origin: about:blank with the creator's origin;
+    // its fetches' client is the creator's URL, its policy container a clone.
+    state
+        .window_request_urls
+        .insert(context, creator_url.clone());
+    state.realm_origins.insert(context, origin);
+    state.referrer_policies.insert(context, policy);
+    // HTML #copy-session-storage: Storage's legacy-clone of the opener
+    // traversable's storage shed.
+    let storage_shed = crate::js::new_storage_shed();
+    crate::js::clone_storage_shed(&state.storage, shed, storage_shed);
+    state.traversables.created.push(CreatedTraversable {
+        id,
+        creator,
+        name: name.clone(),
+        popup,
+        storage_shed,
+    });
+    SEVERAL_TRAVERSABLES.with(|several| several.set(true));
+
+    // Realm creation and bootstrap form one publication: no collection may
+    // see a partially initialized set of intrinsics.
+    ctx.suspend_gc();
+    let realm = ctx.create_embed_realm();
+    if let Some(state) = ctx.host_mut::<HostState>() {
+        state.window_realms.insert(context, realm.clone());
+    }
+    let installed = ctx.with_embed_realm(&realm, |realm_ctx| {
+        realm_ctx.set_host_job_context(context);
+        for &(name, len, host_fn) in LUMEN_HOST_FUNCTIONS {
+            realm_ctx.define_embed_global(name, len, host_fn);
+        }
+        let config = realm_ctx.new_object_with_proto(&Value::Null);
+        for key in [
+            "ua",
+            "navigatorMode",
+            "platform",
+            "language",
+            "languages",
+            "width",
+            "height",
+            "devicePixelRatio",
+            "hardwareConcurrency",
+            "globalPrivacyControl",
+            "secureContext",
+            "frameTrace",
+            "challengeMessageTrace",
+            "fullscreenSupported",
+            "inlineMedia",
+            "newTraversables",
+            "systemFocus",
+        ] {
+            if let Ok(value) = realm_ctx.member_get(&source_config, key) {
+                realm_ctx.member_set(&config, key, value)?;
+            }
+        }
+        // The frontend shows the new traversable at once.
+        realm_ctx.member_set(&config, "hidden", Value::Bool(false))?;
+        realm_ctx.member_set(
+            &config,
+            "url",
+            Value::from_string("about:blank".to_string()),
+        )?;
+        realm_ctx.member_set(
+            &config,
+            "referrer",
+            Value::from_string(creator_url.to_string()),
+        )?;
+        realm_ctx.member_set(&config, "navigationTiming", Value::Null)?;
+        realm_ctx.member_set(
+            &config,
+            "aboutBaseURL",
+            Value::from_string(creator_base.clone()),
+        )?;
+        realm_ctx.member_set(
+            &config,
+            "documentContentType",
+            Value::from_string("text/html".to_string()),
+        )?;
+        realm_ctx.member_set(&config, "hostSettingsContext", Value::Num(context as f64))?;
+        realm_ctx.member_set(&config, "agentTimeOffset", Value::Num(agent_time))?;
+        realm_ctx.member_set(&config, "traversableId", Value::Num(f64::from(id.0)))?;
+        realm_ctx.member_set(&config, "storageShed", Value::Num(storage_shed as f64))?;
+        realm_ctx.member_set(&config, "openerWindow", opener.clone())?;
+        realm_ctx.member_set(&config, "targetName", Value::from_string(name.clone()))?;
+        realm_ctx.member_set(&config, "isPopup", Value::Bool(popup))?;
+        realm_ctx.member_set(&config, "initialAboutBlank", Value::Bool(true))?;
+        let global = realm_ctx.global_this();
+        #[cfg(test)]
+        let config_for_tests = config.clone();
+        realm_ctx.member_set(&global, "__trust_cfg", config)?;
+        match realm_ctx.eval_shared_classic_snapshot_interruptible(snapshot) {
+            Ok(Ok(_)) => {
+                #[cfg(test)]
+                expose_platform_internals_for_tests(realm_ctx, false, config_for_tests);
+                Ok(())
+            }
+            Ok(Err(EvalError::Throw(error))) => Err(error),
+            Ok(Err(EvalError::Interrupted(reason))) => Err(realm_ctx.make_error(
+                "AbortError",
+                format!("Window Realm bootstrap interrupted: {}", reason.message()),
+            )),
+            Err(error) => Err(realm_ctx.make_error(
+                "SyntaxError",
+                format!(
+                    "Window Realm bootstrap parse error at line {}: {}",
+                    error.line, error.message
+                ),
+            )),
+        }
+    });
+    ctx.resume_gc();
+    match installed {
+        Ok(Ok(())) => Ok(realm),
+        Ok(Err(error)) | Err(error) => {
+            if let Some(state) = ctx.host_mut::<HostState>() {
+                state
+                    .traversables
+                    .created
+                    .retain(|created| created.id != id);
+                state.window_realms.remove(&context);
+                state.window_request_urls.remove(&context);
+                state.forget_realm_origin(context);
+                state.traversables.contexts.remove(&context);
+                if let Some(index) = state
+                    .traversables
+                    .parked
+                    .iter()
+                    .position(|(slot, _)| *slot == id)
+                {
+                    state.traversables.parked.swap_remove(index);
+                }
+            }
+            crate::js::forget_storage_shed(storage_shed);
+            Err(error)
+        }
+    }
+}
+
+/// `__dom_top_document()`: the calling Realm's top-level traversable's
+/// Document (the arena's own Document), whose nodes the platform addresses
+/// as "the top-level Document".
+fn host_top_document(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+    Ok(Value::Num(host_dom(ctx).borrow().document() as f64))
+}
+
 fn host_set_job_context(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let context = args
         .first()
@@ -15720,40 +18123,7 @@ fn host_release_job_context(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
         return Ok(Value::Bool(false));
     }
     if let Some(state) = ctx.host_mut::<HostState>() {
-        state.import_maps.remove(&context);
-        state.window_realms.remove(&context);
-        state.message_ports.release(Some(context));
-        state.indexed_db.release(Some(context));
-        state.webaudio.release_realm(context);
-        // File API #lifeTime: the Window's entries go away with its Document.
-        state
-            .blobs
-            .remove_environment(state.blob_agent, Some(context));
-        state.window_request_urls.remove(&context);
-        state.window_cookie_contexts.remove(&context);
-        state.forget_realm_origin(context);
-        if let Some(network) = state.network.as_mut() {
-            network
-                .pending_fetches
-                .retain(|_, pending| pending.context != context);
-            // HTML #unload-a-document aborts the Document's fetches
-            // (Fetch #fetch-controller-abort): stop its response bodies'
-            // transfers, which may otherwise never end (event streams).
-            network.body_streams.retain(|_, stream| {
-                let keep = stream.context != context;
-                if !keep {
-                    stream.flow.cancel();
-                }
-                keep
-            });
-        }
-        if let Some(workers) = state.workers.as_mut() {
-            // Removing the sole owner closes these dedicated workers. Dropping
-            // their handles interrupts execution; late queued replies are inert.
-            workers
-                .workers
-                .retain(|_, worker| worker.context != context);
-        }
+        state.release_window_settings(context);
     }
     Ok(Value::Bool(ctx.release_host_job_context(context)))
 }
@@ -16012,7 +18382,7 @@ fn send_resource_completion(
         }
         _ => None,
     };
-    let Some(events) = ctx.host_mut::<HostState>().and_then(|state| {
+    let Some((events, traversable)) = ctx.host_mut::<HostState>().and_then(|state| {
         let events = state.task_events.clone()?;
         if kind.delays_load() {
             state.pending_resources += 1;
@@ -16020,13 +18390,14 @@ fn send_resource_completion(
             state.pending_preloads += 1;
         }
         state.dom_gc.start_resource(node_id);
-        Some(events)
+        Some((events, state.traversables.selected))
     }) else {
         return false;
     };
     if events
         .send(LumenHostTask::ResourceDone {
             context,
+            traversable,
             node_id,
             name,
             kind,
@@ -16194,13 +18565,20 @@ fn spawn_preload_fetch(
         .as_ref()
         .map(|policy| policy.credentials);
     let context = ctx.host_job_context();
-    let Some((handle, cache, events)) = ctx.host_mut::<HostState>().and_then(|state| {
-        let events = state.task_events.clone()?;
-        let network = state.network.as_ref()?;
-        state.pending_preloads += 1;
-        state.dom_gc.start_resource(node_id);
-        Some((network.handle.clone(), network.cache.clone(), events))
-    }) else {
+    let Some((handle, cache, events, traversable)) =
+        ctx.host_mut::<HostState>().and_then(|state| {
+            let events = state.task_events.clone()?;
+            let network = state.network.as_ref()?;
+            state.pending_preloads += 1;
+            state.dom_gc.start_resource(node_id);
+            Some((
+                network.handle.clone(),
+                network.cache.clone(),
+                events,
+                state.traversables.selected,
+            ))
+        })
+    else {
         return false;
     };
     let (shared, preloaded) =
@@ -16234,6 +18612,7 @@ fn spawn_preload_fetch(
         };
         let _ = events.send(LumenHostTask::ResourceDone {
             context,
+            traversable,
             node_id,
             name,
             kind: LumenResourceKind::Preload,
@@ -16268,13 +18647,20 @@ fn spawn_resource_fetch(
         .as_ref()
         .map(|policy| policy.credentials);
     let context = ctx.host_job_context();
-    let Some((handle, cache, events)) = ctx.host_mut::<HostState>().and_then(|state| {
-        let events = state.task_events.clone()?;
-        let network = state.network.as_ref()?;
-        state.pending_resources += 1;
-        state.dom_gc.start_resource(node_id);
-        Some((network.handle.clone(), network.cache.clone(), events))
-    }) else {
+    let Some((handle, cache, events, traversable)) =
+        ctx.host_mut::<HostState>().and_then(|state| {
+            let events = state.task_events.clone()?;
+            let network = state.network.as_ref()?;
+            state.pending_resources += 1;
+            state.dom_gc.start_resource(node_id);
+            Some((
+                network.handle.clone(),
+                network.cache.clone(),
+                events,
+                state.traversables.selected,
+            ))
+        })
+    else {
         return false;
     };
     let shared = cache.consume_resource(&request.url, &client, destination, credentials);
@@ -16421,6 +18807,7 @@ fn spawn_resource_fetch(
         }
         let _ = events.send(LumenHostTask::ResourceDone {
             context,
+            traversable,
             node_id,
             name,
             kind,
@@ -17785,7 +20172,7 @@ fn run_lumen_worker(
     state.window_cookie_contexts.insert(
         0,
         (
-            DOCUMENT,
+            state.dom.borrow().document(),
             launch.script_url.clone(),
             launch.cookie_context.clone(),
         ),
@@ -19150,12 +21537,58 @@ fn settle_network_task(
     let realm = engine
         .ctx()
         .host_mut::<HostState>()
-        .and_then(|state| state.window_realms.get(&context).cloned());
+        .and_then(|state| state.window_realm(context));
     let Some(realm) = realm else { return Ok(()) }; // Replaced/inactive Document.
     match engine.with_embed_realm(&realm, run) {
         Ok(result) => result,
         Err(_) => Err(String::from("image networking task Realm is unavailable")),
     }
+}
+
+/// The top-level traversable a host task belongs to, when its content
+/// names one: a node, a Window's settings context, a media element's
+/// player, a fetch's or worker's owner, or the traversable that queued it.
+/// Its handler then finds that traversable's arena and presentation state
+/// selected; other tasks reach only shared state and their Realm's script.
+fn host_task_traversable(state: &HostState, task: &LumenHostTask) -> Option<TraversableId> {
+    let fetch = |id: &usize| {
+        let network = state.network.as_ref()?;
+        network
+            .pending_fetches
+            .get(id)
+            .map(|pending| pending.context)
+            .or_else(|| network.body_streams.get(id).map(|stream| stream.context))
+    };
+    let context = match task {
+        // The traversable whose count the fetch joined, also when its element
+        // has moved to another traversable since.
+        LumenHostTask::FontDone { traversable, .. }
+        | LumenHostTask::StyleImportsDone { traversable, .. }
+        | LumenHostTask::ParserResourceTiming { traversable, .. }
+        | LumenHostTask::ResourceDone { traversable, .. } => return Some(*traversable),
+        LumenHostTask::CanvasFrame { node } => return state.traversable_of_node(*node),
+        LumenHostTask::Media { id, .. } => {
+            return state.traversable_of_node(state.media.player_node(*id)?);
+        }
+        LumenHostTask::DocumentImageDone { context, .. }
+        | LumenHostTask::DynamicModuleStart { context, .. }
+        | LumenHostTask::DynamicModule { context, .. }
+        | LumenHostTask::AbortDocument { context } => *context,
+        LumenHostTask::ImageDone { timing_context, .. } => *timing_context,
+        LumenHostTask::FetchDone { id, .. }
+        | LumenHostTask::FetchHead { id, .. }
+        | LumenHostTask::FetchBodyChunk { id, .. }
+        | LumenHostTask::FetchBodyEnd { id, .. }
+        | LumenHostTask::NavigateDone { id, .. } => fetch(id)?,
+        LumenHostTask::Worker { id, .. } | LumenHostTask::WorkerExited { id } => {
+            state.workers.as_ref()?.workers.get(id)?.context
+        }
+        LumenHostTask::PortReady
+        | LumenHostTask::WebAudio(_)
+        | LumenHostTask::SvgResourceDone
+        | LumenHostTask::WebSocket { .. } => return None,
+    };
+    Some(state.traversable_of_context(context))
 }
 
 fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result<(), String> {
@@ -19173,12 +21606,15 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
             canvas_host::present_frames(&mut dom.borrow_mut(), Some(node));
         }
         LumenHostTask::SvgResourceDone => {
-            // The next rendering opportunity resolves the references again.
+            // The next rendering opportunity resolves the references again,
+            // in whichever traversable's Documents make them.
             if let Some(state) = engine.ctx().host_mut::<HostState>() {
-                state.dom.borrow_mut().resource_changed();
+                for dom in state.arenas() {
+                    dom.borrow_mut().resource_changed();
+                }
             }
         }
-        LumenHostTask::FontDone { url, bytes } => {
+        LumenHostTask::FontDone { url, bytes, .. } => {
             let dom = engine
                 .ctx()
                 .host_mut::<HostState>()
@@ -19187,7 +21623,7 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
                 .clone();
             dom.borrow_mut().install_downloaded_font(&url, bytes);
         }
-        LumenHostTask::StyleImportsDone { url, sheets } => {
+        LumenHostTask::StyleImportsDone { url, sheets, .. } => {
             let dom = {
                 let state = engine
                     .ctx()
@@ -19209,7 +21645,7 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
             // associate them and hand the cascade their rules.
             let _ = host_call_trust(engine.ctx(), "styleImportsArrived", &[]);
         }
-        LumenHostTask::ParserResourceTiming(timing) => {
+        LumenHostTask::ParserResourceTiming { timing, .. } => {
             record_resource_timing_ref(engine.ctx(), &timing);
         }
         LumenHostTask::ImageDone {
@@ -19381,7 +21817,7 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
                 let realm = engine
                     .ctx()
                     .host_mut::<HostState>()
-                    .and_then(|state| state.window_realms.get(&context).cloned());
+                    .and_then(|state| state.window_realm(context));
                 let Some(realm) = realm else {
                     // A task associated with a no-longer-active Document is
                     // not runnable on the Window event loop.
@@ -19412,6 +21848,7 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
             sheet,
             timing,
             external,
+            ..
         } => {
             let _lease = engine
                 .ctx()
@@ -19440,7 +21877,7 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
                 let realm = engine
                     .ctx()
                     .host_mut::<HostState>()
-                    .and_then(|state| state.window_realms.get(&context).cloned());
+                    .and_then(|state| state.window_realm(context));
                 let Some(realm) = realm else {
                     // Its Document was replaced while the fetch was in
                     // flight. Tasks whose document is no longer active are
@@ -19516,7 +21953,11 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
             }
             install_context_module_loader(engine, context);
             let _ = engine.finish_dynamic_module_load(request_id, result);
-            install_context_module_loader(engine, 0);
+            let top_context = engine
+                .ctx()
+                .host_mut::<HostState>()
+                .map_or(0, |state| state.top_context);
+            install_context_module_loader(engine, top_context);
         }
         LumenHostTask::WebSocket { id, event } => {
             dispatch_websocket_task(engine, id, event)?;
@@ -19581,7 +22022,7 @@ fn dispatch_lumen_worker_task(
         let realm = engine
             .ctx()
             .host_mut::<HostState>()
-            .and_then(|state| state.window_realms.get(&context).cloned());
+            .and_then(|state| state.window_realm(context));
         let Some(realm) = realm else { return Ok(()) };
         engine
             .with_embed_realm(&realm, run)
@@ -19880,7 +22321,7 @@ fn host_pi_target(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
 fn host_creation_document(dom: &Dom, args: &[Value], index: usize) -> usize {
     host_arg_node(dom, args, index)
         .filter(|&id| matches!(dom.node(id).data, NodeData::Document))
-        .unwrap_or(DOCUMENT)
+        .unwrap_or(dom.document())
 }
 
 /// DOM #dom-domimplementation-createdocumenttype: a new doctype whose node
@@ -19970,17 +22411,98 @@ fn pre_insert_result(result: Result<(), crate::dom::PreInsertError>) -> Value {
     }
 }
 
+/// The node argument at `index` of a DOM host call when another
+/// traversable's arena of the browsing context group holds it, with that
+/// arena. Inserting or adopting such a node adopts it across the arenas
+/// (`Dom::transplant_subtree`), keeping its identity.
+fn foreign_node_argument(
+    ctx: &mut Ctx,
+    args: &[Value],
+    index: usize,
+) -> Option<(usize, Rc<RefCell<Dom>>)> {
+    if !SEVERAL_TRAVERSABLES.with(Cell::get) {
+        return None;
+    }
+    let state = ctx.host_mut::<HostState>()?;
+    let node = match args.get(index)? {
+        value @ Value::Obj(_) => state.dom_gc.node_identity(value),
+        value => value
+            .as_num_opt()
+            .filter(|number| number.is_finite() && *number >= 0.0 && number.fract() == 0.0)
+            .map(|number| number as usize),
+    }?;
+    if state.dom.try_borrow().is_ok_and(|dom| dom.is_valid(node)) {
+        return None;
+    }
+    state
+        .traversables
+        .parked
+        .iter()
+        .find(|(_, slot)| slot.dom.try_borrow().is_ok_and(|dom| dom.is_valid(node)))
+        .map(|(_, slot)| (node, slot.dom.clone()))
+}
+
+/// DOM #concept-node-ensure-pre-insertion-validity for `node`, a node of
+/// another arena of the group (`source`), inserted into `parent` of `dom`
+/// before `child`; then, when `insert` is set, DOM #concept-node-insert step
+/// 7.1, adopting it into `parent`'s node document across the arenas. An
+/// invalid insertion moves nothing. `Ok(false)` when the node cannot move.
+fn adopt_foreign_insertion(
+    source: &RefCell<Dom>,
+    node: usize,
+    dom: &mut Dom,
+    parent: usize,
+    child: Option<usize>,
+    exclude: &dyn Fn(usize) -> bool,
+    insert: bool,
+) -> Result<bool, crate::dom::PreInsertError> {
+    let Ok(mut source) = source.try_borrow_mut() else {
+        return Ok(false);
+    };
+    dom.ensure_pre_insert_validity_of(
+        source.inserted_node(node).foreign(),
+        parent,
+        child,
+        exclude,
+    )?;
+    if !insert {
+        return Ok(true);
+    }
+    let document = if matches!(dom.node(parent).data, NodeData::Document) {
+        parent
+    } else {
+        dom.node(parent).owner_document
+    };
+    Ok(source.transplant_subtree(node, dom, document))
+}
+
 fn host_append(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let foreign = foreign_node_argument(ctx, args, 1);
     let dom = host_dom(ctx);
     let mut dom = dom.borrow_mut();
-    if let (Some(parent), Some(child)) =
-        (host_arg_node(&dom, args, 0), host_arg_node(&dom, args, 1))
-    {
-        if let Err(error) = dom.ensure_pre_insert_validity(child, parent, None, &|_| false) {
-            return Ok(pre_insert_result(Err(error)));
+    let Some(parent) = host_arg_node(&dom, args, 0) else {
+        return Ok(Value::Bool(true));
+    };
+    let child = match foreign {
+        Some((child, source)) => {
+            match adopt_foreign_insertion(&source, child, &mut dom, parent, None, &|_| false, true)
+            {
+                Ok(true) => child,
+                Ok(false) => return Ok(Value::Bool(true)),
+                Err(error) => return Ok(pre_insert_result(Err(error))),
+            }
         }
-        dom.append(parent, child);
-    }
+        None => {
+            let Some(child) = host_arg_node(&dom, args, 1) else {
+                return Ok(Value::Bool(true));
+            };
+            if let Err(error) = dom.ensure_pre_insert_validity(child, parent, None, &|_| false) {
+                return Ok(pre_insert_result(Err(error)));
+            }
+            child
+        }
+    };
+    dom.append(parent, child);
     Ok(Value::Bool(true))
 }
 
@@ -19991,22 +22513,52 @@ fn host_append(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Val
 /// children are inserted one by one by the caller. Mode 4 only validates,
 /// excluding every child (DOM #dom-parentnode-replacechildren).
 fn host_insert_before(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let foreign = foreign_node_argument(ctx, args, 1);
     let dom = host_dom(ctx);
     let mut dom = dom.borrow_mut();
-    if let (Some(parent), Some(node)) = (host_arg_node(&dom, args, 0), host_arg_node(&dom, args, 1))
-    {
-        let reference = host_arg_node(&dom, args, 2);
-        let mode = args.get(3).and_then(Value::as_num_opt).unwrap_or(0.0);
-        let excluded = reference.filter(|_| mode == 1.0 || mode == 3.0);
-        let exclude = |c| mode == 4.0 || Some(c) == excluded;
-        if let Err(error) = dom.ensure_pre_insert_validity(node, parent, reference, &exclude) {
-            return Ok(pre_insert_result(Err(error)));
+    let Some(parent) = host_arg_node(&dom, args, 0) else {
+        return Ok(Value::Bool(true));
+    };
+    // The reference child as given: a node of another arena of the group is
+    // not `parent`'s child, which validity reports (NotFoundError).
+    let reference = args
+        .get(2)
+        .and_then(Value::as_num_opt)
+        .filter(|number| number.is_finite() && *number >= 0.0 && number.fract() == 0.0)
+        .map(|number| number as usize);
+    let mode = args.get(3).and_then(Value::as_num_opt).unwrap_or(0.0);
+    let excluded = reference.filter(|_| mode == 1.0 || mode == 3.0);
+    let exclude = |c| mode == 4.0 || Some(c) == excluded;
+    let node = match foreign {
+        Some((node, source)) => {
+            match adopt_foreign_insertion(
+                &source,
+                node,
+                &mut dom,
+                parent,
+                reference,
+                &exclude,
+                mode < 2.0,
+            ) {
+                Ok(true) => node,
+                Ok(false) => return Ok(Value::Bool(true)),
+                Err(error) => return Ok(pre_insert_result(Err(error))),
+            }
         }
-        if mode >= 2.0 {
-            return Ok(Value::Bool(true));
+        None => {
+            let Some(node) = host_arg_node(&dom, args, 1) else {
+                return Ok(Value::Bool(true));
+            };
+            if let Err(error) = dom.ensure_pre_insert_validity(node, parent, reference, &exclude) {
+                return Ok(pre_insert_result(Err(error)));
+            }
+            node
         }
-        dom.insert_before(parent, node, reference);
+    };
+    if mode >= 2.0 {
+        return Ok(Value::Bool(true));
     }
+    dom.insert_before(parent, node, reference);
     Ok(Value::Bool(true))
 }
 
@@ -20042,20 +22594,34 @@ fn host_owner_document(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
 /// DOM Standard §4.5's adopt algorithm. Negative values are an internal result enum interpreted by
 /// the prelude, which exposes the required Web IDL exceptions and custom-element reactions.
 fn host_adopt(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let foreign = foreign_node_argument(ctx, args, 1);
     let dom = host_dom(ctx);
     let mut dom = dom.borrow_mut();
     let Some(document) = host_arg_node(&dom, args, 0) else {
         return Ok(Value::Num(-1.0));
     };
-    let Some(node) = host_arg_node(&dom, args, 1) else {
-        return Ok(Value::Num(-2.0));
+    let adopted = match foreign {
+        // Another traversable's node: the adoption crosses the group's arenas.
+        Some((node, source)) => {
+            let Ok(mut source) = source.try_borrow_mut() else {
+                return Ok(Value::Num(-2.0));
+            };
+            dom.adopt_foreign_node(&mut source, document, node)
+        }
+        None => {
+            let Some(node) = host_arg_node(&dom, args, 1) else {
+                return Ok(Value::Num(-2.0));
+            };
+            dom.adopt_node(document, node)
+        }
     };
-    let result = match dom.adopt_node(document, node) {
+    let result = match adopted {
         Ok(old_document) => old_document as f64,
         Err(AdoptError::TargetNotDocument) => -3.0,
         Err(AdoptError::InvalidNode) => -2.0,
         Err(AdoptError::Document) => -4.0,
         Err(AdoptError::ShadowRoot) => -5.0,
+        Err(AdoptError::HostedFragment) => -6.0,
     };
     Ok(Value::Num(result))
 }
@@ -20246,12 +22812,12 @@ fn host_fragment_target(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
         .first()
         .filter(|v| !matches!(v, Value::Undefined | Value::Null))
         .map(|_| host_arg_string(ctx, args, 0));
+    let dom = host_dom(ctx);
     let document = args
         .get(1)
         .and_then(Value::as_num_opt)
         .filter(|value| value.is_finite() && *value >= 0.0)
-        .map_or(DOCUMENT, |value| value as usize);
-    let dom = host_dom(ctx);
+        .map_or_else(|| dom.borrow().document(), |value| value as usize);
     let target = dom
         .borrow_mut()
         .set_document_fragment_target(document, fragment.as_deref());
@@ -20511,8 +23077,11 @@ fn host_track_changes(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Va
         if state.window_realms.is_empty() {
             all
         } else {
-            let (mine, others): (Vec<_>, Vec<_>) = all.into_iter().partition(|&(track, _, _)| {
-                node_window_context(state, &dom, track).is_none_or(|owner| owner == caller)
+            // The steps change the media element's list of text tracks: the
+            // Realm of its Document runs them, also for a track element that
+            // has left for another arena of the group.
+            let (mine, others): (Vec<_>, Vec<_>) = all.into_iter().partition(|&(_, media, _)| {
+                node_window_context(state, &dom, media).is_none_or(|owner| owner == caller)
             });
             dom.restore_track_changes(others);
             mine
@@ -21520,8 +24089,9 @@ fn host_get_by_id(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
     let target = host_arg_string(ctx, args, 0);
     let dom = host_dom(ctx);
     let dom = dom.borrow();
-    Ok(host_id_value(dom.descendants(DOCUMENT).find(|&id| {
-        dom.owner_document(id) == Some(DOCUMENT) && dom.attr(id, "id") == Some(target.as_str())
+    let document = dom.document();
+    Ok(host_id_value(dom.descendants(document).find(|&id| {
+        dom.owner_document(id) == Some(document) && dom.attr(id, "id") == Some(target.as_str())
     })))
 }
 
@@ -21795,14 +24365,61 @@ fn host_clone(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Valu
     // A copied clonable shadow tree's slots receive the copied slottables
     // (DOM #concept-node-insert step 7.4 for its children).
     dom.settle_parsed_slot_assignments(true);
+    drop(dom);
+    // importNode() into a Document of another traversable of the group: the
+    // copy moves to that Document's arena, whose node it is.
+    if let Some(copy) = id
+        && document.is_none()
+        && let Some(target) = args
+            .get(2)
+            .filter(|value| !matches!(value, Value::Null | Value::Undefined))
+    {
+        adopt_copy_into(ctx, target, copy);
+    }
     Ok(host_id_value(id))
+}
+
+/// importNode() into `document`, a Document of another traversable of the
+/// group: `copy`, made in the selected arena, moves to that Document's arena,
+/// which adopts it (DOM #concept-node-clone with document set to it).
+fn adopt_copy_into(ctx: &mut Ctx, document: &Value, copy: usize) {
+    if !SEVERAL_TRAVERSABLES.with(Cell::get) {
+        return;
+    }
+    let Some(state) = ctx.host_mut::<HostState>() else {
+        return;
+    };
+    let document = match document {
+        value @ Value::Obj(_) => state.dom_gc.node_identity(value),
+        value => value
+            .as_num_opt()
+            .filter(|number| number.is_finite() && *number >= 0.0 && number.fract() == 0.0)
+            .map(|number| number as usize),
+    };
+    let Some(document) = document else {
+        return;
+    };
+    let Some(target) = state
+        .arenas()
+        .find(|arena| arena.try_borrow().is_ok_and(|dom| dom.is_valid(document)))
+        .cloned()
+    else {
+        return;
+    };
+    if Rc::ptr_eq(&target, &state.dom) {
+        return;
+    }
+    if let (Ok(mut source), Ok(mut target)) = (state.dom.try_borrow_mut(), target.try_borrow_mut())
+    {
+        source.transplant_subtree(copy, &mut target, document);
+    }
 }
 
 fn host_doc_element(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
     let dom = host_dom(ctx);
     let dom = dom.borrow();
     Ok(host_id_value(
-        dom.children(DOCUMENT)
+        dom.children(dom.document())
             .into_iter()
             .find(|&child| dom.tag_name(child) == Some("html")),
     ))
@@ -21828,11 +24445,10 @@ fn is_all_named_element(dom: &Dom, node: usize) -> bool {
 /// non-empty ID and every "all"-named member's non-empty name, in tree order,
 /// later duplicates ignored, an element's ID before its name.
 fn live_all_names(ctx: &Ctx, key: &Value) -> Vec<String> {
-    let (Some(members), Some(state)) = (live_query_members(ctx, key), ctx.host::<HostState>())
-    else {
+    let (Some(members), Some(arena)) = (live_query_members(ctx, key), query_arena(ctx, key)) else {
         return Vec::new();
     };
-    let dom = state.dom.borrow();
+    let dom = arena.borrow();
     let mut seen = rustc_hash::FxHashSet::default();
     let mut names = Vec::new();
     for &member in members.iter() {
@@ -21864,10 +24480,10 @@ fn live_all_named_ids(
     let name = host_arg_string(ctx, args, 0);
     let ids = match (
         live_query_members(ctx, &captures[0]),
-        ctx.host::<HostState>(),
+        query_arena(ctx, &captures[0]),
     ) {
-        (Some(members), Some(state)) if !name.is_empty() => {
-            let dom = state.dom.borrow();
+        (Some(members), Some(arena)) if !name.is_empty() => {
+            let dom = arena.borrow();
             members
                 .iter()
                 .copied()
@@ -22112,7 +24728,7 @@ fn host_css_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
             .parse::<usize>()
             .ok()
             .filter(|&id| dom.is_valid(id))
-            .unwrap_or(DOCUMENT);
+            .unwrap_or(dom.document());
         dom.request_import(owner, &text);
         return Ok(Value::from_engine_text("null"));
     }
@@ -22862,12 +25478,13 @@ fn reusable_top_hit_test_cache(ctx: &mut Ctx) -> Option<Rc<RefCell<LumenGeomCach
 /// The JavaScript binding performs WebIDL conversion, viewport bounds checks,
 /// wrapper conversion, and the required root-element fallback.
 fn host_elements_from_point(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let document = host_dom(ctx).borrow().document();
     let scope = args
         .first()
         .and_then(Value::as_num_opt)
         .filter(|value| value.is_finite() && *value >= 0.0)
         .map(|value| value as usize)
-        .unwrap_or(DOCUMENT);
+        .unwrap_or(document);
     let x = args.get(1).and_then(Value::as_num_opt).unwrap_or(0.0) as f32;
     let y = args.get(2).and_then(Value::as_num_opt).unwrap_or(0.0) as f32;
     let scroll_x = args.get(3).and_then(Value::as_num_opt).unwrap_or(0.0) as f32;
@@ -22878,7 +25495,7 @@ fn host_elements_from_point(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
         .expect("HostState installed")
         .viewport
         .get();
-    let cache = match (scope == DOCUMENT)
+    let cache = match (scope == document)
         .then(|| reusable_top_hit_test_cache(ctx))
         .flatten()
     {
@@ -22889,7 +25506,7 @@ fn host_elements_from_point(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
     let Some(paint) = cached.paint.as_ref() else {
         return Ok(ctx.make_array(Vec::new()));
     };
-    let point = if scope == DOCUMENT {
+    let point = if scope == document {
         crate::core::CssPoint::new(x, y)
     } else if let Some(frame) = paint
         .scroll_containers
@@ -22920,7 +25537,7 @@ fn host_elements_from_point(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
 
     let dom = host_dom(ctx);
     let dom = dom.borrow();
-    let wanted_frame = (scope != DOCUMENT).then_some(scope);
+    let wanted_frame = (scope != document).then_some(scope);
     // A reused top-level paint may name since-collected nodes of a nested
     // Document; those are never top-level hits.
     let nodes = hits
@@ -23443,10 +26060,13 @@ fn document_cookie_url(ctx: &mut Ctx, args: &[Value]) -> Option<url::Url> {
         return None;
     }
     let state = ctx.host_mut::<HostState>()?;
-    if id == DOCUMENT && context_id == 0 {
+    if id == state.dom.borrow().document() && context_id == state.top_context {
         return crate::http::same_origin_for_host(
             &url,
-            state.window_request_urls.get(&0).unwrap_or(&state.base),
+            state
+                .window_request_urls
+                .get(&state.top_context)
+                .unwrap_or(&state.base),
         )
         .then_some(url);
     }
@@ -24118,6 +26738,25 @@ fn host_blob_url(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, V
                 state.navigation_blob = state.blobs.resolve(&key).map(|entry| (key, entry));
             }
             Ok(Value::Undefined)
+        }
+        // HTML #get-noopener-for-window-open step 1 (and #get-an-element's-noopener step 3):
+        // a blob: URL whose entry's environment's origin is not same site with the source
+        // Document's top-level origin opens a new top-level traversable without an opener.
+        "noopener" => {
+            let Some(state) = ctx.host_mut::<HostState>() else {
+                return Ok(Value::Bool(false));
+            };
+            let top_level = state
+                .window_request_urls
+                .get(&state.top_context)
+                .unwrap_or(&state.base)
+                .clone();
+            let cross_site = state
+                .blobs
+                .resolve(crate::blob_url_store::key(&url))
+                .and_then(|entry| url::Url::parse(&entry.origin).ok())
+                .is_some_and(|origin| !crate::site_storage::same_site(&origin, &top_level));
+            Ok(Value::Bool(cross_site))
         }
         _ => Ok(Value::Undefined),
     }
@@ -25030,10 +27669,14 @@ mod fetch_stream_tests;
 #[cfg(test)]
 #[path = "media_host_tests.rs"]
 mod media_host_tests;
+#[cfg(test)]
+#[path = "traversable_tests.rs"]
+mod traversable_tests;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dom::DOCUMENT;
 
     #[test]
     fn main_page_diagnostic_init_is_explicit_once_and_failure_is_contained() {
@@ -27004,6 +29647,65 @@ mod tests {
             ),
             "x z|x z|L|b|0|1||t|v|true|0|false|false|true|true|3|4|0|auto|x.mp3|true|true|true|true|1|0|0||[object VisualViewport]"
         );
+    }
+
+    #[test]
+    fn hidden_quiet_pages_align_their_timers_to_whole_seconds() {
+        // HTML #run-steps-after-a-timeout ("optionally, wait a further
+        // implementation-defined length of time"): once a hidden page that
+        // makes no sound has been hidden for ten seconds, its timers fall
+        // due at whole seconds of the agent clock, in their nominal order.
+        let mut engine = platform_engine();
+        let number = |engine: &mut lumen::Engine, source: &str| {
+            eval_value(engine, source, "timer probe")
+                .unwrap()
+                .as_num_opt()
+                .unwrap()
+        };
+        eval(
+            &mut engine,
+            "globalThis.fired = [];\
+             globalThis.base = __trust.now();\
+             setTimeout(() => fired.push('late'), 12500);\
+             setTimeout(() => fired.push('soon'), 300);",
+            "timers",
+        )
+        .unwrap();
+        let base = number(&mut engine, "base");
+        // Visible: the earliest timer is due on time.
+        let due = number(&mut engine, "__trust.nextDeadline()");
+        assert!((due - (base + 300.0)).abs() < 50.0, "due={due} base={base}");
+        // Hidden: within the first ten seconds nothing changes...
+        eval(&mut engine, "__trust.systemVisibilityChanged(true)", "hide").unwrap();
+        assert_eq!(number(&mut engine, "__trust.nextDeadline()"), due);
+        // ...and a timer due after them waits for a whole second.
+        eval(&mut engine, "__trust.setTimerThrottleFrom(0)", "throttle").unwrap();
+        let aligned = number(&mut engine, "__trust.nextDeadline()");
+        assert_eq!(aligned % 1000.0, 0.0, "aligned={aligned}");
+        assert!(aligned >= due && aligned - due < 1000.0);
+        // A page that makes sound runs its timers on time.
+        eval(
+            &mut engine,
+            "__trust.setTimerThrottleFrom(null); __trust.noteAudible({}, true)",
+            "sound",
+        )
+        .unwrap();
+        assert_eq!(number(&mut engine, "__trust.nextDeadline()"), due);
+        // Both still fire, in their nominal order.
+        eval(&mut engine, "__trust.setTimerThrottleFrom(0)", "throttle").unwrap();
+        for _ in 0..4 {
+            let Some(deadline) = eval_value(&mut engine, "__trust.nextDeadline()", "deadline")
+                .unwrap()
+                .as_num_opt()
+                .filter(|n| n.is_finite())
+            else {
+                break;
+            };
+            if engine_call_trust_method(&mut engine, "tickTo", &[Value::Num(deadline)]).is_err() {
+                panic!("a timer failed");
+            }
+        }
+        assert_eq!(string_value(&mut engine, "fired.join()"), "soon,late");
     }
 
     fn platform_engine() -> lumen::Engine {
@@ -31327,6 +34029,7 @@ mod tests {
                 false,
                 true,
                 MainWindowTraces::default(),
+                crate::js::TraversableState::SHOWN,
             )
             .contains("fullscreenSupported: false")
         );
@@ -34189,7 +36892,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 257, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 262, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -34200,7 +36903,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 257);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 262);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(
@@ -56294,8 +58997,7 @@ mod tests {
                 commands,
                 interactions,
                 hover,
-                Default::default(),
-                interrupt.clone(),
+                crate::js::TraversableLink::for_test(interrupt.clone()),
             );
             engine.ctx().op_state().put(QueuedClick {
                 handle,

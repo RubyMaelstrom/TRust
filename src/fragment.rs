@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use crate::dom::{DOCUMENT, Dom, NodeId};
+use crate::dom::{Dom, NodeId};
 
 pub fn same_document(left: &url::Url, right: &url::Url) -> bool {
     let mut left = left.clone();
@@ -54,7 +54,7 @@ pub fn position<T: Copy>(fragment: &str, targets: &HashMap<String, T>, top: T) -
 /// Select before looking up geometry: IDs beat legacy names regardless of
 /// their relative positions, and duplicates use DOM tree order, not paint order.
 pub(crate) fn targets(dom: &Dom) -> HashMap<String, NodeId> {
-    targets_in(dom, DOCUMENT)
+    targets_in(dom, dom.document())
 }
 
 /// HTML #find-a-potential-indicated-element in `document`, the top-level

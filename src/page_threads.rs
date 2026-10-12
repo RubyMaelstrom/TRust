@@ -75,6 +75,15 @@ impl PageThreads {
         // has cancelled the shared interrupt, so the actor exits regardless.
     }
 
+    /// Whether a page thread is still running.
+    fn running(&self) -> bool {
+        let state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        state
+            .threads
+            .iter()
+            .any(|entry| !entry.thread.is_finished())
+    }
+
     fn shutdown(&self) {
         let threads = {
             let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -118,6 +127,10 @@ pub(crate) fn attach_cache(
 
 pub(crate) fn shutdown() {
     THREADS.shutdown();
+}
+
+pub(crate) fn running() -> bool {
+    THREADS.running()
 }
 
 #[cfg(test)]

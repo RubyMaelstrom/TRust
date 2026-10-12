@@ -25,7 +25,7 @@ use std::sync::Arc;
 use url::Url;
 
 use crate::doc::{FieldKind, Form};
-use crate::dom::{DOCUMENT, Dom, NodeData, NodeId, PseudoEl};
+use crate::dom::{Dom, NodeData, NodeId, PseudoEl};
 use crate::layout2::{ControlMap, Units, css_length_px, is_collapsible_space};
 
 use super::style::{BoxStyle, Disp, Pos, display_of};
@@ -394,7 +394,7 @@ pub(super) fn build_document(
 ) -> Option<SharedBox> {
     dom.flush_style_invalidations();
     let root = dom
-        .children(DOCUMENT)
+        .children(dom.document())
         .into_iter()
         .find(|&c| dom.tag_name(c).is_some())?;
     let mut b = Builder {

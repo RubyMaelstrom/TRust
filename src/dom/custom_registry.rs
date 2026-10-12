@@ -84,6 +84,17 @@ impl State {
             + self.inert_documents.capacity() * std::mem::size_of::<NodeId>()
     }
 
+    /// Carry the recorded registries of elements moving to another arena of
+    /// the group (`Dom::transplant_subtree`); their shadow roots' registries
+    /// travel in their shadow root data.
+    pub(super) fn transplant(&self, into: &mut State, moved: &FxHashSet<NodeId>) {
+        for (&element, &registry) in &self.elements {
+            if moved.contains(&element) {
+                into.elements.insert(element, registry);
+            }
+        }
+    }
+
     /// Drop the associations of retired identities. An inert template
     /// document lives while a node it owns (or its wrapper) does; once it is
     /// gone, its Document gets a new one when another template needs it,
@@ -118,7 +129,7 @@ impl Dom {
         if let Some(&registry) = self.ce_registries.documents.get(&document) {
             return registry;
         }
-        let browsing_context = document == DOCUMENT
+        let browsing_context = document == self.document()
             || self.nodes.get(document).is_some_and(|node| {
                 node.parent
                     .is_some_and(|frame| matches!(self.tag_name(frame), Some("iframe" | "frame")))
@@ -329,7 +340,24 @@ impl Dom {
         old: RegistryContext,
         new: RegistryContext,
     ) {
-        let old_default = self.default_registry(old);
+        self.adopt_registries_from(root, self.default_registry(old), new);
+    }
+
+    /// The default registry of the conceptual document a node left, for a
+    /// node that leaves another arena of the group (`transplant_subtree`).
+    pub(super) fn departing_default_registry(&self, node: NodeId) -> Option<CeRegistry> {
+        self.registries_recorded()
+            .then(|| self.default_registry(self.registry_context(node)))
+    }
+
+    /// [`Self::adopt_registries`] for nodes whose old conceptual document's
+    /// default registry is `old_default`, which may be another arena's.
+    pub(super) fn adopt_registries_from(
+        &mut self,
+        root: NodeId,
+        old_default: CeRegistry,
+        new: RegistryContext,
+    ) {
         let new_document = self.default_registry(new);
         // (node, the registry its parent looks up; None for the root and an
         // exclusive DocumentFragment parent, which use the document's).

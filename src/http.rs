@@ -1305,6 +1305,8 @@ async fn fetch_cors_page_image(
 pub struct LivePage {
     pub handle: crate::js::PageHandle,
     pub events: tokio::sync::mpsc::Receiver<crate::js::PageEvt>,
+    /// The traversable's presentation the page was created with.
+    pub traversable: crate::js::TraversableState,
 }
 
 /// A successful GET response, cached for one page load.
@@ -1327,6 +1329,31 @@ pub struct CachedResp {
 pub type FetchOutcome = Result<std::sync::Arc<CachedResp>, ()>;
 pub type SharedFetch = futures::future::Shared<futures::future::BoxFuture<'static, FetchOutcome>>;
 type FetchTimingReporter = Box<dyn FnOnce(Option<Box<crate::performance::FetchTiming>>) + Send>;
+
+/// Keepalive fetches in flight in this process (Fetch
+/// #request-keepalive-flag), which a browser ending lets finish
+/// (`js::shutdown_page_threads_after`).
+static KEEPALIVE_FETCHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub(crate) fn keepalive_fetches_in_flight() -> usize {
+    KEEPALIVE_FETCHES.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// One keepalive fetch in flight, until it finishes or is aborted.
+struct KeepaliveFlight;
+
+impl KeepaliveFlight {
+    fn start() -> Self {
+        KEEPALIVE_FETCHES.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Self
+    }
+}
+
+impl Drop for KeepaliveFlight {
+    fn drop(&mut self) {
+        KEEPALIVE_FETCHES.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
 
 /// A per-page subresource cache with in-flight dedup. Shared across the
 /// runtime (the initial `execute_js` prefetch) and the page thread (the
@@ -1390,7 +1417,8 @@ impl PageTaskScope {
     /// [`Self::spawn`] for work a document can stop on its own (a script's
     /// fetch, HTML #abort-a-document): its abort handle, unless the scope was
     /// already retired. While it runs it counts as loading ([`Self::loading`])
-    /// unless it is `keepalive`.
+    /// unless it is `keepalive`; a keepalive fetch also survives
+    /// [`Self::cancel`].
     pub(crate) fn spawn_abortable<F>(
         &self,
         handle: &tokio::runtime::Handle,
@@ -1408,14 +1436,25 @@ impl PageTaskScope {
         if self.cancelled.load(Ordering::Acquire) {
             return None;
         }
+        if keepalive {
+            // Fetch #concept-fetch-group-terminate spares keepalive fetches:
+            // they outlive their document (a beacon sent while it unloads).
+            let flight = KeepaliveFlight::start();
+            return Some(
+                handle
+                    .spawn(async move {
+                        let _flight = flight;
+                        future.await
+                    })
+                    .abort_handle(),
+            );
+        }
         let task = handle.spawn(future).abort_handle();
         tasks.push(task.clone());
         drop(tasks);
-        if !keepalive {
-            let mut loading = self.script_fetches.lock().unwrap();
-            loading.retain(|task| !task.is_finished());
-            loading.push(task.clone());
-        }
+        let mut loading = self.script_fetches.lock().unwrap();
+        loading.retain(|task| !task.is_finished());
+        loading.push(task.clone());
         Some(task)
     }
 
@@ -6366,6 +6405,8 @@ pub async fn execute_js_for_device(
         true,
         // The terminal presents a fullscreen page by hiding its chrome rows.
         true,
+        crate::js::TraversableState::SHOWN,
+        None,
     )
     .await
 }
@@ -6511,7 +6552,12 @@ pub(crate) fn prefetch_parser_scripts(
     }
 }
 
-/// `fullscreen_supported` is the frontend's Fullscreen API #fullscreen-is-supported.
+/// `fullscreen_supported` is the frontend's Fullscreen API #fullscreen-is-supported;
+/// `traversable` is how the frontend presents the document's top-level traversable.
+/// `group` is the traversable's link while it shares its browsing context
+/// group with others: then its Document, script-free or not, is created in
+/// the group's engine (`js::spawn_page_in`), with the group's network state.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_js_for_window(
     response: Response,
     viewport: (u16, u16),
@@ -6520,6 +6566,8 @@ pub(crate) async fn execute_js_for_window(
     screen_position: (i32, i32),
     storage: crate::js::WebStorage,
     fullscreen_supported: bool,
+    traversable: crate::js::TraversableState,
+    group: Option<crate::js::TraversableLink>,
 ) -> Response {
     execute_js_with_presentation(
         response,
@@ -6530,6 +6578,8 @@ pub(crate) async fn execute_js_for_window(
         storage,
         false,
         fullscreen_supported,
+        traversable,
+        group,
     )
     .await
 }
@@ -6544,6 +6594,8 @@ async fn execute_js_with_presentation(
     storage: crate::js::WebStorage,
     terminal_presentation: bool,
     fullscreen_supported: bool,
+    traversable: crate::js::TraversableState,
+    group: Option<crate::js::TraversableLink>,
 ) -> Response {
     let device_pixel_ratio = if device_pixel_ratio.is_finite() && device_pixel_ratio > 0.0 {
         device_pixel_ratio
@@ -6573,7 +6625,9 @@ async fn execute_js_with_presentation(
     // need the canonical live DOM even when there are no author scripts.
     let mut prefetched_sheets = None;
     let mut scripted_frames = false;
-    if !html.to_ascii_lowercase().contains("<script") {
+    // A group's traversables keep their Windows for each other: none of its
+    // Documents is presented without a page actor.
+    if group.is_none() && !html.to_ascii_lowercase().contains("<script") {
         let sheets =
             fetch_page_sheets(&html, &response.url, document_encoding, referrer_policy).await;
         let needs_live_dom = {
@@ -6660,8 +6714,12 @@ async fn execute_js_with_presentation(
     // "unexpected token '<'" and the app never boots). The SSRF gate still
     // keys off the real page URL.
     let doc_base = base_with_doc_base(&html, &response.url);
-    // The parser, module loader, and page fetches share this resource cache.
-    let cache = std::sync::Arc::new(PageCache::default());
+    // The parser, module loader, and page fetches share this resource cache
+    // (a group's Documents share their group's).
+    let cache = group.as_ref().map_or_else(
+        || std::sync::Arc::new(PageCache::default()),
+        |link| link.cache(),
+    );
     // HTML #speculative-html-parsing: the parser's scripts start fetching as
     // soon as the document's bytes are here, alongside its style sheets,
     // instead of when the page engine has started. Their timing reports wait
@@ -6832,7 +6890,9 @@ async fn execute_js_with_presentation(
     install_stylesheet_fonts(&html, &sheets, &response.url, true, referrer_policy).await;
     // Created HERE so it outlives the engine: the app hangs it on the Doc
     // and decodes blob: image srcs from it even after the page froze.
-    let blobs = crate::js::BlobMap::default();
+    let blobs = group
+        .as_ref()
+        .map_or_else(crate::js::BlobMap::default, |link| link.blobs());
     response.blobs = Some(blobs.clone());
     // The page actor owns the document's image requests; frontends present
     // its responses from this store (HTML #updating-the-image-data).
@@ -6859,6 +6919,7 @@ async fn execute_js_with_presentation(
         document_encoding,
         content_type: media.clone(),
         fullscreen_supported,
+        traversable,
     };
     // The page actor owns the engine on its own dedicated stack. Its first
     // event is `Static`
@@ -6881,7 +6942,10 @@ async fn execute_js_with_presentation(
         response.live = None;
         return response;
     }
-    let (handle, mut events) = crate::js::spawn_page(html, env);
+    let (handle, mut events) = match &group {
+        Some(link) => crate::js::spawn_page_in(link, html, env),
+        None => crate::js::spawn_page(html, env),
+    };
     let first = tokio::time::timeout(Duration::from_secs(60), events.recv()).await;
     if std::env::var_os("TRUST_NET_TRACE").is_some() {
         eprintln!(
@@ -6917,7 +6981,16 @@ async fn execute_js_with_presentation(
                 )
                 .await;
             };
-            (html, rendered, outcome, Some(LivePage { handle, events }))
+            (
+                html,
+                rendered,
+                outcome,
+                Some(LivePage {
+                    handle,
+                    events,
+                    traversable,
+                }),
+            )
         }
         // Died, hung, or spoke out of turn (most often: the page's JS is too
         // slow to first-paint within the timeout — a big GitHub code file).
@@ -8662,7 +8735,8 @@ fn css_only_render(
     let _cells = terminal_presentation
         .then(|| crate::text::cell_metrics_scope(terminal_cell_metrics(cell_px)));
     let mut dom = crate::js::css_prepare(html, viewport, cell_px);
-    dom.set_document_encoding(crate::dom::DOCUMENT, document_encoding);
+    let document = dom.document();
+    dom.set_document_encoding(document, document_encoding);
     if !frames.is_empty() {
         install_page_frames(&mut dom, page_url, frames);
     }
@@ -8688,7 +8762,7 @@ fn css_only_render(
         None,
         &crate::layout2::ImageSizes::new(),
     );
-    let body = dom.serialize(crate::dom::DOCUMENT).into_bytes();
+    let body = dom.serialize(dom.document()).into_bytes();
     (rendered, body, dom.take_svg_resource_requests())
 }
 
@@ -8873,7 +8947,7 @@ fn detect_declarative_refresh(response: &Response, html: &str) -> Option<Declara
     }
     let dom = crate::dom::Dom::parse_document(html);
     let base = base_with_doc_base(html, &response.url);
-    for node in dom.descendants(crate::dom::DOCUMENT) {
+    for node in dom.descendants(dom.document()) {
         if dom.tag_name(node) != Some("meta")
             || !dom
                 .attr(node, "http-equiv")
@@ -8899,7 +8973,7 @@ fn detect_declarative_refresh(response: &Response, html: &str) -> Option<Declara
 /// exists (the prefetch phase needs it too).
 fn base_with_doc_base(html: &str, doc_url: &Url) -> Url {
     let dom = crate::dom::Dom::parse_document(html);
-    for id in dom.flat_descendants(crate::dom::DOCUMENT) {
+    for id in dom.flat_descendants(dom.document()) {
         if dom.tag_name(id) == Some("base")
             && let Some(href) = dom.attr(id, "href")
             && let Ok(u) = doc_url.join(href.trim())
@@ -8988,7 +9062,7 @@ fn scan_frame_sources(
     let dom = crate::dom::Dom::parse_document(html);
     let mut srcs = Vec::new();
     let mut srcdocs = Vec::new();
-    for id in dom.flat_descendants(crate::dom::DOCUMENT) {
+    for id in dom.flat_descendants(dom.document()) {
         match dom.tag_name(id) {
             Some("iframe") | Some("frame") => {}
             _ => continue,
@@ -9162,12 +9236,12 @@ async fn prefetch_frame_documents(
 /// `srcdoc` frame from its attribute (base = the parent document). Synchronous
 /// — `Dom` never crosses an `.await`. Bounded identically to the prefetch.
 fn install_page_frames(dom: &mut crate::dom::Dom, page_url: &Url, fetched: &FrameDocuments) {
-    use crate::dom::{DOCUMENT, NodeId};
+    use crate::dom::NodeId;
     use std::collections::VecDeque;
 
     let base = {
         let mut b = page_url.clone();
-        for id in dom.descendants(DOCUMENT) {
+        for id in dom.descendants(dom.document()) {
             if dom.tag_name(id) == Some("base")
                 && let Some(href) = dom.attr(id, "href")
                 && let Ok(u) = page_url.join(href.trim())
@@ -9184,10 +9258,10 @@ fn install_page_frames(dom: &mut crate::dom::Dom, page_url: &Url, fetched: &Fram
     let mut queue: VecDeque<(NodeId, Url, Vec<String>, &'static encoding_rs::Encoding)> =
         VecDeque::new();
     queue.push_back((
-        DOCUMENT,
+        dom.document(),
         base,
         vec![strip_fragment(page_url.as_str()).to_string()],
-        dom.document_encoding(DOCUMENT),
+        dom.document_encoding(dom.document()),
     ));
 
     while let Some((root, base, ancestors, encoding)) = queue.pop_front() {
@@ -9503,8 +9577,8 @@ pub(crate) fn document_referrer_policy(
     {
         return container;
     }
-    crate::dom::Dom::parse_document(html)
-        .parsed_referrer_meta_policy(crate::dom::DOCUMENT)
+    let dom = crate::dom::Dom::parse_document(html);
+    dom.parsed_referrer_meta_policy(dom.document())
         .unwrap_or(container)
 }
 
@@ -10004,7 +10078,7 @@ fn collect_hover_ids(
     dom: &crate::dom::Dom,
 ) -> std::collections::HashMap<crate::dom::NodeId, usize> {
     let mut map = std::collections::HashMap::new();
-    let mut stack: Vec<(crate::dom::NodeId, Option<usize>)> = vec![(crate::dom::DOCUMENT, None)];
+    let mut stack: Vec<(crate::dom::NodeId, Option<usize>)> = vec![(dom.document(), None)];
     while let Some((id, mut cur)) = stack.pop() {
         let marker = dom
             .internal_marker(id, "data-trust-hover")
@@ -10080,7 +10154,7 @@ pub fn lay_region_patch(
     dom.set_device_pixel_ratio(1.0);
     let key = boundary_node.to_string();
     let boundary = dom
-        .descendants(crate::dom::DOCUMENT)
+        .descendants(dom.document())
         .into_iter()
         .find(|&id| dom.internal_marker(id, "data-trust-node") == Some(key.as_str()))?;
     let (_forms, controls) = extract_forms_arena(&dom, url, None);
@@ -10106,7 +10180,7 @@ pub fn lay_region_patch(
         boundary,
     );
     if diag {
-        let n_nodes = dom.descendants(crate::dom::DOCUMENT).count();
+        let n_nodes = dom.descendants(dom.document()).count();
         eprintln!(
             "DIAGPATCH region-split parse={}us layout={}us nodes={} rows={}",
             t_parse.as_micros(),
@@ -10174,7 +10248,7 @@ pub fn lay_subtree_patch(
     dom.set_device_pixel_ratio(1.0);
     let key = boundary_node.to_string();
     let boundary = dom
-        .descendants(crate::dom::DOCUMENT)
+        .descendants(dom.document())
         .into_iter()
         .find(|&id| dom.internal_marker(id, "data-trust-node") == Some(key.as_str()))?;
     let (_forms, controls) = extract_forms_arena(&dom, url, None);
@@ -10503,7 +10577,7 @@ fn collect_image_urls_for_boxes(
         lazy_handles.remove(&crate::render::ImageHandle::for_source(&preview));
         attribute(
             &preview,
-            crate::dom::DOCUMENT,
+            dom.document(),
             crate::page_images::ImageInitiator::UserAgent,
         );
         eager.push(preview.clone());
@@ -10636,7 +10710,7 @@ pub fn extract_forms_arena(
     let mut implicit = None;
     walk_forms_arena(
         dom,
-        crate::dom::DOCUMENT,
+        dom.document(),
         None,
         base,
         &mut forms,
@@ -10937,7 +11011,7 @@ fn element_target(dom: &crate::dom::Dom, element: usize) -> String {
         return target.to_string();
     }
     let owner = dom.frame_owner(element);
-    let root = owner.unwrap_or(crate::dom::DOCUMENT);
+    let root = owner.unwrap_or(dom.document());
     dom.descendants(root)
         .find(|&node| {
             dom.tag_name(node) == Some("base")
@@ -15225,6 +15299,8 @@ mod tests {
                 Default::default(),
                 false,
                 true,
+                crate::js::TraversableState::SHOWN,
+                None,
             )
             .await;
             assert_eq!(response.live.is_some(), live, "{inner}");
@@ -15306,6 +15382,8 @@ mod tests {
                 Default::default(),
                 terminal,
                 true,
+                crate::js::TraversableState::SHOWN,
+                None,
             )
             .await;
             assert!(
@@ -18141,6 +18219,8 @@ mod tests {
                 (0, 0),
                 Default::default(),
                 true,
+                crate::js::TraversableState::SHOWN,
+                None,
             )
             .await
         } else {

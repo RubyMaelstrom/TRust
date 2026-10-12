@@ -2224,7 +2224,7 @@ impl Dom {
         ) {
             id
         } else {
-            self.owner_document(id).unwrap_or(super::DOCUMENT)
+            self.owner_document(id).unwrap_or(self.document())
         };
         let evaluation = Evaluation {
             dom: self,

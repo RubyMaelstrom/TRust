@@ -148,7 +148,9 @@ async fn main() -> ExitCode {
     );
     pop_terminal_title();
     ratatui::restore();
-    trust::js::shutdown_page_threads();
+    // The page unloaded as the browser ended: let its unload handlers and
+    // beacons finish.
+    trust::js::shutdown_page_threads_after(trust::js::PAGE_END_GRACE);
     if let Err(error) = trust::site_storage::shutdown() {
         eprintln!("trust: {error}");
     }

@@ -206,6 +206,8 @@ impl<'a> NodesRef<'a> {
 /// `SharedView` needs no argument beyond the arena's.
 #[derive(Clone, Copy)]
 pub(super) struct ViewState<'a> {
+    /// The arena's Document (`Dom::document`).
+    pub(super) document: NodeId,
     pub(super) shadow_hosts: &'a FxHashMap<NodeId, NodeId>,
     pub(super) shadow_roots: &'a FxHashMap<NodeId, NodeId>,
     pub(super) shadow_data: &'a FxHashMap<NodeId, shadow::ShadowRootData>,
@@ -216,6 +218,7 @@ pub(super) struct ViewState<'a> {
     pub(super) fullscreen_flags: &'a FxHashSet<NodeId>,
     pub(super) top_layer: &'a [NodeId],
     pub(super) focused_areas: &'a FxHashMap<NodeId, NodeId>,
+    pub(super) system_focus: bool,
     pub(super) input_values: &'a FxHashMap<NodeId, input::InputValue>,
     pub(super) element_states: &'a FxHashMap<NodeId, input::ElementState>,
     pub(super) render_live: bool,
@@ -249,6 +252,7 @@ impl Dom {
         StyleView {
             nodes: NodesRef(&self.nodes),
             state: ViewState {
+                document: self.document,
                 shadow_hosts: &self.shadow_hosts,
                 shadow_roots: &self.shadow_roots,
                 shadow_data: &self.shadow_data,
@@ -259,6 +263,7 @@ impl Dom {
                 fullscreen_flags: &self.fullscreen_flags,
                 top_layer: &self.top_layer,
                 focused_areas: &self.focused_areas,
+                system_focus: self.system_focus,
                 input_values: &self.input_values,
                 element_states: &self.element_states,
                 render_live: self.render_live,

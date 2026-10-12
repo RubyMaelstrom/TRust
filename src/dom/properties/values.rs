@@ -82,7 +82,9 @@ pub(super) fn length_scale(unit: &str, ctx: &Context<'_>) -> Option<f64> {
                 _ => 16.,
             });
         };
-        let root = dom.style_scope_root_element(ctx.id).unwrap_or(DOCUMENT);
+        let root = dom
+            .style_scope_root_element(ctx.id)
+            .unwrap_or(dom.document());
         let root_relative = unit.starts_with('r');
         let id = if root_relative { root } else { ctx.id };
         let pseudo = if root_relative { None } else { ctx.pseudo };
@@ -119,10 +121,10 @@ pub(super) fn length_scale(unit: &str, ctx: &Context<'_>) -> Option<f64> {
                 .is_some_and(|value| value.starts_with("vertical") || value.starts_with("sideways"))
         })
     };
-    let root = ctx
-        .dom
-        .and_then(|dom| dom.style_scope_root_element(ctx.id))
-        .unwrap_or(DOCUMENT);
+    let root = ctx.dom.map(|dom| {
+        dom.style_scope_root_element(ctx.id)
+            .unwrap_or(dom.document())
+    });
     let viewport_unit = unit
         .strip_prefix(['s', 'l', 'd'])
         .filter(|_| unit.len() >= 3)
@@ -130,8 +132,8 @@ pub(super) fn length_scale(unit: &str, ctx: &Context<'_>) -> Option<f64> {
     let viewport = match viewport_unit {
         "vw" => Some(w),
         "vh" => Some(h),
-        "vi" => Some(if vertical_at(root) { h } else { w }),
-        "vb" => Some(if vertical_at(root) { w } else { h }),
+        "vi" => Some(if root.is_some_and(vertical_at) { h } else { w }),
+        "vb" => Some(if root.is_some_and(vertical_at) { w } else { h }),
         "vmin" => Some(w.min(h)),
         "vmax" => Some(w.max(h)),
         _ => None,
@@ -173,14 +175,14 @@ pub(super) fn length_scale(unit: &str, ctx: &Context<'_>) -> Option<f64> {
             0 => w,
             1 => h,
             2 => {
-                if vertical_at(root) {
+                if root.is_some_and(vertical_at) {
                     h
                 } else {
                     w
                 }
             }
             _ => {
-                if vertical_at(root) {
+                if root.is_some_and(vertical_at) {
                     w
                 } else {
                     h

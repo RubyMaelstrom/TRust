@@ -81,8 +81,8 @@ impl EmbeddedDocument {
             return Err("This document contains too many elements to display");
         }
         let mut depths = crate::dom::arena::DenseIdMap::with_capacity(dom.node_count());
-        depths.insert(crate::dom::DOCUMENT, 0usize);
-        for node in dom.descendants(crate::dom::DOCUMENT) {
+        depths.insert(dom.document(), 0usize);
+        for node in dom.descendants(dom.document()) {
             depths.insert(node, dom.node(node).parent.map_or(0, |p| depths[p] + 1));
             if depths[node] > limits.depth {
                 return Err("This document is nested too deeply to display");
@@ -326,8 +326,9 @@ impl EmbeddedDocument {
     /// thread. Native callers send mutations back using these stable node IDs.
     pub fn snapshot(&self, semantics: bool) -> EmbeddedSnapshot {
         let mut nodes = crate::dom::arena::DenseIdMap::with_capacity(self.dom.node_count());
-        nodes.insert(crate::dom::DOCUMENT, SnapshotNode::default());
-        for id in self.dom.flat_descendants(crate::dom::DOCUMENT) {
+        let document = self.dom.document();
+        nodes.insert(document, SnapshotNode::default());
+        for id in self.dom.flat_descendants(document) {
             let attrs = match &self.dom.node(id).data {
                 crate::dom::NodeData::Element { attrs, .. } => attrs
                     .iter()
@@ -350,7 +351,7 @@ impl EmbeddedDocument {
                 },
             );
         }
-        nodes[crate::dom::DOCUMENT].children = self.dom.flat_children(crate::dom::DOCUMENT);
+        nodes[document].children = self.dom.flat_children(document);
         EmbeddedSnapshot {
             dom: SnapshotDom { nodes },
             layout: SnapshotLayout {

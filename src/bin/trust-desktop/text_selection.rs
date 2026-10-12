@@ -75,18 +75,26 @@ impl DesktopApp {
     /// The paint list the selection's boundary points are laid out in: the
     /// HTML page's, or the line document's.
     pub(super) fn selection_page(&self) -> Option<&trust::render::PagePaint> {
-        if self.terminal.is_some() {
+        if self.tab.terminal.is_some() {
             return None;
         }
-        self.page_layout
+        self.tab
+            .page_layout
             .as_ref()
             .map(|page| &page.layout.paint)
-            .or_else(|| self.protocol_page.as_ref().map(|page| &page.layout.paint))
+            .or_else(|| {
+                self.tab
+                    .protocol_page
+                    .as_ref()
+                    .map(|page| &page.layout.paint)
+            })
     }
 
     /// Whether a live page's Document owns the selection.
     fn selection_owned_by_page(&self) -> bool {
-        self.terminal.is_none() && self.page_layout.is_some() && self.browser.page_is_live()
+        self.tab.terminal.is_none()
+            && self.tab.page_layout.is_some()
+            && self.tab.browser.page_is_live()
     }
 
     /// The pointer, kept inside the content viewport, as a gesture extends
@@ -110,7 +118,7 @@ impl DesktopApp {
     }
 
     pub(super) fn clear_text_selection(&mut self) {
-        let selection = &mut self.text_selection;
+        let selection = &mut self.tab.text_selection;
         selection.anchor = None;
         selection.focus = None;
         selection.gesture = None;
@@ -120,7 +128,7 @@ impl DesktopApp {
     }
 
     fn set_local_selection(&mut self, anchor: TextPoint, focus: TextPoint) {
-        let selection = &mut self.text_selection;
+        let selection = &mut self.tab.text_selection;
         selection.anchor = Some(anchor);
         selection.focus = Some(focus);
         selection.paint = Some(PageSelection::Painted { anchor, focus });
@@ -132,35 +140,40 @@ impl DesktopApp {
     /// processed every gesture input sent to it. Returns whether the
     /// painted selection changed.
     pub(super) fn sync_page_selection(&mut self) -> bool {
-        let generation = self.browser.document_generation();
-        if generation != self.text_selection.document_generation {
-            self.text_selection = TextSelectionState {
+        let generation = self.tab.browser.document_generation();
+        if generation != self.tab.text_selection.document_generation {
+            self.tab.text_selection = TextSelectionState {
                 document_generation: generation,
-                report_generation: self.text_selection.report_generation,
-                serial: self.text_selection.serial,
+                report_generation: self.tab.text_selection.report_generation,
+                serial: self.tab.text_selection.serial,
                 ..TextSelectionState::default()
             };
             return true;
         }
-        let (report_generation, report) = self.browser.page_selection();
-        if report_generation == self.text_selection.report_generation {
+        let (report_generation, report) = self.tab.browser.page_selection();
+        if report_generation == self.tab.text_selection.report_generation {
             return false;
         }
-        self.text_selection.report_generation = report_generation;
+        self.tab.text_selection.report_generation = report_generation;
         let Some(report) = report else {
             // The live page went away, and its Document's selection.
-            if matches!(self.text_selection.paint, Some(PageSelection::Document(_))) {
-                self.text_selection.paint = None;
-                self.text_selection.anchor = None;
-                self.text_selection.focus = None;
+            if matches!(
+                self.tab.text_selection.paint,
+                Some(PageSelection::Document(_))
+            ) {
+                self.tab.text_selection.paint = None;
+                self.tab.text_selection.anchor = None;
+                self.tab.text_selection.focus = None;
                 return true;
             }
             return false;
         };
-        if report.serial < self.text_selection.serial || self.text_selection.gesture.is_some() {
+        if report.serial < self.tab.text_selection.serial
+            || self.tab.text_selection.gesture.is_some()
+        {
             return false;
         }
-        let selection = &mut self.text_selection;
+        let selection = &mut self.tab.text_selection;
         selection.paint =
             (!report.segments.is_empty()).then(|| PageSelection::Document(report.segments.clone()));
         selection.anchor = report.anchor;
@@ -173,7 +186,7 @@ impl DesktopApp {
     pub(super) fn begin_selection_gesture(&mut self, link_press: bool) -> Option<PointerSelection> {
         self.selection_page()?;
         let now = Instant::now();
-        let count = match self.text_selection.clicks {
+        let count = match self.tab.text_selection.clicks {
             Some((at, point, count))
                 if now.duration_since(at) < CLICK_INTERVAL
                     && (point.x - self.pointer.x).abs() <= CLICK_SLOP
@@ -183,11 +196,11 @@ impl DesktopApp {
             }
             _ => 1,
         };
-        self.text_selection.clicks = Some((now, self.pointer, count));
-        self.text_selection.serial += 1;
+        self.tab.text_selection.clicks = Some((now, self.pointer, count));
+        self.tab.text_selection.serial += 1;
         let point = self.selection_point_at_pointer();
-        let report = Some(PointerSelection::new(point, self.text_selection.serial));
-        self.text_selection.gesture = None;
+        let report = Some(PointerSelection::new(point, self.tab.text_selection.serial));
+        self.tab.text_selection.gesture = None;
         // CSS UI 4 #content-selection: a press in `user-select: none`
         // content neither starts a selection nor affects the one there is.
         let scene = self.scene.as_ref()?;
@@ -196,15 +209,15 @@ impl DesktopApp {
         }
         let Some(point) = point else {
             // §2: a user action collapses a selection rather than emptying it.
-            if self.text_selection.selects() {
-                self.text_selection.paint = None;
+            if self.tab.text_selection.selects() {
+                self.tab.text_selection.paint = None;
                 self.request_redraw();
             }
             return report;
         };
         let pointer = self.pointer;
         let shift = self.modifiers.shift_key();
-        let (granularity, origin) = match (shift, self.text_selection.anchor, count) {
+        let (granularity, origin) = match (shift, self.tab.text_selection.anchor, count) {
             (true, Some(anchor), _) => (SelectionGranularity::Character, (anchor, anchor)),
             (_, _, 2) => (
                 SelectionGranularity::Word,
@@ -216,12 +229,12 @@ impl DesktopApp {
             ),
             _ => (SelectionGranularity::Character, (point, point)),
         };
-        self.text_selection.gesture = Some(SelectionGesture {
+        self.tab.text_selection.gesture = Some(SelectionGesture {
             granularity,
             origin,
             drag: !link_press || self.modifiers.alt_key(),
         });
-        if shift && self.text_selection.anchor.is_some() {
+        if shift && self.tab.text_selection.anchor.is_some() {
             self.set_local_selection(origin.0, point);
         } else {
             self.set_local_selection(origin.0, origin.1);
@@ -242,13 +255,13 @@ impl DesktopApp {
         });
         if form {
             self.selection_page()?;
-            self.text_selection.gesture = None;
-            if self.text_selection.selects() {
-                self.text_selection.paint = None;
+            self.tab.text_selection.gesture = None;
+            if self.tab.text_selection.selects() {
+                self.tab.text_selection.paint = None;
                 self.request_redraw();
             }
-            self.text_selection.serial += 1;
-            return Some(PointerSelection::new(None, self.text_selection.serial));
+            self.tab.text_selection.serial += 1;
+            return Some(PointerSelection::new(None, self.tab.text_selection.serial));
         }
         let link = hit
             .and_then(|hit| hit.link.as_ref())
@@ -260,7 +273,11 @@ impl DesktopApp {
     /// pointer, by whole granules. Returns what the page is told of it,
     /// when it changed the selection.
     pub(super) fn extend_selection_gesture(&mut self) -> Option<PointerSelection> {
-        let gesture = self.text_selection.gesture.filter(|gesture| gesture.drag)?;
+        let gesture = self
+            .tab
+            .text_selection
+            .gesture
+            .filter(|gesture| gesture.drag)?;
         self.schedule_selection_autoscroll();
         let point = self.selection_point_at_pointer()?;
         let (anchor, focus) = match gesture.granularity {
@@ -284,36 +301,38 @@ impl DesktopApp {
                 }
             }
         };
-        if self.text_selection.anchor == Some(anchor) && self.text_selection.focus == Some(focus) {
+        if self.tab.text_selection.anchor == Some(anchor)
+            && self.tab.text_selection.focus == Some(focus)
+        {
             return None;
         }
         self.set_local_selection(anchor, focus);
-        self.text_selection.serial += 1;
+        self.tab.text_selection.serial += 1;
         Some(PointerSelection::new(
             Some(point),
-            self.text_selection.serial,
+            self.tab.text_selection.serial,
         ))
     }
 
     /// The release ends the gesture at the pointer.
     pub(super) fn end_selection_gesture(&mut self) -> Option<PointerSelection> {
         self.selection_page()?;
-        let gesture = self.text_selection.gesture.take();
-        self.text_selection.serial += 1;
+        let gesture = self.tab.text_selection.gesture.take();
+        self.tab.text_selection.serial += 1;
         let point = gesture
             .filter(|gesture| gesture.drag)
             .and_then(|_| self.selection_point_at_pointer());
-        Some(PointerSelection::new(point, self.text_selection.serial))
+        Some(PointerSelection::new(point, self.tab.text_selection.serial))
     }
 
     /// While a drag holds the pointer beyond the content viewport, scroll
     /// it toward the pointer, faster the farther the pointer is, and keep
     /// extending the selection (the platform's drag autoscroll).
     fn schedule_selection_autoscroll(&mut self) {
-        if self.text_selection.autoscroll_scheduled || self.autoscroll_step().is_none() {
+        if self.tab.text_selection.autoscroll_scheduled || self.autoscroll_step().is_none() {
             return;
         }
-        self.text_selection.autoscroll_scheduled = true;
+        self.tab.text_selection.autoscroll_scheduled = true;
         let proxy = self.event_proxy.clone();
         self.runtime.spawn(async move {
             tokio::time::sleep(AUTOSCROLL_INTERVAL).await;
@@ -323,7 +342,10 @@ impl DesktopApp {
 
     /// The scroll a drag beyond the content viewport asks for now.
     fn autoscroll_step(&self) -> Option<CssPoint> {
-        self.text_selection.gesture.filter(|gesture| gesture.drag)?;
+        self.tab
+            .text_selection
+            .gesture
+            .filter(|gesture| gesture.drag)?;
         let scene = self.scene.as_ref()?;
         let content = scene.content_viewport;
         let speed = |beyond: f32| (beyond * 0.6).clamp(2.0, 64.0);
@@ -341,7 +363,7 @@ impl DesktopApp {
         } else {
             0.0
         };
-        let scroll = self.browser.interaction().scroll;
+        let scroll = self.tab.browser.interaction().scroll;
         let max = CssPoint::new(
             (scene.page_size.width - content.width).max(0.0),
             (scene.page_size.height - content.height).max(0.0),
@@ -354,7 +376,7 @@ impl DesktopApp {
     }
 
     pub(super) fn selection_autoscroll_tick(&mut self) {
-        self.text_selection.autoscroll_scheduled = false;
+        self.tab.text_selection.autoscroll_scheduled = false;
         if !self.selection_dragging() {
             return;
         }
@@ -369,7 +391,8 @@ impl DesktopApp {
     }
 
     fn selection_dragging(&self) -> bool {
-        self.text_selection
+        self.tab
+            .text_selection
             .gesture
             .is_some_and(|gesture| gesture.drag)
             && self.page_pointer_buttons & 1 != 0
@@ -388,7 +411,7 @@ impl DesktopApp {
             self.pointer.x - scene.content_viewport.x,
             self.pointer.y - scene.content_viewport.y,
         );
-        let actor = self.hovered_actor;
+        let actor = self.tab.hovered_actor;
         let mut metadata = self.pointer_metadata();
         metadata.selection = Some(selection);
         self.dispatch(UserAction::PageHover {
@@ -411,7 +434,7 @@ impl DesktopApp {
         else {
             return false;
         };
-        self.text_selection.gesture = None;
+        self.tab.text_selection.gesture = None;
         self.set_local_selection(first, last);
         true
     }
@@ -419,7 +442,7 @@ impl DesktopApp {
     /// What copying the page's selection puts on the clipboard, for a page
     /// without a live Document (a live page runs its copy action).
     pub(super) fn selected_page_text(&self) -> Option<String> {
-        let selection = self.text_selection.paint.as_ref()?;
+        let selection = self.tab.text_selection.paint.as_ref()?;
         let text = trust::render::selection::selected_page_text(self.selection_page()?, selection);
         (!text.is_empty()).then_some(text)
     }
@@ -429,7 +452,7 @@ impl DesktopApp {
     /// through its clipboard requests; otherwise the frontend writes the
     /// selected text. Returns whether there was a selection to copy.
     pub(super) fn copy_page_selection(&mut self) -> bool {
-        if !self.text_selection.selects() {
+        if !self.tab.text_selection.selects() {
             return false;
         }
         if self.selection_owned_by_page() {

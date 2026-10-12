@@ -1399,7 +1399,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             .dom
             .owner_document(root.node)
             .filter(|_| root.node != NO_NODE)
-            .unwrap_or(crate::dom::DOCUMENT);
+            .unwrap_or(self.dom.document());
         self.quirky_strut_root = (self.dom.document_mode(document)
             != html5ever::tree_builder::QuirksMode::NoQuirks)
             .then_some(root.node);
@@ -3946,7 +3946,7 @@ pub(super) fn poster_media_target(
         _ => return None,
     };
     let videos: Vec<_> = dom
-        .flat_descendants(crate::dom::DOCUMENT)
+        .flat_descendants(dom.document())
         .into_iter()
         .filter(|&id| dom.tag_name(id) == Some("video"))
         .filter(|&id| {

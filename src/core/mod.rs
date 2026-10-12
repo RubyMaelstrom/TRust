@@ -303,6 +303,10 @@ pub enum UserAction {
     Focus(bool),
     /// The native window became hidden (`true`) or visible again.
     Occluded(bool),
+    /// The frontend shows this controller's top-level traversable (`true`),
+    /// or keeps it out of view, as a tab in the background (HTML
+    /// #page-visibility: the traversable's system visibility state).
+    Visible(bool),
     PointerMove(CssPoint),
     PointerButton {
         position: CssPoint,
@@ -460,6 +464,54 @@ impl HistoryEntry {
     }
 }
 
+/// A traversable's session history as a closed or discarded tab keeps it:
+/// each entry's address and scroll position, without its documents (HTML
+/// #session-history-entry). Small cached replies are dropped too; the
+/// entries load again when traversed.
+#[derive(Clone, Debug, Default)]
+pub struct SessionHistory {
+    back: Vec<HistoryEntry>,
+    current: Option<HistoryEntry>,
+    /// Forward entries, the nearest last (as `BrowserController::forward`).
+    forward: Vec<HistoryEntry>,
+}
+
+impl SessionHistory {
+    /// A history of one entry at `address`, such as a Telnet session's.
+    pub fn for_address(address: &str) -> Self {
+        let (target, fallback_http) = parse_navigation_target(address)
+            .unwrap_or_else(|_| (Link::External(address.to_owned()), false));
+        Self {
+            back: Vec::new(),
+            current: Some(HistoryEntry {
+                same_document_generation: None,
+                target,
+                fallback_http,
+                internal_source: None,
+                dict_view: None,
+                gopher_page: None,
+                gemini_page: None,
+                scroll: CssPoint::default(),
+            }),
+            forward: Vec::new(),
+        }
+    }
+
+    /// The address the history's current entry loads.
+    pub fn current_address(&self) -> Option<String> {
+        self.current.as_ref().map(|entry| entry.target.to_string())
+    }
+
+    fn light(entry: &HistoryEntry) -> HistoryEntry {
+        HistoryEntry {
+            same_document_generation: None,
+            gopher_page: None,
+            gemini_page: None,
+            ..entry.clone()
+        }
+    }
+}
+
 /// The file-picker request id reserved for a Gopher+ form's `ChooseF:`.
 const ASK_FILE_REQUEST: u64 = u64::MAX;
 
@@ -538,6 +590,45 @@ impl NavigationIntent {
     }
 }
 
+/// What runs once the live page answers whether unloading is canceled
+/// (HTML #checking-if-unloading-is-canceled).
+enum AfterUnloadCheck {
+    /// A navigation the user started from the browser's interface.
+    Action(UserAction),
+    /// The Document's declarative refresh (HTML #shared-declarative-refresh-steps).
+    Refresh(url::Url),
+    /// The frontend leaves the page itself (`ask_unload`): closing the
+    /// traversable, or a navigation the controller does not run.
+    Frontend,
+}
+
+/// A `PageCmd::CheckUnload` the live page has yet to answer.
+struct UnloadCheck {
+    request: u64,
+    after: AfterUnloadCheck,
+    /// The page asked the user, who has the time they need to answer.
+    prompted: bool,
+}
+
+/// How long a page may take to answer whether unloading is canceled before
+/// the user agent goes on without it (a page that never answers cannot
+/// keep the user on it). An unload prompt waits for the user instead.
+#[cfg(not(test))]
+const UNLOAD_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+#[cfg(test)]
+const UNLOAD_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// How a live page ends.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PageEnd {
+    /// Its Documents unload (navigation, closing).
+    Unload,
+    /// Page Lifecycle: freeze, then discard to save memory.
+    Discard,
+    /// At once: the user killed it, or the actor already ended.
+    Retire,
+}
+
 #[derive(Clone, Debug)]
 struct PendingNavigation {
     generation: u64,
@@ -598,6 +689,10 @@ enum CoreEvent {
         generation: u64,
         url: url::Url,
     },
+    /// The live page took `UNLOAD_CHECK_TIMEOUT` to answer check `request`.
+    UnloadCheckTimeout {
+        request: u64,
+    },
 }
 
 enum InteractiveFetch {
@@ -646,6 +741,8 @@ struct WindowEnvironment {
     /// Fullscreen API #fullscreen-is-supported: whether this frontend can
     /// present a page fullscreen (`set_fullscreen_available`).
     fullscreen_supported: bool,
+    /// The traversable's presentation, which a new document starts with.
+    traversable: crate::js::TraversableState,
 }
 
 /// Durable browser/protocol controller shared by native frontends.
@@ -665,6 +762,38 @@ pub struct BrowserController {
     animation_frames_only: bool,
     /// The native window cannot currently be seen.
     occluded: bool,
+    /// The frontend keeps this traversable out of view (a background tab).
+    tab_hidden: bool,
+    /// The traversable's presentation as the live page last heard of it,
+    /// starting from the one it was created with (`None`: no live page
+    /// attached); `sync_traversable` sends what changed.
+    live_traversable: Option<crate::js::TraversableState>,
+    /// The next document replaces one discarded to save memory (Page
+    /// Lifecycle #dom-document-wasdiscarded).
+    restore_discarded: bool,
+    /// The scroll position a restored session history's current entry
+    /// returns to when the navigation of this generation commits.
+    restore_scroll: Option<(u64, CssPoint)>,
+    /// The live page's reports for the frontend's chrome: its top-level
+    /// Document's title, whether it makes sound, and whether the user has
+    /// unsubmitted edits in it.
+    page_title: Option<String>,
+    page_audible: bool,
+    page_user_edits: bool,
+    /// The live page listens for beforeunload: closing it or navigating it
+    /// away from the browser's interface first asks it (`UnloadCheck`).
+    page_beforeunload: bool,
+    unload_check: Option<UnloadCheck>,
+    next_unload_check: u64,
+    /// `handle_action` runs the next navigation without checking again:
+    /// the page already answered for it.
+    unload_check_passed: bool,
+    /// The page's requests that the user confirm unloading, for a frontend
+    /// that can ask (`set_unload_prompts_available`).
+    unload_prompts_available: bool,
+    pending_unload_prompts: VecDeque<crate::js::UnloadPrompt>,
+    /// Answers to `ask_unload` for the frontend: (request, whether to leave).
+    unload_answers: VecDeque<(u64, bool)>,
     back: Vec<HistoryEntry>,
     forward: Vec<HistoryEntry>,
     /// The live page has not yet been told the current session history
@@ -724,6 +853,14 @@ pub struct BrowserController {
     /// picker (`set_file_picker_available`); otherwise each prompt is dismissed at once.
     file_picker_available: bool,
     pending_file_pickers: VecDeque<crate::js::FilePickerRequest>,
+    /// Navigations the page asked to happen in new top-level traversables,
+    /// for a frontend that can create them (`set_new_traversables_available`).
+    new_traversables_available: bool,
+    pending_new_traversables: VecDeque<NewTraversableRequest>,
+    /// The page asked to close its traversable (`PageEvt::CloseTraversable`)
+    /// or to show it (`PageEvt::FocusTraversable`).
+    close_requested: bool,
+    focus_requested: bool,
     external_media: VecDeque<(url::Url, Option<url::Url>)>,
     download_offer: Option<crate::download::DownloadOffer>,
     prompt: Option<crate::prompt::Prompt>,
@@ -732,6 +869,16 @@ pub struct BrowserController {
     ask_file: Option<(u64, usize)>,
     /// A DICT lookup waiting for the user to supply its AUTH secret.
     pending_dict: Option<crate::dict::Target>,
+    /// This traversable's storage shed: its sessionStorage across its
+    /// Documents, a sleeping tab's included (Storage
+    /// #traversable-storage-shed).
+    storage_shed: u64,
+    /// While the traversable shares its browsing context group with others
+    /// (`TraversableLink::shared`), its hold on it between Documents: a
+    /// navigation's next Document is created in the group's engine. A
+    /// Document without a page actor leaves the group (as a browsing
+    /// context group switch would).
+    group_link: Option<crate::js::TraversableLink>,
     storage: crate::js::WebStorage,
     external_address: Option<String>,
     generation: u64,
@@ -773,20 +920,46 @@ fn event_variant_name(event: &crate::js::PageEvt) -> &'static str {
     }
 }
 
+/// A top-level traversable a page asked for (`take_new_traversable`).
+#[derive(Debug)]
+pub enum NewTraversableRequest {
+    /// A navigation to start in a new browsing context group.
+    Navigate(crate::js::NewTraversable),
+    /// An auxiliary browsing context the page created in its own group.
+    Auxiliary(crate::js::AuxiliaryTraversable),
+}
+
 impl BrowserController {
     pub fn new(runtime: Handle, wake: impl WakeSink + 'static, viewport: CssSize) -> Self {
         let invalidation = InvalidationHandle {
             wake: Arc::new(wake),
         };
         let (tx, rx) = events::channel(invalidation.clone());
+        let storage_shed = crate::js::new_storage_shed();
         Self {
             runtime,
+            storage_shed,
+            group_link: None,
             invalidation,
             tx,
             rx,
             current: None,
             animation_frames_only: false,
             occluded: false,
+            tab_hidden: false,
+            live_traversable: None,
+            restore_discarded: false,
+            restore_scroll: None,
+            page_title: None,
+            page_audible: false,
+            page_user_edits: false,
+            page_beforeunload: false,
+            unload_check: None,
+            next_unload_check: 0,
+            unload_check_passed: false,
+            unload_prompts_available: false,
+            pending_unload_prompts: VecDeque::new(),
+            unload_answers: VecDeque::new(),
             back: Vec::new(),
             forward: Vec::new(),
             session_history_unsent: false,
@@ -816,6 +989,10 @@ impl BrowserController {
             clipboard_available: false,
             file_picker_available: false,
             pending_file_pickers: VecDeque::new(),
+            new_traversables_available: false,
+            pending_new_traversables: VecDeque::new(),
+            close_requested: false,
+            focus_requested: false,
             pending_clipboard_writes: VecDeque::new(),
             page_selection: None,
             page_selection_generation: 0,
@@ -836,6 +1013,10 @@ impl BrowserController {
                 device_pixel_ratio: 1.0,
                 screen_position: (0, 0),
                 fullscreen_supported: false,
+                traversable: crate::js::TraversableState {
+                    storage_shed,
+                    ..crate::js::TraversableState::SHOWN
+                },
             })
             .0,
             device_pixel_ratio: 1.0,
@@ -1119,13 +1300,7 @@ impl BrowserController {
 
     pub fn snapshot(&self) -> BrowserSnapshot {
         BrowserSnapshot {
-            address: self
-                .pending
-                .as_ref()
-                .map(|p| p.target.to_string())
-                .or_else(|| self.current.as_ref().map(BrowserPage::address))
-                .or_else(|| self.external_address.clone())
-                .unwrap_or_default(),
+            address: self.address(),
             status: self.status.clone(),
             loading: self.pending.is_some(),
             can_go_back: !self.back.is_empty(),
@@ -1161,6 +1336,225 @@ impl BrowserController {
             self.invalidation.request_redraw();
         }
         dismissed
+    }
+
+    /// The current document's title (HTML #document.title as the page's
+    /// rendering last reported it), for tab and window titles.
+    pub fn title(&self) -> Option<String> {
+        if let Some(title) = self.page_title.as_deref().map(str::trim)
+            && !title.is_empty()
+        {
+            return Some(title.to_owned());
+        }
+        let page = self.current.as_ref()?;
+        page.rendered_page()
+            .and_then(|rendered| rendered.semantics.nodes.first())
+            .map(|root| root.name.trim().to_owned())
+            .filter(|title| !title.is_empty())
+    }
+
+    /// The address the chrome shows: the pending navigation's, else the
+    /// current document's.
+    pub fn address(&self) -> String {
+        self.pending
+            .as_ref()
+            .map(|p| p.target.to_string())
+            .or_else(|| self.current.as_ref().map(BrowserPage::address))
+            .or_else(|| self.external_address.clone())
+            .unwrap_or_default()
+    }
+
+    /// A navigation is in progress.
+    pub fn is_loading(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// The current document as the source of a link the user opens in
+    /// another top-level traversable, such as a new tab (HTML
+    /// #following-hyperlinks-2: the hyperlink's node document is the
+    /// navigation's source).
+    pub fn link_initiator(&self) -> Option<http::NavigationInitiator> {
+        self.document_initiator()
+    }
+
+    /// Whether the current document may direct a navigation to `link`: a
+    /// local file needs a document that may reach it.
+    pub fn may_open_link(&self, link: &Link) -> bool {
+        let Link::Http(url) = link else {
+            return true;
+        };
+        url.scheme() != "file"
+            || self.current.as_ref().is_some_and(|page| {
+                (matches!(&page.document, FetchedDocument::Internal(_))
+                    && matches!(&page.target, Link::External(address) if address == "about:bookmarks"))
+                    || matches!(&page.target, Link::Http(client) if crate::file::allowed_from(client, url))
+            })
+    }
+
+    /// Navigate this (new) traversable to `link`, opened from another
+    /// traversable's document whose request context is `initiator`.
+    pub fn open_link_from(&mut self, link: Link, initiator: Option<http::NavigationInitiator>) {
+        match link {
+            Link::Media(url) => self.queue_external_media(url),
+            Link::JsClick { href, .. } => {
+                if let Ok((target, fallback)) = parse_navigation_target(&href) {
+                    self.begin_fetch_from(target, fallback, NavigationIntent::New, initiator);
+                }
+            }
+            Link::Form { .. } => {}
+            target => self.begin_fetch_from(target, false, NavigationIntent::New, initiator),
+        }
+    }
+
+    /// HTML #page-visibility: this traversable cannot currently be seen,
+    /// because its window is occluded or it is a background tab.
+    fn system_hidden(&self) -> bool {
+        self.occluded || self.tab_hidden
+    }
+
+    /// The traversable's presentation now (HTML #page-visibility,
+    /// #system-focus): hidden while occluded or in the background, focused
+    /// while shown in the focused window.
+    fn traversable_state(&self) -> crate::js::TraversableState {
+        crate::js::TraversableState {
+            hidden: self.system_hidden(),
+            focused: self.interaction.focused && !self.system_hidden(),
+            was_discarded: false,
+            new_traversables: self.new_traversables_available,
+            storage_shed: self.storage_shed,
+        }
+    }
+
+    /// Keep new documents and the live page in step with the traversable's
+    /// presentation. The live page hears of each change once; a full
+    /// command channel leaves it unsent, so a later round retries.
+    fn sync_traversable(&mut self) {
+        let state = self.traversable_state();
+        self.window_environment.send_if_modified(|env| {
+            let changed =
+                env.traversable.hidden != state.hidden || env.traversable.focused != state.focused;
+            env.traversable.hidden = state.hidden;
+            env.traversable.focused = state.focused;
+            changed
+        });
+        // The live page knows the presentation it was created with
+        // (`attach_live_page`); it hears of each change from then on.
+        let (Some(page), Some(mut sent)) = (&self.live_page, self.live_traversable) else {
+            return;
+        };
+        if sent.hidden != state.hidden
+            && page
+                .cmds
+                .try_send(crate::js::PageCmd::SystemVisibility(state.hidden))
+                .is_ok()
+        {
+            sent.hidden = state.hidden;
+        }
+        if sent.focused != state.focused
+            && page
+                .cmds
+                .try_send(crate::js::PageCmd::SystemFocus(state.focused))
+                .is_ok()
+        {
+            sent.focused = state.focused;
+        }
+        self.live_traversable = Some(sent);
+        if sent.hidden != state.hidden || sent.focused != state.focused {
+            // Retry once the actor drains its channel.
+            self.invalidation.request_redraw();
+        }
+    }
+
+    /// The live page's last report of its top-level Document's title.
+    pub fn page_title(&self) -> Option<&str> {
+        self.page_title.as_deref()
+    }
+
+    /// The current document is the result of a form's POST: loading it
+    /// again would submit the form again.
+    pub fn is_post_result(&self) -> bool {
+        self.current.as_ref().is_some_and(
+            |page| matches!(&page.document, FetchedDocument::Http(response) if response.from_post),
+        )
+    }
+
+    /// The live page makes sound (a media element plays audibly, or an
+    /// audio context renders sound).
+    pub fn is_audible(&self) -> bool {
+        self.page_audible
+    }
+
+    /// The user has edits in the live page that were not submitted.
+    pub fn has_user_edits(&self) -> bool {
+        self.page_user_edits
+    }
+
+    /// The next document this traversable loads replaces one the frontend
+    /// discarded to save memory (Page Lifecycle #discarding).
+    pub fn restore_discarded(&mut self) {
+        self.restore_discarded = true;
+    }
+
+    /// The session history without its documents, for a tab that is
+    /// closed or discarded. A navigation in progress is the current entry.
+    pub fn session_history(&self) -> SessionHistory {
+        let current = match (&self.pending, &self.current) {
+            (Some(pending), _) => Some(HistoryEntry {
+                same_document_generation: None,
+                target: pending.target.clone(),
+                fallback_http: pending.fallback_http,
+                internal_source: None,
+                dict_view: None,
+                gopher_page: None,
+                gemini_page: None,
+                scroll: CssPoint::default(),
+            }),
+            (None, Some(page)) => Some(HistoryEntry {
+                same_document_generation: None,
+                target: page.target.clone(),
+                fallback_http: page.fallback_http,
+                internal_source: match &page.document {
+                    FetchedDocument::Internal(source) => Some(source.clone()),
+                    _ => None,
+                },
+                dict_view: None,
+                gopher_page: None,
+                gemini_page: None,
+                scroll: self.interaction.scroll,
+            }),
+            (None, None) => None,
+        };
+        SessionHistory {
+            back: self.back.iter().map(SessionHistory::light).collect(),
+            current,
+            forward: self.forward.iter().map(SessionHistory::light).collect(),
+        }
+    }
+
+    /// Give this new traversable `history` and load its current entry
+    /// again, returning to its scroll position. `discarded`: the document
+    /// replaces one discarded to save memory.
+    pub fn restore_session_history(&mut self, history: SessionHistory, discarded: bool) {
+        let SessionHistory {
+            back,
+            current,
+            forward,
+        } = history;
+        self.back = back;
+        self.forward = forward;
+        self.session_history_unsent = true;
+        let Some(entry) = current else {
+            return;
+        };
+        self.restore_discarded = discarded;
+        if let Some(source) = entry.internal_source {
+            self.begin_internal_gemtext(entry.target, source, NavigationIntent::Replace);
+        } else {
+            self.begin_fetch(entry.target, entry.fallback_http, NavigationIntent::Replace);
+        }
+        if entry.scroll != CssPoint::default() {
+            self.restore_scroll = Some((self.generation, entry.scroll));
+        }
     }
 
     pub fn page_is_live(&self) -> bool {
@@ -1411,6 +1805,118 @@ impl BrowserController {
             .send_modify(|env| env.fullscreen_supported = available);
     }
 
+    /// Declare whether this frontend can ask the user to confirm leaving a
+    /// page (HTML #steps-to-fire-beforeunload). Without it no page asks:
+    /// the user agent judges such a prompt pointless and leaves.
+    pub fn set_unload_prompts_available(&mut self, available: bool) {
+        self.unload_prompts_available = available;
+        if !available {
+            while let Some(prompt) = self.pending_unload_prompts.pop_front() {
+                prompt.answer(true);
+            }
+        }
+    }
+
+    /// The next request of the page that the user confirm leaving it. The
+    /// page waits until it is answered (`UnloadPrompt::answer`).
+    pub fn take_unload_prompt(&mut self) -> Option<crate::js::UnloadPrompt> {
+        self.pending_unload_prompts.pop_front()
+    }
+
+    /// Whether the frontend must ask the live page before leaving it on the
+    /// user's behalf (`ask_unload`): it listens for beforeunload.
+    pub fn unload_needs_check(&self) -> bool {
+        self.page_beforeunload && self.live_page.is_some()
+    }
+
+    /// Before the frontend closes this traversable (HTML
+    /// #definitely-close-a-top-level-traversable) or navigates it away
+    /// itself, check if unloading is canceled. The answer comes as
+    /// `take_unload_answer` with the returned request; a newer navigation
+    /// cancels the check, answering it `false`.
+    pub fn ask_unload(&mut self) -> u64 {
+        if !self.unload_needs_check() {
+            self.next_unload_check += 1;
+            let request = self.next_unload_check;
+            self.unload_answers.push_back((request, true));
+            self.invalidation.request_redraw();
+            return request;
+        }
+        self.begin_unload_check(AfterUnloadCheck::Frontend)
+    }
+
+    /// The next answer to `ask_unload`: (request, whether to leave).
+    pub fn take_unload_answer(&mut self) -> Option<(u64, bool)> {
+        self.unload_answers.pop_front()
+    }
+
+    /// The traversable closes: its live page unloads (HTML
+    /// #unload-a-document-and-its-descendants) and ends. Call after
+    /// `ask_unload` allowed it.
+    pub fn close(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+        self.end_live_page(PageEnd::Unload);
+        // The traversable leaves its group, and its sessionStorage goes.
+        self.group_link = None;
+        crate::js::forget_storage_shed(self.storage_shed);
+    }
+
+    /// Release the live page to save memory (Page Lifecycle #discarding):
+    /// its Documents are frozen and destroyed without unloading.
+    pub fn discard(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+        self.end_live_page(PageEnd::Discard);
+    }
+
+    /// Declare whether this frontend can create new top-level traversables
+    /// (tabs). Without them, a page's request for one navigates this
+    /// traversable, the only one the frontend presents.
+    pub fn set_new_traversables_available(&mut self, available: bool) {
+        self.new_traversables_available = available;
+        // Later documents choose their navigables accordingly.
+        self.window_environment
+            .send_modify(|env| env.traversable.new_traversables = available);
+    }
+
+    /// The next top-level traversable the page asked for: a navigation to
+    /// start in a new controller with
+    /// [`BrowserController::open_new_traversable`], or an auxiliary browsing
+    /// context the page already created, for a new controller to present
+    /// with [`BrowserController::adopt_auxiliary`].
+    pub fn take_new_traversable(&mut self) -> Option<NewTraversableRequest> {
+        self.pending_new_traversables.pop_front()
+    }
+
+    /// Whether the page asked to close this traversable (HTML
+    /// #definitely-close-a-top-level-traversable): the frontend closes it as
+    /// it would for the user.
+    pub fn take_close_request(&mut self) -> bool {
+        std::mem::take(&mut self.close_requested)
+    }
+
+    /// Whether the page asked that this traversable be shown (HTML
+    /// #dom-window-focus).
+    pub fn take_focus_request(&mut self) -> bool {
+        std::mem::take(&mut self.focus_requested)
+    }
+
+    /// Whether this traversable shares its browsing context group with
+    /// others, which reach its Windows: it must keep its Documents (no
+    /// sleeping) and their engine.
+    pub fn in_shared_group(&self) -> bool {
+        self.live_page
+            .as_ref()
+            .is_some_and(|page| page.link().shared())
+            || self
+                .group_link
+                .as_ref()
+                .is_some_and(crate::js::TraversableLink::shared)
+    }
+
     /// The next fullscreen change the frontend must present. Answer
     /// `FullscreenChange::Enter` with `UserAction::FullscreenResult`.
     pub fn take_fullscreen_change(&mut self) -> Option<FullscreenChange> {
@@ -1492,6 +1998,12 @@ impl BrowserController {
     }
 
     pub fn handle_action(&mut self, action: UserAction) -> ActionOutcome {
+        let Some(action) = self.check_unload_before(action) else {
+            return ActionOutcome {
+                invalidated: true,
+                loading_retired: false,
+            };
+        };
         let generation_before = self.generation;
         let invalidated = match action {
             UserAction::PointerLockResult { request, error } => {
@@ -1660,10 +2172,11 @@ impl BrowserController {
                 changed
             }
             UserAction::Occluded(occluded) => {
-                if self.occluded != occluded {
-                    self.occluded = occluded;
-                    self.send_live(crate::js::PageCmd::Occluded(occluded));
-                }
+                self.occluded = occluded;
+                false
+            }
+            UserAction::Visible(visible) => {
+                self.tab_hidden = !visible;
                 false
             }
             UserAction::PointerMove(point) => {
@@ -1860,6 +2373,7 @@ impl BrowserController {
             }
             UserAction::TextInput(_) => false,
         };
+        self.sync_traversable();
         ActionOutcome {
             invalidated: invalidated || self.generation != generation_before,
             loading_retired: self.generation != generation_before,
@@ -1960,13 +2474,21 @@ impl BrowserController {
                 CoreEvent::DeclarativeRefresh { generation, url } => {
                     if generation == self.document_generation {
                         self.declarative_refresh_task = None;
-                        self.begin_page_fetch(
-                            Link::Http(url),
-                            false,
-                            NavigationIntent::Replace,
-                            None,
-                        );
+                        if self.page_beforeunload && self.live_page.is_some() {
+                            self.begin_unload_check(AfterUnloadCheck::Refresh(url));
+                        } else {
+                            self.follow_refresh(url);
+                        }
                         changed = true;
+                    }
+                }
+                CoreEvent::UnloadCheckTimeout { request } => {
+                    if self
+                        .unload_check
+                        .as_ref()
+                        .is_some_and(|check| check.request == request && !check.prompted)
+                    {
+                        changed |= self.finish_unload_check(request, true);
                     }
                 }
             }
@@ -1975,6 +2497,7 @@ impl BrowserController {
             }
         }
         self.sync_session_history();
+        self.sync_traversable();
         self.rx.wake_if_pending();
         self.animation_frames_only =
             animation_frames == Some(true) && self.generation == generation_before;
@@ -2249,6 +2772,10 @@ impl BrowserController {
         self.drop_live_page();
         self.external_address = None;
         self.download_offer = None;
+        // Only the document that replaces a discarded one was discarded.
+        let was_discarded = std::mem::take(&mut self.restore_discarded);
+        self.window_environment
+            .send_modify(|env| env.traversable.was_discarded = was_discarded);
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
         self.render_is_final = false;
@@ -2262,6 +2789,7 @@ impl BrowserController {
         let tx = self.tx.clone();
         let window_environment = self.window_environment.subscribe();
         let storage = self.storage.clone();
+        let group = self.group_link.clone();
         self.task = Some(self.runtime.spawn(async move {
             if let Link::Gemini(url) = &target {
                 let result = gemini::fetch_updates(url, |response| {
@@ -2291,6 +2819,7 @@ impl BrowserController {
                                     device_pixel_ratio,
                                     screen_position,
                                     fullscreen_supported,
+                                    traversable,
                                 } = *window_environment.borrow();
                                 let size = (
                                     viewport.width.round().clamp(1.0, u16::MAX as f32) as u16,
@@ -2304,6 +2833,8 @@ impl BrowserController {
                                     screen_position,
                                     storage,
                                     fullscreen_supported,
+                                    traversable,
+                                    None,
                                 )
                                 .await;
                                 CoreEvent::GeminiImage {
@@ -2422,6 +2953,7 @@ impl BrowserController {
                 storage,
                 None,
                 intent,
+                group,
             )
             .await;
             let event = interactive_fetch_event(generation, result);
@@ -3052,10 +3584,20 @@ impl BrowserController {
                 self.trim_gopher_history();
                 self.interaction.scroll = CssPoint::default();
                 self.interaction.nested_scroll.clear();
+                let restore_scroll = self
+                    .restore_scroll
+                    .take()
+                    .filter(|&(restored, _)| restored == generation)
+                    .map(|(_, scroll)| scroll);
+                if let Some(scroll) = restore_scroll {
+                    self.interaction.scroll = scroll;
+                }
                 // A document that gets no resident actor is final the moment it
                 // commits; one that does becomes final only when the actor says
-                // so with `PageEvt::Static`.
+                // so with `PageEvt::Static`. A group's Document holds its own
+                // link; one without an actor has left the group.
                 self.render_is_final = live.is_none();
+                self.group_link = None;
                 if let Some(live) = live {
                     self.attach_live_page(generation, live);
                     self.send_live(crate::js::PageCmd::Viewport(layout_viewport(self.viewport)));
@@ -3066,8 +3608,14 @@ impl BrowserController {
                         self.screen_position.0,
                         self.screen_position.1,
                     ));
-                    if self.occluded {
-                        self.send_live(crate::js::PageCmd::Occluded(true));
+                    // The page began with the presentation of its fetch's
+                    // start; tell it what changed since.
+                    self.sync_traversable();
+                    if let Some(scroll) = restore_scroll {
+                        self.send_user(crate::js::PageCmd::Scroll {
+                            x: f64::from(scroll.x),
+                            y: f64::from(scroll.y),
+                        });
                     }
                 }
                 if let Some(refresh) = declarative_refresh {
@@ -3076,6 +3624,7 @@ impl BrowserController {
             }
             Err(error) => {
                 self.render_is_final = true;
+                self.group_link = None;
                 self.status = format!("{} — {error}", pending.target);
             }
         }
@@ -3097,7 +3646,8 @@ impl BrowserController {
             task.abort();
         }
         self.retire_query("Incomplete reply: stopped");
-        self.drop_live_page();
+        // Killing a page ends it at once, without its unload handlers.
+        self.end_live_page(PageEnd::Retire);
         self.abort_declarative_refresh();
         self.generation = self.generation.wrapping_add(1);
         // Nothing is left to render: the fetch task, the actor, and any
@@ -3279,6 +3829,33 @@ impl BrowserController {
     }
 
     fn drop_live_page(&mut self) {
+        self.end_live_page(PageEnd::Unload);
+    }
+
+    fn end_live_page(&mut self, end: PageEnd) {
+        // A traversable that shares its browsing context group keeps its
+        // place in it for the Document that replaces this one.
+        if let Some(page) = &self.live_page
+            && page.link().shared()
+        {
+            self.group_link = Some(page.link().clone());
+        }
+        // The page that was asked is gone: the frontend may leave, and a
+        // navigation waiting on it gives way to what replaced the page.
+        if let Some(check) = self.unload_check.take()
+            && matches!(check.after, AfterUnloadCheck::Frontend)
+        {
+            self.unload_answers.push_back((check.request, true));
+        }
+        self.page_beforeunload = false;
+        self.unload_check_passed = false;
+        while let Some(prompt) = self.pending_unload_prompts.pop_front() {
+            prompt.answer(true);
+        }
+        self.live_traversable = None;
+        self.page_title = None;
+        self.page_audible = false;
+        self.page_user_edits = false;
         self.pending_pointer_lock.clear();
         self.pending_clipboard_writes.clear();
         self.context_menu_results.clear();
@@ -3302,7 +3879,11 @@ impl BrowserController {
         }
         self.pending_user_input.clear();
         if let Some(page) = self.live_page.take() {
-            page.retire();
+            match end {
+                PageEnd::Unload => page.unload(&self.runtime),
+                PageEnd::Discard => page.discard(&self.runtime),
+                PageEnd::Retire => page.retire(),
+            }
         }
         http::prune_idle_connections();
         self.pending_live_submit = None;
@@ -3318,6 +3899,7 @@ impl BrowserController {
 
     fn attach_live_page(&mut self, generation: u64, mut live: http::LivePage) {
         self.live_page = Some(live.handle);
+        self.live_traversable = Some(live.traversable);
         self.session_history_unsent = true;
         self.history_updates_applied = 0;
         let tx = self.tx.clone();
@@ -3507,7 +4089,8 @@ impl BrowserController {
                     page.revision = page.revision.wrapping_add(1);
                     page.rendered_revision = page.revision;
                 }
-                self.drop_live_page();
+                // The actor has ended by itself.
+                self.end_live_page(PageEnd::Retire);
                 self.render_is_final = true;
                 self.status = if outcome.errors.is_empty() {
                     String::from("Page updated · JS")
@@ -3653,6 +4236,21 @@ impl BrowserController {
                 }
                 true
             }
+            PageEvt::Title(title) => {
+                // The frontend's tab and window titles follow it.
+                let changed = self.page_title.as_ref() != Some(&title);
+                self.page_title = Some(title);
+                changed
+            }
+            PageEvt::Audible(audible) => {
+                let changed = self.page_audible != audible;
+                self.page_audible = audible;
+                changed
+            }
+            PageEvt::UserEdits(edits) => {
+                self.page_user_edits = edits;
+                false
+            }
             PageEvt::Settled => {
                 // A quiescent dispatch acknowledges completion but changes no
                 // page pixels. The terminal frontend treats repeated Settled
@@ -3717,6 +4315,264 @@ impl BrowserController {
                 }
                 true
             }
+            PageEvt::OpenTraversable(request) => {
+                self.request_new_traversable(*request);
+                true
+            }
+            PageEvt::OpenAuxiliary(auxiliary) => {
+                self.pending_new_traversables
+                    .push_back(NewTraversableRequest::Auxiliary(*auxiliary));
+                true
+            }
+            PageEvt::CloseTraversable => {
+                self.close_requested = true;
+                true
+            }
+            PageEvt::FocusTraversable => {
+                self.focus_requested = true;
+                true
+            }
+            PageEvt::BeforeUnloadListeners(listening) => {
+                self.page_beforeunload = listening;
+                false
+            }
+            PageEvt::UnloadPrompt(prompt) => {
+                if let Some(check) = &mut self.unload_check {
+                    check.prompted = true;
+                }
+                if self.unload_prompts_available {
+                    self.pending_unload_prompts.push_back(prompt);
+                } else {
+                    prompt.answer(true);
+                }
+                true
+            }
+            PageEvt::UnloadChecked { request, proceed } => {
+                self.finish_unload_check(request, proceed)
+            }
+        }
+    }
+
+    /// HTML #navigate for a navigation the user starts from the browser's
+    /// interface: one that leaves a live page listening for beforeunload
+    /// first checks if unloading is canceled, and runs once the page has
+    /// answered. `None` while it waits.
+    fn check_unload_before(&mut self, action: UserAction) -> Option<UserAction> {
+        if std::mem::take(&mut self.unload_check_passed)
+            || !self.unload_needs_check()
+            || !self.leaves_document(&action)
+        {
+            return Some(action);
+        }
+        // The newest navigation replaces one still waiting (HTML #navigate:
+        // its ongoing navigation changed).
+        if let Some(check) = &mut self.unload_check
+            && matches!(check.after, AfterUnloadCheck::Action(_))
+        {
+            check.after = AfterUnloadCheck::Action(action);
+            return None;
+        }
+        self.begin_unload_check(AfterUnloadCheck::Action(action));
+        None
+    }
+
+    /// Whether `action` navigates the traversable away from its current
+    /// Document (a fragment navigation or a same-document history step
+    /// keeps it).
+    fn leaves_document(&self, action: &UserAction) -> bool {
+        match action {
+            UserAction::Navigate(address) => match parse_navigation_target(address) {
+                Ok((Link::Http(url), _)) => {
+                    !(url.fragment().is_some()
+                        && self.current.as_ref().is_some_and(|page| {
+                            matches!(&page.target, Link::Http(current)
+                            if crate::fragment::same_document(current, &url))
+                        }))
+                }
+                Ok(_) => true,
+                Err(_) => false,
+            },
+            UserAction::Back | UserAction::Forward => {
+                let delta = if matches!(action, UserAction::Back) {
+                    -1
+                } else {
+                    1
+                };
+                crate::history::entry(&self.back, &self.forward, delta).is_some_and(|entry| {
+                    entry.same_document_generation != Some(self.document_generation)
+                })
+            }
+            UserAction::Reload => self.current.is_some(),
+            _ => false,
+        }
+    }
+
+    /// Ask the live page whether unloading is canceled
+    /// (`PageCmd::CheckUnload`), running `after` with its answer. A check
+    /// still waiting gives way to this one.
+    fn begin_unload_check(&mut self, after: AfterUnloadCheck) -> u64 {
+        if let Some(check) = self.unload_check.take()
+            && matches!(check.after, AfterUnloadCheck::Frontend)
+        {
+            self.unload_answers.push_back((check.request, false));
+        }
+        self.next_unload_check += 1;
+        let request = self.next_unload_check;
+        self.unload_check = Some(UnloadCheck {
+            request,
+            after,
+            prompted: false,
+        });
+        self.send_user(crate::js::PageCmd::CheckUnload { request });
+        let tx = self.tx.clone();
+        self.runtime.spawn(async move {
+            tokio::time::sleep(UNLOAD_CHECK_TIMEOUT).await;
+            let _ = tx.send(CoreEvent::UnloadCheckTimeout { request }).await;
+        });
+        request
+    }
+
+    /// The live page answered check `request`: run what waited on it.
+    fn finish_unload_check(&mut self, request: u64, proceed: bool) -> bool {
+        let Some(check) = self.unload_check.take_if(|check| check.request == request) else {
+            return false;
+        };
+        match check.after {
+            AfterUnloadCheck::Action(action) if proceed => {
+                self.unload_check_passed = true;
+                self.handle_action(action);
+            }
+            AfterUnloadCheck::Refresh(url) if proceed => self.follow_refresh(url),
+            AfterUnloadCheck::Frontend => self.unload_answers.push_back((request, proceed)),
+            AfterUnloadCheck::Action(_) | AfterUnloadCheck::Refresh(_) => {}
+        }
+        true
+    }
+
+    /// HTML #shared-declarative-refresh-steps: navigate to the refresh URL,
+    /// replacing the current entry.
+    fn follow_refresh(&mut self, url: url::Url) {
+        self.begin_page_fetch(Link::Http(url), false, NavigationIntent::Replace, None);
+    }
+
+    /// HTML #the-rules-for-choosing-a-navigable: the page asked for a new
+    /// top-level traversable. A frontend with tabs creates one
+    /// (`take_new_traversable`); one without is configured to choose this
+    /// traversable instead. The current Document is the navigation's source
+    /// either way, so its document-directed checks apply here.
+    fn request_new_traversable(&mut self, request: crate::js::NewTraversable) {
+        if !self.new_traversables_available {
+            match request.submission {
+                Some(submission) => self.submit_page_form(submission),
+                None => {
+                    self.begin_page_address(&request.url, NavigationIntent::New, request.initiator);
+                }
+            }
+            return;
+        }
+        match parse_navigation_target(&request.url) {
+            Ok((target, _)) if !self.may_open_link(&target) => {
+                self.status = String::from("Local file navigation blocked for this document.");
+            }
+            Ok(_) => self
+                .pending_new_traversables
+                .push_back(NewTraversableRequest::Navigate(request)),
+            Err(error) => self.status = error,
+        }
+    }
+
+    /// Present a top-level traversable that another traversable's page
+    /// created in its browsing context group (HTML
+    /// #creating-a-new-auxiliary-browsing-context): its initial `about:blank`
+    /// Document already runs in the opener's engine. It commits like a
+    /// navigation's Document once its first rendering arrives, with the
+    /// sessionStorage its opener's copy gave it.
+    pub fn adopt_auxiliary(&mut self, auxiliary: crate::js::AuxiliaryTraversable) {
+        let crate::js::AuxiliaryTraversable {
+            handle,
+            mut events,
+            storage_shed,
+            ..
+        } = auxiliary;
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+        self.abort_declarative_refresh();
+        self.drop_live_page();
+        crate::js::forget_storage_shed(self.storage_shed);
+        self.storage_shed = storage_shed;
+        self.window_environment
+            .send_modify(|env| env.traversable.storage_shed = storage_shed);
+        self.generation = self.generation.wrapping_add(1);
+        let generation = self.generation;
+        let url = url::Url::parse("about:blank").expect("about:blank parses");
+        self.render_is_final = false;
+        self.pending = Some(PendingNavigation {
+            generation,
+            target: Link::Http(url.clone()),
+            fallback_http: false,
+            intent: NavigationIntent::New,
+        });
+        let traversable = self.traversable_state();
+        let tx = self.tx.clone();
+        self.task = Some(self.runtime.spawn(async move {
+            let link = handle.link().clone();
+            let result = match events.recv().await {
+                Some(crate::js::PageEvt::Updated { html, mut outcome }) => {
+                    let rendered = outcome.rendered.take();
+                    Ok(FetchedDocument::Http(Box::new(http::Response {
+                        url,
+                        status: 200,
+                        status_text: String::new(),
+                        content_type: String::from("text/html; charset=utf-8"),
+                        headers: Vec::new(),
+                        body: html.into_bytes(),
+                        rendered,
+                        js: Some(outcome),
+                        blobs: Some(link.blobs()),
+                        live: Some(http::LivePage {
+                            handle,
+                            events,
+                            traversable,
+                        }),
+                        images: Some(link.cache().images()),
+                        declarative_refresh: None,
+                        challenge: None,
+                        from_post: false,
+                        timing: None,
+                        referrer: String::new(),
+                        referrer_policy: None,
+                    })))
+                }
+                _ => Err(String::from("its opener's page has closed")),
+            };
+            let _ = tx
+                .send(CoreEvent::FetchFinished { generation, result })
+                .await;
+        }));
+    }
+
+    /// Start this new top-level traversable's first navigation, which
+    /// another traversable's page asked for (`take_new_traversable`): a GET
+    /// of the request's URL or its form's submission, from the source
+    /// Document. The source's controller applied the document-directed
+    /// checks.
+    pub fn open_new_traversable(&mut self, request: crate::js::NewTraversable) {
+        let crate::js::NewTraversable {
+            url,
+            initiator,
+            submission,
+            ..
+        } = request;
+        let initiator = initiator.map(|initiator| *initiator);
+        match submission {
+            Some(submission) => self.begin_form_navigation(submission, initiator),
+            None => match parse_navigation_target(&url) {
+                Ok((target, fallback)) => {
+                    self.begin_fetch_from(target, fallback, NavigationIntent::New, initiator)
+                }
+                Err(error) => self.status = error,
+            },
         }
     }
 
@@ -3808,10 +4664,6 @@ impl BrowserController {
     }
 
     fn submit_page_form(&mut self, mut submission: crate::js::FormSubmission) {
-        let Ok(mut action) = url::Url::parse(&submission.action) else {
-            self.status = String::from("Invalid form action.");
-            return;
-        };
         // HTML #plan-to-navigate / #process-a-navigate-fetch retain the form
         // document as the fetch client (local snapshot e5071a20, 2026-09-06).
         // Capture it before retiring the actor so Fetch can derive Origin,
@@ -3823,11 +4675,37 @@ impl BrowserController {
             .take()
             .map(|initiator| *initiator)
             .or_else(|| self.document_initiator());
+        if submission.method.eq_ignore_ascii_case("get")
+            && let Ok(action) = url::Url::parse(&submission.action)
+            && !self.may_open_link(&Link::Http(action))
+        {
+            self.status = String::from("Local file navigation blocked for this document.");
+            return;
+        }
+        self.begin_form_navigation(submission, initiator);
+    }
+
+    /// Navigate to a form's submission from its Document's request context
+    /// (`fallback` when the submission does not carry one).
+    fn begin_form_navigation(
+        &mut self,
+        mut submission: crate::js::FormSubmission,
+        fallback: Option<http::NavigationInitiator>,
+    ) {
+        let Ok(mut action) = url::Url::parse(&submission.action) else {
+            self.status = String::from("Invalid form action.");
+            return;
+        };
+        let initiator = submission
+            .initiator
+            .take()
+            .map(|initiator| *initiator)
+            .or(fallback);
         if submission.method.eq_ignore_ascii_case("post") {
             self.begin_post_body(action, submission.content_type, submission.body, initiator);
         } else if !submission.method.eq_ignore_ascii_case("dialog") {
             action.set_query(submission.query());
-            self.begin_page_fetch(Link::Http(action), false, NavigationIntent::New, initiator);
+            self.begin_fetch_from(Link::Http(action), false, NavigationIntent::New, initiator);
         }
     }
 
@@ -3870,6 +4748,7 @@ impl BrowserController {
         let tx = self.tx.clone();
         let window_environment = self.window_environment.subscribe();
         let storage = self.storage.clone();
+        let group = self.group_link.clone();
         self.task = Some(self.runtime.spawn(async move {
             let result = fetch_protocol_interactive(
                 &target,
@@ -3879,6 +4758,7 @@ impl BrowserController {
                 storage,
                 Some((content_type, body)),
                 NavigationIntent::New,
+                group,
             )
             .await;
             let event = interactive_fetch_event(generation, result);
@@ -3965,6 +4845,7 @@ async fn fetch_protocol_interactive(
     storage: crate::js::WebStorage,
     post_body: Option<(String, Vec<u8>)>,
     intent: NavigationIntent,
+    group: Option<crate::js::TraversableLink>,
 ) -> Result<InteractiveFetch, String> {
     if let Link::Gopher(url) = target
         && (url.is_image() || url.is_html() || url.is_binary_file())
@@ -3996,6 +4877,7 @@ async fn fetch_protocol_interactive(
             device_pixel_ratio,
             screen_position,
             fullscreen_supported,
+            traversable,
         } = *window_environment.borrow();
         let size = (
             viewport.width.round().clamp(1.0, u16::MAX as f32) as u16,
@@ -4009,6 +4891,8 @@ async fn fetch_protocol_interactive(
             screen_position,
             storage,
             fullscreen_supported,
+            traversable,
+            group.clone(),
         )
         .await;
         return Ok(InteractiveFetch::Document(FetchedDocument::Http(Box::new(
@@ -4074,6 +4958,7 @@ async fn fetch_protocol_interactive(
             device_pixel_ratio,
             screen_position,
             fullscreen_supported,
+            traversable,
         } = *window_environment.borrow();
         let css_viewport = (
             viewport.width.round().clamp(1.0, f32::from(u16::MAX)) as u16,
@@ -4087,6 +4972,8 @@ async fn fetch_protocol_interactive(
             screen_position,
             storage,
             fullscreen_supported,
+            traversable,
+            group.clone(),
         )
         .await;
         Ok(InteractiveFetch::Document(FetchedDocument::Http(Box::new(
@@ -4474,6 +5361,7 @@ mod tests {
             device_pixel_ratio: 1.,
             screen_position: (0, 0),
             fullscreen_supported: false,
+            traversable: crate::js::TraversableState::SHOWN,
         });
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
@@ -4487,6 +5375,7 @@ mod tests {
                 device_pixel_ratio: 2.,
                 screen_position: (25, 30),
                 fullscreen_supported: false,
+                traversable: crate::js::TraversableState::SHOWN,
             });
             let body = "<!doctype html><script>console.log('GEOMETRY '+innerWidth+' '+innerHeight+' '+devicePixelRatio+' '+screenX+' '+screenY)</script>";
             stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
@@ -4499,6 +5388,7 @@ mod tests {
             Default::default(),
             None,
             NavigationIntent::New,
+            None,
         )
         .await
         .unwrap();
@@ -4551,6 +5441,7 @@ mod tests {
                 device_pixel_ratio: 1.,
                 screen_position: (0, 0),
                 fullscreen_supported: false,
+                traversable: crate::js::TraversableState::SHOWN,
             });
             let result = fetch_protocol_interactive(
                 &Link::Http(url.clone()),
@@ -4560,6 +5451,7 @@ mod tests {
                 Default::default(),
                 None,
                 NavigationIntent::New,
+                None,
             )
             .await
             .unwrap();
@@ -5134,6 +6026,120 @@ mod tests {
         assert_eq!(server.log.lock().unwrap().len(), 2, "no network request");
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn new_traversable_requests_open_from_their_source_or_choose_the_current_one() {
+        // HTML #the-rules-for-choosing-a-navigable: a frontend that can create
+        // new top-level traversables receives the page's request, and the new
+        // traversable navigates from the source Document (its URL and
+        // policy), GET or form submission alike; a frontend without them is
+        // configured to choose the current navigable. Document-directed
+        // checks run where the source Document is current.
+        use crate::referrer_policy::ReferrerPolicy;
+        let server = crate::http::referer_server::Server::start(|_| {
+            (String::from("text/plain"), String::new(), b"ok".to_vec())
+        })
+        .await;
+        let base = server.base.clone();
+        let page = url::Url::parse(&format!("{base}/doc/page")).unwrap();
+        async fn finish(browser: &mut BrowserController) {
+            browser.task.take().unwrap().await.unwrap();
+            browser.process_async_events();
+        }
+        let request = |url: String, submission: Option<crate::js::FormSubmission>| {
+            Box::new(crate::js::NewTraversable {
+                url,
+                initiator: Some(Box::new(http::NavigationInitiator::document(
+                    &page,
+                    ReferrerPolicy::Origin,
+                ))),
+                name: String::from("popup"),
+                noopener: false,
+                foreground: true,
+                submission,
+            })
+        };
+
+        let mut source =
+            BrowserController::new(Handle::current(), || {}, CssSize::new(800.0, 600.0));
+        source.set_new_traversables_available(true);
+        assert!(
+            source
+                .window_environment
+                .borrow()
+                .traversable
+                .new_traversables
+        );
+        source.current = Some(desktop_page(&page, None));
+        source.handle_page_event(crate::js::PageEvt::OpenTraversable(request(
+            format!("{base}/opened"),
+            None,
+        )));
+        let submission = crate::js::FormSubmission {
+            action: format!("{base}/searched"),
+            method: String::from("get"),
+            content_type: String::new(),
+            body: b"q=tabs".to_vec(),
+            initiator: None,
+        };
+        source.handle_page_event(crate::js::PageEvt::OpenTraversable(request(
+            format!("{base}/searched"),
+            Some(submission),
+        )));
+        source.handle_page_event(crate::js::PageEvt::OpenTraversable(request(
+            String::from("file:///etc/hostname"),
+            None,
+        )));
+        assert!(source.pending.is_none(), "the source traversable stays");
+        let navigation = |request: Option<NewTraversableRequest>| match request {
+            Some(NewTraversableRequest::Navigate(request)) => request,
+            other => panic!("not a navigation request: {other:?}"),
+        };
+        let opened = navigation(source.take_new_traversable());
+        assert_eq!((opened.name.as_str(), opened.noopener), ("popup", false));
+        let searched = navigation(source.take_new_traversable());
+        assert!(
+            source.take_new_traversable().is_none(),
+            "a web page cannot open a local file"
+        );
+        let mut tab = BrowserController::new(Handle::current(), || {}, CssSize::new(800.0, 600.0));
+        tab.open_new_traversable(opened);
+        finish(&mut tab).await;
+        assert_eq!(
+            tab.current_page().unwrap().address(),
+            format!("{base}/opened")
+        );
+        assert!(tab.back.is_empty(), "the first document has no history");
+        let mut tab = BrowserController::new(Handle::current(), || {}, CssSize::new(800.0, 600.0));
+        tab.open_new_traversable(searched);
+        finish(&mut tab).await;
+        assert_eq!(
+            tab.current_page().unwrap().address(),
+            format!("{base}/searched?q=tabs")
+        );
+
+        let mut single =
+            BrowserController::new(Handle::current(), || {}, CssSize::new(800.0, 600.0));
+        single.current = Some(desktop_page(&page, None));
+        single.handle_page_event(crate::js::PageEvt::OpenTraversable(request(
+            format!("{base}/here"),
+            None,
+        )));
+        finish(&mut single).await;
+        assert_eq!(
+            single.current_page().unwrap().address(),
+            format!("{base}/here")
+        );
+        assert_eq!(single.back.len(), 1, "the source stays in session history");
+
+        server
+            .wait_for(&["/opened", "/searched?q=tabs", "/here"])
+            .await;
+        let origin = Some(Some(format!("{base}/")));
+        assert_eq!(server.referer("/opened"), origin);
+        assert_eq!(server.referer("/searched?q=tabs"), origin);
+        assert_eq!(server.referer("/here"), origin);
+    }
+
     #[test]
     fn unsupported_download_offer_leaves_the_desktop_document_committed() {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -5189,6 +6195,146 @@ mod tests {
             "report.pdf"
         );
         assert!(browser.pending.is_none());
+    }
+
+    #[test]
+    fn leaving_a_page_that_listens_for_beforeunload_waits_for_its_answer() {
+        // HTML #navigate with userInvolvement "browser UI" and
+        // #definitely-close-a-top-level-traversable: check if unloading is
+        // canceled first, and only for a page that listens for beforeunload.
+        // Fragment navigations keep the Document and ask nothing; a page that
+        // never answers cannot hold the user; leaving unloads the page.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let page_url = url::Url::parse("https://leave.test/page").unwrap();
+        let mut browser =
+            BrowserController::new(runtime.handle().clone(), || {}, CssSize::new(640., 480.));
+        browser.current = Some(desktop_page(&page_url, None));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        browser.live_page = Some(crate::js::PageHandle::from_test_sender(tx));
+        // The commands the page gets, without the traversable's presentation.
+        fn next(
+            rx: &mut tokio::sync::mpsc::Receiver<crate::js::PageCmd>,
+        ) -> Result<crate::js::PageCmd, tokio::sync::mpsc::error::TryRecvError> {
+            loop {
+                match rx.try_recv() {
+                    Ok(
+                        crate::js::PageCmd::SystemVisibility(_)
+                        | crate::js::PageCmd::SystemFocus(_),
+                    ) => {}
+                    other => return other,
+                }
+            }
+        }
+        let check = |rx: &mut tokio::sync::mpsc::Receiver<crate::js::PageCmd>| match next(rx) {
+            Ok(crate::js::PageCmd::CheckUnload { request }) => request,
+            other => panic!("expected a check, got {other:?}"),
+        };
+
+        // Without listeners the navigation starts at once.
+        assert!(!browser.unload_needs_check());
+        browser.handle_page_event(crate::js::PageEvt::BeforeUnloadListeners(true));
+        assert!(browser.unload_needs_check());
+
+        browser.handle_action(UserAction::Navigate(String::from(
+            "https://leave.test/page#part",
+        )));
+        assert!(
+            matches!(
+                next(&mut rx),
+                Ok(crate::js::PageCmd::NavigateFragment { .. })
+            ),
+            "a fragment navigation asks nothing"
+        );
+
+        browser.handle_action(UserAction::Navigate(String::from(
+            "https://leave.test/other",
+        )));
+        let first = check(&mut rx);
+        assert!(browser.pending.is_none(), "the navigation waits");
+        // A newer navigation replaces the waiting one without asking twice.
+        browser.handle_action(UserAction::Navigate(String::from(
+            "https://leave.test/newer",
+        )));
+        assert!(next(&mut rx).is_err());
+        // The user stayed.
+        browser.handle_page_event(crate::js::PageEvt::UnloadChecked {
+            request: first,
+            proceed: false,
+        });
+        assert!(browser.pending.is_none());
+        assert!(browser.live_page.is_some());
+
+        // The frontend's own leave (closing a tab) gets the answer.
+        let close = browser.ask_unload();
+        assert_eq!(check(&mut rx), close);
+        assert!(browser.take_unload_answer().is_none());
+        browser.handle_page_event(crate::js::PageEvt::UnloadChecked {
+            request: close,
+            proceed: false,
+        });
+        assert_eq!(browser.take_unload_answer(), Some((close, false)));
+
+        // A page that never answers is left after the timeout; one that
+        // asked the user waits for them.
+        browser.handle_action(UserAction::Reload);
+        let reload = check(&mut rx);
+        browser.set_unload_prompts_available(true);
+        let (answer, _reply) = tokio::sync::oneshot::channel();
+        browser.handle_page_event(crate::js::PageEvt::UnloadPrompt(
+            crate::js::UnloadPrompt::new(answer),
+        ));
+        assert!(browser.take_unload_prompt().is_some());
+        runtime.block_on(tokio::time::sleep(UNLOAD_CHECK_TIMEOUT * 2));
+        browser.process_async_events();
+        assert!(browser.pending.is_none(), "the user is still deciding");
+        browser.handle_page_event(crate::js::PageEvt::UnloadChecked {
+            request: reload,
+            proceed: true,
+        });
+        assert_eq!(
+            browser.pending.as_ref().map(|pending| pending.intent),
+            Some(NavigationIntent::Reload)
+        );
+        // Leaving unloads the page rather than killing it.
+        assert!(matches!(next(&mut rx), Ok(crate::js::PageCmd::Unload)));
+        assert!(browser.live_page.is_none());
+        browser.task.take().unwrap().abort();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        browser.current = Some(desktop_page(&page_url, None));
+        browser.live_page = Some(crate::js::PageHandle::from_test_sender(tx));
+        browser.handle_page_event(crate::js::PageEvt::BeforeUnloadListeners(true));
+        browser.handle_action(UserAction::Navigate(String::from(
+            "https://leave.test/late",
+        )));
+        let _late = check(&mut rx);
+        runtime.block_on(tokio::time::sleep(UNLOAD_CHECK_TIMEOUT * 2));
+        browser.process_async_events();
+        assert_eq!(
+            browser
+                .pending
+                .as_ref()
+                .map(|pending| pending.target.to_string()),
+            Some(String::from("https://leave.test/late"))
+        );
+        browser.task.take().unwrap().abort();
+
+        // Killing a page retires it without unloading; a frontend without
+        // prompts lets the page go without asking the user.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        browser.live_page = Some(crate::js::PageHandle::from_test_sender(tx));
+        browser.set_unload_prompts_available(false);
+        let (answer, mut reply) = tokio::sync::oneshot::channel();
+        browser.handle_page_event(crate::js::PageEvt::UnloadPrompt(
+            crate::js::UnloadPrompt::new(answer),
+        ));
+        assert_eq!(reply.try_recv(), Ok(true));
+        browser.handle_action(UserAction::Kill);
+        assert!(next(&mut rx).is_err(), "a killed page gets no unload task");
     }
 
     #[test]
@@ -6952,11 +8098,13 @@ mod whois_tests {
                 device_pixel_ratio: 1.0,
                 screen_position: (0, 0),
                 fullscreen_supported: false,
+                traversable: crate::js::TraversableState::SHOWN,
             })
             .1,
             Default::default(),
             None,
             NavigationIntent::New,
+            None,
         )
         .await
         .unwrap();

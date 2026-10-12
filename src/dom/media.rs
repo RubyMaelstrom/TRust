@@ -159,6 +159,32 @@ impl Dom {
             .clone()
     }
 
+    /// Carry the inline presentations of media elements moving to another
+    /// arena of the group (`Dom::transplant_subtree`), into which their
+    /// players keep presenting; substitute controls remembered for the
+    /// moving nodes stay behind.
+    pub(super) fn transplant_media(&self, into: &Dom, moved: &rustc_hash::FxHashSet<NodeId>) {
+        let mut from = self.media_fallbacks.borrow_mut();
+        from.entries.retain(|entry| {
+            !moved.contains(&entry.media) && !entry.ancestors.iter().any(|id| moved.contains(id))
+        });
+        let moving: Vec<NodeId> = from
+            .presentations
+            .keys()
+            .copied()
+            .filter(|media| moved.contains(media))
+            .collect();
+        if moving.is_empty() {
+            return;
+        }
+        let mut to = into.media_fallbacks.borrow_mut();
+        for media in moving {
+            if let Some(presentation) = from.presentations.remove(&media) {
+                to.presentations.insert(media, presentation);
+            }
+        }
+    }
+
     pub(crate) fn forget_media(&self, media: NodeId) {
         self.media_fallbacks
             .borrow_mut()

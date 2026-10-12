@@ -72,9 +72,43 @@ impl Dom {
         }
     }
 
+    /// HTML #system-focus: the arena's top-level traversable gained or
+    /// lost it. Each Document keeps its focused area; only what the focus
+    /// selectors match changes, and exactly those elements restyle.
+    pub(crate) fn set_system_focus(&mut self, focused: bool) {
+        if self.system_focus == focused {
+            return;
+        }
+        // The elements matching while focused: their state flips.
+        let areas: Vec<NodeId> = self.focused_areas.values().copied().collect();
+        self.system_focus = true;
+        let mut changed: Vec<_> = areas
+            .into_iter()
+            .flat_map(|area| self.focus_state_changes(Some(area), None))
+            .collect();
+        changed.sort_unstable_by_key(|&(node, state)| (node, state as u8));
+        changed.dedup();
+        let visible: Vec<NodeId> = self
+            .focused_areas
+            .iter()
+            .filter(|&(&document, _)| self.focus_indicated(document))
+            .map(|(_, &area)| area)
+            .collect();
+        changed.extend(
+            visible
+                .into_iter()
+                .map(|area| (area, invalidation::LiveState::Focus)),
+        );
+        self.system_focus = focused;
+        let index = self.style_index();
+        if changed.is_empty() || !self.invalidate_live_state(&index, &changed) {
+            self.touch();
+        }
+    }
+
     fn pointer_modality(&self) -> bool {
         self.element_states
-            .get(&DOCUMENT)
+            .get(&self.document())
             .is_some_and(|state| state.pointer_modality)
     }
 
@@ -130,7 +164,7 @@ impl Dom {
     /// use affects the focus moves that follow.
     pub(crate) fn set_input_modality(&mut self, keyboard: bool) {
         if self.pointer_modality() == keyboard {
-            self.update_control_state(DOCUMENT, |state| state.pointer_modality = !keyboard);
+            self.update_control_state(self.document(), |state| state.pointer_modality = !keyboard);
         }
         if keyboard {
             let documents: Vec<NodeId> = self.focused_areas.keys().copied().collect();
@@ -247,7 +281,7 @@ impl Dom {
         let blocked = self.any_document_blocked();
         // Unlike the layout flat iterator, retain slot elements: each is a
         // focus scope owner, even when it generates no box of its own.
-        let mut walk = self.children(DOCUMENT);
+        let mut walk = self.children(self.document());
         walk.reverse();
         while let Some(node) = walk.pop() {
             let children = if let Some(root) = self.shadow_root(node) {
@@ -266,8 +300,8 @@ impl Dom {
             let Some(tag) = self.tag_name(node) else {
                 continue;
             };
-            let parent = self.parent_flat(node).unwrap_or(DOCUMENT);
-            let owner = owners.get(&parent).copied().unwrap_or(DOCUMENT);
+            let parent = self.parent_flat(node).unwrap_or(self.document());
+            let owner = owners.get(&parent).copied().unwrap_or(self.document());
             let scope = self.shadow_root(node).is_some() || tag == "slot";
             owners.insert(node, if scope { node } else { owner });
             if self.attr(node, "inert").is_some() || inert.contains(&parent) {
@@ -310,7 +344,7 @@ impl Dom {
             // Stable sort preserves tree order for equal/default values.
             entries.sort_by_key(|&(_, index, _)| if index > 0 { (0, index) } else { (1, 0) });
         }
-        let mut pending = scopes.remove(&DOCUMENT).unwrap_or_default();
+        let mut pending = scopes.remove(&self.document()).unwrap_or_default();
         pending.reverse();
         let mut result = Vec::new();
         while let Some((node, _, focusable)) = pending.pop() {
@@ -355,6 +389,9 @@ impl StyleView<'_> {
     /// HTML #selector-focus additionally matches shadow hosts, but excludes
     /// navigable containers. Ordinary parents do not inherit :focus.
     pub(super) fn matches_focus(&self, id: NodeId) -> bool {
+        if !self.state.system_focus {
+            return false;
+        }
         let focused = self
             .state
             .focused_areas
@@ -377,7 +414,8 @@ impl StyleView<'_> {
     /// while its Document indicates focus.
     pub(super) fn matches_focus_visible(&self, id: NodeId) -> bool {
         let document = self.nodes.owner_document(id);
-        self.state.focused_areas.get(&document) == Some(&id)
+        self.state.system_focus
+            && self.state.focused_areas.get(&document) == Some(&id)
             && !matches!(self.tag_name(id), Some("iframe" | "frame"))
             && self
                 .state

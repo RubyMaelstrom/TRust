@@ -66,6 +66,12 @@ pub(super) struct WebAudioHost {
 }
 
 impl WebAudioHost {
+    /// Whether the page has an audio context: its rendering threads live
+    /// with the page's actor.
+    pub(super) fn has_contexts(&self) -> bool {
+        !self.contexts.is_empty()
+    }
+
     pub(super) fn retained_bytes(&self) -> usize {
         self.contents
             .values()
@@ -979,6 +985,7 @@ pub(super) fn dispatch(engine: &mut lumen::Engine, task: WebAudioTask) -> Result
             Notice::OfflineSuspended(frame) => ("offlineSuspended", frame as f64, 0.0, 0.0, 0.0),
             Notice::SuspendMissed(frame) => ("suspendMissed", frame as f64, 0.0, 0.0, 0.0),
             Notice::RenderFailed => ("renderFailed", 0.0, 0.0, 0.0, 0.0),
+            Notice::Audible(audible) => ("audible", f64::from(u8::from(audible)), 0.0, 0.0, 0.0),
             Notice::Rendered(data) => {
                 let Some((id, length, channels)) = store(engine, data) else {
                     return Ok(());

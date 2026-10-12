@@ -374,6 +374,8 @@ impl Syntax {
 /// #relative-lengths) and query containers for container lengths (CSS
 /// Conditional 5 #container-lengths).
 pub(in crate::dom) trait Host {
+    /// The arena's Document.
+    fn document(&self) -> NodeId;
     fn style_scope_root_element(&self, id: NodeId) -> Option<NodeId>;
     fn font_px(&self, id: NodeId) -> f32;
     fn root_font_px(&self) -> f32;
@@ -387,6 +389,9 @@ pub(in crate::dom) trait Host {
 }
 
 impl<B: StyleBackend + ?Sized> Host for ComputeView<'_, B> {
+    fn document(&self) -> NodeId {
+        self.0.document()
+    }
     fn style_scope_root_element(&self, id: NodeId) -> Option<NodeId> {
         ComputeView::style_scope_root_element(self, id)
     }
@@ -432,7 +437,8 @@ impl Context<'_> {
     fn validation() -> Self {
         Self {
             dom: None,
-            id: DOCUMENT,
+            // Without a Document no node is named.
+            id: 0,
             pseudo: None,
             base: None,
             independent: false,

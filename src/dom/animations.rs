@@ -543,6 +543,40 @@ impl State {
         self.private.remove(&node);
     }
 
+    /// CSS Animations 1 #animations: an element that left this arena for
+    /// another of the group (`Dom::transplant_subtree`) is no longer in the
+    /// document, which ends its animations as `display: none` would. Those
+    /// neither idle nor finished are canceled (CSS Animations 2
+    /// #event-dispatch) at the time of the last sample, and their
+    /// `animationcancel` events stay queued here, with the document
+    /// timeline that ran them; `remove_node` forgets the rest.
+    pub(super) fn cancel_departed(&mut self, departed: &FxHashSet<NodeId>) {
+        let targets: Vec<StyleTarget> = self
+            .elements
+            .keys()
+            .copied()
+            .filter(|(node, _)| departed.contains(node))
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        self.generation += 1;
+        for target in targets {
+            if let Some(element) = self.elements.remove(&target) {
+                for (index, animation) in element.animations.iter().enumerate() {
+                    cancel(
+                        &mut self.events,
+                        target,
+                        animation,
+                        self.now,
+                        element.tree_order,
+                        index,
+                    );
+                }
+            }
+        }
+    }
+
     pub(super) fn visit_gc_roots(&self, visit: &mut dyn FnMut(NodeId)) {
         // Pending events target their elements until dispatched.
         for event in &self.events {
@@ -855,7 +889,7 @@ impl Dom {
             None => self.style_parent(id),
             Some(_) => Some(id),
         }
-        .filter(|&parent| parent != DOCUMENT)
+        .filter(|&parent| parent != self.document())
         .map_or(FONT_SIZE_INITIAL, |parent| self.font_px(parent));
         let root = self
             .style_scope_root_element(id)
@@ -1027,14 +1061,16 @@ impl Dom {
         if !index.keyframes.keys().any(|name| sampled(name, true)) {
             return false;
         }
-        self.composed_descendants(DOCUMENT).into_iter().any(|id| {
-            self.tag_name(id).is_some()
-                && self.animation_targets(id).into_iter().any(|target| {
-                    self.animation_specs(target)
-                        .iter()
-                        .any(|spec| sampled(&spec.name, target.1.is_some()))
-                })
-        })
+        self.composed_descendants(self.document())
+            .into_iter()
+            .any(|id| {
+                self.tag_name(id).is_some()
+                    && self.animation_targets(id).into_iter().any(|target| {
+                        self.animation_specs(target)
+                            .iter()
+                            .any(|spec| sampled(&spec.name, target.1.is_some()))
+                    })
+            })
     }
 
     /// `id` and those of its pseudo-elements that are generated and declare
@@ -1301,7 +1337,7 @@ impl Dom {
             self.animations.keyframes.set(keyframes);
             let candidates: Vec<NodeId> = if full {
                 let mut candidates = if keyframes {
-                    self.composed_descendants(DOCUMENT)
+                    self.composed_descendants(self.document())
                 } else {
                     Vec::new()
                 };
@@ -1422,7 +1458,7 @@ impl Dom {
         }
         let order = *tree_order
             .get_or_insert_with(|| {
-                self.composed_descendants(DOCUMENT)
+                self.composed_descendants(self.document())
                     .into_iter()
                     .enumerate()
                     .map(|(order, node)| (node, order))

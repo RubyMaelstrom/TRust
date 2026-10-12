@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 
 use crate::doc::{FieldKind, Form};
-use crate::dom::{DOCUMENT, Dom, NodeId};
+use crate::dom::{Dom, NodeId};
 use crate::layout2::{ControlMap, PxRect};
 use crate::render::CssRect;
 
@@ -107,13 +107,13 @@ impl SemanticTree {
     ) -> Self {
         let mut nodes = Vec::new();
         let root_children = dom
-            .flat_children(DOCUMENT)
+            .flat_children(dom.document())
             .into_iter()
             .filter_map(|node| semantic_id(dom, boxes, node))
             .collect();
         nodes.push(SemanticNode {
             id: Self::ROOT,
-            dom_node: Some(DOCUMENT),
+            dom_node: Some(dom.document()),
             role: Role::Document,
             name: document_title(dom),
             value: None,
@@ -123,7 +123,7 @@ impl SemanticTree {
             bounds: document_bounds(boxes),
             children: root_children,
             actions: Vec::new(),
-            focused: focused == Some(DOCUMENT),
+            focused: focused == Some(dom.document()),
             checked: None,
         });
         for &node in dom.flat_document_order().iter() {
@@ -309,11 +309,9 @@ fn accessible_name(dom: &Dom, node: NodeId, field_label: Option<&str>) -> String
     crate::dom::display_text(&name).into_owned()
 }
 
+/// The document's title as `document.title` reads it (HTML #document.title).
 pub fn document_title(dom: &Dom) -> String {
-    dom.descendants(DOCUMENT)
-        .find(|node| dom.tag_name(*node) == Some("title"))
-        .map(|node| crate::dom::display_text(dom.text_content(node).trim()).into_owned())
-        .unwrap_or_default()
+    crate::dom::display_text(&dom.document_title_of(dom.document())).into_owned()
 }
 
 fn document_bounds(boxes: &HashMap<NodeId, PxRect>) -> CssRect {
