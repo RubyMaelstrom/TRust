@@ -780,21 +780,21 @@ impl Builder<'_> {
                 }
                 if kids.iter().any(Built::is_block) {
                     // A flex or grid item is blockified (CSS Display 3
-                    // #transformations): a block container of its blocks.
-                    // The sizing properties of the inline element's own
-                    // display do not apply to it here (CSS 2 §§10.2, 10.4,
-                    // 10.5, 10.7; css-sizing-4 #aspect-ratio), as with an
-                    // object's fallback whose dimension attributes map to
-                    // width/height (HTML #dimRendering).
-                    let mut style = BoxStyle::of(self.dom, id, self.vp);
-                    style.width = super::value::Len::Auto;
-                    style.height = super::value::Len::Auto;
-                    style.min_width = super::value::Len::Auto;
-                    style.min_height = super::value::Len::Auto;
-                    style.max_width = super::value::Len::None;
-                    style.max_height = super::value::Len::None;
-                    style.aspect_ratio = None;
-                    Built::Block(Arc::new(self.assemble(id, style, kids, None, None, false)))
+                    // #transformations; css-flexbox-1 #flex-items, css-grid-2
+                    // #grid-items): its computed outer display is block, so
+                    // it is a block container of its blocks and, unlike an
+                    // inline box split around them, takes its own sizing
+                    // properties (CSS 2 §10.2 applies to it). YouTube's
+                    // `ytd-rich-item-renderer` grid items are such elements,
+                    // sized by `width: calc(100%/var(--…items-per-row) - …)`.
+                    Built::Block(Arc::new(self.assemble(
+                        id,
+                        BoxStyle::of(self.dom, id, self.vp),
+                        kids,
+                        None,
+                        None,
+                        false,
+                    )))
                 } else {
                     Built::Inline(Inline::Box {
                         node: id,

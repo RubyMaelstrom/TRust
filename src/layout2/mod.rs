@@ -4860,6 +4860,43 @@ mod tests {
     }
 
     #[test]
+    fn blockified_items_holding_blocks_take_their_sizing_properties() {
+        // CSS Display 3 #transformations with css-flexbox-1 #flex-items and
+        // css-grid-2 #grid-items: a flex or grid item's computed display is
+        // blockified, so an inline element holding block children is a block
+        // box there, not an inline box split around them (CSS 2 §9.2.1.1),
+        // and its sizing properties apply (§10.2). YouTube's channel grid
+        // (`ytd-rich-item-renderer`, default display inline, wrapping a flex
+        // `div`) took its title's width instead of a third of the row.
+        let html = r#"<!DOCTYPE html><body style="margin:0;font:16px/20px sans-serif">
+            <div style="display:flex;flex-wrap:wrap;width:1090px;--per-row:3;--gap:16px">
+                <x-item id=a style="width:calc(100%/var(--per-row) - var(--gap))"><div>a long title that is wider than nothing</div></x-item>
+                <x-item id=b style="width:calc(100%/var(--per-row) - var(--gap))"><div>short</div></x-item>
+                <span id=s style="width:200px;height:50px"><div>span</div></span>
+                <object id=o width=300 height=30><div>fallback content of an object</div></object>
+            </div>
+            <div style="display:grid;grid-template-columns:400px"><span id=g style="width:150px;justify-self:start"><div>grid item</div></span></div>
+            </body>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 1280.0, &HashMap::new());
+        let rect = |id: &str| layout.boxes[&dom.get_by_id(id).unwrap()];
+        let third = 1090.0 / 3.0 - 16.0;
+        assert!(
+            (rect("a").width - third).abs() < 0.01,
+            "{}",
+            rect("a").width
+        );
+        assert!(
+            (rect("b").width - third).abs() < 0.01,
+            "{}",
+            rect("b").width
+        );
+        assert_eq!((rect("s").width, rect("s").height), (200.0, 50.0));
+        assert_eq!((rect("o").width, rect("o").height), (300.0, 30.0));
+        assert_eq!(rect("g").width, 150.0);
+    }
+
+    #[test]
     fn noembed_and_the_other_hidden_elements_have_no_box() {
         // HTML Rendering #hidden-elements: `area, base, basefont, datalist,
         // head, link, meta, noembed, noframes, param, rp, script, style,
