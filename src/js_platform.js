@@ -10604,6 +10604,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 videoWidth: 0, videoHeight: 0, mediaTracks: [], played: [], playedFrom: null,
                 candidate: null, pointer: null, waitingForSource: false, delaying: false,
                 timeCache: null, controlsUntil: 0, controlsKey: "",
+                // The resource fetch waiting for the user to request it
+                // (preload none): {queued} until its tasks ran, with
+                // {requested} when a request came before that.
+                deferredFetch: null,
                 // The attached MediaSource (Media Source Extensions).
                 mediaSource: null,
                 // Encrypted Media Extensions: the MediaKeys and its CDM id.
@@ -10674,6 +10678,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // "stop the fetching process", and replacement of the resource).
     function closePlayer(element, state) {
         detachMediaSource(element, state);
+        state.deferredFetch = null;
         if (state.player < 0) return;
         mediaControl(element, state, "close");
         mediaPlayers.delete(state.player);
@@ -10972,9 +10977,51 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             type = fileAPI.type(provider);
         }
         closePlayer(element, state);
-        const id = __media_load(nodeIds.get(element), url || "", element.localName, type || "", bytes);
+        // Mode remote's optional steps: a user agent that will not fetch the
+        // resource until the user requests it, as for the preload
+        // attribute's None state, idles until then.
+        const deferred = provider === null && preloadNone(element, state);
+        const id = __media_load(nodeIds.get(element), url || "", element.localName, type || "", bytes, deferred);
         if (typeof id !== "number" || id < 0) return failure();
         adoptPlayer(element, state, id, candidate);
+        if (!deferred) return;
+        const fetch = {queued: true, requested: false};
+        state.deferredFetch = fetch;
+        state.network = NETWORK_IDLE;
+        queueMediaTask(element, state, function () {
+            if (state.deferredFetch === fetch) fireMediaEvent(element, "suspend");
+        });
+        queueMediaTask(element, state, function () {
+            if (state.deferredFetch !== fetch) return;
+            state.delaying = false;
+            fetch.queued = false;
+            if (fetch.requested) resumeDeferredFetch(element, state);
+        });
+    }
+    // #attr-media-preload: whether the None state asks the user agent not to
+    // fetch the resource before the user requests it. #attr-media-autoplay
+    // can override it, as can a playback request already made.
+    function preloadNone(element, state) {
+        const preload = element.getAttribute("preload");
+        return preload !== null && preload.toLowerCase() === "none" && !element.hasAttribute("autoplay")
+            && state.paused;
+    }
+    // The implementation-defined event the deferred fetch waits for: the
+    // user (or script) requesting playback, or a preload state that wants
+    // the data after all.
+    function resumeDeferredFetch(element, state) {
+        const fetch = state.deferredFetch;
+        if (fetch === null) return;
+        // "Wait for the task to be run" before the event counts.
+        if (fetch.queued) { fetch.requested = true; return; }
+        state.deferredFetch = null;
+        state.delaying = true;
+        state.network = NETWORK_LOADING;
+        mediaControl(element, state, "start");
+    }
+    function mediaPreloadChanged(element) {
+        const state = mediaState(element);
+        if (state.deferredFetch !== null && !preloadNone(element, state)) resumeDeferredFetch(element, state);
     }
     // The element's new player: send it the element's state.
     function adoptPlayer(element, state, id, candidate) {
@@ -11090,6 +11137,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             queueMediaTask(element, state, () => resolvePlayPromises(promises));
         }
         state.canAutoplay = false;
+        resumeDeferredFetch(element, state);
         syncPlaying(element, state);
     }
     // #dom-media-seek
@@ -23238,6 +23286,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (localName === "source") pictureSourceAttributeChanged(element, lower);
         if (lower === "loading" && localName === "img" && v.toLowerCase() !== "lazy") resumeLazyImage(element);
         if (lower === "src" && (localName === "video" || localName === "audio")) loadMediaElement(element);
+        if ((lower === "preload" || lower === "autoplay") && element instanceof HTMLMediaElement) mediaPreloadChanged(element);
         if ((lower === "controls" || lower === "muted") && element instanceof HTMLMediaElement) {
             const state = mediaState(element);
             if (lower === "muted") sendVolume(element, state);
@@ -23279,6 +23328,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // HTML #lazy-loading-attributes: the Eager state resumes a lazy load.
         if (lower === "loading" && localName === "img") resumeLazyImage(element);
         if (lower === "src" && localName === "track" && isTrackElement(element)) trackSourceChanged(element);
+        // A missing preload attribute is the Metadata state.
+        if (lower === "preload" && element instanceof HTMLMediaElement) mediaPreloadChanged(element);
         if ((lower === "controls" || lower === "muted") && element instanceof HTMLMediaElement) {
             const state = mediaState(element);
             if (lower === "muted") sendVolume(element, state);

@@ -157,7 +157,15 @@ struct Shared {
 /// One media element's playback engine.
 pub struct Player {
     shared: Arc<Shared>,
-    control: Option<JoinHandle<()>>,
+    control: Mutex<Option<JoinHandle<()>>>,
+    /// A deferred player's input until it starts.
+    pending: Mutex<Option<Pending>>,
+}
+
+struct Pending {
+    input: Input,
+    options: Options,
+    events: EventSink,
 }
 
 /// Counts for HTML `getVideoPlaybackQuality()`.
@@ -173,6 +181,21 @@ impl Player {
         options: Options,
         events: impl Fn(Event) + Send + Sync + 'static,
     ) -> Self {
+        let player = Self::deferred(input, options, events);
+        player.start();
+        player
+    }
+
+    /// A player that reads nothing from its input, and runs no thread, until
+    /// it starts (`start`, or a `play` command): HTML
+    /// #concept-media-load-resource lets a user agent wait for the user to
+    /// request playback before fetching, as for the `preload` attribute's
+    /// None state. Its surface, clock and commands work meanwhile.
+    pub fn deferred(
+        input: Input,
+        options: Options,
+        events: impl Fn(Event) + Send + Sync + 'static,
+    ) -> Self {
         let shared = Arc::new(Shared {
             commands: Mutex::new(VecDeque::new()),
             wake: Arc::new((Mutex::new(false), Condvar::new())),
@@ -184,8 +207,33 @@ impl Player {
             video_presented: Arc::new(AtomicU64::new(0)),
             video_dropped: Arc::new(AtomicU64::new(0)),
         });
-        let events: EventSink = Arc::new(events);
-        let thread_shared = shared.clone();
+        Self {
+            shared,
+            control: Mutex::new(None),
+            pending: Mutex::new(Some(Pending {
+                input,
+                options,
+                events: Arc::new(events),
+            })),
+        }
+    }
+
+    /// Start reading the input and decoding, once.
+    pub fn start(&self) {
+        let pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let Some(Pending {
+            input,
+            options,
+            events,
+        }) = pending
+        else {
+            return;
+        };
+        let thread_shared = self.shared.clone();
         let control = std::thread::Builder::new()
             .name(String::from("trust-media"))
             .spawn(move || {
@@ -202,7 +250,7 @@ impl Player {
                 }
             })
             .ok();
-        Self { shared, control }
+        *self.control.lock().unwrap_or_else(|e| e.into_inner()) = control;
     }
 
     fn command(&self, command: Command) {
@@ -218,6 +266,7 @@ impl Player {
 
     pub fn play(&self) {
         self.command(Command::Play);
+        self.start();
     }
 
     pub fn pause(&self) {
@@ -290,7 +339,12 @@ impl Drop for Player {
         // The control thread may be blocked on the network; it notices the
         // stop at its next wake-up and tears down its own threads. Joining
         // here would stall the page actor, so detach instead.
-        drop(self.control.take());
+        drop(
+            self.control
+                .get_mut()
+                .unwrap_or_else(|e| e.into_inner())
+                .take(),
+        );
     }
 }
 

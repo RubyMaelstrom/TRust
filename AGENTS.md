@@ -781,8 +781,13 @@ current behavior and limits; consult the governing standards before changing it.
   what cannot decode. Containers are TRust's own ISO BMFF, Matroska/WebM and
   ADTS parsers plus Symphonia's Ogg/MP3/FLAC/WAV readers; HTTP media streams
   through Range requests (CORS-safelisted single ranges) into a bounded sparse
-  cache. A top-level navigation to playable audio/video is a media document
-  (HTML #read-media) on the desktop, not a download.
+  cache. A `preload="none"` element without `autoplay` takes the resource
+  fetch algorithm's optional wait for the user (#concept-media-load-resource):
+  NETWORK_IDLE, `suspend`, no load-event delay, and a `Player::deferred` that
+  runs no thread and fetches nothing until `play()` or a preload change
+  (`resumeDeferredFetch`); a page of sixty such videos fetched and decoded
+  them all at once. A top-level navigation to playable audio/video is a media
+  document (HTML #read-media) on the desktop, not a download.
 - Media Source Extensions (w3c/media-source): `media::mse` runs the segment
   parser loop for ISO BMFF and WebM byte streams, coded frame processing
   (segments and sequence modes, timestampOffset, append windows, overlap

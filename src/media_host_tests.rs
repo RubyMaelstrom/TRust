@@ -16,7 +16,20 @@ fn runtime() -> tokio::runtime::Runtime {
         .unwrap()
 }
 
-/// Serve the media fixtures by name, honouring single byte ranges.
+/// Every request path the fixture servers answered, query included.
+static SERVED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn served(query: &str) -> usize {
+    SERVED
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|path| path.ends_with(query))
+        .count()
+}
+
+/// Serve the media fixtures by name (a query string is ignored), honouring
+/// single byte ranges.
 fn serve(runtime: &tokio::runtime::Runtime) -> String {
     let listener = runtime.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -32,7 +45,9 @@ fn serve(runtime: &tokio::runtime::Runtime) -> String {
                     head.push(byte[0]);
                 }
                 let head = String::from_utf8_lossy(&head).to_string();
-                let path = head.split_whitespace().nth(1).unwrap_or("/").trim_start_matches('/').to_string();
+                let target = head.split_whitespace().nth(1).unwrap_or("/").to_string();
+                SERVED.lock().unwrap().push(target.clone());
+                let path = target.trim_start_matches('/').split('?').next().unwrap_or("").to_string();
                 let lower = head.to_ascii_lowercase();
                 let range = lower
                     .lines()
@@ -252,6 +267,77 @@ fn a_video_loads_plays_and_ends() {
     assert_eq!(string_value(&mut engine, "log.join('|')"), "seeking|seeked");
     assert_eq!(string_value(&mut engine, "v.currentTime"), "0.25");
     assert_eq!(string_value(&mut engine, "v.ended || v.seeking"), "false");
+}
+
+/// HTML #concept-media-load-resource, mode remote: a user agent that will
+/// not fetch the resource until the user requests it (the preload
+/// attribute's None state) sets networkState to NETWORK_IDLE, fires
+/// `suspend` and stops delaying the load event; playback, or a preload
+/// state that wants data, resumes the fetch. erome's albums hold sixty-one
+/// such videos, which all fetched and decoded at once.
+#[test]
+fn preload_none_fetches_nothing_until_playback_is_requested() {
+    let runtime = runtime();
+    let base = serve(&runtime);
+    let (mut engine, mut tasks) = page(&runtime, &format!("{base}/page.html"));
+    eval(
+        &mut engine,
+        &format!(
+            "globalThis.v = document.createElement('video'); v.preload = 'none'; v.muted = true; \
+             v.src = '{base}/av1_mp3.mp4?play'; document.body.appendChild(v); \
+             globalThis.w = document.createElement('video'); w.preload = 'none'; \
+             w.src = '{base}/av1_mp3.mp4?preload'; document.body.appendChild(w);"
+        ),
+        "videos",
+    )
+    .unwrap();
+    watch(&mut engine, "v");
+    eval(
+        &mut engine,
+        "w.addEventListener('suspend', () => log.push('w:suspend')); \
+         w.addEventListener('loadedmetadata', () => log.push('w:loadedmetadata'));",
+        "listeners",
+    )
+    .unwrap();
+    run_until(
+        &runtime,
+        &mut engine,
+        &mut tasks,
+        "log.includes('suspend') && log.includes('w:suspend')",
+    );
+    // Give a fetch every chance to start.
+    let waited = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < waited {
+        run_until(&runtime, &mut engine, &mut tasks, "true");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        string_value(&mut engine, "log.join('|')"),
+        "loadstart|suspend|w:suspend"
+    );
+    assert_eq!(
+        string_value(
+            &mut engine,
+            "[v.networkState, v.readyState, w.networkState].join()"
+        ),
+        "1,0,1"
+    );
+    assert_eq!(served("?play") + served("?preload"), 0);
+    // Script requesting playback is the user agent's event.
+    eval(&mut engine, "v.play();", "play").unwrap();
+    assert_eq!(string_value(&mut engine, "v.networkState"), "2");
+    run_until(&runtime, &mut engine, &mut tasks, "log.includes('playing')");
+    assert!(served("?play") > 0);
+    assert_eq!(served("?preload"), 0);
+    // A preload state other than None wants the data after all.
+    eval(&mut engine, "w.preload = 'metadata';", "preload").unwrap();
+    run_until(
+        &runtime,
+        &mut engine,
+        &mut tasks,
+        "log.includes('w:loadedmetadata')",
+    );
+    assert!(served("?preload") > 0);
 }
 
 #[test]

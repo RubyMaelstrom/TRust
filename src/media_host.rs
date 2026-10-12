@@ -280,9 +280,12 @@ fn task_sender(ctx: &mut Ctx) -> Option<LumenTaskSender> {
     ctx.host_mut::<HostState>()?.task_events.clone()
 }
 
-/// `__media_load(node, url, destination, typeHint)`: start fetching and
-/// playing `url` for media element `node`. Returns the player id, or -1 when
-/// the URL cannot be fetched (the element then runs its failure steps).
+/// `__media_load(node, url, destination, typeHint, provider, deferred)`:
+/// start fetching and playing `url` (or the Blob `provider`'s bytes) for
+/// media element `node`. A `deferred` player fetches nothing until the
+/// `start` or `play` control (HTML #concept-media-load-resource's wait for
+/// the user to request playback). Returns the player id, or -1 when the URL
+/// cannot be fetched (the element then runs its failure steps).
 pub(super) fn load(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     if !inline_media(ctx) {
         return Ok(Value::Num(-1.0));
@@ -308,6 +311,7 @@ pub(super) fn load(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
         return Ok(Value::Num(-1.0));
     };
     let calling = ctx.host_job_context();
+    let deferred = matches!(args.get(5), Some(Value::Bool(true)));
     let id = {
         let Some(state) = ctx.host_mut::<HostState>() else {
             return Ok(Value::Num(-1.0));
@@ -335,13 +339,15 @@ pub(super) fn load(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
             Input::Resource { source, hint },
             sender,
             Taint::Clean,
+            deferred,
         )));
     }
     let Ok(url) = url::Url::parse(&target) else {
         return Ok(Value::Num(-1.0));
     };
     media_log!(
-        "player {id}: load {}",
+        "player {id}: load{} {}",
+        if deferred { " (deferred)" } else { "" },
         url.as_str().chars().take(200).collect::<String>()
     );
     let mut taint = Taint::Clean;
@@ -417,6 +423,7 @@ pub(super) fn load(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
         Input::Resource { source, hint },
         sender,
         taint,
+        deferred,
     )))
 }
 
@@ -464,6 +471,7 @@ pub(super) fn attach(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
         Input::Demuxer(Box::new(demuxer)),
         sender,
         Taint::Clean,
+        false,
     );
     if let Some(state) = ctx.host_mut::<HostState>() {
         if let Some(entry) = state.media.players.get_mut(&id) {
@@ -856,6 +864,7 @@ fn start(
     input: Input,
     sender: LumenTaskSender,
     taint: Taint,
+    deferred: bool,
 ) -> f64 {
     let player_sender = std::sync::Mutex::new(sender);
     let context = {
@@ -877,7 +886,12 @@ fn start(
     if let (Some(tap), Some(opaque)) = (&tap, taint.opaque()) {
         tap.set_opaque(opaque);
     }
-    let player = Player::new(
+    let player = if deferred {
+        Player::deferred
+    } else {
+        Player::new
+    };
+    let player = player(
         input,
         Options {
             audio: match tap {
@@ -1043,6 +1057,7 @@ pub(super) fn control(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Val
     };
     let player = &entry.player;
     match op.as_str() {
+        "start" => player.start(),
         "play" => player.play(),
         "pause" => player.pause(),
         "seek" => player.seek(seconds_to_micros(number(&a)), flag(&b)),
