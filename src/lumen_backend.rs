@@ -6392,6 +6392,9 @@ mod desktop {
         interrupt.set_deadline(None);
     }
 
+    /// Evaluate `source` in the page as a task (tests drive pages this way; the
+    /// browser reaches the prelude only through `platform_control`).
+    #[cfg(test)]
     fn evaluate_task(page: &mut LumenPage, source: &str, label: &str) -> Option<Value> {
         let evaluated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             page.engine.eval_value_interruptible(source)
@@ -8329,9 +8332,12 @@ mod desktop {
                 if changed {
                     page.render_environment_dirty = true;
                     prepare_unbounded_task(interrupt);
-                    let _ = evaluate_task(
+                    // CSSOM View #dom-window-devicepixelratio reads the new ratio; the
+                    // platform keeps it behind the [Replaceable] attribute.
+                    let _ = call_trust(
                         page,
-                        &format!("globalThis.devicePixelRatio={ratio}"),
+                        "setDevicePixelRatio",
+                        &[Value::Num(f64::from(ratio))],
                         "devicePixelRatio",
                     );
                     let _ = call_trust(page, "reactToImageEnvironment", &[], "image environment");
@@ -45352,6 +45358,181 @@ mod tests {
     }
 
     #[test]
+    fn window_attributes_and_operations_have_web_idl_shapes() {
+        // Web IDL #js-attributes / #Replaceable / #LegacyUnforgeable and #js-operations for the
+        // [Global] Window (HTML #the-window-object, CSSOM View #extensions-to-the-window-
+        // interface, HR Time #the-performance-attribute): attributes are own enumerable
+        // accessors whose functions are named "get <id>"/"set <id>", unforgeable ones are not
+        // configurable, [Replaceable] ones shadow themselves with a data property when
+        // assigned, and each operation is its own non-constructor builtin named by its
+        // identifier with the shortest overload's length. Bot-detection scripts (Kasada on
+        // Twitch) probe exactly these shapes; a data-property devicePixelRatio or an anonymous
+        // `function () { [native code] }` reads as a tampered environment.
+        let mut engine = platform_engine();
+        let shapes = string_value(
+            &mut engine,
+            r#"
+            const own = Object.getOwnPropertyDescriptor;
+            const shape = name => {
+                const d = own(window, name);
+                if (!d) return name + ':missing';
+                if ('value' in d) return name + ':data';
+                return [name, d.get && d.get.name, d.set ? d.set.name : '-', d.enumerable, d.configurable,
+                    'prototype' in d.get].join(':');
+            };
+            [
+                ...['window', 'document', 'top', 'self', 'frames', 'parent', 'history', 'performance',
+                    'isSecureContext', 'customElements', 'devicePixelRatio', 'scrollX', 'pageXOffset',
+                    'scrollY', 'pageYOffset'].map(shape),
+                ...['matchMedia', 'alert', 'confirm', 'prompt', 'scroll', 'scrollTo', 'scrollBy',
+                    'getSelection', 'requestIdleCallback', 'cancelIdleCallback', 'setTimeout',
+                    'clearTimeout', 'clearInterval', 'requestAnimationFrame', 'cancelAnimationFrame',
+                    'structuredClone'].map(name => [name, window[name].name, window[name].length,
+                        'prototype' in window[name]].join(':')),
+                scroll !== scrollTo && clearTimeout !== clearInterval,
+            ].join('\n')
+        "#,
+        );
+        assert_eq!(
+            shapes,
+            "window:get window:-:true:false:false\n\
+             document:get document:-:true:false:false\n\
+             top:get top:-:true:false:false\n\
+             self:get self:set self:true:true:false\n\
+             frames:get frames:set frames:true:true:false\n\
+             parent:get parent:set parent:true:true:false\n\
+             history:get history:-:true:true:false\n\
+             performance:get performance:set performance:true:true:false\n\
+             isSecureContext:get isSecureContext:-:true:true:false\n\
+             customElements:get customElements:-:true:true:false\n\
+             devicePixelRatio:get devicePixelRatio:set devicePixelRatio:true:true:false\n\
+             scrollX:get scrollX:set scrollX:true:true:false\n\
+             pageXOffset:get pageXOffset:set pageXOffset:true:true:false\n\
+             scrollY:get scrollY:set scrollY:true:true:false\n\
+             pageYOffset:get pageYOffset:set pageYOffset:true:true:false\n\
+             matchMedia:matchMedia:1:false\n\
+             alert:alert:0:false\n\
+             confirm:confirm:0:false\n\
+             prompt:prompt:0:false\n\
+             scroll:scroll:0:false\n\
+             scrollTo:scrollTo:0:false\n\
+             scrollBy:scrollBy:0:false\n\
+             getSelection:getSelection:0:false\n\
+             requestIdleCallback:requestIdleCallback:1:false\n\
+             cancelIdleCallback:cancelIdleCallback:1:false\n\
+             setTimeout:setTimeout:1:false\n\
+             clearTimeout:clearTimeout:0:false\n\
+             clearInterval:clearInterval:0:false\n\
+             requestAnimationFrame:requestAnimationFrame:1:false\n\
+             cancelAnimationFrame:cancelAnimationFrame:1:false\n\
+             structuredClone:structuredClone:1:false\n\
+             true"
+        );
+        // [Replaceable] assignment shadows the attribute with an own data property; an
+        // unforgeable or readonly one ignores it (sloppy mode); internal state is unaffected.
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"
+                (() => {
+                    const before = [document, isSecureContext];
+                    window.devicePixelRatio = 7; window.scrollX = 'author'; window.self = 3;
+                    window.document = null; window.isSecureContext = 'no'; window.top = 1;
+                    const d = Object.getOwnPropertyDescriptor(window, 'devicePixelRatio');
+                    return [d.value, d.writable, scrollX, pageXOffset, self, document === before[0],
+                        isSecureContext === before[1], top === window].join();
+                })()
+            "#,
+            ),
+            "7,true,author,0,3,true,true,true"
+        );
+        // DOM #interface-nodefilter: a legacy callback interface object (Web IDL
+        // #legacy-callback-interface-object) carrying DOM's constants.
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"
+                (() => {
+                    const d = Object.getOwnPropertyDescriptor(window, 'NodeFilter');
+                    let threw = false; try { NodeFilter(); } catch (e) { threw = e instanceof TypeError; }
+                    const c = Object.getOwnPropertyDescriptor(NodeFilter, 'SHOW_DOCUMENT_FRAGMENT');
+                    return [typeof NodeFilter, NodeFilter.name, d.enumerable, d.writable, threw,
+                        'prototype' in NodeFilter, c.value, c.writable, c.enumerable, c.configurable,
+                        NodeFilter.SHOW_ALL, NodeFilter.FILTER_SKIP].join();
+                })()
+            "#,
+            ),
+            "function,NodeFilter,false,true,true,false,1024,false,true,false,4294967295,3"
+        );
+    }
+
+    #[test]
+    fn every_platform_member_is_named_by_its_identifier() {
+        // Web IDL #js-operations and #js-attributes for every interface prototype, interface
+        // object, namespace and the global (Window here, the worker scope below): an
+        // operation's function is named by its identifier and an attribute's accessors by
+        // "get <id>"/"set <id>". The platform defines many members with anonymous function
+        // expressions and shared helpers, which the CLASS_STRINGS pass names; this guards it.
+        let audit = r#"
+            (() => {
+                const own = Object.getOwnPropertyDescriptor, bad = [], seen = new Set();
+                const es = new Set(['Object', 'Function', 'Array', 'Number', 'Boolean', 'String', 'Symbol',
+                    'Date', 'RegExp', 'Promise', 'Proxy', 'Map', 'Set', 'WeakMap', 'WeakSet', 'WeakRef',
+                    'FinalizationRegistry', 'ArrayBuffer', 'SharedArrayBuffer', 'DataView', 'BigInt',
+                    'Iterator', 'AsyncIterator', 'Math', 'JSON', 'Reflect', 'Atomics', 'Intl', 'Temporal',
+                    'DisposableStack', 'AsyncDisposableStack', 'WebAssembly']);
+                const check = (object, label, global) => {
+                    for (const key of Object.getOwnPropertyNames(object)) {
+                        if (['constructor', 'prototype', 'name', 'length', 'arguments', 'caller'].includes(key) ||
+                            key.startsWith('__')) continue;
+                        const d = own(object, key), first = key.charCodeAt(0);
+                        if ('value' in d) {
+                            if (typeof d.value === 'function' && !(first >= 65 && first <= 90) &&
+                                !(global && /^[A-Z]/.test(d.value.name)) && d.value.name !== key)
+                                bad.push(label + '.' + key + '=' + d.value.name);
+                        } else {
+                            if (d.get && d.get.name !== 'get ' + key) bad.push(label + '.get ' + key + '=' + d.get.name);
+                            if (d.set && d.set.name !== 'set ' + key) bad.push(label + '.set ' + key + '=' + d.set.name);
+                        }
+                    }
+                };
+                check(globalThis, 'global', true);
+                for (const name of Object.getOwnPropertyNames(globalThis)) {
+                    if (!/^[A-Z]/.test(name) || es.has(name) || /Error$/.test(name) || /Array$/.test(name)) continue;
+                    const value = own(globalThis, name).value;
+                    if (!value || seen.has(value) || seen.has(value.prototype)) continue;
+                    seen.add(value);
+                    if (typeof value === 'function') {
+                        check(value, name, false);
+                        if (value.prototype && typeof value.prototype === 'object') {
+                            seen.add(value.prototype);
+                            check(value.prototype, name + '.prototype', false);
+                        }
+                    }
+                }
+                for (const name of ['console', 'CSS']) if (globalThis[name]) check(globalThis[name], name, false);
+                return bad.join('\n');
+            })()
+        "#;
+        let mut engine = platform_engine();
+        assert_eq!(string_value(&mut engine, audit), "");
+        let mut worker = worker_platform_engine();
+        assert_eq!(string_value(&mut worker, audit), "");
+        // The worker scope's attributes are accessors too (HTML #the-workerglobalscope-
+        // common-interface, #dedicated-workers-and-the-dedicatedworkerglobalscope-interface).
+        assert_eq!(
+            string_value(
+                &mut worker,
+                r#"['self', 'name', 'performance', 'isSecureContext'].map(name => {
+                    const d = Object.getOwnPropertyDescriptor(self, name);
+                    return [name, 'get' in d, d.set ? d.set.name : '-'].join(':');
+                }).join()"#
+            ),
+            "self:true:-,name:true:set name,performance:true:set performance,isSecureContext:true:-"
+        );
+    }
+
+    #[test]
     fn unhandled_rejections_fire_at_the_rejecting_scripts_global() {
         // HTML #the-hostpromiserejectiontracker-implementation: a rejection goes on the
         // about-to-be-notified list of the running script's settings object's global, so a
@@ -54705,7 +54886,8 @@ mod tests {
             body.appendChild(frame);
             __trust.hydrateFrames();
 
-            const top = document.elementsFromPoint(20, 20);
+            // A global lexical `top` would clash with the [LegacyUnforgeable] attribute.
+            const stack = document.elementsFromPoint(20, 20);
             const frameRect = frame.getBoundingClientRect();
             const parentAtFrame = document.elementFromPoint(frameRect.left + 10, frameRect.top + 10);
             const childDoc = frame.contentDocument;
@@ -54714,8 +54896,8 @@ mod tests {
             try { document.elementFromPoint(1); } catch (error) { missingThrows = error instanceof TypeError; }
             try { document.elementFromPoint(Infinity, 1); } catch (error) { infinityThrows = error instanceof TypeError; }
             globalThis.pointQueryResult = [
-                top[0] && top[0].id, top.some(node => node.id === "ignored"),
-                top[top.length - 1] === document.documentElement,
+                stack[0] && stack[0].id, stack.some(node => node.id === "ignored"),
+                stack[stack.length - 1] === document.documentElement,
                 parentAtFrame === frame,
                 child[0] && child[0].id,
                 child[child.length - 1] === childDoc.documentElement,

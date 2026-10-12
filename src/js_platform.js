@@ -54,6 +54,51 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (origin === "null" || storagePartition === "null") return "null";
         return storagePartition === "" ? origin : origin + "^" + storagePartition;
     }
+    // The values behind the Window attributes that the platform itself
+    // changes (`defineWindowAttribute`): its Document, ancestors, scroll
+    // position and device pixel ratio. Internal code reads and writes these,
+    // never the global's properties, which author code may replace.
+    const windowAttributes = Object.assign(Object.create(null), {scrollX: 0, scrollY: 0});
+    // Web IDL #js-attributes and #Replaceable for an attribute of the [Global]
+    // Window interface: an own enumerable accessor of the global whose getter
+    // is a non-constructor builtin named "get <name>" and whose setter, for a
+    // [Replaceable] attribute, creates an own data property on the receiver
+    // (CreateDataPropertyOrThrow). A [LegacyUnforgeable] attribute is not
+    // configurable; a readonly one has no setter. The receiver is this Window
+    // (undefined and null stand for it); a borrowed accessor reads another
+    // same-origin Window's own attribute and refuses a cross-origin one. The
+    // single-global frame model's contentWindow facades inherit from this
+    // global and read its values, as they did its former data properties.
+    const windowAttributeIsPrototypeOf = Object.prototype.isPrototypeOf;
+    function defineWindowAttribute(name, kind, read) {
+        const receiver = function (value) {
+            if (value === undefined || value === null || value === g) return g;
+            const state = windowMessageState(value);
+            if (state) {
+                if (state.originKey !== windowMessageState(g).originKey)
+                    throw new DOMException("Cross-origin Window access", "SecurityError");
+                return state.window;
+            }
+            if (Reflect.apply(windowAttributeIsPrototypeOf, g, [value])) return g;
+            throw new TypeError("Illegal Window invocation");
+        };
+        const accessors = {
+            ["get " + name]() {
+                const target = receiver(this);
+                return target === g ? read() : Reflect.get(target, name);
+            },
+            ["set " + name](value) {
+                receiver(this);
+                Object.defineProperty(this === undefined || this === null ? g : this, name,
+                    {value, writable: true, enumerable: true, configurable: true});
+            },
+        };
+        Object.defineProperty(g, name, {
+            get: accessors["get " + name],
+            set: kind === "replaceable" ? accessors["set " + name] : undefined,
+            enumerable: true, configurable: kind !== "unforgeable",
+        });
+    }
     const documentReferrers = new WeakMap(), frameReferrers = new WeakMap();
     // A frame's navigation response `Referrer-Policy` (HTML #creating-a-policy-
     // container-from-a-fetch-response), for the Document the response creates.
@@ -6351,7 +6396,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         } catch {}
         const event = integralPointerEvent("contextmenu", {
             bubbles: true, cancelable: true, composed: true, view: g, detail: 0,
-            clientX: x, clientY: y, screenX: x, screenY: y, pageX: x + (g.scrollX || 0), pageY: y + (g.scrollY || 0),
+            clientX: x, clientY: y, screenX: x, screenY: y, pageX: x + windowAttributes.scrollX, pageY: y + windowAttributes.scrollY,
             button: 0, buttons: 0, pointerId: -1, pointerType: "", isPrimary: false,
         });
         dispatch(element, event, false);
@@ -6733,7 +6778,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         }
         nativePointerPosition = {
             clientX: x, clientY: y, screenX, screenY,
-            pageX: x + (g.scrollX || 0), pageY: y + (g.scrollY || 0),
+            pageX: x + windowAttributes.scrollX, pageY: y + windowAttributes.scrollY,
             ...nativeModifiers(), detail:down ? down.detail : 1, button, buttons,
         };
         lastPointerPosition = nativePointerPosition;
@@ -6815,7 +6860,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const init = {
             bubbles: bubbling, cancelable: bubbling, composed: bubbling,
             clientX: x, clientY: y,
-            pageX: x + (g.scrollX || 0), pageY: y + (g.scrollY || 0),
+            pageX: x + windowAttributes.scrollX, pageY: y + windowAttributes.scrollY,
             screenX, screenY, button: buttons & 1 ? 0 : buttons & 2 ? 2 : buttons & 4 ? 1 : 0, buttons,
             relatedTarget: related, view: g, detail: 0,
             movementX, movementY,
@@ -6895,7 +6940,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (t && motion && !childFrame) fireHoverPair("move", t, null, true, x, y, screenX, screenY,
             previous ? screenX - previous.screenX : 0, previous ? screenY - previous.screenY : 0);
         lastPointerPosition = previousPointerMotion = t ? {clientX:x, clientY:y, screenX, screenY,
-            pageX:x+(g.scrollX||0), pageY:y+(g.scrollY||0)} : null;
+            pageX:x+windowAttributes.scrollX, pageY:y+windowAttributes.scrollY} : null;
         // The CSS half: the cascade's :hover chain follows the same committed
         // target (Phase B syscall; guarded so the JS half stands alone).
         if (typeof __dom_set_hover === "function") __dom_set_hover(t ? nodeIds.get(t) : -1);
@@ -10496,21 +10541,21 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // (`__dom_scroll_set` → the app re-windows the region). The root's setter
         // routes to the window scroll and its frontend presentation request.
         get scrollTop() {
-            if (this.localName === "html") return g.scrollY || 0;
+            if (this.localName === "html") return windowAttributes.scrollY;
             return __dom_scroll_get(nodeIds.get(this), 0) || 0;
         }
         set scrollTop(v) {
             v = normalizedScrollNumber(v);
-            if (this.localName === "html") { g.scrollTo(g.scrollX || 0, v); return; }
+            if (this.localName === "html") { g.scrollTo(windowAttributes.scrollX, v); return; }
             if (__dom_scroll_set(nodeIds.get(this), v, this.scrollLeft)) queueElementScroll(this);
         }
         get scrollLeft() {
-            if (this.localName === "html") return g.scrollX || 0;
+            if (this.localName === "html") return windowAttributes.scrollX;
             return __dom_scroll_get(nodeIds.get(this), 1) || 0;
         }
         set scrollLeft(v) {
             v = normalizedScrollNumber(v);
-            if (this.localName === "html") { g.scrollTo(v, g.scrollY || 0); return; }
+            if (this.localName === "html") { g.scrollTo(v, windowAttributes.scrollY); return; }
             const direction = v > this.scrollLeft ? 1 : (v < this.scrollLeft ? -1 : 0);
             v = elementSnapInlinePosition.call(this, v, direction);
             if (__dom_scroll_set(nodeIds.get(this), this.scrollTop, v)) queueElementScroll(this);
@@ -19048,8 +19093,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                             return typeof value === "function" ? scopedCallable(value) : value;
                         },
                     });
-                    proxy.self = proxy;
-                    proxy.window = proxy;
+                    // Its own self/window: the Window's are accessors (window is
+                    // [LegacyUnforgeable], without a setter to assign through).
+                    for (const key of ["self", "window"])
+                        Object.defineProperty(proxy, key, {value: proxy, writable: true, enumerable: true, configurable: true});
                     messageApply(weakSetAdd, ownWindowFacades, [proxy]);
                     messageApply(messageWeakSet, windowMessageSlots, [proxy, {
                         resolve() { return windowMessageState(internalsOf(frame).contentRealmWindow); }
@@ -19850,7 +19897,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (x < 0 || y < 0 || x > width || y > height) return [];
 
         const ids = __dom_elements_from_point(
-            frame ? nodeIds.get(frame) : topDocumentId, x, y, +(g.scrollX || 0), +(g.scrollY || 0)
+            frame ? nodeIds.get(frame) : topDocumentId, x, y, +windowAttributes.scrollX, +windowAttributes.scrollY
         );
         const result = [];
         for (const id of ids || []) {
@@ -19872,7 +19919,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const frame = doc && internalsOf(doc).frame || null;
         if (!doc || (!frame && nodeIds.get(doc) !== topDocumentId)) return fallback;
         const ids = __dom_elements_from_point(
-            frame ? nodeIds.get(frame) : topDocumentId, x, y, +(g.scrollX || 0), +(g.scrollY || 0)
+            frame ? nodeIds.get(frame) : topDocumentId, x, y, +windowAttributes.scrollX, +windowAttributes.scrollY
         );
         return ids && ids.length ? ids[0] : fallback;
     }
@@ -20536,24 +20583,24 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     function captureFrameState() {
         return {
-            document: g.document,
+            document: windowAttributes.document,
             location: Object.getOwnPropertyDescriptor(g, "location"),
-            parent: g.parent, top: g.top, frames: g.frames, frameElement: frameElementState,
+            parent: windowAttributes.parent, top: windowAttributes.top,
+            frames: windowAttributes.frames, frameElement: frameElementState,
             cfgUrl: cfg.url,
             innerWidth: windowViewportWidth, innerHeight: windowViewportHeight,
-            pageXOffset: g.pageXOffset, pageYOffset: g.pageYOffset,
-            scrollX: g.scrollX, scrollY: g.scrollY, base: baseHrefCache,
+            scrollX: windowAttributes.scrollX, scrollY: windowAttributes.scrollY, base: baseHrefCache,
         };
     }
     function restoreFrameState(state) {
-        g.document = state.document;
+        windowAttributes.document = state.document;
         if (state.location) Object.defineProperty(g, "location", state.location);
-        g.parent = state.parent; g.top = state.top; g.frames = state.frames;
+        windowAttributes.parent = state.parent; windowAttributes.top = state.top;
+        windowAttributes.frames = state.frames;
         frameElementState = state.frameElement;
         cfg.url = state.cfgUrl;
         windowViewportWidth = state.innerWidth; windowViewportHeight = state.innerHeight;
-        g.pageXOffset = state.pageXOffset; g.pageYOffset = state.pageYOffset;
-        g.scrollX = state.scrollX; g.scrollY = state.scrollY;
+        windowAttributes.scrollX = state.scrollX; windowAttributes.scrollY = state.scrollY;
         baseHrefCache = state.base;
     }
     // Each Lumen-backed nested Window owns this entire platform Realm. Internal
@@ -20600,7 +20647,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             get() { return frameLocation; },
             set(v) { frameLocation.assign(v); },
         });
-        g.document = frameDocument(frame);
+        windowAttributes.document = frameDocument(frame);
         const topWindow = internalsOf(frame).trustTopWindow || makeParentWindow(topLocation, frame,
             frameSameOriginWithParent(frame, topLocation), null, null);
         const parent = parentFrame
@@ -20608,7 +20655,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             : topWindow;
         internalsFor(frame).trustTopWindow = topWindow;
         internalsFor(frame).trustParentWindow = parent;
-        g.parent = parent; g.top = topWindow; g.frames = sameOrigin ? g : parent;
+        windowAttributes.parent = parent; windowAttributes.top = topWindow;
+        windowAttributes.frames = sameOrigin ? g : parent;
         frameElementState = frame;
         cfg.url = url;
         windowViewportWidth = frameWidth; windowViewportHeight = frameHeight;
@@ -24448,10 +24496,25 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         Object.defineProperty(C.prototype, Symbol.toStringTag, {value: name, configurable: true});
         Object.defineProperty(g, name, {value: C, writable: true, configurable: true});
     }
-    g.NodeFilter = {
-        SHOW_ALL: 0xFFFFFFFF, SHOW_ELEMENT: 1, SHOW_TEXT: 4, SHOW_COMMENT: 128,
-        FILTER_ACCEPT: 1, FILTER_REJECT: 2, FILTER_SKIP: 3,
-    };
+    // DOM #interface-nodefilter is a callback interface with constants, so its
+    // global is a legacy callback interface object (Web IDL #legacy-callback-
+    // interface-object): a non-constructor builtin function named NodeFilter
+    // that throws a TypeError, carrying the constants (Web IDL #js-constants:
+    // {[[Writable]]: false, [[Enumerable]]: true, [[Configurable]]: false}),
+    // defined like an interface object ({writable, configurable}, not
+    // enumerable).
+    {
+        const NodeFilter = {NodeFilter() { throw new TypeError("Illegal constructor"); }}.NodeFilter;
+        for (const [name, value] of [
+            ["FILTER_ACCEPT", 1], ["FILTER_REJECT", 2], ["FILTER_SKIP", 3],
+            ["SHOW_ALL", 0xFFFFFFFF], ["SHOW_ELEMENT", 0x1], ["SHOW_ATTRIBUTE", 0x2],
+            ["SHOW_TEXT", 0x4], ["SHOW_CDATA_SECTION", 0x8], ["SHOW_ENTITY_REFERENCE", 0x10],
+            ["SHOW_ENTITY", 0x20], ["SHOW_PROCESSING_INSTRUCTION", 0x40], ["SHOW_COMMENT", 0x80],
+            ["SHOW_DOCUMENT", 0x100], ["SHOW_DOCUMENT_TYPE", 0x200],
+            ["SHOW_DOCUMENT_FRAGMENT", 0x400], ["SHOW_NOTATION", 0x800],
+        ]) Object.defineProperty(NodeFilter, name, {value, writable: false, enumerable: true, configurable: false});
+        Object.defineProperty(g, "NodeFilter", {value: NodeFilter, writable: true, configurable: true});
+    }
     g.StyleSheet = StyleSheet; g.CSSStyleSheet = CSSStyleSheet;
     g.CSSRule = CSSRule; g.CSSStyleRule = CSSStyleRule;
     g.CSSGroupingRule = CSSGroupingRule; g.CSSConditionRule = CSSConditionRule; g.CSSMediaRule = CSSMediaRule;
@@ -24463,16 +24526,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     g.CSSPropertyRule = CSSPropertyRule; g.CSSRuleList = CSSRuleList;
     g.StyleSheetList = StyleSheetList;
     g.CustomElementRegistry = CustomElementRegistry;
+    // HTML #dom-window-customelements: a readonly attribute.
     if (realmRootFrame) {
-        Object.defineProperty(g, "customElements", {
-            configurable: true, enumerable: true,
-            value: customElementRegistryForWindow(topWindowState, null),
-        });
+        const registry = customElementRegistryForWindow(topWindowState, null);
+        defineWindowAttribute("customElements", "readonly", () => registry);
     } else {
-        Object.defineProperty(g, "customElements", {
-            configurable: true, enumerable: true,
-            get: currentCustomElementRegistry,
-        });
+        defineWindowAttribute("customElements", "readonly", () => currentCustomElementRegistry());
     }
     g.SVGElement = SVGElement;
     g.MathMLElement = MathMLElement;
@@ -28094,7 +28153,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             relatedTarget, dataTransfer, detail: 0, button: 0, buttons: 0,
             clientX: pointer.x, clientY: pointer.y, screenX: pointer.screenX, screenY: pointer.screenY,
             shiftKey: !!(bits & 1), ctrlKey: !!(bits & 2), altKey: !!(bits & 4), metaKey: !!(bits & 8),
-            pageX: pointer.x + (g.scrollX || 0), pageY: pointer.y + (g.scrollY || 0),
+            pageX: pointer.x + windowAttributes.scrollX, pageY: pointer.y + windowAttributes.scrollY,
         });
         dispatch(element, event, false);
         store.allowedEffects = state.effectAllowed;
@@ -28287,7 +28346,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         return entries;
     }
 
-    g.window = g; g.self = g;
+    // HTML #the-window-object: `window` is [LegacyUnforgeable], `self`
+    // [Replaceable]; both return the WindowProxy.
+    defineWindowAttribute("window", "unforgeable", () => g);
+    defineWindowAttribute("self", "replaceable", () => g);
     // HTML #dom-window-closed: a destroyed navigable, or a top-level
     // traversable that window.close() is closing.
     Object.defineProperty(g, "closed", {configurable: true, enumerable: true,
@@ -28298,15 +28360,19 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 throw new TypeError("Illegal Window invocation");
             return control.navigableClosed();
         }}, "closed").get});
-    g.top = cfg.topWindow || g;
-    g.parent = cfg.parentWindow || g;
+    // HTML #dom-top ([LegacyUnforgeable]) and #dom-parent ([Replaceable]).
+    windowAttributes.top = cfg.topWindow || g;
+    defineWindowAttribute("top", "unforgeable", () => windowAttributes.top);
+    windowAttributes.parent = cfg.parentWindow || g;
+    defineWindowAttribute("parent", "replaceable", () => windowAttributes.parent);
     // `window.frames` is the WindowProxy itself in a browser (an array-like of
     // child browsing contexts). With no child frames it's just `window`, so
     // `window.frames[name]` is a plain undefined lookup rather than a throw.
     // Consent-management bootstraps (IAB TCF `__tcfapiLocator` probes —
     // FastCMP, Quantcast, every CMP stub) read `window.frames[locatorName]`
     // unguarded; a missing `frames` made that a "convert undefined to object".
-    g.frames = g;
+    windowAttributes.frames = g;
+    defineWindowAttribute("frames", "replaceable", () => windowAttributes.frames);
     // HTML #dom-name / #creating-a-new-nested-browsing-context. A target name
     // belongs to the navigable, not its current Document or iframe attribute.
     Object.defineProperty(g, "name", {
@@ -28316,7 +28382,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     });
     g.DOMTokenList = DOMTokenList;
     g.DOMStringMap = DOMStringMap;
-    g.document = realmRootFrame ? frameDocument(realmRootFrame) : wrap(topDocumentId);
+    // HTML #dom-document-2: [LegacyUnforgeable].
+    windowAttributes.document = realmRootFrame ? frameDocument(realmRootFrame) : wrap(topDocumentId);
+    defineWindowAttribute("document", "unforgeable", () => windowAttributes.document);
     cookieDocuments.set(g.document, [realmRootFrame ? nodeIds.get(realmRootFrame) : topDocumentId, Number(cfg.hostSettingsContext) || 0, !!cfg.cookieOpaque, String(cfg.url)]);
     pointerDefine(Element.prototype, "requestPointerLock", {
         value:requestPointerLock, writable:true, enumerable:true, configurable:true,
@@ -28460,7 +28528,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (internalsOf(realmRootFrame).contentDoc)
             detachListenerTarget(internalsOf(realmRootFrame).contentDoc);
         internalsFor(realmRootFrame).contentDoc = new FrameDocument(realmRootFrame);
-        g.document = internalsOf(realmRootFrame).contentDoc;
+        windowAttributes.document = internalsOf(realmRootFrame).contentDoc;
         documentReferrers.set(g.document, referrer);
         documentContentTypes.set(g.document, contentType);
         internalsFor(g.document).trustContentType = undefined;
@@ -28602,9 +28670,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
           (locState.hostname.toLowerCase() === "localhost" ||
            locState.hostname.toLowerCase().endsWith(".localhost") ||
            /^127(?:\.\d{1,3}){3}$/.test(locState.hostname) || locState.hostname === "::1")));
-    Object.defineProperty(g, "isSecureContext", {
-        configurable: true, enumerable: true, value: secureContext, writable: false,
-    });
+    // HTML #dom-issecurecontext: a readonly WindowOrWorkerGlobalScope attribute.
+    defineWindowAttribute("isSecureContext", "readonly", () => secureContext);
     // HTML #dom-crossoriginisolated: the settings object's cross-origin
     // isolated capability. TRust does not yet isolate agent clusters with
     // COOP/COEP, so the host never sets cfg.crossOriginIsolated outside
@@ -30094,7 +30161,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         };
         const VISUAL_VIEWPORT_ATTRIBUTES = {
             offsetLeft: () => 0, offsetTop: () => 0,
-            pageLeft: () => g.scrollX || 0, pageTop: () => g.scrollY || 0,
+            pageLeft: () => windowAttributes.scrollX, pageTop: () => windowAttributes.scrollY,
             width: () => windowViewportDimension("width"),
             height: () => windowViewportDimension("height"),
             scale: () => 1,
@@ -30230,8 +30297,18 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             define(g, name, descriptor);
         }
     })();
-    g.devicePixelRatio = cfg.devicePixelRatio; g.pageXOffset = 0; g.pageYOffset = 0;
-    g.scrollX = 0; g.scrollY = 0;
+    // CSSOM View #extensions-to-the-window-interface: [Replaceable]
+    // devicePixelRatio, scrollX/pageXOffset and scrollY/pageYOffset (each
+    // pair returns the same value).
+    windowAttributes.devicePixelRatio = cfg.devicePixelRatio;
+    windowAttributes.scrollX = 0; windowAttributes.scrollY = 0;
+    defineWindowAttribute("devicePixelRatio", "replaceable", () => windowAttributes.devicePixelRatio);
+    defineWindowAttribute("scrollX", "replaceable", () => windowAttributes.scrollX);
+    defineWindowAttribute("pageXOffset", "replaceable", () => windowAttributes.scrollX);
+    defineWindowAttribute("scrollY", "replaceable", () => windowAttributes.scrollY);
+    defineWindowAttribute("pageYOffset", "replaceable", () => windowAttributes.scrollY);
+    // The host's device pixel ratio changed (a window moved between screens).
+    trust.setDevicePixelRatio = function (ratio) { windowAttributes.devicePixelRatio = ratio; };
     // WHATWG HTML §7.2.5 "The History interface", shared history
     // (local snapshot e5071a20, 2026-09-06); Web IDL §§js-interfaces,
     // interface-object, and interface-prototype-object require the exposed
@@ -30365,7 +30442,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         },
     });
     g.History = History;
-    g.history = historyObject;
+    // HTML #dom-history: a readonly attribute.
+    defineWindowAttribute("history", "readonly", () => historyObject);
     // getComputedStyle is now cascade-backed (read-only): __dom_computed
     // returns the inherited / UA-defaulted value for tracked properties and
     // the inline value for the rest, falling back to the element's own inline
@@ -30437,9 +30515,13 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // Rust `@media` evaluator the cascade uses (width/height/orientation etc.);
     // `.matches` is a live getter so a later read reflects the current viewport.
     // A viewport change reports changed lists to their change listeners.
-    g.matchMedia = (m) => mediaQueryListForViewport(m, function () {
-        return [windowViewportDimension("width"), windowViewportDimension("height")];
-    });
+    // Web IDL #js-operations: each Window operation is its own non-constructor
+    // builtin named by its identifier, with the shortest overload's length.
+    g.matchMedia = {matchMedia(query) {
+        return mediaQueryListForViewport(query, function () {
+            return [windowViewportDimension("width"), windowViewportDimension("height")];
+        });
+    }}.matchMedia;
     // window.CSS — feature detection (used across the web, not just
     // css3test). `supports("selector(…)")` runs the real selector engine
     // (honest); the property/value form leans on the style declaration's
@@ -30497,7 +30579,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         },
     };
     g.CSS = CSS;
-    g.alert = () => {}; g.confirm = () => false; g.prompt = () => null;
+    g.alert = {alert() {}}.alert;
+    g.confirm = {confirm() { return false; }}.confirm;
+    g.prompt = {prompt() { return null; }}.prompt;
     // HTML #dom-print: this user agent cannot print, so the printing steps
     // end without a dialog. This replaces the engine's Test262 `print` hook.
     g.print = { print() {} }.print;
@@ -30757,20 +30841,23 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         checkedScrollBehavior(options);
         const left = options.left;
         const top = options.top;
-        x = (relative ? (g.scrollX || 0) : 0) +
-            (left === undefined ? (relative ? 0 : (g.scrollX || 0)) : normalizedScrollNumber(left));
-        y = (relative ? (g.scrollY || 0) : 0) +
-            (top === undefined ? (relative ? 0 : (g.scrollY || 0)) : normalizedScrollNumber(top));
-        const oldX = g.scrollX || 0, oldY = g.scrollY || 0;
+        x = (relative ? windowAttributes.scrollX : 0) +
+            (left === undefined ? (relative ? 0 : windowAttributes.scrollX) : normalizedScrollNumber(left));
+        y = (relative ? windowAttributes.scrollY : 0) +
+            (top === undefined ? (relative ? 0 : windowAttributes.scrollY) : normalizedScrollNumber(top));
+        const oldX = windowAttributes.scrollX, oldY = windowAttributes.scrollY;
         trust.setScroll(x, y);
-        if (oldX === g.scrollX && oldY === g.scrollY) return Promise.resolve();
+        if (oldX === windowAttributes.scrollX && oldY === windowAttributes.scrollY) return Promise.resolve();
         const frame = trust.__activeFrame || realmRootFrame;
-        if (frame) __dom_scroll_set(nodeIds.get(frame), g.scrollY, g.scrollX);
-        else viewportScrollRequest = [g.scrollX, g.scrollY];
+        if (frame) __dom_scroll_set(nodeIds.get(frame), windowAttributes.scrollY, windowAttributes.scrollX);
+        else viewportScrollRequest = [windowAttributes.scrollX, windowAttributes.scrollY];
         return new Promise(resolve => queueElementScroll(g.document, resolve));
     }
-    g.scroll = g.scrollTo = function (x, y) { return windowScroll(x, y, false, arguments.length); };
-    g.scrollBy = function (x, y) { return windowScroll(x, y, true, arguments.length); };
+    // CSSOM View #dom-window-scroll: scroll and scrollTo are distinct operations
+    // with the same steps.
+    g.scroll = {scroll() { return windowScroll(arguments[0], arguments[1], false, arguments.length); }}.scroll;
+    g.scrollTo = {scrollTo() { return windowScroll(arguments[0], arguments[1], false, arguments.length); }}.scrollTo;
+    g.scrollBy = {scrollBy() { return windowScroll(arguments[0], arguments[1], true, arguments.length); }}.scrollBy;
     // HTML #windowproxy for a top-level traversable of this browsing context
     // group: one object per traversable in this Realm, which follows the
     // traversable's active Window across its navigations: the Window itself
@@ -32233,7 +32320,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (!selection) documentSelections.set(document, selection = new Selection(SELECTION_TOKEN, document));
         return selection;
     }
-    g.getSelection = function getSelection() { return g.document ? selectionFor(g.document) : null; };
+    g.getSelection = {getSelection() { return g.document ? selectionFor(g.document) : null; }}.getSelection;
     // ---- Selection API §2 "User Interactions" with CSS UI 4 ----------------
     // The user changes a Document's selection with the primary pointer
     // button: its press, the motion while it is held and its release run
@@ -33003,7 +33090,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     function updateLazyImages() {
         lazyImageUpdatePending = false;
         if (!lazyImages.size) return 0;
-        const sx = g.scrollX || 0, sy = g.scrollY || 0;
+        const sx = windowAttributes.scrollX, sy = windowAttributes.scrollY;
         const vw = windowViewportDimension("width"), vh = windowViewportDimension("height");
         const rL = sx - vw, rT = sy - 2 * vh, rR = sx + 2 * vw, rB = sy + 3 * vh;
         const resume = [];
@@ -33028,7 +33115,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const lazyQueued = updateLazyImages();
         if (!IO.length) return lazyQueued;
         let queued = lazyQueued;
-        const sx = g.scrollX || 0, sy = g.scrollY || 0;
+        const sx = windowAttributes.scrollX, sy = windowAttributes.scrollY;
         const vw = windowViewportDimension("width"), vh = windowViewportDimension("height");
         const observers = IO.slice();
         for (let oi = 0; oi < observers.length; oi++) {
@@ -33098,8 +33185,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
 
     // The host throttles invisible paint-only CSS animations against the
     // Window's scroll position (document coordinates).
-    trust.windowScrollX = function () { return +(g.scrollX || 0); };
-    trust.windowScrollY = function () { return +(g.scrollY || 0); };
+    trust.windowScrollX = function () { return +windowAttributes.scrollX; };
+    trust.windowScrollY = function () { return +windowAttributes.scrollY; };
     // Apply a viewport scroll (CSS px, document origin): update the scroll
     // position properties, fire the viewport `scroll` event, and re-run the
     // intersection observations. Driven by the actor's PageCmd::Scroll as the
@@ -33120,8 +33207,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             const maxX = Math.max(0, de.scrollWidth - windowViewportDimension("width"));
             if (x > maxX) x = maxX;
         }
-        if (x === (g.scrollX || 0) && y === (g.scrollY || 0)) return;
-        g.scrollX = x; g.scrollY = y; g.pageXOffset = x; g.pageYOffset = y;
+        if (x === windowAttributes.scrollX && y === windowAttributes.scrollY) return;
+        windowAttributes.scrollX = x; windowAttributes.scrollY = y;
         queueElementScroll(g.document);
         trust.updateIntersections();
     };
@@ -33292,7 +33379,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         }
         return null;
     }
-    g.requestIdleCallback = function (callback, options) {
+    g.requestIdleCallback = {requestIdleCallback(callback, options = undefined) {
         if (typeof callback !== "function") throw new TypeError("requestIdleCallback callback must be callable");
         const handle = ++idleCallbacks.seq;
         const entry = {
@@ -33313,12 +33400,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             }
         }
         return handle;
-    };
-    g.cancelIdleCallback = function (handle) {
+    }}.requestIdleCallback;
+    g.cancelIdleCallback = {cancelIdleCallback(handle) {
         handle = Number(handle) >>> 0;
         const entry = takeIdleCallback(handle);
         if (entry && entry.timeoutTimer !== null) g.clearTimeout(entry.timeoutTimer);
-    };
+    }}.cancelIdleCallback;
     trust.hasIdleRequest = function () {
         if (idleCallbacks.pending.length > 0 || idleCallbacks.runnable.length > 0) return true;
         for (const childTrust of childWindowTrusts)
@@ -35165,8 +35252,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         return view;
     }
     trust.refreshAncestorWindows = function () {
-        if (cfg.parentWindow) g.parent = windowForRealm(cfg.parentWindow);
-        if (cfg.topWindow) g.top = windowForRealm(cfg.topWindow);
+        if (cfg.parentWindow) windowAttributes.parent = windowForRealm(cfg.parentWindow);
+        if (cfg.topWindow) windowAttributes.top = windowForRealm(cfg.topWindow);
     };
     trust.refreshAncestorWindows();
     // `on<event>` IDL attributes (window.onload = fn). Standard semantics:
@@ -37432,13 +37519,16 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         unloadEventStart: 0, unloadEventEnd: 0, redirectStart: 0, redirectEnd: 0,
         toJSON() { return Object.assign({}, this); },
     };
-    g.performance = {
+    const windowPerformance = {
         now: () => 0,
         timeOrigin: __perfOrigin,
         timing: __perfTiming, navigation: { type: 0, redirectCount: 0 }, memory: {},
         clearResourceTimings() {},
         setResourceTimingBufferSize() {},
     };
+    // HR Time #the-performance-attribute: [Replaceable]. The Performance block
+    // below gives this object its interface.
+    defineWindowAttribute("performance", "replaceable", () => windowPerformance);
 
     // Storage maps retain storage-key boundaries (`storageKeyFor`): an embed
     // under a cross-site ancestor gets its own partition. Only first-party
@@ -37672,14 +37762,18 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         return addTimer(fn, timerTimeout(d), args, true, undefined, timers.activeNesting,
             undefined, undefined, source);
     }, "setInterval", 1);
-    g.clearTimeout = g.clearInterval = function (id) {
+    // HTML #dom-cleartimeout and #dom-clearinterval: distinct operations that
+    // clear the same map of active timers.
+    function clearTimer(id) {
         id = Number(id) | 0;
         const windowState = activeWindowState();
         windowState.timerIds.delete(id);
         timers.q = timers.q.filter(
             (timer) => timer.windowState !== windowState || timer.id !== id
         );
-    };
+    }
+    g.clearTimeout = {clearTimeout(id = 0) { clearTimer(id); }}.clearTimeout;
+    g.clearInterval = {clearInterval(id = 0) { clearTimer(id); }}.clearInterval;
     // A browser host invokes a queued timer handler as the entry point of its
     // task, with no platform JavaScript execution context underneath it
     // (ECMA-262 §9.5 and HTML §8.7). These two hooks let the Lumen host perform
@@ -37743,7 +37837,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         return completionValue;
     }
     trust.runSelectedTimerTask = function (task) { return runTimerTask(task, 1); };
-    g.requestAnimationFrame = function (callback) {
+    g.requestAnimationFrame = {requestAnimationFrame(callback) {
         if (typeof callback !== "function") throw new TypeError("requestAnimationFrame callback must be callable");
         const windowState = activeWindowState();
         const id = ++windowState.animationFrameIdentifier;
@@ -37752,15 +37846,15 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         });
         if (animationFrames.deadline === null) animationFrames.deadline = currentTime() + 16;
         return id;
-    };
-    g.cancelAnimationFrame = function (handle) {
+    }}.requestAnimationFrame;
+    g.cancelAnimationFrame = {cancelAnimationFrame(handle) {
         handle = Number(handle);
         const windowState = activeWindowState();
         animationFrames.q = animationFrames.q.filter(
             (entry) => entry.windowState !== windowState || entry.id !== handle
         );
         if (!animationFrames.q.length) animationFrames.deadline = null;
-    };
+    }}.cancelAnimationFrame;
     pristineAnimationFrameMethods = animationFrameMethods();
     topAnimationFrameMethods = pristineAnimationFrameMethods;
     // The time value of the last "update animations and send events", in
@@ -37877,9 +37971,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // node as a plain object (`__id` included), a wrapper aliasing a live
     // arena node. Transfer records are consumed in this Realm, just as at a
     // receiving Window, without queuing a message event.
-    g.structuredClone = function (value, options) {
+    g.structuredClone = {structuredClone(value, options = undefined) {
         return deserializeMessage(serializeMessage(value, options && options.transfer)).data;
-    };
+    }}.structuredClone;
     trust.oneShot = false;
     trust.tick = function () {
         // The settle primitive. Two modes, set by `trust.oneShot`:
@@ -38109,7 +38203,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // the REAL host clock while `Date.now()` was fast-forwarded — a page
     // comparing them (or diffing two `new Date()`s across a settle) saw time
     // stand still or run backwards.
-    g.performance.now = () => currentTime();
+    windowPerformance.now = () => currentTime();
 
     // --- console into the outcome's ring ---
     let consoleGroupDepth = 0;
@@ -56891,6 +56985,83 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // A same-Realm child navigable's Document wrapper inherits from this
         // Document subclass, which is not itself exposed.
         if (typeof FrameDocument === "function") enumerateMembers(FrameDocument.prototype, PROTOTYPE_SKIP);
+        // Web IDL #js-operations (CreateBuiltinFunction(steps, length, id)),
+        // #js-attributes ("get <id>" / "set <id>"), #namespace-object and
+        // #js-stringifier: every operation of an interface, namespace or global
+        // is named by its identifier and every attribute's accessor functions
+        // by "get"/"set" and the identifier. The prelude builds many members
+        // from anonymous function expressions and shared helper closures, so
+        // they are named here in place. Interface objects reached through a
+        // lowercase alias (webkitURL) and ECMAScript intrinsics that an
+        // interface reuses (Web IDL #js-iterable's %Array.prototype.forEach%)
+        // keep their own names; a function exposed under two identifiers
+        // keeps the first.
+        const interfaceObjects = new Set(), intrinsics = new Set(), named = new Set();
+        for (const name of ownNames(globalThis)) {
+            const binding = own(globalThis, name), value = binding && binding.value;
+            if (typeof value !== "function" && (typeof value !== "object" || value === null)) continue;
+            const first = name.charCodeAt(0);
+            if (first >= 65 && first <= 90 && typeof value === "function") interfaceObjects.add(value);
+            // ECMAScript's globals, but not the global object itself (globalThis)
+            // or the console namespace (Console Standard) an engine supplies.
+            if (!engineNames.has(name) || value === globalThis || name === "console") continue;
+            if (typeof value === "function") intrinsics.add(value);
+            for (const holder of [value, typeof value === "function" ? value.prototype : null]) {
+                if (!holder || (typeof holder !== "object" && typeof holder !== "function")) continue;
+                for (const member of ownNames(holder)) {
+                    const descriptor = own(holder, member);
+                    for (const fn of [descriptor.value, descriptor.get, descriptor.set])
+                        if (typeof fn === "function") intrinsics.add(fn);
+                }
+            }
+        }
+        function nameFunction(fn, name) {
+            if (named.has(fn) || intrinsics.has(fn) || interfaceObjects.has(fn)) return;
+            named.add(fn);
+            const binding = own(fn, "name");
+            if (binding && (binding.value === name || !binding.configurable)) return;
+            define(fn, "name", {value: name, writable: false, enumerable: false, configurable: true});
+        }
+        function nameMembers(object, skipInterfaces) {
+            for (const key of ownNames(object)) {
+                if (key === "constructor" || key === "prototype" || key === "length" ||
+                    key === "name" || key === "arguments" || key === "caller") continue;
+                const descriptor = own(object, key);
+                if ("value" in descriptor) {
+                    const first = key.charCodeAt(0);
+                    if (typeof descriptor.value === "function" && !(skipInterfaces && first >= 65 && first <= 90))
+                        nameFunction(descriptor.value, key);
+                } else {
+                    if (descriptor.get) nameFunction(descriptor.get, "get " + key);
+                    if (descriptor.set) nameFunction(descriptor.set, "set " + key);
+                }
+            }
+        }
+        for (const proto of enumerated) {
+            nameMembers(proto, false);
+            nameMembers(proto.constructor, true);
+        }
+        for (const name of ["console", "CSS", "WebAssembly"]) {
+            const binding = own(globalThis, name);
+            if (binding && binding.value && typeof binding.value === "object" &&
+                (name === "console" || !engineNames.has(name)))
+                nameMembers(binding.value, true);
+        }
+        if (typeof FrameDocument === "function") nameMembers(FrameDocument.prototype, false);
+        // The global's own operations and attributes, but not its interface
+        // objects, namespaces or ECMAScript globals.
+        for (const name of ownNames(globalThis)) {
+            if (engineNames.has(name)) continue;
+            const first = name.charCodeAt(0);
+            if (first >= 65 && first <= 90) continue;
+            const descriptor = own(globalThis, name);
+            if ("value" in descriptor) {
+                if (typeof descriptor.value === "function") nameFunction(descriptor.value, name);
+            } else {
+                if (descriptor.get) nameFunction(descriptor.get, "get " + name);
+                if (descriptor.set) nameFunction(descriptor.set, "set " + name);
+            }
+        }
     })(new Set(globalThis.__engine_global_names));
     delete globalThis.__engine_global_names;
     /*__CLASS_STRINGS_END__*/

@@ -575,14 +575,41 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         console(line) { if (WK.consoleLines.length < 100) WK.consoleLines.push("worker: " + line); },
     };
 
+    // Web IDL #js-attributes and #Replaceable for an attribute of the [Global]
+    // worker scope: an own enumerable, configurable accessor whose getter is
+    // a non-constructor builtin named "get <name>"; a [Replaceable] one's
+    // setter creates an own data property on the receiver instead.
+    function defineScopeAttribute(name, kind, read) {
+        var receiver = function (value) {
+            if (value !== undefined && value !== null && value !== g)
+                throw new TypeError("Illegal WorkerGlobalScope invocation");
+            return g;
+        };
+        var accessors = {
+            ["get " + name]() { receiver(this); return read(); },
+            ["set " + name](value) {
+                Object.defineProperty(receiver(this), name,
+                    { value: value, writable: true, enumerable: true, configurable: true });
+            },
+        };
+        Object.defineProperty(g, name, {
+            get: accessors["get " + name],
+            set: kind === "replaceable" ? accessors["set " + name] : undefined,
+            enumerable: true, configurable: true,
+        });
+    }
+
     // --- self / postMessage / close / on* (DedicatedWorkerGlobalScope) ---
-    g.self = g;
-    g.name = cfg.name || "";
-    if (!cfg.shared) g.postMessage = function (message, options) {
+    // HTML #dom-workerglobalscope-self (readonly) and #dom-dedicatedworker-
+    // globalscope-name / #dom-sharedworkerglobalscope-name ([Replaceable]).
+    defineScopeAttribute("self", "readonly", function () { return g; });
+    var workerName = cfg.name || "";
+    defineScopeAttribute("name", "replaceable", function () { return workerName; });
+    if (!cfg.shared) g.postMessage = {postMessage(message) {
         if (arguments.length === 0) throw new TypeError("postMessage requires a message");
-        __worker_self_post(JSON.stringify(portAPI.serialize(message, portAPI.optionsTransfer(options))));
-    };
-    g.close = function () { workerClosing = true; __worker_self_close(); };
+        __worker_self_post(JSON.stringify(portAPI.serialize(message, portAPI.optionsTransfer(arguments[1]))));
+    }}.postMessage;
+    g.close = {close() { workerClosing = true; __worker_self_close(); }}.close;
     {
         // HTML #the-workerglobalscope-common-interface, #dedicated-workers-and-the-
         // dedicatedworkerglobalscope-interface and #shared-workers-and-the-
@@ -608,21 +635,25 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
 
     // --- timers / microtasks / performance ---
-    g.setTimeout = function (fn, delay) { return addTimer(fn, delay, Array.prototype.slice.call(arguments, 2), false); };
-    g.setInterval = function (fn, delay) { return addTimer(fn, delay, Array.prototype.slice.call(arguments, 2), true); };
-    g.clearTimeout = function (id) { removeTimer(id); };
-    g.clearInterval = function (id) { removeTimer(id); };
-    g.queueMicrotask = function (fn) { Promise.resolve().then(function () { try { fn(); } catch (e) { reportException(e); } }); };
+    // HTML #timers and #microtask-queuing: distinct non-constructor operations
+    // with Web IDL lengths (the shortest overload's required arguments).
+    g.setTimeout = {setTimeout(fn) { return addTimer(fn, arguments[1], Array.prototype.slice.call(arguments, 2), false); }}.setTimeout;
+    g.setInterval = {setInterval(fn) { return addTimer(fn, arguments[1], Array.prototype.slice.call(arguments, 2), true); }}.setInterval;
+    g.clearTimeout = {clearTimeout(id = 0) { removeTimer(id); }}.clearTimeout;
+    g.clearInterval = {clearInterval(id = 0) { removeTimer(id); }}.clearInterval;
+    g.queueMicrotask = {queueMicrotask(fn) { Promise.resolve().then(function () { try { fn(); } catch (e) { reportException(e); } }); }}.queueMicrotask;
     // HR-Time #now-method / #dfn-coarsen-time: use the shared native monotonic
     // clock, independently of Date's integral milliseconds or author overrides.
     // HTML #run-a-worker records the origin before the worker prelude runs.
     var perfClock = g.__clock_now, perfFloor = Math.floor;
     delete g.__clock_now;
     var perfOrigin = perfFloor((cfg.timeOrigin === undefined ? perfClock() : cfg.timeOrigin) * 10) / 10;
-    g.performance = Object.assign(new g.EventTarget(), {
+    var workerPerformance = Object.assign(new g.EventTarget(), {
         now: function () { return perfFloor(perfClock() * 10) / 10 - perfOrigin; },
         timeOrigin: perfOrigin
     });
+    // HR Time #the-performance-attribute: [Replaceable].
+    defineScopeAttribute("performance", "replaceable", function () { return workerPerformance; });
 
     // --- console: lines reach the owner's developer console after each task ---
     // WHATWG Console #logger: each line is the level and the stringified data;
@@ -668,17 +699,17 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         time(label = "default") {
             label = consoleLabel(label);
             if (consoleTimers.has(label)) { consoleLog("warn")("Timer '" + label + "' already exists"); return; }
-            consoleTimers.set(label, g.performance.now());
+            consoleTimers.set(label, workerPerformance.now());
         },
         timeLog(label = "default", ...data) {
             label = consoleLabel(label);
             if (!consoleTimers.has(label)) { consoleLog("warn")("Timer '" + label + "' does not exist"); return; }
-            consoleLog("timeLog").apply(null, [label + ": " + (g.performance.now() - consoleTimers.get(label)).toFixed(3) + " ms"].concat(data));
+            consoleLog("timeLog").apply(null, [label + ": " + (workerPerformance.now() - consoleTimers.get(label)).toFixed(3) + " ms"].concat(data));
         },
         timeEnd(label = "default") {
             label = consoleLabel(label);
             if (!consoleTimers.has(label)) { consoleLog("warn")("Timer '" + label + "' does not exist"); return; }
-            consoleLog("timeEnd")(label + ": " + (g.performance.now() - consoleTimers.get(label)).toFixed(3) + " ms");
+            consoleLog("timeEnd")(label + ": " + (workerPerformance.now() - consoleTimers.get(label)).toFixed(3) + " ms");
             consoleTimers.delete(label);
         },
     };
@@ -746,9 +777,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // Secure Contexts §1.3: a dedicated worker inherits the owner's secure
     // context when its script URL is potentially trustworthy. Rust computes
     // that relationship, including Blob URL inheritance, at construction.
-    Object.defineProperty(g, "isSecureContext", {
-        configurable: true, enumerable: true, value: !!cfg.secureContext, writable: false,
-    });
+    defineScopeAttribute("isSecureContext", "readonly", function () { return !!cfg.secureContext; });
     // HTML #dom-origin and Web IDL #Replaceable. A worker's origin is opaque
     // for a data: URL and otherwise its owner's (HTML #run-a-worker), which a
     // same-origin or blob: script URL carries.

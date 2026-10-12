@@ -214,6 +214,16 @@ The project favors:
   observers, CSSOM, fetch/XHR, IndexedDB, …) also lives in internal slots
   (`internalsFor`), and internal operations are closures rather than
   prototype methods: no own or inherited `__…`/`…trust…` property is visible.
+- Platform members have Web IDL shapes, which bot-detection scripts probe:
+  Window attributes are accessors (`defineWindowAttribute`; workers'
+  `defineScopeAttribute`), `[LegacyUnforgeable]` ones non-configurable and
+  `[Replaceable]` ones shadowed by assignment, so the prelude reads and writes
+  the values the platform changes (Document, ancestors, scroll, device pixel
+  ratio) in `windowAttributes`, never through `g.document`/`g.scrollX`. Define
+  operations as method shorthand (`{name() {…}}.name`: no `prototype`, not a
+  constructor); the `CLASS_STRINGS` pass names every operation and accessor
+  ("get x"/"set x"), and `every_platform_member_is_named_by_its_identifier`
+  guards it.
 - Keep session caches bounded. Avoid copying large scripts, DOMs, images, or
   bytecode unnecessarily.
 
