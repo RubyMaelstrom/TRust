@@ -34,6 +34,36 @@ impl Site {
             + 'static,
         Fut: Future<Output = ()> + std::marker::Send + 'static,
     {
+        let handler = Arc::new(handler);
+        Self::serve(move |quic, requests| {
+            let handler = handler.clone();
+            async move {
+                let mut connection =
+                    h3::server::Connection::new(h3_quinn::Connection::new(quic.clone()))
+                        .await
+                        .unwrap();
+                let mut streams = tokio::task::JoinSet::new();
+                while let Ok(Some(request)) = connection.accept().await {
+                    let handler = handler.clone();
+                    let requests = requests.clone();
+                    let quic = quic.clone();
+                    streams.spawn(async move {
+                        let (request, stream) = request.resolve_request().await.unwrap();
+                        requests.fetch_add(1, Ordering::SeqCst);
+                        handler(request, stream, quic).await;
+                    });
+                }
+            }
+        })
+        .await
+    }
+
+    /// A site whose QUIC connections `serve` handles below HTTP/3, counting requests itself.
+    async fn serve<F, Fut>(serve: F) -> Self
+    where
+        F: Fn(quinn::Connection, Arc<AtomicUsize>) -> Fut + std::marker::Send + Sync + 'static,
+        Fut: Future<Output = ()> + std::marker::Send + 'static,
+    {
         crate::tls::ensure_provider();
         let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let request = Request::get(
@@ -112,33 +142,19 @@ impl Site {
         });
         let quic = {
             let endpoint = endpoint.clone();
-            let handler = Arc::new(handler);
+            let serve = Arc::new(serve);
             let connections = connections.clone();
             let requests = requests.clone();
             tokio::spawn(async move {
                 let mut tasks = tokio::task::JoinSet::new();
                 while let Some(incoming) = endpoint.accept().await {
-                    let handler = handler.clone();
+                    let serve = serve.clone();
                     let connections = connections.clone();
                     let requests = requests.clone();
                     tasks.spawn(async move {
                         let Ok(quic) = incoming.await else { return };
                         connections.fetch_add(1, Ordering::SeqCst);
-                        let mut connection =
-                            h3::server::Connection::new(h3_quinn::Connection::new(quic.clone()))
-                                .await
-                                .unwrap();
-                        let mut streams = tokio::task::JoinSet::new();
-                        while let Ok(Some(request)) = connection.accept().await {
-                            let handler = handler.clone();
-                            let requests = requests.clone();
-                            let quic = quic.clone();
-                            streams.spawn(async move {
-                                let (request, stream) = request.resolve_request().await.unwrap();
-                                requests.fetch_add(1, Ordering::SeqCst);
-                                handler(request, stream, quic).await;
-                            });
-                        }
+                        serve(quic, requests).await;
                     });
                 }
             })
@@ -232,6 +248,72 @@ async fn http3_discovers_from_http2_authenticates_origin_and_reuses_session() {
     assert!(second.timing.unwrap().connection_reused);
     assert_eq!(site.connections.load(Ordering::SeqCst), 1);
     assert_eq!(site.tcp_requests.load(Ordering::SeqCst), 1);
+}
+
+/// QUIC variable-length integer (RFC 9000 §16).
+fn varint(bytes: &mut &[u8]) -> u64 {
+    let len = 1 << (bytes[0] >> 6);
+    let value = bytes[1..len]
+        .iter()
+        .fold(u64::from(bytes[0] & 0x3f), |value, byte| {
+            value << 8 | u64::from(*byte)
+        });
+    *bytes = &bytes[len..];
+    value
+}
+
+/// RFC 9114 §4.1: a request is its HEADERS frame and the DATA frames of its content. Reserved
+/// frame types (§7.2.8) are optional, and claude.ai's Cloudflare edge answered every GET whose
+/// stream carried h3's GREASE frame after HEADERS with 500 (the frame went out on each request,
+/// though h3 means to send it once per connection), so requests carry no reserved frames.
+#[tokio::test]
+async fn http3_request_streams_carry_only_their_message_frames() {
+    let streams = Arc::new(Mutex::new(Vec::new()));
+    let seen = streams.clone();
+    let site = Site::serve(move |quic, requests| {
+        let seen = seen.clone();
+        async move {
+            // The server's control stream and its SETTINGS frame (§6.2.1, §7.2.4).
+            let mut control = quic.open_uni().await.unwrap();
+            control.write_all(&[0x00, 0x04, 0x00]).await.unwrap();
+            while let Ok((mut send, mut recv)) = quic.accept_bi().await {
+                let bytes = recv.read_to_end(64 * 1024).await.unwrap();
+                let mut rest = &bytes[..];
+                let mut frames = Vec::new();
+                while !rest.is_empty() {
+                    frames.push(varint(&mut rest));
+                    let length = varint(&mut rest) as usize;
+                    rest = &rest[length..];
+                }
+                seen.lock().unwrap().push(frames);
+                requests.fetch_add(1, Ordering::SeqCst);
+                // HEADERS: an empty QPACK prefix and static entry 25, `:status: 200`
+                // (RFC 9204 §4.5.2, Appendix A).
+                send.write_all(&[0x01, 0x03, 0x00, 0x00, 0xd9])
+                    .await
+                    .unwrap();
+                send.finish().unwrap();
+            }
+            drop(control);
+        }
+    })
+    .await;
+    site.warm().await;
+    for _ in 0..3 {
+        let response = site.fetch(&site.request).await.unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.timing.unwrap().next_hop_protocol, "h3");
+    }
+    let mut post = site.request.clone();
+    post.method = "POST".into();
+    post.body = Some(("text/plain".into(), b"content".to_vec()));
+    assert_eq!(site.fetch(&post).await.unwrap().status, 200);
+    // HEADERS is frame type 0x01, DATA 0x00 (§7.2).
+    assert_eq!(
+        *streams.lock().unwrap(),
+        [vec![0x01], vec![0x01], vec![0x01], vec![0x01, 0x00]]
+    );
+    assert_eq!(site.connections.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

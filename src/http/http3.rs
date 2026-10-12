@@ -385,8 +385,14 @@ async fn handshake(
     timing: FetchTiming,
 ) -> Result<Arc<Session>, String> {
     let clock = Arc::new(io::ResponseClock::default());
+    // GREASE (RFC 9114 §6.2.3, §7.2.4.1, §7.2.8) is optional, and h3 has one switch for its
+    // reserved setting, stream and request-stream frame. That frame went out on every request
+    // (each clones the SendRequest that should send it once per connection), and claude.ai's
+    // Cloudflare Worker answered every GET carrying it after its HEADERS with 500, as if it
+    // were request content. Chromium puts no reserved frames on request streams.
     let (mut driver, sender) = h3::client::builder()
         .max_field_section_size(u64::from(wire::HEADER_BYTES))
+        .send_grease(false)
         .build(io::Open::new(
             h3_quinn::Connection::new(quic.clone()),
             clock.clone(),
