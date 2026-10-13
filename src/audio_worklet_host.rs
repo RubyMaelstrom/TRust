@@ -204,6 +204,7 @@ impl Worklet for AudioWorkletScope {
             &launch.environment,
             url,
             launch.page.as_str(),
+            None,
         ) else {
             return Err(String::from("AbortError:The module could not be fetched"));
         };
@@ -218,7 +219,7 @@ impl Worklet for AudioWorkletScope {
         let outcome = self.engine.eval_module_attrs_interruptible(
             &source,
             &resolved,
-            move |specifier, referrer, _attributes| {
+            move |specifier, referrer, module_type| {
                 module_dependency_loader(
                     &page,
                     &cookie_context,
@@ -229,6 +230,7 @@ impl Worklet for AudioWorkletScope {
                     &environment,
                     specifier,
                     referrer,
+                    module_type,
                 )
             },
         );

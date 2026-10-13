@@ -303,6 +303,8 @@ enum LumenHostTask {
         context: u64,
         specifier: String,
         referrer: String,
+        /// The import's `type` attribute (None for a JavaScript module).
+        module_type: Option<String>,
     },
     DynamicModule {
         context: u64,
@@ -431,11 +433,16 @@ impl ModuleFetchEnvironment {
     }
 
     /// HTML #fetch-a-single-module-script for a `blob:` URL: the entry's Blob (URL parsing
-    /// resolved the entry; this environment must share its partition), whose type must be a
-    /// JavaScript MIME type, as `(module URL, source)`.
-    fn blob_module(&self, url: &url::Url, integrity: &str) -> Option<(String, String)> {
+    /// resolved the entry; this environment must share its partition), whose type must match
+    /// the import's `module_type` (`http::module_response_allowed`), as `(module URL, source)`.
+    fn blob_module(
+        &self,
+        url: &url::Url,
+        integrity: &str,
+        module_type: Option<&str>,
+    ) -> Option<(String, String)> {
         let entry = self.blobs.obtain(url.as_str(), Some(&self.storage_key))?;
-        if !crate::http::module_script_response_allowed(200, &entry.content_type) {
+        if !crate::http::module_response_allowed(200, &entry.content_type, module_type) {
             return None;
         }
         let body = entry.read().ok()?;
@@ -1536,7 +1543,7 @@ impl HostState {
                     .copied()
                     .unwrap_or_default(),
             };
-            engine.set_module_loader(move |specifier, referrer| {
+            engine.set_module_loader_attrs(move |specifier, referrer, module_type| {
                 module_dependency_loader(
                     &page,
                     &cookie_context,
@@ -1547,6 +1554,7 @@ impl HostState {
                     &environment,
                     specifier,
                     referrer,
+                    module_type,
                 )
             });
         }
@@ -1610,7 +1618,7 @@ impl HostState {
         }
         let early_imports = self.early_imports.clone();
         engine.set_async_dynamic_module_loader_with_context(
-            move |request_id, context, specifier, referrer, _attribute_type| {
+            move |request_id, context, specifier, referrer, module_type| {
                 pending_dynamic_modules.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if let Some(loader) = early_imports.borrow().get(&context) {
                     begin_dynamic_module_fetch(loader, specifier, referrer);
@@ -1620,6 +1628,7 @@ impl HostState {
                     context,
                     specifier: specifier.into(),
                     referrer: referrer.into(),
+                    module_type: module_type.map(str::to_owned),
                 });
                 true
             },
@@ -13949,6 +13958,51 @@ document.body.appendChild(injected);
         }
 
         #[tokio::test]
+        async fn json_module_imports_require_a_json_mime_type() {
+            // HTML #fetch-a-single-module-script: an import with `type: "json"` needs a JSON MIME
+            // type and becomes a synthetic module whose default export is the parsed value; a
+            // JavaScript import needs a JavaScript MIME type. Adobe Edge Delivery pages import
+            // their component models this way (`with { type: 'json' }`).
+            let html = r##"<!doctype html><html><body>
+                <output id="result">waiting</output>
+                <script type="module">
+                    import data from "data:application/json,%7B%22a%22%3A1%7D" with { type: "json" };
+                    const outcomes = [String(data.a)];
+                    const settle = p => p.then(m => String(m.default), e => e.name);
+                    outcomes.push(await settle(import("data:text/json,[2]", { with: { type: "json" } })));
+                    outcomes.push(await settle(import("data:application/ld+json,3", { with: { type: "json" } })));
+                    outcomes.push(await settle(import("data:text/javascript,export default 4", { with: { type: "json" } })));
+                    outcomes.push(await settle(import("data:application/json,5")));
+                    document.getElementById("result").textContent = outcomes.join("|");
+                </script>
+            </body></html>"##;
+            // Module loaders are installed for a page with network access.
+            let mut env = PageEnv::bare(DEFAULT_URL);
+            env.net = Some(tokio::runtime::Handle::current());
+            let (_handle, mut events) = spawn_page(html.to_string(), env);
+            let mut last_html = String::new();
+            let completed = tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Updated { html, .. }) => {
+                            if html.contains("<output id=\"result\">1|2|3|TypeError|TypeError</output>") {
+                                break;
+                            }
+                            last_html = html;
+                        }
+                        Some(PageEvt::Trouble(errors)) => {
+                            panic!("JSON module test failed: {errors:?}")
+                        }
+                        Some(_) => {}
+                        None => panic!("Lumen actor closed before the JSON module result"),
+                    }
+                }
+            })
+            .await;
+            assert!(completed.is_ok(), "JSON module imports: {last_html}");
+        }
+
+        #[tokio::test]
         async fn iframe_parser_module_is_started_once() {
             // HTML §4.12.1.1 gives every script element an `already
             // started` flag: preparation returns immediately once it is set.
@@ -20047,7 +20101,7 @@ fn eval_lumen_worker_module(
     match engine.eval_module_attrs_interruptible(
         &script.source,
         script.url.as_str(),
-        move |specifier, referrer, _attributes| {
+        move |specifier, referrer, module_type| {
             let loaded = module_dependency_loader(
                 &loader_page,
                 &cookie_context,
@@ -20058,6 +20112,7 @@ fn eval_lumen_worker_module(
                 &environment,
                 specifier,
                 referrer,
+                module_type,
             );
             if loaded.is_none() {
                 loader_missing.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -20663,7 +20718,7 @@ fn install_context_module_loader(engine: &mut lumen::Engine, context: u64) {
             .map(|n| (n.handle.clone(), n.cache.clone(), n.fetched.clone()))
     });
     if let Some((handle, cache, fetched)) = work {
-        engine.set_module_loader(move |specifier, referrer| {
+        engine.set_module_loader_attrs(move |specifier, referrer, module_type| {
             module_dependency_loader(
                 &page,
                 &cookie_context,
@@ -20674,6 +20729,7 @@ fn install_context_module_loader(engine: &mut lumen::Engine, context: u64) {
                 &environment,
                 specifier,
                 referrer,
+                module_type,
             )
         });
     }
@@ -20699,6 +20755,7 @@ fn module_dependency_loader(
     environment: &ModuleFetchEnvironment,
     specifier: &str,
     referrer: &str,
+    module_type: Option<&str>,
 ) -> Option<(String, String)> {
     let base = url::Url::parse(referrer).unwrap_or_else(|_| page.clone());
     let resolved = if let Some(map) = import_map {
@@ -20718,7 +20775,7 @@ fn module_dependency_loader(
         .unwrap_or_default();
     if resolved.scheme() == "data" {
         let content_type = data_url_content_type(resolved.as_str());
-        if !crate::http::module_script_response_allowed(200, &content_type) {
+        if !crate::http::module_response_allowed(200, &content_type, module_type) {
             return None;
         }
         let body = crate::img::decode_data_url(resolved.as_str())?;
@@ -20731,7 +20788,7 @@ fn module_dependency_loader(
         ));
     }
     if resolved.scheme() == "blob" {
-        return environment.blob_module(&resolved, &integrity);
+        return environment.blob_module(&resolved, &integrity, module_type);
     }
     if !matches!(resolved.scheme(), "http" | "https")
         || !crate::http::subresource_allowed(page, &resolved)
@@ -20764,10 +20821,14 @@ fn module_dependency_loader(
         );
         crate::http::PageCache::block_on_fetch(Some(handle), shared)?
     };
-    (crate::http::module_script_response_allowed(response.status, &response.content_type)
+    (crate::http::module_response_allowed(response.status, &response.content_type, module_type)
         && crate::import_maps::integrity_matches(&integrity, &response.body))
     .then(|| {
-        if !cookie_context.cross_site_ancestor && cache.claim_module_import_scan(&resolved) {
+        // A JSON module imports nothing.
+        if module_type.is_none()
+            && !cookie_context.cross_site_ancestor
+            && cache.claim_module_import_scan(&resolved)
+        {
             speculate_module_imports(page, handle, cache, fetched, &resolved, &response.body);
         }
         (
@@ -20792,9 +20853,12 @@ fn resolve_module_specifier(page: &url::Url, specifier: &str, referrer: &str) ->
     base.join(specifier).ok()
 }
 
-fn data_dynamic_module_result(resolved: &url::Url) -> Option<(String, String)> {
+fn data_dynamic_module_result(
+    resolved: &url::Url,
+    module_type: Option<&str>,
+) -> Option<(String, String)> {
     let content_type = data_url_content_type(resolved.as_str());
-    crate::http::module_script_response_allowed(200, &content_type)
+    crate::http::module_response_allowed(200, &content_type, module_type)
         .then(|| crate::img::decode_data_url(resolved.as_str()))
         .flatten()
         .map(|body| {
@@ -20813,6 +20877,7 @@ fn queue_dynamic_module_load(
     request_id: u64,
     specifier: &str,
     referrer: &str,
+    module_type: Option<&str>,
 ) {
     let base = url::Url::parse(referrer).unwrap_or_else(|_| loader.page.clone());
     let Some(resolved) = loader
@@ -20835,7 +20900,7 @@ fn queue_dynamic_module_load(
         .integrity(&resolved)
         .to_owned();
     if resolved.scheme() == "data" {
-        let result = data_dynamic_module_result(&resolved).filter(|_| {
+        let result = data_dynamic_module_result(&resolved, module_type).filter(|_| {
             crate::img::decode_data_url(resolved.as_str())
                 .is_some_and(|bytes| crate::import_maps::integrity_matches(&integrity, &bytes))
         });
@@ -20848,7 +20913,9 @@ fn queue_dynamic_module_load(
     }
     if resolved.scheme() == "blob" {
         // Resolving the specifier parsed the URL and resolved its blob URL entry now.
-        let result = loader.environment.blob_module(&resolved, &integrity);
+        let result = loader
+            .environment
+            .blob_module(&resolved, &integrity, module_type);
         let _ = loader.events.send(LumenHostTask::DynamicModule {
             context: loader.context,
             request_id,
@@ -20909,9 +20976,14 @@ fn queue_dynamic_module_load(
     };
     let events = loader.events.clone();
     let context = loader.context;
+    let module_type = module_type.map(str::to_owned);
     network.cache.spawn(&network.handle, async move {
         let result = shared.await.ok().and_then(|response| {
-            (crate::http::module_script_response_allowed(response.status, &response.content_type)
+            (crate::http::module_response_allowed(
+                response.status,
+                &response.content_type,
+                module_type.as_deref(),
+            )
                 && crate::import_maps::integrity_matches(&integrity, &response.body))
             .then(|| {
                 (
@@ -21368,7 +21440,7 @@ fn run_injected_module_task(
                 engine.eval_module_attrs_interruptible(
                     source,
                     name,
-                    move |specifier, referrer, _attributes| {
+                    move |specifier, referrer, module_type| {
                         module_dependency_loader(
                             &loader_page,
                             &cookie_context,
@@ -21379,6 +21451,7 @@ fn run_injected_module_task(
                             &environment,
                             specifier,
                             referrer,
+                            module_type,
                         )
                     },
                 )
@@ -22059,6 +22132,7 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
             context,
             specifier,
             referrer,
+            module_type,
         } => {
             if std::env::var_os("TRUST_NET_TRACE").is_some() {
                 eprintln!(
@@ -22090,7 +22164,13 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
                             fetched: network.fetched.clone(),
                         }),
                 };
-                queue_dynamic_module_load(&loader, request_id, &specifier, &referrer);
+                queue_dynamic_module_load(
+                    &loader,
+                    request_id,
+                    &specifier,
+                    &referrer,
+                    module_type.as_deref(),
+                );
             }
         }
         LumenHostTask::DynamicModule {
@@ -51461,19 +51541,19 @@ mod tests {
         };
         let url = url::Url::parse("blob:https://a.test/1").unwrap();
         assert_eq!(
-            environment("https://a.test").blob_module(&url, ""),
+            environment("https://a.test").blob_module(&url, "", None),
             Some((url.to_string(), String::from("export default 1;")))
         );
-        assert_eq!(environment("https://b.test").blob_module(&url, ""), None);
+        assert_eq!(environment("https://b.test").blob_module(&url, "", None), None);
         let text = url::Url::parse("blob:https://a.test/2").unwrap();
-        assert_eq!(environment("https://a.test").blob_module(&text, ""), None);
+        assert_eq!(environment("https://a.test").blob_module(&text, "", None), None);
         assert_eq!(
             environment("https://a.test")
-                .blob_module(&url, "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+                .blob_module(&url, "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", None),
             None
         );
         let gone = url::Url::parse("blob:https://a.test/3").unwrap();
-        assert_eq!(environment("https://a.test").blob_module(&gone, ""), None);
+        assert_eq!(environment("https://a.test").blob_module(&gone, "", None), None);
     }
 
     #[test]

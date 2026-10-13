@@ -6348,6 +6348,37 @@ pub(crate) fn module_script_response_allowed(status: u16, content_type: &str) ->
     (200..300).contains(&status) && is_javascript_mime_type(content_type)
 }
 
+/// Whether a MIME type is a JSON MIME type (MIME Sniffing §4.6): its essence is
+/// `application/json` or `text/json`, or its subtype ends in `+json`.
+pub(crate) fn is_json_mime_type(content_type: &str) -> bool {
+    let essence = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    matches!(essence.as_str(), "application/json" | "text/json")
+        || essence
+            .split_once('/')
+            .is_some_and(|(_, subtype)| subtype.ends_with("+json"))
+}
+
+/// HTML "fetch a single module script" for an import whose `type` attribute is `module_type`
+/// (None for a JavaScript module): an OK response with a JavaScript MIME type, or a JSON MIME
+/// type for `type: "json"`. Other module types (CSS module scripts) are not supported.
+pub(crate) fn module_response_allowed(
+    status: u16,
+    content_type: &str,
+    module_type: Option<&str>,
+) -> bool {
+    (200..300).contains(&status)
+        && match module_type {
+            None => is_javascript_mime_type(content_type),
+            Some("json") => is_json_mime_type(content_type),
+            Some(_) => false,
+        }
+}
+
 /// Fetch's style-destination `nosniff` check, plus the ordinary OK-status
 /// requirement for obtaining an external stylesheet.
 pub(crate) fn stylesheet_response_allowed(
@@ -14498,6 +14529,16 @@ mod tests {
         assert!(module_script_response_allowed(200, "text/javascript"));
         assert!(!module_script_response_allowed(200, "text/plain"));
         assert!(!module_script_response_allowed(404, "text/javascript"));
+
+        // A JSON module (`with { type: "json" }`) needs a JSON MIME type instead.
+        assert!(module_response_allowed(200, "text/javascript", None));
+        assert!(!module_response_allowed(200, "application/json", None));
+        assert!(module_response_allowed(200, "application/json", Some("json")));
+        assert!(module_response_allowed(200, "Text/JSON; charset=utf-8", Some("json")));
+        assert!(module_response_allowed(200, "application/manifest+json", Some("json")));
+        assert!(!module_response_allowed(200, "text/javascript", Some("json")));
+        assert!(!module_response_allowed(404, "application/json", Some("json")));
+        assert!(!module_response_allowed(200, "text/css", Some("css")));
 
         assert!(stylesheet_response_allowed(200, "text/plain", &[]));
         assert!(!stylesheet_response_allowed(200, "text/plain", &nosniff));
