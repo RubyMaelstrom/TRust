@@ -97,8 +97,8 @@ fn page(
     runtime: &tokio::runtime::Runtime,
     page: &str,
 ) -> (
-    lumen::Engine,
-    tokio::sync::mpsc::UnboundedReceiver<LumenHostTask>,
+    trust_js::Engine,
+    tokio::sync::mpsc::UnboundedReceiver<TrustJsHostTask>,
 ) {
     let (task_tx, task_rx) = tokio::sync::mpsc::unbounded_channel();
     let dom = Rc::new(RefCell::new(Dom::parse_document(
@@ -127,8 +127,8 @@ fn page(
 
 fn run_until(
     runtime: &tokio::runtime::Runtime,
-    engine: &mut lumen::Engine,
-    tasks: &mut tokio::sync::mpsc::UnboundedReceiver<LumenHostTask>,
+    engine: &mut trust_js::Engine,
+    tasks: &mut tokio::sync::mpsc::UnboundedReceiver<TrustJsHostTask>,
     condition: &str,
 ) {
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -161,7 +161,7 @@ const EVENTS: &str = "['loadstart','progress','suspend','abort','error','emptied
     'loadeddata','canplay','canplaythrough','playing','waiting','seeking','seeked','ended','durationchange',\
     'timeupdate','play','pause','ratechange','resize','volumechange']";
 
-fn watch(engine: &mut lumen::Engine, element: &str) {
+fn watch(engine: &mut trust_js::Engine, element: &str) {
     eval(
         engine,
         &format!(
@@ -398,7 +398,7 @@ fn unsupported_resources_fail_and_sources_fall_through() {
 fn can_play_type_reports_the_decoders() {
     let runtime = runtime();
     let (mut engine, _tasks) = page(&runtime, "http://127.0.0.1/page.html");
-    let answer = |engine: &mut lumen::Engine, type_: &str| {
+    let answer = |engine: &mut trust_js::Engine, type_: &str| {
         string_value(
             engine,
             &format!("document.createElement('video').canPlayType('{type_}')"),
@@ -458,11 +458,11 @@ fn a_muted_traversable_silences_its_players_and_audio_contexts_unobserved() {
     )
     .unwrap();
     run_until(&runtime, &mut engine, &mut tasks, "v.readyState >= 1");
-    let mutes = |engine: &mut lumen::Engine| {
+    let mutes = |engine: &mut trust_js::Engine| {
         let state = engine.ctx().host_mut::<HostState>().unwrap();
         (state.media.player_mutes(), state.webaudio.context_mutes())
     };
-    let set_muted = |engine: &mut lumen::Engine, muted: bool| {
+    let set_muted = |engine: &mut trust_js::Engine, muted: bool| {
         let state = engine.ctx().host_mut::<HostState>().unwrap();
         let traversable = state.traversables.selected;
         state.set_traversable_muted(traversable, muted);
@@ -570,7 +570,7 @@ fn a_video_keeps_painting_after_a_same_document_url_change() {
     run_until(&runtime, &mut engine, &mut tasks, "log.includes('ready')");
     let dom = engine.ctx().host_mut::<HostState>().unwrap().dom.clone();
     let base_url = url::Url::parse(&base).unwrap();
-    let paint = |engine: &mut lumen::Engine| {
+    let paint = |engine: &mut trust_js::Engine| {
         let rect = string_value(
             engine,
             "(r => [r.width, r.height].join())(v.getBoundingClientRect())",

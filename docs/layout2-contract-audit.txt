@@ -183,7 +183,7 @@ Artifacts: `target/layout2-contract-audit-20260927-WM7EoT/`.
   unchanged-old-heap work-bound test passes after correction. The other failure
   was the explicit canonical/native binding counts after adding __geometry_bind;
   both count assertions now include that binding. Broader rerun is pending.
-- Lumen native-constructor integration: full debug and release both pass
+- TRust JS native-constructor integration: full debug and release both pass
   1,572 library tests plus one integration test. All-tier coverage checks
   reentrant NewTarget restoration and >64 bound/proxy GetFunctionRealm chains;
   the former arbitrary realm-lookup cutoff has been removed.

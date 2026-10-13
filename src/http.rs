@@ -6590,7 +6590,7 @@ pub(crate) fn prefetch_parser_scripts(
                         && cache.claim_module_import_scan(&url)
                     {
                         let fetched = cache.fetch_count();
-                        crate::lumen_backend::speculate_module_graph(
+                        crate::trust_js_backend::speculate_module_graph(
                             page,
                             runtime,
                             cache,
@@ -14533,11 +14533,31 @@ mod tests {
         // A JSON module (`with { type: "json" }`) needs a JSON MIME type instead.
         assert!(module_response_allowed(200, "text/javascript", None));
         assert!(!module_response_allowed(200, "application/json", None));
-        assert!(module_response_allowed(200, "application/json", Some("json")));
-        assert!(module_response_allowed(200, "Text/JSON; charset=utf-8", Some("json")));
-        assert!(module_response_allowed(200, "application/manifest+json", Some("json")));
-        assert!(!module_response_allowed(200, "text/javascript", Some("json")));
-        assert!(!module_response_allowed(404, "application/json", Some("json")));
+        assert!(module_response_allowed(
+            200,
+            "application/json",
+            Some("json")
+        ));
+        assert!(module_response_allowed(
+            200,
+            "Text/JSON; charset=utf-8",
+            Some("json")
+        ));
+        assert!(module_response_allowed(
+            200,
+            "application/manifest+json",
+            Some("json")
+        ));
+        assert!(!module_response_allowed(
+            200,
+            "text/javascript",
+            Some("json")
+        ));
+        assert!(!module_response_allowed(
+            404,
+            "application/json",
+            Some("json")
+        ));
         assert!(!module_response_allowed(200, "text/css", Some("css")));
 
         assert!(stylesheet_response_allowed(200, "text/plain", &[]));

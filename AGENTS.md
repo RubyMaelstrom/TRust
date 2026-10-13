@@ -87,7 +87,7 @@ The project favors:
   cascade, computed values, serialization, and live geometry state.
 - `src/js.rs`: JavaScript/browser contract and engine-neutral
   DOM/resource helpers. It delegates the resident page actor to
-  `src/lumen_backend.rs`, backed by the maintained sibling Lumen checkout.
+  `src/trust_js_backend.rs`, backed by the maintained sibling TRust JS checkout.
   A single resident actor owns the live DOM and JS realm and handles events,
   timers, fetch/XHR, modules, workers,
   WebSockets, storage, blobs, and WebAssembly.
@@ -143,8 +143,8 @@ The project favors:
 - `src/telnet.rs`, `src/gopher.rs`, `src/gemini.rs`, `src/oneshot.rs`,
   `src/tls.rs`, and `src/ws.rs`: protocol implementations.
 - `vendor/`: owned forks of wasmi and frontend/font/image dependencies.
-  The Lumen engine is maintained separately at the sibling
-  `../Lumen` checkout. A bug whose correct
+  The TRust JS engine is maintained separately at the sibling
+  `../trust-js` checkout. A bug whose correct
   fix belongs in an engine should be fixed in its engine repository rather
   than hidden behind a downstream workaround.
 
@@ -164,7 +164,7 @@ The project favors:
   snapshots rather than reparsing declaration strings.
 - HTML output uses positioned `Row`/`Item` data. Gopher, Gemini, one-shot
   protocols, and plain text use the simpler line model.
-- One page engine (actor, Lumen Agent) runs each browsing context group: a
+- One page engine (actor, TRust JS Agent) runs each browsing context group: a
   tab's pages, plus the auxiliary browsing contexts they open (pop-up tabs,
   which share their opener's engine). Navigation drops the old page actor and
   its heap, unless the tab shares its group with another tab: then the next
@@ -253,8 +253,8 @@ benefit both frontends.
 
 ## Development and Verification
 
-Cargo uses the sibling Lumen checkout (`../Lumen/crates/lumen`) directly;
-TRust and Lumen are developed together on their `main` branches while
+Cargo uses the sibling TRust JS checkout (`../trust-js/crates/trust-js`) directly;
+TRust and TRust JS are developed together on their `main` branches while
 host-boundary work is upstreamed. TRust supplies networking and TLS.
 
 Build and test from the repository root:
@@ -272,9 +272,9 @@ and the release build. Exercise affected sites with the release binaries;
 a debug test pass or release startup check does not verify rendering or
 performance. Documentation-only edits do not need a browser rebuild.
 
-Lumen is the only JavaScript engine and is always compiled. No backend-selection
+TRust JS is the only JavaScript engine and is always compiled. No backend-selection
 features or comparison targets exist. `--all-features` also enables the synthetic
-`trust-lumen-spike` benchmark harness.
+`trust-js-spike` benchmark harness.
 
 Ordinary release builds produce `trust`, `trust-desktop`, and `trust-headless`.
 `trust-browser-replay` is a developer-only example target, not a distributed
@@ -285,7 +285,7 @@ acceptance testing and local installation stay fast. Public numbered releases
 use `cargo build --profile numbered-release --locked`; that explicit profile
 uses Fat-LTO and one codegen unit and is not part of the ordinary development
 or local-promotion cycle. Native ARM64/x86-64 Linux and Windows cross-build
-instructions are in `INSTALL.md`; use the same Lumen checkout for each. With Wine installed,
+instructions are in `INSTALL.md`; use the same TRust JS checkout for each. With Wine installed,
 `cargo xwin test --target x86_64-pc-windows-msvc` runs the Windows tests.
 
 Focused checks and diagnostics:
@@ -345,7 +345,7 @@ During development:
   the task specifically requires it.
 
 The default features enable mimalloc. A build without that
-allocator uses `--no-default-features`; Lumen remains enabled. Several
+allocator uses `--no-default-features`; TRust JS remains enabled. Several
 performance diagnostics and safety switches are controlled by `TRUST_*`
 environment variables documented near their use.
 
@@ -423,7 +423,7 @@ current behavior and limits; consult the governing standards before changing it.
   (`http::fetch_script_streaming`, `http/body_stream.rs`) with incremental
   content decoding (`http/content_coding.rs`: gzip, deflate, br, zstd) into
   the body's ReadableStream, which pulls from a per-response host buffer
-  (`LumenHostTask::FetchHead`/`FetchBodyChunk`/`FetchBodyEnd`,
+  (`TrustJsHostTask::FetchHead`/`FetchBodyChunk`/`FetchBodyEnd`,
   `__http_fetch_pull`). The transfer suspends while more than 1 MiB waits
   unread and resumes below 256 KiB. Aborting the fetch, canceling or
   garbage-collecting its stream, or unloading its document cancels the
@@ -627,7 +627,7 @@ current behavior and limits; consult the governing standards before changing it.
   holds one WindowProxy per other traversable that follows its navigations
   (`traversableWindowProxy`, cross-origin views as for frames); a raw Window
   reached through another Realm (`popup.frames[0].parent`) is not that
-  object, as a Lumen WindowProxy exotic object would make it. `opener`,
+  object, as a TRust JS WindowProxy exotic object would make it. `opener`,
   `name` (reset on cross-origin Documents of non-auxiliary traversables),
   `BarProp.visible`, `focus()` (shows the tab when the caller's user just
   interacted) and named lookup across the group's traversables and their
@@ -779,7 +779,7 @@ current behavior and limits; consult the governing standards before changing it.
   algorithms; `media_host` owns each element's `media::player::Player` (a
   control thread that demuxes and decodes audio, a video decode thread and a
   presenter publishing frames to a `VideoSurface` that paint reads by surface
-  id), whose reports come back as `LumenHostTask::Media`. Audio goes to
+  id), whose reports come back as `TrustJsHostTask::Media`. Audio goes to
   PulseAudio/PipeWire (the pure-Rust `pulseaudio` crate) or dlopen'd ALSA,
   silently in trust-headless (`media::audio::disable_device_output`); the
   clock follows the heard audio. Bundled decoders: rav1d (AV1) and Symphonia
@@ -831,7 +831,7 @@ current behavior and limits; consult the governing standards before changing it.
   context, in both frontends. The prelude's block is the control thread: it
   validates and queues control messages through `__audio_context_binding`;
   the thread swaps the queue each render quantum (#rendering-loop) and its
-  reports return as `LumenHostTask::WebAudio` tasks. An `AudioContext`
+  reports return as `TrustJsHostTask::WebAudio` tasks. An `AudioContext`
   renders ahead of the default output device (its preferred rate and
   channel count are the defaults) through a lock-free ring sized by the
   latency hint, paced by the device; suspended contexts sleep. Like Firefox,
@@ -870,7 +870,7 @@ current behavior and limits; consult the governing standards before changing it.
   is connected; the filled `outputBuffer` plays two buffers later (double
   buffering), and an `OfflineAudioContext` waits for each answer (closing
   the context, or 10 s without one, ends the wait).
-- AudioWorklet: each context's `AudioWorkletGlobalScope` is a Lumen engine on
+- AudioWorklet: each context's `AudioWorkletGlobalScope` is a TRust JS engine on
   its rendering thread (`src/audio_worklet_host.rs`), built by the first
   `addModule()` from the worker platform plus `js_audio_worklet.js`
   (`js::audio_worklet_prelude`, which removes what a WorkletGlobalScope does
@@ -1177,4 +1177,4 @@ Keep installation in `INSTALL.md`, development guidance here, and diagnostic
 commands/environment variables in `DIAGNOSTICS.md`. Interactive commands are
 available through the built-in `help` (`src/command.rs`) and `gemini-help`.
 Detailed architecture and standards notes live in module and item comments
-throughout `src/`; keep them aligned with the Lumen-only implementation.
+throughout `src/`; keep them aligned with the TRust JS-only implementation.

@@ -1,7 +1,7 @@
-//! Engine-neutral browser contract and Lumen-backed page actor.
+//! Engine-neutral browser contract and TRust JS-backed page actor.
 //!
 //! The browser-facing contract delegates JavaScript execution to the sibling
-//! Lumen engine in every build configuration.
+//! TRust JS engine in every build configuration.
 
 use crate::dom::Dom;
 use std::time::{Duration, Instant};
@@ -399,7 +399,7 @@ pub fn css_finish(mut dom: Dom, sheets: &[crate::http::PageSheet]) -> String {
 }
 
 pub fn transform(html: &str, env: &PageEnv) -> (String, Outcome) {
-    crate::lumen_backend::transform(html, env)
+    crate::trust_js_backend::transform(html, env)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1076,13 +1076,13 @@ struct PageHandleState {
 /// the last one gone cancels both.
 #[derive(Debug)]
 pub(crate) struct EngineLife {
-    interrupt: std::sync::Arc<lumen::RuntimeInterrupt>,
+    interrupt: std::sync::Arc<trust_js::RuntimeInterrupt>,
     cache: std::sync::Arc<crate::http::PageCache>,
 }
 
 impl EngineLife {
     pub(crate) fn new(
-        interrupt: std::sync::Arc<lumen::RuntimeInterrupt>,
+        interrupt: std::sync::Arc<trust_js::RuntimeInterrupt>,
         cache: std::sync::Arc<crate::http::PageCache>,
     ) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self { interrupt, cache })
@@ -1235,14 +1235,14 @@ impl TraversableLink {
     }
 
     /// The engine's interrupt, which its page thread polls.
-    pub(crate) fn interrupt(&self) -> std::sync::Arc<lumen::RuntimeInterrupt> {
+    pub(crate) fn interrupt(&self) -> std::sync::Arc<trust_js::RuntimeInterrupt> {
         self.0.life.interrupt.clone()
     }
 
     /// The first traversable of a group no actor serves, for handles that
     /// tests drive themselves.
     #[cfg(test)]
-    pub(crate) fn for_test(interrupt: std::sync::Arc<lumen::RuntimeInterrupt>) -> Self {
+    pub(crate) fn for_test(interrupt: std::sync::Arc<trust_js::RuntimeInterrupt>) -> Self {
         let cache = std::sync::Arc::<crate::http::PageCache>::default();
         let life = EngineLife::new(interrupt, cache.clone());
         let (commands, _) = tokio::sync::mpsc::unbounded_channel();
@@ -1253,7 +1253,7 @@ impl TraversableLink {
 }
 
 impl PageHandle {
-    pub(crate) fn from_lumen_parts(
+    pub(crate) fn from_trust_js_parts(
         cmds: tokio::sync::mpsc::Sender<PageCmd>,
         interactions: tokio::sync::mpsc::Sender<PageCmd>,
         hover: tokio::sync::watch::Sender<PageHover>,
@@ -1419,7 +1419,7 @@ pub const PAGE_END_GRACE: std::time::Duration = std::time::Duration::from_secs(2
 /// and event receivers. Keep the network runtime alive to service cancellation.
 /// Further page actors are rejected; ordinary navigation remains asynchronous.
 pub fn shutdown_page_threads() {
-    crate::lumen_backend::shutdown_spare_engine();
+    crate::trust_js_backend::shutdown_spare_engine();
     crate::page_threads::shutdown();
 }
 
@@ -1428,7 +1428,7 @@ pub fn shutdown_page_threads() {
 /// keepalive fetches they started (Fetch #request-keepalive-flag), up to
 /// `grace` to finish. Keep the network runtime alive meanwhile.
 pub fn shutdown_page_threads_after(grace: std::time::Duration) {
-    crate::lumen_backend::shutdown_spare_engine();
+    crate::trust_js_backend::shutdown_spare_engine();
     let deadline = std::time::Instant::now() + grace;
     while std::time::Instant::now() < deadline
         && (crate::page_threads::running() || crate::http::keepalive_fetches_in_flight() > 0)
@@ -1445,13 +1445,13 @@ pub fn shutdown_page_threads_after(grace: std::time::Duration) {
 /// false when `TRUST_NO_SPARE_ENGINE` keeps every navigation cold. Library
 /// users and tests never get a spare implicitly.
 pub fn enable_spare_page_engine(refill: bool) -> bool {
-    crate::lumen_backend::set_spare_engine_enabled(true, refill)
+    crate::trust_js_backend::set_spare_engine_enabled(true, refill)
 }
 
 /// Start warming a spare page engine now, if enabled and none is waiting,
 /// so that it can serve the next (typically the first) navigation.
 pub fn prewarm_page_engine() {
-    crate::lumen_backend::prewarm_spare_engine();
+    crate::trust_js_backend::prewarm_spare_engine();
 }
 
 /// Whether a frontend's start address can lead to a scripted HTML document,
@@ -1469,14 +1469,14 @@ pub fn start_address_may_use_page_engine(address: &str) -> bool {
 
 /// A navigation's document rendered: warm the next navigation's engine.
 pub(crate) fn refill_spare_page_engine() {
-    crate::lumen_backend::refill_spare_engine();
+    crate::trust_js_backend::refill_spare_engine();
 }
 
 pub fn spawn_page(
     html: String,
     env: PageEnv,
 ) -> (PageHandle, tokio::sync::mpsc::Receiver<PageEvt>) {
-    crate::lumen_backend::spawn_page(html, env)
+    crate::trust_js_backend::spawn_page(html, env)
 }
 
 /// [`spawn_page`] for the next Document of `link`'s traversable, which the
@@ -1508,7 +1508,7 @@ pub fn spawn_page_in(
         events,
     })));
     (
-        PageHandle::from_lumen_parts(cmd_tx, interaction_tx, hover_tx, link.clone()),
+        PageHandle::from_trust_js_parts(cmd_tx, interaction_tx, hover_tx, link.clone()),
         event_rx,
     )
 }

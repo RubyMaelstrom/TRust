@@ -18,9 +18,9 @@ name = "trust-desktop"
 path = "src/bin/trust-desktop.rs"
 
 [[bin]]
-name = "trust-lumen-spike"
-path = "src/bin/trust-lumen-spike.rs"
-required-features = ["lumen-spike"]
+name = "trust-js-spike"
+path = "src/bin/trust-js-spike.rs"
+required-features = ["trust-js-spike"]
 
 # Developer replay harness, built explicitly with --example; not a release binary.
 [[example]]
@@ -46,9 +46,9 @@ default = ["mimalloc"]
 # page's freed high-water to the OS (see `release_allocator_memory`).
 mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 # Synthetic engine benchmark harness; omitted from ordinary browser builds.
-lumen-spike = []
+trust-js-spike = []
 # Opt-in operation/lifetime accounting; never use this build for acceptance timing.
-architecture-diagnostics = ["lumen/architecture-diagnostics"]
+architecture-diagnostics = ["trust-js/architecture-diagnostics"]
 # rav1d's hand-written x86-64/ARM assembly for AV1 decoding. Off by default:
 # it needs nasm (x86) or a C assembler driver at build time, whereas the
 # default build decodes AV1 with rav1d's portable Rust code paths only.
@@ -125,8 +125,8 @@ gif = "0.14.2"
 zune-jpeg = "0.5.15"
 zune-core = { version = "0.5.3", default-features = false }
 libmimalloc-sys = { version = "0.1", features = ["extended"], optional = true }
-# Lumen is the JavaScript engine in every browser and test configuration.
-lumen = { path = "../Lumen/crates/lumen", features = ["embed"] }
+# TRust JS is the JavaScript engine in every browser and test configuration.
+trust-js = { path = "../trust-js/crates/trust-js", features = ["embed"] }
 mimalloc = { version = "0.1", optional = true }
 # ISOBMFF/HEIF parsing for AVIF images (and, later, MP4 demuxing). Firefox's
 # parser; TRust patches grid and clean-aperture support into the 0.17.0
@@ -261,7 +261,7 @@ softbuffer = { version = "0.4.8", default-features = false, features = ["x11", "
 # `simd` is enabled because the SIMD proposal is finalized and the crate is
 # pure-Rust (v128 still cannot cross the JS boundary — that throws TypeError per
 # the JS-API spec — but a module may use SIMD internally). The production
-# `WebAssembly.*` JS<->wasm bridge is in `src/lumen_wasm.rs`. Wasmi 2 gates
+# `WebAssembly.*` JS<->wasm bridge is in `src/trust_js_wasm.rs`. Wasmi 2 gates
 # validation and memory64 behind features that its defaults enable; keep both.
 # `auto-dispatch` uses tail-call dispatch only in optimized builds, where LLVM
 # performs the sibling calls it depends on, and a loop otherwise.

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Attribute JIT samples to Lumen template families.
+"""Attribute JIT samples to TRust JS template families.
 
     tools/jit_families.py OUT.txt [--freq HZ] -- COMMAND [ARGS...]
 
 A thin wrapper over tools/psample.py (same options and requirements: Linux, perf_event_paranoid
-of 2 or lower, ARM64 Lumen JIT). The command runs with LUMEN_JIT_MAP=1, whose stderr
+of 2 or lower, ARM64 TRust JS JIT). The command runs with TRUST_JS_JIT_MAP=1, whose stderr
 (`OUT.txt.jitmap`) now carries `[jit-map-mark] <base> <offset> <family>` lines beside the
 per-operation `[jit-map-pc]` lines: each marks where the code of one template family begins
 (`typed-load`, `typed-store`, `get-elem`, `set-elem`, `load-name`, `call`, `chain`,

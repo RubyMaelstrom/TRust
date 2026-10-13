@@ -3,7 +3,7 @@
 //! `v` flag. Constraint validation and the `:valid`/`:invalid` selectors run
 //! in Rust (selector matching, style worker threads, the presentation arena),
 //! where no page realm is reachable, so the ECMAScript semantics come from a
-//! private Lumen realm on a service thread. It owns no page state: it compiles
+//! private TRust JS realm on a service thread. It owns no page state: it compiles
 //! patterns, tests strings and answers over a channel, blocked while idle.
 //!
 //! ECMA-262 §22.2 (RegExp) defines the matcher; HTML's steps are:
@@ -118,8 +118,8 @@ const MATCHER: &str = r#"(() => {
 })()"#;
 
 fn serve(requests: Receiver<Request>) {
-    let interrupt = std::sync::Arc::new(lumen::RuntimeInterrupt::default());
-    let mut engine = lumen::Engine::new_with_interrupt(interrupt.clone());
+    let interrupt = std::sync::Arc::new(trust_js::RuntimeInterrupt::default());
+    let mut engine = trust_js::Engine::new_with_interrupt(interrupt.clone());
     let Ok(Ok(matcher)) = engine.eval_value(MATCHER) else {
         // Without a matcher every request answers "no compiled pattern".
         for request in requests {
@@ -131,15 +131,15 @@ fn serve(requests: Receiver<Request>) {
         interrupt.set_deadline(Some(Instant::now() + MATCH_BUDGET));
         let result = engine.call_function_interruptible(
             &matcher,
-            lumen::embed::Value::Undefined,
+            trust_js::embed::Value::Undefined,
             &[
-                lumen::embed::Value::from_engine_text(request.pattern),
-                lumen::embed::Value::from_engine_text(request.value),
+                trust_js::embed::Value::from_engine_text(request.pattern),
+                trust_js::embed::Value::from_engine_text(request.value),
             ],
         );
         interrupt.set_deadline(None);
         let verdict = match result {
-            Ok(lumen::embed::Value::Bool(matched)) => Some(matched),
+            Ok(trust_js::embed::Value::Bool(matched)) => Some(matched),
             _ => None,
         };
         let _ = request.reply.send(verdict);

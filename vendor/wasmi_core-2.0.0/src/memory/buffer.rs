@@ -4,7 +4,7 @@ use core::{cell::RefCell, fmt, iter, mem::ManuallyDrop, ptr::NonNull};
 
 /// TRust: linear-memory bytes shared with an embedder, see [`ByteBuffer::share`].
 ///
-/// This is the representation of an ECMAScript `ArrayBuffer` Data Block in the Lumen
+/// This is the representation of an ECMAScript `ArrayBuffer` Data Block in the TRust JS
 /// engine, so a `WebAssembly.Memory`'s `buffer` can be identified with the memory's bytes
 /// (WebAssembly JS API #memories) instead of mirroring them.
 pub type SharedBytes = Rc<RefCell<Vec<u8>>>;

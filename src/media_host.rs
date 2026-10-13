@@ -6,7 +6,7 @@
 //! (#concept-media-load-resource) with the element's potential-CORS request
 //! (destination "audio" or "video") and returns a player id. Commands go to
 //! the player through `__media_control`. The player's reports arrive as host
-//! tasks (`LumenHostTask::Media`) and run in the element's Window realm as
+//! tasks (`TrustJsHostTask::Media`) and run in the element's Window realm as
 //! `trust.mediaEvent(id, kind, a, b, c)`, which queues the element's media
 //! element tasks.
 //!
@@ -23,7 +23,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::{
-    Ctx, HostState, LumenHostTask, LumenTaskSender, Value, host_arg_node, host_arg_string, host_dom,
+    Ctx, HostState, TrustJsHostTask, TrustJsTaskSender, Value, host_arg_node, host_arg_string,
+    host_dom,
 };
 use crate::dom::media::MediaPresentation;
 use crate::media::container::{self, Container};
@@ -276,7 +277,7 @@ pub(super) fn media_capabilities(
     Ok(Value::Num(f64::from(flags)))
 }
 
-fn task_sender(ctx: &mut Ctx) -> Option<LumenTaskSender> {
+fn task_sender(ctx: &mut Ctx) -> Option<TrustJsTaskSender> {
     ctx.host_mut::<HostState>()?.task_events.clone()
 }
 
@@ -393,7 +394,7 @@ pub(super) fn load(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
             };
             let network_sender = sender.clone();
             let events: crate::media::resource::NetworkEvents = Arc::new(move |event| {
-                let _ = network_sender.send(LumenHostTask::Media {
+                let _ = network_sender.send(TrustJsHostTask::Media {
                     id,
                     task: MediaTask::Network(event),
                 });
@@ -862,7 +863,7 @@ fn start(
     id: u64,
     calling: u64,
     input: Input,
-    sender: LumenTaskSender,
+    sender: TrustJsTaskSender,
     taint: Taint,
     deferred: bool,
 ) -> f64 {
@@ -902,7 +903,7 @@ fn start(
         },
         move |event| {
             if let Ok(sender) = player_sender.lock() {
-                let _ = sender.send(LumenHostTask::Media {
+                let _ = sender.send(TrustJsHostTask::Media {
                     id,
                     task: MediaTask::Player(event),
                 });
@@ -1080,7 +1081,11 @@ fn json_string(value: &str) -> String {
 }
 
 /// Deliver a player's report to its element.
-pub(super) fn dispatch(engine: &mut lumen::Engine, id: u64, task: MediaTask) -> Result<(), String> {
+pub(super) fn dispatch(
+    engine: &mut trust_js::Engine,
+    id: u64,
+    task: MediaTask,
+) -> Result<(), String> {
     let Some((node, context)) = engine
         .ctx()
         .host_mut::<HostState>()
@@ -1209,7 +1214,7 @@ pub(super) fn dispatch(engine: &mut lumen::Engine, id: u64, task: MediaTask) -> 
     })
 }
 
-fn set_natural_size(engine: &mut lumen::Engine, node: usize, width: u32, height: u32) {
+fn set_natural_size(engine: &mut trust_js::Engine, node: usize, width: u32, height: u32) {
     let dom = host_dom(engine.ctx());
     let mut dom = dom.borrow_mut();
     if let Some(mut presentation) = dom.media_presentation(node) {

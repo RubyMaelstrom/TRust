@@ -1,4 +1,4 @@
-//! Production Lumen JavaScript backend and its synthetic benchmark harness.
+//! Production TRust JS JavaScript backend and its synthetic benchmark harness.
 //!
 //! The resident actor owns TRust's platform prelude, DOM arena, and integer-handle host boundary.
 //! Bindings are checked against the canonical registry so host names and JavaScript-visible
@@ -6,17 +6,17 @@
 
 use crate::dom::custom_registry::CeRegistry as CustomElementRegistryRef;
 use crate::dom::{AdoptError, Dom, NodeData, SelectorList};
-use lumen::bytecode::Tier;
-use lumen::embed::{
-    Ctx, EvalError, HostGc, HostGcVisitor, HostRetainedMemoryVisitor, NativeFn, NativeGcId,
-    RetainedManagedAllocation, RetainedMemory, Value,
-};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use trust_js::bytecode::Tier;
+use trust_js::embed::{
+    Ctx, EvalError, HostGc, HostGcVisitor, HostRetainedMemoryVisitor, NativeFn, NativeGcId,
+    RetainedManagedAllocation, RetainedMemory, Value,
+};
 
 #[path = "canvas_host.rs"]
 mod canvas_host;
@@ -35,8 +35,6 @@ mod image_host;
 mod indexed_db_host;
 #[path = "live_range_host.rs"]
 mod live_range_host;
-#[path = "lumen_wasm.rs"]
-mod lumen_wasm;
 #[path = "media_host.rs"]
 mod media_host;
 #[path = "message_port_host.rs"]
@@ -47,6 +45,8 @@ mod page_spare;
 mod svg_geometry_host;
 #[path = "text_decoder_host.rs"]
 mod text_decoder_host;
+#[path = "trust_js_wasm.rs"]
+mod trust_js_wasm;
 #[path = "webaudio_host.rs"]
 mod webaudio_host;
 #[path = "webgl_host.rs"]
@@ -58,7 +58,7 @@ const DEFAULT_VIEWPORT: crate::layout2::Viewport = crate::layout2::Viewport {
     height: 384.0,
 };
 
-struct LumenGeomCache {
+struct TrustJsGeomCache {
     epoch: u64,
     presentation_epoch: u64,
     svg_sprite_revision: u64,
@@ -89,7 +89,7 @@ struct LumenGeomCache {
     top_document_valid: bool,
 }
 
-impl LumenGeomCache {
+impl TrustJsGeomCache {
     fn empty() -> Self {
         Self {
             epoch: u64::MAX,
@@ -156,13 +156,13 @@ fn top_hit_key(ctx: &mut Ctx) -> TopHitKey {
 
 /// (status, Content-Type, body, header blob, final URL after redirects; empty when unknown).
 /// (status, Content-Type, body, header list, final URL, status message).
-type LumenFetchResult = Option<(u16, String, Vec<u8>, String, String, String)>;
-type LumenResourceResult = Option<(u16, String, Vec<u8>, Vec<(String, String)>)>;
+type TrustJsFetchResult = Option<(u16, String, Vec<u8>, String, String, String)>;
+type TrustJsResourceResult = Option<(u16, String, Vec<u8>, Vec<(String, String)>)>;
 
-use crate::performance::ResourceTiming as LumenResourceTiming;
+use crate::performance::ResourceTiming as TrustJsResourceTiming;
 
 #[derive(Clone, Copy)]
-enum LumenResourceKind {
+enum TrustJsResourceKind {
     ClassicScript,
     ModuleScript,
     Stylesheet,
@@ -175,7 +175,7 @@ enum LumenResourceKind {
     Preload,
 }
 
-impl LumenResourceKind {
+impl TrustJsResourceKind {
     /// HTML #delay-the-load-event: script and style sheet loads delay their
     /// document's load event; #link-type-preload must not.
     fn delays_load(self) -> bool {
@@ -184,10 +184,10 @@ impl LumenResourceKind {
 }
 
 /// Send-only work returned by background platform operations. Engine values never enter this
-/// channel: the page thread retains Promise resolvers in [`LumenNetwork`] and settles them after
+/// channel: the page thread retains Promise resolvers in [`TrustJsNetwork`] and settles them after
 /// selecting the corresponding HTML task.
 #[allow(dead_code)] // Some task variants are exercised only by particular web-platform features.
-enum LumenHostTask {
+enum TrustJsHostTask {
     PortReady,
     /// A media element's player reported (`media_host`).
     Media {
@@ -224,12 +224,12 @@ enum LumenHostTask {
     /// finished (`http::prefetch_page_scripts`).
     ParserResourceTiming {
         traversable: TraversableId,
-        timing: LumenResourceTiming,
+        timing: TrustJsResourceTiming,
     },
     ImageDone {
         id: usize,
         result: Option<image_host::LoadedImage>,
-        timing: Option<LumenResourceTiming>,
+        timing: Option<TrustJsResourceTiming>,
         /// The element's node document's settings context, whose global
         /// receives the timing entry (Fetch #fetch-finale).
         timing_context: u64,
@@ -239,7 +239,7 @@ enum LumenHostTask {
     DocumentImageDone {
         context: u64,
         url: String,
-        timing: Option<LumenResourceTiming>,
+        timing: Option<TrustJsResourceTiming>,
         /// Natural dimensions, when the response is an image.
         size: Option<(u32, u32)>,
         /// An inline SVG's `<image>` reference (`img::record_document_svg_image`).
@@ -247,15 +247,15 @@ enum LumenHostTask {
     },
     FetchDone {
         id: usize,
-        result: LumenFetchResult,
-        timing: Option<LumenResourceTiming>,
+        result: TrustJsFetchResult,
+        timing: Option<TrustJsResourceTiming>,
     },
     /// A script fetch's response whose body is read as it arrives (Fetch
     /// #concept-http-network-fetch): the header section, then the body's
     /// bytes in order, then its end.
     FetchHead {
         id: usize,
-        result: LumenFetchResult,
+        result: TrustJsFetchResult,
         flow: Arc<crate::http::BodyFlow>,
     },
     FetchBodyChunk {
@@ -267,7 +267,7 @@ enum LumenHostTask {
     FetchBodyEnd {
         id: usize,
         ok: bool,
-        timing: Option<LumenResourceTiming>,
+        timing: Option<TrustJsResourceTiming>,
     },
     NavigateDone {
         id: usize,
@@ -285,8 +285,8 @@ enum LumenHostTask {
         traversable: TraversableId,
         node_id: usize,
         name: String,
-        kind: LumenResourceKind,
-        result: LumenResourceResult,
+        kind: TrustJsResourceKind,
+        result: TrustJsResourceResult,
         /// The decoded text of a classic script, decoded with the fallback
         /// encoding of HTML #prepare-the-script-element when the element was
         /// prepared.
@@ -295,7 +295,7 @@ enum LumenHostTask {
         /// the response URL, and the sheets its imports fetched
         /// (`http::fetched_stylesheet`).
         sheet: Option<Box<crate::http::FetchedStyleSheet>>,
-        timing: Option<LumenResourceTiming>,
+        timing: Option<TrustJsResourceTiming>,
         external: bool,
     },
     DynamicModuleStart {
@@ -330,21 +330,21 @@ enum LumenHostTask {
     },
 }
 
-struct LumenNetwork {
+struct TrustJsNetwork {
     handle: tokio::runtime::Handle,
     cache: Arc<crate::http::PageCache>,
     fetched: Arc<std::sync::atomic::AtomicUsize>,
     next_fetch_id: usize,
-    pending_fetches: HashMap<usize, LumenPendingFetch>,
+    pending_fetches: HashMap<usize, TrustJsPendingFetch>,
     /// Response bodies still being read, by fetch id.
-    body_streams: HashMap<usize, LumenBodyStream>,
+    body_streams: HashMap<usize, TrustJsBodyStream>,
 }
 
 /// Fetch #concept-http-network-fetch's network buffer for one response body:
 /// bytes the transfer delivered that the body's stream has not yet pulled.
 /// The transfer suspends while more than `http::BODY_FLOW_UPPER` bytes wait
 /// here and resumes when a pull leaves fewer than `http::BODY_FLOW_LOWER`.
-struct LumenBodyStream {
+struct TrustJsBodyStream {
     /// The environment whose Realm owns the response body's stream.
     context: u64,
     flow: Arc<crate::http::BodyFlow>,
@@ -355,7 +355,7 @@ struct LumenBodyStream {
     pull: Option<Value>,
 }
 
-impl LumenBodyStream {
+impl TrustJsBodyStream {
     /// The transfer still runs on its own: it will queue more tasks without
     /// waiting for script to pull.
     fn transferring(&self) -> bool {
@@ -363,7 +363,7 @@ impl LumenBodyStream {
     }
 }
 
-impl Drop for LumenBodyStream {
+impl Drop for TrustJsBodyStream {
     /// A body nobody can pull any more (its environment or agent is gone)
     /// stops its transfer, including one suspended waiting for a pull.
     fn drop(&mut self) {
@@ -371,7 +371,7 @@ impl Drop for LumenBodyStream {
     }
 }
 
-struct LumenPendingFetch {
+struct TrustJsPendingFetch {
     /// Fetch's task destination: the environment whose global receives the
     /// networking task and owns the resulting Response/Body objects.
     context: u64,
@@ -387,19 +387,19 @@ struct LumenPendingFetch {
 }
 
 #[derive(Clone)]
-struct LumenDynamicModuleNetwork {
+struct TrustJsDynamicModuleNetwork {
     handle: tokio::runtime::Handle,
     cache: Arc<crate::http::PageCache>,
     fetched: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 #[derive(Clone)]
-struct LumenDynamicModuleLoader {
+struct TrustJsDynamicModuleLoader {
     context: u64,
     page: url::Url,
     cookie_context: crate::http::CookieContext,
-    events: LumenTaskSender,
-    network: Option<LumenDynamicModuleNetwork>,
+    events: TrustJsTaskSender,
+    network: Option<TrustJsDynamicModuleNetwork>,
     import_map: crate::import_maps::Handle,
     environment: ModuleFetchEnvironment,
 }
@@ -479,7 +479,7 @@ impl ModuleFetchEnvironment {
     }
 }
 
-struct LumenWebSockets {
+struct TrustJsWebSockets {
     handle: tokio::runtime::Handle,
     page: url::Url,
     tasks: Arc<crate::http::PageTaskScope>,
@@ -488,9 +488,9 @@ struct LumenWebSockets {
     next_id: usize,
 }
 
-enum LumenWorkerCtl {
+enum TrustJsWorkerCtl {
     Message(String),
-    HostTask(Box<LumenHostTask>),
+    HostTask(Box<TrustJsHostTask>),
     PortReady(Arc<std::sync::atomic::AtomicBool>),
     Terminate,
 }
@@ -499,20 +499,20 @@ enum LumenWorkerCtl {
 /// Wake its existing blocking inbox directly: no polling or forwarding task
 /// (and no extra thread) is needed for each idle worker.
 #[derive(Clone)]
-enum LumenTaskSender {
-    Page(tokio::sync::mpsc::UnboundedSender<LumenHostTask>),
-    Worker(std::sync::Weak<LumenWorkerInbox>),
+enum TrustJsTaskSender {
+    Page(tokio::sync::mpsc::UnboundedSender<TrustJsHostTask>),
+    Worker(std::sync::Weak<TrustJsWorkerInbox>),
 }
 
-impl LumenTaskSender {
-    fn send(&self, task: LumenHostTask) -> Result<(), ()> {
+impl TrustJsTaskSender {
+    fn send(&self, task: TrustJsHostTask) -> Result<(), ()> {
         match self {
             Self::Page(sender) => sender.send(task).map_err(|_| ()),
             Self::Worker(inbox) => inbox
                 .upgrade()
                 .ok_or(())?
                 .sender
-                .send(LumenWorkerCtl::HostTask(Box::new(task)))
+                .send(TrustJsWorkerCtl::HostTask(Box::new(task)))
                 .map_err(|_| ()),
         }
     }
@@ -522,13 +522,13 @@ impl LumenTaskSender {
 /// every posted message, including while the worker is still starting. A fixed
 /// try_send inbox silently lost messages. Only redundant port wakes coalesce;
 /// actual messages are never discarded to make room for another message.
-struct LumenWorkerInbox {
-    sender: std::sync::mpsc::Sender<LumenWorkerCtl>,
+struct TrustJsWorkerInbox {
+    sender: std::sync::mpsc::Sender<TrustJsWorkerCtl>,
     port_wake_pending: Arc<std::sync::atomic::AtomicBool>,
 }
 
-impl LumenWorkerInbox {
-    fn new() -> (Arc<Self>, std::sync::mpsc::Receiver<LumenWorkerCtl>) {
+impl TrustJsWorkerInbox {
+    fn new() -> (Arc<Self>, std::sync::mpsc::Receiver<TrustJsWorkerCtl>) {
         let (sender, receiver) = std::sync::mpsc::channel();
         (
             Arc::new(Self {
@@ -546,21 +546,21 @@ impl LumenWorkerInbox {
         {
             let _ = self
                 .sender
-                .send(LumenWorkerCtl::PortReady(self.port_wake_pending.clone()));
+                .send(TrustJsWorkerCtl::PortReady(self.port_wake_pending.clone()));
         }
     }
 }
 
-struct LumenWorkerHandle {
-    ctl: Arc<LumenWorkerInbox>,
-    interrupt: Arc<lumen::RuntimeInterrupt>,
+struct TrustJsWorkerHandle {
+    ctl: Arc<TrustJsWorkerInbox>,
+    interrupt: Arc<trust_js::RuntimeInterrupt>,
     tasks: Arc<crate::http::PageTaskScope>,
     /// HTML Worker.outside port belongs to its constructor's settings Realm,
     /// not necessarily the top-level Window that owns the native page actor.
     context: u64,
 }
 
-impl Drop for LumenWorkerHandle {
+impl Drop for TrustJsWorkerHandle {
     fn drop(&mut self) {
         // HTML §10.2.4 "terminate a worker": cancellation is host control
         // flow, so author catch/finally cannot observe or suppress it.
@@ -568,38 +568,38 @@ impl Drop for LumenWorkerHandle {
         // Cancel an in-flight script/module/fetch independently of the page,
         // and wake an idle agent without waiting for it on the owner's thread.
         self.tasks.cancel();
-        let _ = self.ctl.sender.send(LumenWorkerCtl::Terminate);
+        let _ = self.ctl.sender.send(TrustJsWorkerCtl::Terminate);
     }
 }
 
 /// Release outstanding I/O on self.close(), startup failure, and unwinding too,
 /// without waiting for the owner to dispatch WorkerExited.
-struct LumenWorkerTaskLifetime(Arc<crate::http::PageTaskScope>);
+struct TrustJsWorkerTaskLifetime(Arc<crate::http::PageTaskScope>);
 
-impl Drop for LumenWorkerTaskLifetime {
+impl Drop for TrustJsWorkerTaskLifetime {
     fn drop(&mut self) {
         self.0.cancel();
     }
 }
 
-struct LumenPageWorkers {
+struct TrustJsPageWorkers {
     handle: tokio::runtime::Handle,
     page: url::Url,
     tasks: Arc<crate::http::PageTaskScope>,
     /// The owner's event loop: the page actor, or for a nested dedicated worker
     /// (HTML #dedicated-workers-and-the-worker-interface) its owning worker's inbox.
-    events: LumenTaskSender,
-    workers: HashMap<usize, LumenWorkerHandle>,
+    events: TrustJsTaskSender,
+    workers: HashMap<usize, TrustJsWorkerHandle>,
     next_id: usize,
     /// HTML #shared-workers-and-the-sharedworker-interface: this page's shared worker global
     /// scopes, keyed by constructor storage key (origin), constructor URL and name. Each
     /// records its worker type and secure-context state for the constructor's match checks.
-    shared: HashMap<String, (usize, LumenWorkerKind, bool)>,
+    shared: HashMap<String, (usize, TrustJsWorkerKind, bool)>,
 }
 
-struct LumenWorkerSelf {
+struct TrustJsWorkerSelf {
     id: usize,
-    events: LumenTaskSender,
+    events: TrustJsTaskSender,
     closed: bool,
     /// HTML #set-up-a-worker-environment-settings-object: origin is inherited
     /// from the creator, whereas the API base URL remains the script URL.
@@ -617,7 +617,7 @@ struct LumenWorkerSelf {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum LumenWorkerKind {
+enum TrustJsWorkerKind {
     Classic,
     Module,
 }
@@ -625,12 +625,12 @@ enum LumenWorkerKind {
 /// Permissions #dfn-permission-store entries keyed by "origin\0feature".
 type PermissionStore = Arc<std::sync::Mutex<HashMap<String, &'static str>>>;
 
-struct LumenWorkerLaunch {
+struct TrustJsWorkerLaunch {
     id: usize,
     owner_page: url::Url,
     cookie_context: crate::http::CookieContext,
     script_url: url::Url,
-    kind: LumenWorkerKind,
+    kind: TrustJsWorkerKind,
     name: String,
     /// HTML #dom-worker: the script URL's blob URL entry, resolved (and checked for the
     /// outside settings' partition, File API #blob-url-obtain-object) when the constructor
@@ -649,7 +649,7 @@ struct LumenWorkerLaunch {
     agent_cluster: u64,
     port_registry: Arc<std::sync::Mutex<message_port_host::Registry>>,
     port_wake: message_port_host::Wake,
-    task_sender: LumenTaskSender,
+    task_sender: TrustJsTaskSender,
     /// The owner's storage shed and permission store: a dedicated worker shares its
     /// settings object's origin (Storage #obtain-a-storage-key, Permissions #dfn-permission-store).
     storage: crate::js::WebStorage,
@@ -810,7 +810,7 @@ struct HostState {
     viewport: Cell<crate::layout2::Viewport>,
     device_pixel_ratio: Cell<f32>,
     screen_position: Cell<(i32, i32)>,
-    geom_cache: Rc<RefCell<LumenGeomCache>>,
+    geom_cache: Rc<RefCell<TrustJsGeomCache>>,
     images: Rc<RefCell<crate::layout2::ImageSizes>>,
     /// Compressed bytes behind element image request records, by record token
     /// (`image_host`), and each element's current request's token: one map
@@ -821,7 +821,7 @@ struct HostState {
     next_image_payload: u64,
     /// Presentation images the document requested for its rendering, in flight.
     pending_document_images: usize,
-    task_events: Option<LumenTaskSender>,
+    task_events: Option<TrustJsTaskSender>,
     /// The players of this document's media elements (`media_host`).
     media: media_host::MediaHost,
     /// Web Audio contexts' engines and shared data (`webaudio_host`).
@@ -836,11 +836,11 @@ struct HostState {
     pending_module_evaluations: usize,
     modules_skipped: usize,
     pending_dynamic_modules: Arc<std::sync::atomic::AtomicUsize>,
-    network: Option<LumenNetwork>,
-    websockets: Option<LumenWebSockets>,
-    workers: Option<LumenPageWorkers>,
-    worker_self: Option<LumenWorkerSelf>,
-    wasm: lumen_wasm::PageWasm,
+    network: Option<TrustJsNetwork>,
+    websockets: Option<TrustJsWebSockets>,
+    workers: Option<TrustJsPageWorkers>,
+    worker_self: Option<TrustJsWorkerSelf>,
+    wasm: trust_js_wasm::PageWasm,
     next_window_context: u64,
     window_realms: HashMap<u64, Value>,
     /// Fetch/XHR's client settings belong to the initiating Window, not its
@@ -866,7 +866,7 @@ struct HostState {
     parser: ParserProgress,
     /// Each same-agent Window's settings for starting an import()'s fetch as
     /// it runs, shared with the engine's dynamic module loader.
-    early_imports: Rc<RefCell<HashMap<u64, LumenDynamicModuleLoader>>>,
+    early_imports: Rc<RefCell<HashMap<u64, TrustJsDynamicModuleLoader>>>,
     /// One private WeakMap shared by this Agent's ImageData interface bindings. The map is
     /// rooted, not its keys: same-Agent cross-Realm getters keep their Web IDL brand semantics.
     image_data_slots: Option<Value>,
@@ -1010,7 +1010,7 @@ struct TraversableHost {
     viewport: Cell<crate::layout2::Viewport>,
     device_pixel_ratio: Cell<f32>,
     screen_position: Cell<(i32, i32)>,
-    geom_cache: Rc<RefCell<LumenGeomCache>>,
+    geom_cache: Rc<RefCell<TrustJsGeomCache>>,
     images: Rc<RefCell<crate::layout2::ImageSizes>>,
     pending_document_images: usize,
     parser: ParserProgress,
@@ -1047,7 +1047,7 @@ impl TraversableHost {
             viewport: Cell::new(viewport),
             device_pixel_ratio: Cell::new(device_pixel_ratio),
             screen_position: Cell::new((0, 0)),
-            geom_cache: Rc::new(RefCell::new(LumenGeomCache::empty())),
+            geom_cache: Rc::new(RefCell::new(TrustJsGeomCache::empty())),
             images: Default::default(),
             pending_document_images: 0,
             parser: ParserProgress::default(),
@@ -1153,7 +1153,7 @@ impl HostState {
             viewport: Cell::new(viewport),
             device_pixel_ratio: Cell::new(device_pixel_ratio),
             screen_position: Cell::new((0, 0)),
-            geom_cache: Rc::new(RefCell::new(LumenGeomCache::empty())),
+            geom_cache: Rc::new(RefCell::new(TrustJsGeomCache::empty())),
             images: Default::default(),
             image_payloads: HashMap::new(),
             element_image_payloads: HashMap::new(),
@@ -1172,7 +1172,7 @@ impl HostState {
             websockets: None,
             workers: None,
             worker_self: None,
-            wasm: lumen_wasm::PageWasm::new(),
+            wasm: trust_js_wasm::PageWasm::new(),
             next_window_context: 1,
             window_realms: HashMap::new(),
             window_request_urls: HashMap::new(),
@@ -1447,26 +1447,26 @@ impl HostState {
         page: url::Url,
         handle: tokio::runtime::Handle,
         cache: Arc<crate::http::PageCache>,
-        events: tokio::sync::mpsc::UnboundedSender<LumenHostTask>,
+        events: tokio::sync::mpsc::UnboundedSender<TrustJsHostTask>,
     ) {
         self.base = page;
-        self.task_events = Some(LumenTaskSender::Page(events.clone()));
+        self.task_events = Some(TrustJsTaskSender::Page(events.clone()));
         self.enable_websockets(
             self.base.clone(),
             &handle,
             &cache,
-            LumenTaskSender::Page(events.clone()),
+            TrustJsTaskSender::Page(events.clone()),
         );
-        self.workers = Some(LumenPageWorkers {
+        self.workers = Some(TrustJsPageWorkers {
             handle: handle.clone(),
             page: self.base.clone(),
             tasks: cache.task_scope(),
-            events: LumenTaskSender::Page(events.clone()),
+            events: TrustJsTaskSender::Page(events.clone()),
             workers: HashMap::new(),
             next_id: 1,
             shared: HashMap::new(),
         });
-        self.network = Some(LumenNetwork {
+        self.network = Some(TrustJsNetwork {
             handle,
             // The document's count includes its speculative parser fetches.
             fetched: cache.fetch_count(),
@@ -1486,17 +1486,20 @@ impl HostState {
         page: url::Url,
         handle: &tokio::runtime::Handle,
         cache: &Arc<crate::http::PageCache>,
-        tasks: LumenTaskSender,
+        tasks: TrustJsTaskSender,
     ) {
         let (ws_events, mut ws_rx) = tokio::sync::mpsc::channel(64);
         cache.spawn(handle, async move {
             while let Some((id, event)) = ws_rx.recv().await {
-                if tasks.send(LumenHostTask::WebSocket { id, event }).is_err() {
+                if tasks
+                    .send(TrustJsHostTask::WebSocket { id, event })
+                    .is_err()
+                {
                     break;
                 }
             }
         });
-        self.websockets = Some(LumenWebSockets {
+        self.websockets = Some(TrustJsWebSockets {
             handle: handle.clone(),
             page,
             tasks: cache.task_scope(),
@@ -1506,7 +1509,7 @@ impl HostState {
         });
     }
 
-    fn configure_module_loading(&self, engine: &mut lumen::Engine) {
+    fn configure_module_loading(&self, engine: &mut trust_js::Engine) {
         engine.set_import_base(self.base.as_str());
         if let Some(network) = self.network.as_ref() {
             let page = self
@@ -1561,7 +1564,7 @@ impl HostState {
 
         // ECMA-262 HostLoadImportedModule/FinishLoadingImportedModule: dynamic import starts a
         // host load and returns its promise without waiting for I/O. Static graph loading retains
-        // the synchronous fallback above until Lumen exposes an asynchronous graph-loader API.
+        // the synchronous fallback above until TRust JS exposes an asynchronous graph-loader API.
         let Some(events) = self.task_events.clone() else {
             return;
         };
@@ -1581,7 +1584,7 @@ impl HostState {
                 .get(&self.top_context)
                 .cloned()
                 .unwrap_or_else(|| page.origin());
-            let loader = LumenDynamicModuleLoader {
+            let loader = TrustJsDynamicModuleLoader {
                 context: self.top_context,
                 cookie_context: self
                     .window_cookie_contexts
@@ -1606,7 +1609,7 @@ impl HostState {
                     .get(&self.top_context)
                     .cloned()
                     .unwrap_or_default(),
-                network: Some(LumenDynamicModuleNetwork {
+                network: Some(TrustJsDynamicModuleNetwork {
                     handle: network.handle.clone(),
                     cache: network.cache.clone(),
                     fetched: network.fetched.clone(),
@@ -1623,7 +1626,7 @@ impl HostState {
                 if let Some(loader) = early_imports.borrow().get(&context) {
                     begin_dynamic_module_fetch(loader, specifier, referrer);
                 }
-                let _ = events.send(LumenHostTask::DynamicModuleStart {
+                let _ = events.send(TrustJsHostTask::DynamicModuleStart {
                     request_id,
                     context,
                     specifier: specifier.into(),
@@ -1675,7 +1678,7 @@ impl RetainedMemory for HostState {
     fn scan_retained_memory(&self, visitor: &mut dyn HostRetainedMemoryVisitor) {
         // Exhaustive by construction: adding an owning HostState field is a compile error until
         // it receives an explicit classification here. ECMA-262 Agents aggregate every Realm's
-        // host-defined roots; the Lumen visitor deduplicates the identities emitted below across
+        // host-defined roots; the TRust JS visitor deduplicates the identities emitted below across
         // the root realm and its ShadowRealms.
         let HostState {
             message_ports,
@@ -2005,12 +2008,12 @@ impl RetainedMemory for HostState {
             let bytes = network
                 .pending_fetches
                 .capacity()
-                .saturating_mul(std::mem::size_of::<(usize, LumenPendingFetch)>())
+                .saturating_mul(std::mem::size_of::<(usize, TrustJsPendingFetch)>())
                 .saturating_add(
                     network
                         .body_streams
                         .capacity()
-                        .saturating_mul(std::mem::size_of::<(usize, LumenBodyStream)>()),
+                        .saturating_mul(std::mem::size_of::<(usize, TrustJsBodyStream)>()),
                 )
                 .saturating_add(
                     network
@@ -2046,7 +2049,7 @@ impl RetainedMemory for HostState {
             if bytes != 0 {
                 visitor.allocation(RetainedManagedAllocation::new(
                     "trust.network-metadata",
-                    network as *const LumenNetwork as usize,
+                    network as *const TrustJsNetwork as usize,
                     bytes,
                 ));
             }
@@ -2069,7 +2072,7 @@ impl RetainedMemory for HostState {
             if bytes != 0 {
                 visitor.allocation(RetainedManagedAllocation::new(
                     "trust.websocket-metadata",
-                    websockets as *const LumenWebSockets as usize,
+                    websockets as *const TrustJsWebSockets as usize,
                     bytes,
                 ));
             }
@@ -2080,7 +2083,7 @@ impl RetainedMemory for HostState {
                 workers
                     .workers
                     .capacity()
-                    .saturating_mul(std::mem::size_of::<(usize, LumenWorkerHandle)>()),
+                    .saturating_mul(std::mem::size_of::<(usize, TrustJsWorkerHandle)>()),
             );
             if workers.workers.capacity() != 0 || !workers.workers.is_empty() {
                 visitor.opaque_storage();
@@ -2089,7 +2092,7 @@ impl RetainedMemory for HostState {
             if bytes != 0 {
                 visitor.allocation(RetainedManagedAllocation::new(
                     "trust.worker-metadata",
-                    workers as *const LumenPageWorkers as usize,
+                    workers as *const TrustJsPageWorkers as usize,
                     bytes,
                 ));
             }
@@ -2325,7 +2328,7 @@ impl RetainedMemory for HostState {
                 "trust.early-import-settings",
                 Rc::as_ptr(early_imports) as usize,
                 early_imports.borrow().capacity()
-                    * std::mem::size_of::<(u64, LumenDynamicModuleLoader)>(),
+                    * std::mem::size_of::<(u64, TrustJsDynamicModuleLoader)>(),
             ));
         }
         if parser.abandoned.capacity() != 0 {
@@ -2350,12 +2353,12 @@ impl RetainedMemory for HostState {
     }
 }
 
-impl lumen::embed::RetainedExternalMemory for HostState {
+impl trust_js::embed::RetainedExternalMemory for HostState {
     fn retained_external_memory(
         &self,
-        visit: &mut dyn FnMut(lumen::embed::RetainedExternalAllocation),
+        visit: &mut dyn FnMut(trust_js::embed::RetainedExternalAllocation),
     ) {
-        lumen::embed::RetainedExternalMemory::retained_external_memory(&self.wasm, visit);
+        trust_js::embed::RetainedExternalMemory::retained_external_memory(&self.wasm, visit);
     }
 }
 
@@ -2396,7 +2399,7 @@ impl HostGc for HostState {
         let minor = arenas.len() == 1
             && visitor.is_minor()
             && visitor.native_old_generation("trust.dom", owner, dom.first_young_gc_id());
-        if !minor && std::env::var_os("LUMEN_GC_DUMP").is_some() {
+        if !minor && std::env::var_os("TRUST_JS_GC_DUMP").is_some() {
             let mut roots = std::collections::BTreeMap::<usize, usize>::new();
             let mut allocations = std::collections::BTreeMap::<usize, usize>::new();
             let mut resources = std::collections::BTreeMap::<usize, usize>::new();
@@ -2766,7 +2769,7 @@ pub fn parse_tier(name: &str) -> Result<Tier, String> {
 }
 
 fn engine_call_trust_method(
-    engine: &mut lumen::Engine,
+    engine: &mut trust_js::Engine,
     name: &str,
     args: &[Value],
 ) -> Result<Value, EvalError> {
@@ -2786,7 +2789,7 @@ fn engine_call_trust_method(
 /// bookkeeping, but calling the handler here avoids placing those self-hosted helper frames below
 /// author code. `null` from the selector means an animation-frame opportunity won the ordering
 /// race, which remains a batched JavaScript algorithm and falls back to `tickTo`.
-fn dispatch_timer_task_to(engine: &mut lumen::Engine, deadline: f64) -> Result<bool, EvalError> {
+fn dispatch_timer_task_to(engine: &mut trust_js::Engine, deadline: f64) -> Result<bool, EvalError> {
     let selected = engine_call_trust_method(engine, "takeTimerTaskTo", &[Value::Num(deadline)])?;
     match selected {
         Value::Bool(false) => return Ok(false),
@@ -2866,7 +2869,7 @@ fn dispatch_timer_task_to(engine: &mut lumen::Engine, deadline: f64) -> Result<b
 pub fn run_benchmark(path: &Path, tier: Tier, threshold: u32) -> Result<SpikeReport, String> {
     let source = std::fs::read_to_string(path)
         .map_err(|error| format!("read {}: {error}", path.display()))?;
-    let mut engine = lumen::Engine::new();
+    let mut engine = trust_js::Engine::new();
     engine.set_tier(tier);
     engine.set_tier_threshold(threshold);
     let clock = Rc::new(RealmClock::new());
@@ -2883,7 +2886,7 @@ pub fn run_benchmark(path: &Path, tier: Tier, threshold: u32) -> Result<SpikeRep
     eval(
         &mut engine,
         &format!(
-            "globalThis.__trust_cfg = {{ url: {url:?}, ua: 'TRust/0.2 Lumen spike', language: 'en-US', languages: ['en-US', 'en'], width: 640, height: 384 }};",
+            "globalThis.__trust_cfg = {{ url: {url:?}, ua: 'TRust/0.2 TRust JS spike', language: 'en-US', languages: ['en-US', 'en'], width: 640, height: 384 }};",
             url = DEFAULT_URL
         ),
         "TRust configuration",
@@ -3023,10 +3026,10 @@ mod desktop {
     // A short native-input burst is a poor place for an optional full cycle
     // scan. HTML's checkpoints still complete, including ClearKeptObjects;
     // ECMA-262 #sec-liveness permits servicing the request after input quiets.
-    // Lumen's allocation safepoints/limits remain active throughout this hint.
+    // TRust JS's allocation safepoints/limits remain active throughout this hint.
     const INPUT_GC_QUIET_INTERVAL: Duration = Duration::from_millis(150);
 
-    /// Run the Lumen page pipeline as a one-shot transformation.
+    /// Run the TRust JS page pipeline as a one-shot transformation.
     ///
     /// This path exists for diagnostics and the non-resident HTTP helpers. It
     /// uses the same parser task, microtask checkpoints, platform task source,
@@ -3034,7 +3037,7 @@ mod desktop {
     /// only difference is that virtual time advances to the next timer because
     /// there is no displayed document which could observe real time passing.
     pub(crate) fn transform(html: &str, env: &PageEnv) -> (String, Outcome) {
-        let interrupt = Arc::new(lumen::RuntimeInterrupt::default());
+        let interrupt = Arc::new(trust_js::RuntimeInterrupt::default());
         let (host_tx, mut host_rx) = tokio::sync::mpsc::unbounded_channel();
         let env = PageEnv {
             url: env.url.clone(),
@@ -3158,7 +3161,7 @@ mod desktop {
 
     impl ActorTaskTrace {
         fn enabled() -> Option<Self> {
-            std::env::var_os("TRUST_LUMEN_TASK_TRACE").map(|_| Self {
+            std::env::var_os("TRUST_JS_TASK_TRACE").map(|_| Self {
                 interval_started: Instant::now(),
                 turns: 0,
                 interactions: 0,
@@ -3198,8 +3201,8 @@ mod desktop {
         }
     }
 
-    struct LumenPage {
-        engine: lumen::Engine,
+    struct TrustJsPage {
+        engine: trust_js::Engine,
         dom: Rc<RefCell<Dom>>,
         base: url::Url,
         outcome: Outcome,
@@ -3247,7 +3250,7 @@ mod desktop {
         /// interaction queue.
         interaction_lookahead: Option<PageCmd>,
         task_trace: Option<ActorTaskTrace>,
-        engine_metrics: Option<lumen::PerformanceMetricsSampler>,
+        engine_metrics: Option<trust_js::PerformanceMetricsSampler>,
         /// The top-level traversables of this Agent's browsing context group
         /// (`Traversables` in HostState): the fields above from `dom` to
         /// `interaction_lookahead` are the selected one's.
@@ -3255,7 +3258,7 @@ mod desktop {
         selected: usize,
         /// The selected traversable's top-level Realm, entered while it is
         /// selected; the engine's default Realm is never entered.
-        realm_entry: Option<lumen::RealmEntry>,
+        realm_entry: Option<trust_js::RealmEntry>,
         /// The group's shared handle state (`GroupShared`), and whether it has
         /// ever had more than one traversable: until then a page whose
         /// frontend goes away ends at once, as it always has. A one-shot
@@ -3270,7 +3273,7 @@ mod desktop {
         rotation: usize,
     }
 
-    /// The fields of `LumenPage` that belong to a top-level traversable that
+    /// The fields of `TrustJsPage` that belong to a top-level traversable that
     /// is not selected (`select_traversable` exchanges them).
     struct TraversablePage {
         dom: Rc<RefCell<Dom>>,
@@ -3365,8 +3368,8 @@ mod desktop {
             }
         }
 
-        /// Exchange these fields with LumenPage's own.
-        fn swap_with(&mut self, page: &mut LumenPage) {
+        /// Exchange these fields with TrustJsPage's own.
+        fn swap_with(&mut self, page: &mut TrustJsPage) {
             macro_rules! swap {
                 ($($field:ident),* $(,)?) => {
                     $(std::mem::swap(&mut self.$field, &mut page.$field);)*
@@ -3395,7 +3398,7 @@ mod desktop {
         /// (`crate::js::TraversableLink`); it is discarded once it neither
         /// is held nor has a Document's frontend.
         linked: bool,
-        /// The `LumenPage` fields of a traversable that is not selected.
+        /// The `TrustJsPage` fields of a traversable that is not selected.
         parked: Option<TraversablePage>,
     }
 
@@ -3413,10 +3416,10 @@ mod desktop {
         }
     }
 
-    /// Make the traversable at `index` the selected one: LumenPage's and
+    /// Make the traversable at `index` the selected one: TrustJsPage's and
     /// HostState's fields become its own, and its top-level Realm is
     /// entered. Returns the index of the previously selected one.
-    fn select_traversable(page: &mut LumenPage, index: usize) -> usize {
+    fn select_traversable(page: &mut TrustJsPage, index: usize) -> usize {
         let previous = page.selected;
         if previous == index || index >= page.traversables.len() {
             return previous;
@@ -3454,19 +3457,19 @@ mod desktop {
     }
 
     /// The selected traversable.
-    fn selected_id(page: &LumenPage) -> TraversableId {
+    fn selected_id(page: &TrustJsPage) -> TraversableId {
         page.traversables
             .get(page.selected)
             .map_or_else(TraversableId::default, |slot| slot.id)
     }
 
     /// The index of the traversable `id`, if the group still has it.
-    fn traversable_index(page: &LumenPage, id: TraversableId) -> Option<usize> {
+    fn traversable_index(page: &TrustJsPage, id: TraversableId) -> Option<usize> {
         page.traversables.iter().position(|slot| slot.id == id)
     }
 
     /// The selected traversable's Document frontend's event sender.
-    fn selected_events(page: &LumenPage) -> Option<tokio::sync::mpsc::Sender<PageEvt>> {
+    fn selected_events(page: &TrustJsPage) -> Option<tokio::sync::mpsc::Sender<PageEvt>> {
         page.traversables
             .get(page.selected)
             .and_then(|slot| slot.channels.as_ref())
@@ -3479,7 +3482,7 @@ mod desktop {
         Interaction(usize, Option<PageCmd>),
         Cmd(usize, Option<PageCmd>),
         Hover(usize, Option<PageHover>),
-        Host(Option<LumenHostTask>),
+        Host(Option<TrustJsHostTask>),
         Group(crate::js::GroupCmd),
         Platform(usize),
         Idle(usize, f64),
@@ -3504,7 +3507,7 @@ mod desktop {
         pub(super) group_commands: tokio::sync::mpsc::UnboundedReceiver<crate::js::GroupCmd>,
     }
 
-    /// Spawn the production Lumen resident realm behind the actor contract
+    /// Spawn the production TRust JS resident realm behind the actor contract
     /// shared by the terminal and desktop frontends. A waiting spare engine,
     /// when one exists, takes the document instead of a new cold actor.
     pub(crate) fn spawn_page(
@@ -3533,7 +3536,7 @@ mod desktop {
         // The engine's browsing context group, whose first traversable the
         // document's handle holds. Built per engine: its link keeps that
         // engine's interrupt.
-        let group_for = |interrupt: &Arc<lumen::RuntimeInterrupt>| {
+        let group_for = |interrupt: &Arc<trust_js::RuntimeInterrupt>| {
             let life = crate::js::EngineLife::new(interrupt.clone(), cache.clone());
             let (commands, receiver) = tokio::sync::mpsc::unbounded_channel();
             let group = crate::js::GroupShared::new(commands, &life, cache.clone(), blobs.clone());
@@ -3543,7 +3546,7 @@ mod desktop {
             (group, receiver, link)
         };
         let interrupt = spare.as_ref().map_or_else(
-            || Arc::new(lumen::RuntimeInterrupt::default()),
+            || Arc::new(trust_js::RuntimeInterrupt::default()),
             super::page_spare::SpareEngine::interrupt,
         );
         let (group, group_commands, link) = group_for(&interrupt);
@@ -3562,7 +3565,7 @@ mod desktop {
             match spare.claim(start, &cache) {
                 Ok(_) => {
                     return (
-                        PageHandle::from_lumen_parts(cmd_tx, interaction_tx, hover_tx, link),
+                        PageHandle::from_trust_js_parts(cmd_tx, interaction_tx, hover_tx, link),
                         event_rx,
                     );
                 }
@@ -3572,7 +3575,7 @@ mod desktop {
                 Err(returned) => {
                     start = *returned;
                     let (group, group_commands, cold_link) =
-                        group_for(&Arc::new(lumen::RuntimeInterrupt::default()));
+                        group_for(&Arc::new(trust_js::RuntimeInterrupt::default()));
                     start.group = group;
                     start.group_commands = group_commands;
                     link = cold_link;
@@ -3595,7 +3598,7 @@ mod desktop {
             // to take its existing CSS-only fallback.
         }
         (
-            PageHandle::from_lumen_parts(cmd_tx, interaction_tx, hover_tx, link),
+            PageHandle::from_trust_js_parts(cmd_tx, interaction_tx, hover_tx, link),
             event_rx,
         )
     }
@@ -3603,7 +3606,7 @@ mod desktop {
     /// Every resident page actor, cold or spare, runs on a thread like this.
     pub(super) fn page_thread_builder() -> std::thread::Builder {
         std::thread::Builder::new()
-            .name(String::from("trust-page-lumen"))
+            .name(String::from("trust-page-trust-js"))
             .stack_size(PAGE_STACK)
     }
 
@@ -3611,8 +3614,8 @@ mod desktop {
     /// (see `page_spare`); `None` creates the engine cold.
     pub(super) fn page_actor(
         start: PageStart,
-        interrupt: Arc<lumen::RuntimeInterrupt>,
-        warm: Option<lumen::Engine>,
+        interrupt: Arc<trust_js::RuntimeInterrupt>,
+        warm: Option<trust_js::Engine>,
     ) {
         let PageStart {
             html,
@@ -3727,11 +3730,11 @@ mod desktop {
 
     /// A request of the group's frontends (`crate::js::GroupCmd`).
     fn run_group_command(
-        page: &mut LumenPage,
+        page: &mut TrustJsPage,
         command: crate::js::GroupCmd,
-        host_tasks: &tokio::sync::mpsc::UnboundedSender<LumenHostTask>,
-        host_rx: &mut tokio::sync::mpsc::UnboundedReceiver<LumenHostTask>,
-        interrupt: &Arc<lumen::RuntimeInterrupt>,
+        host_tasks: &tokio::sync::mpsc::UnboundedSender<TrustJsHostTask>,
+        host_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TrustJsHostTask>,
+        interrupt: &Arc<trust_js::RuntimeInterrupt>,
     ) {
         match command {
             crate::js::GroupCmd::Release { traversable } => {
@@ -3759,7 +3762,7 @@ mod desktop {
     /// `closed`). Its fetches are aborted, its child navigables destroyed,
     /// its timers, tasks and observers discarded and its Window's settings
     /// released; its media stop.
-    fn destroy_active_document(page: &mut LumenPage, closing: bool) {
+    fn destroy_active_document(page: &mut TrustJsPage, closing: bool) {
         let context = page
             .engine
             .ctx()
@@ -3788,7 +3791,7 @@ mod desktop {
     /// HTML #destroy-a-top-level-traversable for the traversable at `index`:
     /// its active Document is destroyed (its Windows report `closed` from
     /// now on) and the group forgets it.
-    fn discard_traversable(page: &mut LumenPage, index: usize) {
+    fn discard_traversable(page: &mut TrustJsPage, index: usize) {
         if index >= page.traversables.len() {
             return;
         }
@@ -3820,10 +3823,10 @@ mod desktop {
     /// as a new page actor's first Document is. A group keeps every
     /// Document of its traversables resident, inert or not.
     fn load_traversable_document(
-        page: &mut LumenPage,
+        page: &mut TrustJsPage,
         load: crate::js::GroupLoad,
-        host_tasks: &tokio::sync::mpsc::UnboundedSender<LumenHostTask>,
-        host_rx: &mut tokio::sync::mpsc::UnboundedReceiver<LumenHostTask>,
+        host_tasks: &tokio::sync::mpsc::UnboundedSender<TrustJsHostTask>,
+        host_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TrustJsHostTask>,
     ) {
         let crate::js::GroupLoad {
             traversable,
@@ -3948,7 +3951,7 @@ mod desktop {
         }
         eval_main_page_diagnostic_init(
             &mut page.engine,
-            std::env::var("TRUST_LUMEN_DIAGNOSTIC_INIT").ok().as_deref(),
+            std::env::var("TRUST_JS_DIAGNOSTIC_INIT").ok().as_deref(),
             &mut page.outcome.errors,
         );
         for timing in &env.resource_timings {
@@ -4009,7 +4012,7 @@ mod desktop {
     /// loop and its frontend: its initial `about:blank` Document's first
     /// rendering is its own frontend's first event, and its opener's frontend
     /// learns of it (`PageEvt::OpenAuxiliary`), which presents it.
-    fn adopt_created_traversables(page: &mut LumenPage) {
+    fn adopt_created_traversables(page: &mut TrustJsPage) {
         let created = match page.engine.ctx().host_mut::<HostState>() {
             Some(state) if !state.traversables.created.is_empty() => {
                 std::mem::take(&mut state.traversables.created)
@@ -4080,7 +4083,7 @@ mod desktop {
             });
             select_traversable(page, previous);
             let auxiliary = crate::js::AuxiliaryTraversable {
-                handle: PageHandle::from_lumen_parts(cmd_tx, interaction_tx, hover_tx, link),
+                handle: PageHandle::from_trust_js_parts(cmd_tx, interaction_tx, hover_tx, link),
                 events: event_rx,
                 name: created.name,
                 popup: created.popup,
@@ -4099,7 +4102,7 @@ mod desktop {
 
     /// The Agent's clock, which every Window Realm's timers are kept in
     /// (`trust.now()` of any traversable's top-level Realm).
-    fn agent_time(page: &mut LumenPage) -> f64 {
+    fn agent_time(page: &mut TrustJsPage) -> f64 {
         trust_number(page, "now").unwrap_or(0.0)
     }
 
@@ -4108,10 +4111,10 @@ mod desktop {
     /// Window `context` before its platform bootstrap reads `config` (a
     /// `main_window_config` script). It is entered on return.
     fn create_top_level_realm(
-        engine: &mut lumen::Engine,
+        engine: &mut trust_js::Engine,
         context: u64,
         config: &str,
-    ) -> Result<(Value, lumen::RealmEntry), String> {
+    ) -> Result<(Value, trust_js::RealmEntry), String> {
         // Realm creation and bootstrap form one publication: no collection
         // may see a partially initialized set of intrinsics.
         engine.ctx().suspend_gc();
@@ -4121,7 +4124,7 @@ mod desktop {
         }
         let installed = engine.ctx().with_embed_realm(&realm, |realm_ctx| {
             realm_ctx.set_host_job_context(context);
-            for &(name, len, host_fn) in LUMEN_HOST_FUNCTIONS {
+            for &(name, len, host_fn) in TRUST_JS_HOST_FUNCTIONS {
                 realm_ctx.define_embed_global(name, len, host_fn);
             }
         });
@@ -4167,7 +4170,7 @@ mod desktop {
     /// The selected traversable's runnable work at Agent time `now`, arming
     /// or dropping its rendering deadline on the way.
     fn plan_turn(
-        page: &mut LumenPage,
+        page: &mut TrustJsPage,
         index: usize,
         now: f64,
         interaction_burst: bool,
@@ -4235,7 +4238,7 @@ mod desktop {
 
     /// The traversables in this turn's order: whose turn is first rotates,
     /// so that one traversable's stream of work cannot exclude another's.
-    fn turn_order(page: &LumenPage) -> impl Iterator<Item = usize> + Clone + use<> {
+    fn turn_order(page: &TrustJsPage) -> impl Iterator<Item = usize> + Clone + use<> {
         let count = page.traversables.len();
         let first = page.rotation % count.max(1);
         (0..count).map(move |offset| (first + offset) % count)
@@ -4243,7 +4246,7 @@ mod desktop {
 
     /// The traversable at `index`'s queued interaction, the one taken ahead
     /// of its turn first.
-    fn take_interaction(page: &mut LumenPage, index: usize) -> Option<PageCmd> {
+    fn take_interaction(page: &mut TrustJsPage, index: usize) -> Option<PageCmd> {
         let lookahead = if index == page.selected {
             page.interaction_lookahead.take()
         } else {
@@ -4266,7 +4269,7 @@ mod desktop {
     }
 
     fn take_any_interaction(
-        page: &mut LumenPage,
+        page: &mut TrustJsPage,
         order: impl Iterator<Item = usize>,
     ) -> Option<(usize, PageCmd)> {
         for index in order {
@@ -4278,7 +4281,7 @@ mod desktop {
     }
 
     fn take_any_hover(
-        page: &mut LumenPage,
+        page: &mut TrustJsPage,
         order: impl Iterator<Item = usize>,
     ) -> Option<(usize, PageHover)> {
         for index in order {
@@ -4294,7 +4297,10 @@ mod desktop {
 
     /// A queued browser command: the group's first (a Document the
     /// frontend's navigation brought), then each traversable's in turn.
-    fn take_any_command(page: &mut LumenPage, order: impl Iterator<Item = usize>) -> Option<Wake> {
+    fn take_any_command(
+        page: &mut TrustJsPage,
+        order: impl Iterator<Item = usize>,
+    ) -> Option<Wake> {
         if let Some(command) = page
             .group_commands
             .as_mut()
@@ -4314,7 +4320,7 @@ mod desktop {
     }
 
     /// Whether a frontend has input waiting for any traversable.
-    fn input_waiting(page: &LumenPage) -> bool {
+    fn input_waiting(page: &TrustJsPage) -> bool {
         page.interaction_lookahead.is_some()
             || page.traversables.iter().any(|slot| {
                 slot.parked
@@ -4328,7 +4334,7 @@ mod desktop {
     }
 
     /// The rendering deadline of the traversable at `index`.
-    fn render_deadline_of(page: &LumenPage, index: usize) -> Option<Instant> {
+    fn render_deadline_of(page: &TrustJsPage, index: usize) -> Option<Instant> {
         if index == page.selected {
             page.render_deadline
         } else {
@@ -4344,7 +4350,7 @@ mod desktop {
     enum Ready {
         Interaction(usize, Option<PageCmd>),
         Hover(usize, bool),
-        Host(Option<LumenHostTask>),
+        Host(Option<TrustJsHostTask>),
         Cmd(usize, Option<PageCmd>),
         Group(Option<crate::js::GroupCmd>),
         Timeout,
@@ -4355,7 +4361,7 @@ mod desktop {
     /// event loop's own selection does.
     async fn wait_for_work(
         traversables: &mut [TraversableSlot],
-        host_rx: &mut tokio::sync::mpsc::UnboundedReceiver<LumenHostTask>,
+        host_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TrustJsHostTask>,
         mut group_commands: Option<&mut tokio::sync::mpsc::UnboundedReceiver<crate::js::GroupCmd>>,
         wait: Option<Duration>,
     ) -> Ready {
@@ -4421,7 +4427,7 @@ mod desktop {
     }
 
     /// Finish the selected traversable's turn (`finish_internal_task`).
-    fn finish_selected(page: &mut LumenPage) -> bool {
+    fn finish_selected(page: &mut TrustJsPage) -> bool {
         match selected_events(page) {
             Some(events) => finish_internal_task(page, &events),
             None => true,
@@ -4432,7 +4438,7 @@ mod desktop {
     /// `except`, whose turn its task finished: the Windows of a browsing
     /// context group reach each other's Documents synchronously, so any task
     /// may have changed any of them. Returns those whose frontend went away.
-    fn finish_traversables(page: &mut LumenPage, except: Option<usize>) -> Vec<usize> {
+    fn finish_traversables(page: &mut TrustJsPage, except: Option<usize>) -> Vec<usize> {
         let mut ended = Vec::new();
         for index in 0..page.traversables.len() {
             if Some(index) == except || page.traversables[index].channels.is_none() {
@@ -4447,7 +4453,7 @@ mod desktop {
     }
 
     /// Run a host task with the traversable it belongs to selected.
-    fn dispatch_page_host_task(page: &mut LumenPage, task: LumenHostTask) {
+    fn dispatch_page_host_task(page: &mut TrustJsPage, task: TrustJsHostTask) {
         if page.traversables.len() > 1 {
             let target = page
                 .engine
@@ -4465,7 +4471,7 @@ mod desktop {
 
     /// The frontend of the Document of the traversable at `index` went away:
     /// it unloaded, or its frontend let it go. Whether the actor goes on.
-    fn end_document_frontend(page: &mut LumenPage, index: usize) -> bool {
+    fn end_document_frontend(page: &mut TrustJsPage, index: usize) -> bool {
         // An engine that never had a second traversable ends with its first
         // Document's frontend, as a page actor always has; so does one whose
         // engine failed.
@@ -4487,15 +4493,15 @@ mod desktop {
     /// one Agent, one event loop, each traversable's Documents with their own
     /// frontend, rendering opportunities and lifecycle.
     fn run_event_loop(
-        page: &mut LumenPage,
-        host_tasks: &tokio::sync::mpsc::UnboundedSender<LumenHostTask>,
-        host_rx: &mut tokio::sync::mpsc::UnboundedReceiver<LumenHostTask>,
-        interrupt: &Arc<lumen::RuntimeInterrupt>,
+        page: &mut TrustJsPage,
+        host_tasks: &tokio::sync::mpsc::UnboundedSender<TrustJsHostTask>,
+        host_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TrustJsHostTask>,
+        interrupt: &Arc<trust_js::RuntimeInterrupt>,
     ) {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
-            .expect("trust Lumen page actor runtime");
+            .expect("trust TRust JS page actor runtime");
         let wall_origin = Instant::now();
         let mut virtual_origin = trust_number(page, "now").unwrap_or(0.0);
         // HTML leaves selection among task queues to the user agent. Alternate a ready normal
@@ -4522,7 +4528,7 @@ mod desktop {
         'event_loop: loop {
             if matches!(
                 interrupt.current_reason(),
-                Some(lumen::InterruptReason::Cancelled)
+                Some(trust_js::InterruptReason::Cancelled)
             ) || page.traversables.is_empty()
             {
                 break;
@@ -4537,7 +4543,7 @@ mod desktop {
                 page.engine.collect_pending_task_garbage();
                 if page.task_trace.is_some() {
                     eprintln!(
-                        "lumen: deferred collection elapsed={:.3}s",
+                        "trust-js: deferred collection elapsed={:.3}s",
                         started.elapsed().as_secs_f64()
                     );
                 }
@@ -4759,7 +4765,7 @@ mod desktop {
             let wake = match immediate {
                 Some(wake) => wake,
                 None => {
-                    // Lumen's forced host collection is an idle hook, not a task-
+                    // TRust JS's forced host collection is an idle hook, not a task-
                     // boundary hook. A future timer/animation-frame deadline means
                     // the realm still has active work; allocation-triggered task
                     // checks retain responsibility there. Forcing a full tracing
@@ -4966,12 +4972,12 @@ mod desktop {
                         let queues = call_trust(page, "taskQueueState", &[], "task trace")
                             .map(|value| value_string(&mut page.engine, &value))
                             .unwrap_or_else(|| String::from("unavailable"));
-                        eprintln!("lumen: platform task begin queues={queues}");
+                        eprintln!("trust-js: platform task begin queues={queues}");
                     }
                     let ran = call_trust(page, "runPlatformTask", &[], "platform task")
                         .is_some_and(|value| page.engine.ctx().to_boolean(&value));
                     if page.task_trace.is_some() {
-                        eprintln!("lumen: platform task end ran={ran}");
+                        eprintln!("trust-js: platform task end ran={ran}");
                     }
                     if ran && let Some(trace) = page.task_trace.as_mut() {
                         trace.platform_tasks += 1;
@@ -5018,7 +5024,7 @@ mod desktop {
                             .map(|value| value_string(&mut page.engine, &value))
                             .unwrap_or_else(|| String::from("unavailable"));
                         eprintln!(
-                            "lumen: timer task begin deadline={real_now:.3} animation_frame={animation_frame} queues={queues}"
+                            "trust-js: timer task begin deadline={real_now:.3} animation_frame={animation_frame} queues={queues}"
                         );
                     }
                     let timer_started = Instant::now();
@@ -5035,7 +5041,7 @@ mod desktop {
                     };
                     if page.task_trace.is_some() {
                         eprintln!(
-                            "lumen: timer task end ran={ran} elapsed={:.3}s",
+                            "trust-js: timer task end ran={ran} elapsed={:.3}s",
                             timer_started.elapsed().as_secs_f64()
                         );
                     }
@@ -5191,7 +5197,7 @@ mod desktop {
     /// now (at the frame cadence) while an unthrottled animation runs, or
     /// when a running animation next starts or ends.
     fn css_animation_wake(
-        page: &mut LumenPage,
+        page: &mut TrustJsPage,
         schedule: &mut AnimationSchedule,
     ) -> Option<Instant> {
         if page.hidden {
@@ -5282,7 +5288,7 @@ mod desktop {
     /// Repaint the current retained fragments for a paint-only animation
     /// frame, keeping every other product of the previous presentation.
     /// `None` when the retained geometry no longer describes the document.
-    fn repaint_animation_frame(page: &mut LumenPage) -> Option<crate::http::RenderedPage> {
+    fn repaint_animation_frame(page: &mut TrustJsPage) -> Option<crate::http::RenderedPage> {
         let (cache, images) = {
             let state = page.engine.ctx().host_mut::<HostState>()?;
             (state.geom_cache.clone(), state.images.clone())
@@ -5328,7 +5334,7 @@ mod desktop {
             .clamp(INPUT_BURST_BUDGET, Duration::from_millis(100))
     }
 
-    fn defer_expensive_rendering(page: &mut LumenPage, started: Instant) -> Instant {
+    fn defer_expensive_rendering(page: &mut TrustJsPage, started: Instant) -> Instant {
         // HTML #rendering-opportunity is implementation-defined. Reserve time
         // comparable to the preceding frame for other task sources, bounded
         // so background changes still become visible. Native input retains
@@ -5364,12 +5370,12 @@ mod desktop {
     fn load_page(
         html: &str,
         env: PageEnv,
-        host_tasks: tokio::sync::mpsc::UnboundedSender<LumenHostTask>,
-        host_rx: &mut tokio::sync::mpsc::UnboundedReceiver<LumenHostTask>,
+        host_tasks: tokio::sync::mpsc::UnboundedSender<TrustJsHostTask>,
+        host_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TrustJsHostTask>,
         events: Option<&tokio::sync::mpsc::Sender<PageEvt>>,
-        interrupt: Arc<lumen::RuntimeInterrupt>,
-        warm: Option<lumen::Engine>,
-    ) -> Result<LumenPage, Outcome> {
+        interrupt: Arc<trust_js::RuntimeInterrupt>,
+        warm: Option<trust_js::Engine>,
+    ) -> Result<TrustJsPage, Outcome> {
         let mut outcome = Outcome::default();
         let parsed = parse_navigation_document(html, &env, None);
         if parsed.inert(&env) {
@@ -5410,7 +5416,7 @@ mod desktop {
         }
         // Inline and data-backed module scripts use the HTML task queue even when this document
         // has no network runtime. Keep that local task source independent of `enable_network`.
-        state.task_events = Some(LumenTaskSender::Page(host_tasks.clone()));
+        state.task_events = Some(TrustJsTaskSender::Page(host_tasks.clone()));
         if let Some(handle) = env.net.clone() {
             state.enable_network(
                 response_url.clone(),
@@ -5421,10 +5427,10 @@ mod desktop {
             state.base = base.clone();
         }
 
-        // Keep Lumen's release tiering policy for browser workloads. In particular, compiling
+        // Keep TRust JS's release tiering policy for browser workloads. In particular, compiling
         // every function on its first call is useful for a hot synthetic loop but makes framework
-        // startup pay native-code generation for large numbers of one-shot functions. Lumen's
-        // LUMEN_TIER and LUMEN_TIER_THRESHOLD diagnostics remain available through Engine::new.
+        // startup pay native-code generation for large numbers of one-shot functions. TRust JS's
+        // TRUST_JS_TIER and TRUST_JS_TIER_THRESHOLD diagnostics remain available through Engine::new.
         // A claimed spare engine was built from this same interrupt on this thread; its default
         // Realm is still untouched, and everything below is applied to it exactly as to a new one.
         let mut engine = match warm {
@@ -5432,7 +5438,7 @@ mod desktop {
                 debug_assert!(Arc::ptr_eq(&engine.interrupt_handle(), &interrupt));
                 engine
             }
-            None => lumen::Engine::new_with_interrupt(interrupt),
+            None => trust_js::Engine::new_with_interrupt(interrupt),
         };
         let engine_clock = clock.clone();
         engine.set_wall_clock(move || engine_clock.now_ms());
@@ -5489,7 +5495,7 @@ mod desktop {
         // have initialized (WHATWG HTML "the end", snapshot e5071a20c856).
         eval_main_page_diagnostic_init(
             &mut engine,
-            std::env::var("TRUST_LUMEN_DIAGNOSTIC_INIT").ok().as_deref(),
+            std::env::var("TRUST_JS_DIAGNOSTIC_INIT").ok().as_deref(),
             &mut outcome.errors,
         );
 
@@ -5500,7 +5506,7 @@ mod desktop {
         }
 
         let started = Instant::now();
-        let mut page = LumenPage {
+        let mut page = TrustJsPage {
             engine,
             dom,
             base,
@@ -5531,7 +5537,7 @@ mod desktop {
             animation_schedule: AnimationSchedule::default(),
             interaction_lookahead: None,
             task_trace: ActorTaskTrace::enabled(),
-            engine_metrics: lumen::PerformanceMetricsSampler::from_env(),
+            engine_metrics: trust_js::PerformanceMetricsSampler::from_env(),
             // The page actor gives the first traversable its frontend.
             traversables: vec![TraversableSlot {
                 id: TraversableId::default(),
@@ -5690,11 +5696,11 @@ mod desktop {
     /// went away while the parser waited.
     #[allow(clippy::too_many_arguments)]
     fn run_document_parser(
-        page: &mut LumenPage,
+        page: &mut TrustJsPage,
         html: &str,
         env: &PageEnv,
-        host_tasks: &tokio::sync::mpsc::UnboundedSender<LumenHostTask>,
-        host_rx: &mut tokio::sync::mpsc::UnboundedReceiver<LumenHostTask>,
+        host_tasks: &tokio::sync::mpsc::UnboundedSender<TrustJsHostTask>,
+        host_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TrustJsHostTask>,
         events: Option<&tokio::sync::mpsc::Sender<PageEvt>>,
         scripts: Vec<usize>,
         parser_watermark: usize,
@@ -5711,7 +5717,7 @@ mod desktop {
         let host_tasks = host_tasks.clone();
         let report: Arc<dyn Fn(crate::performance::ResourceTiming) + Send + Sync> =
             Arc::new(move |timing| {
-                let _ = host_tasks.send(LumenHostTask::ParserResourceTiming {
+                let _ = host_tasks.send(TrustJsHostTask::ParserResourceTiming {
                     traversable,
                     timing,
                 });
@@ -5829,7 +5835,7 @@ mod desktop {
                 let dom = page.dom.borrow();
                 (
                     dom.attr(node, "src").map(str::to_string),
-                    // Script source is text for Lumen's source entry points.
+                    // Script source is text for TRust JS's source entry points.
                     dom_text_out(&dom.text_content(node)).into_owned(),
                     dom.attr(node, "type").map(str::to_string),
                 )
@@ -5910,7 +5916,7 @@ mod desktop {
                     page.engine.ctx(),
                     node,
                     src.to_string(),
-                    LumenResourceKind::ClassicScript,
+                    TrustJsResourceKind::ClassicScript,
                     result,
                     true,
                 );
@@ -5970,7 +5976,7 @@ mod desktop {
     /// pending through document.write() ahead of the remaining source
     /// scripts, in tree order, retaining their identity like source scripts.
     fn take_written_scripts(
-        page: &mut LumenPage,
+        page: &mut TrustJsPage,
         queue: &mut std::collections::VecDeque<(usize, bool)>,
         leases: &mut Vec<DomResourceLease>,
     ) {
@@ -5995,7 +6001,7 @@ mod desktop {
         }
     }
 
-    fn parser_aborted(page: &mut LumenPage) -> bool {
+    fn parser_aborted(page: &mut TrustJsPage) -> bool {
         page.engine
             .ctx()
             .host_mut::<HostState>()
@@ -6004,7 +6010,7 @@ mod desktop {
 
     /// Discard the queued completions of parser scripts the aborted parser
     /// will never execute (HTML #abort-a-document step 2).
-    fn abandon_parser_scripts(page: &mut LumenPage, nodes: impl IntoIterator<Item = usize>) {
+    fn abandon_parser_scripts(page: &mut TrustJsPage, nodes: impl IntoIterator<Item = usize>) {
         if let Some(state) = page.engine.ctx().host_mut::<HostState>() {
             state.parser.abandoned.extend(nodes);
         }
@@ -6014,7 +6020,7 @@ mod desktop {
     /// `before` (all of them at the end of parsing), in token order. Their
     /// selection and fetch run in this step's microtask checkpoint.
     fn process_parser_images(
-        page: &mut LumenPage,
+        page: &mut TrustJsPage,
         images: &mut std::collections::VecDeque<usize>,
         before: Option<usize>,
     ) {
@@ -6038,7 +6044,7 @@ mod desktop {
     /// the script `before` (all of them at the end of parsing): those whose
     /// start tag precedes it and that do not contain it.
     fn process_parser_media(
-        page: &mut LumenPage,
+        page: &mut TrustJsPage,
         media: &mut std::collections::VecDeque<usize>,
         before: Option<usize>,
     ) {
@@ -6068,7 +6074,7 @@ mod desktop {
     /// Process the parser-inserted links that precede `before` (all of them
     /// at the end of parsing) in token order.
     fn process_parser_links(
-        page: &mut LumenPage,
+        page: &mut TrustJsPage,
         links: &mut std::collections::VecDeque<usize>,
         before: Option<usize>,
     ) {
@@ -6086,7 +6092,7 @@ mod desktop {
     /// (or, for a sheet that could not be obtained, `error`) as a resource
     /// task that delays the load event. A preload link starts its fetch
     /// (#link-type-preload). An earlier script may have detached the link.
-    fn process_parser_link(page: &mut LumenPage, node: usize) {
+    fn process_parser_link(page: &mut TrustJsPage, node: usize) {
         // HTML #update-a-style-block for a parser-inserted style element: the
         // platform fires its load event once its critical subresources (the
         // imports navigation already fetched) are obtained.
@@ -6112,7 +6118,7 @@ mod desktop {
                 page.engine.ctx(),
                 node,
                 href,
-                LumenResourceKind::ParsedStylesheet { obtained },
+                TrustJsResourceKind::ParsedStylesheet { obtained },
                 None,
                 true,
             );
@@ -6143,10 +6149,10 @@ mod desktop {
     /// tasks, timers and platform tasks remain runnable. Waiting parks the
     /// actor, and closing its event receiver cancels a pending parser wait.
     struct ParserTasks<'a> {
-        receiver: &'a mut tokio::sync::mpsc::UnboundedReceiver<LumenHostTask>,
+        receiver: &'a mut tokio::sync::mpsc::UnboundedReceiver<TrustJsHostTask>,
         events: Option<&'a tokio::sync::mpsc::Sender<PageEvt>>,
         deferred: HashSet<usize>,
-        ready: HashMap<usize, LumenHostTask>,
+        ready: HashMap<usize, TrustJsHostTask>,
         runtime: Option<tokio::runtime::Runtime>,
         wall_origin: Instant,
         virtual_origin: f64,
@@ -6155,9 +6161,9 @@ mod desktop {
 
     impl<'a> ParserTasks<'a> {
         fn new(
-            receiver: &'a mut tokio::sync::mpsc::UnboundedReceiver<LumenHostTask>,
+            receiver: &'a mut tokio::sync::mpsc::UnboundedReceiver<TrustJsHostTask>,
             events: Option<&'a tokio::sync::mpsc::Sender<PageEvt>>,
-            page: &mut LumenPage,
+            page: &mut TrustJsPage,
         ) -> Self {
             Self {
                 receiver,
@@ -6174,21 +6180,21 @@ mod desktop {
         /// Run a host task while the parser waits. It may belong to another
         /// traversable, whose Documents' tasks run meanwhile; the parser's
         /// own is selected again afterwards.
-        fn dispatch(page: &mut LumenPage, task: LumenHostTask) {
+        fn dispatch(page: &mut TrustJsPage, task: TrustJsHostTask) {
             let parsing = page.selected;
             dispatch_page_host_task(page, task);
             checkpoint(page, "parser networking task");
             select_traversable(page, parsing);
         }
 
-        fn execute_when_ready(&mut self, page: &mut LumenPage, node: usize) -> bool {
+        fn execute_when_ready(&mut self, page: &mut TrustJsPage, node: usize) -> bool {
             if let Some(task) = self.ready.remove(&node) {
                 self.deferred.remove(&node);
                 Self::dispatch(page, task);
                 return true;
             }
             while let Some(task) = self.next(page) {
-                if let LumenHostTask::ResourceDone { node_id, .. } = &task {
+                if let TrustJsHostTask::ResourceDone { node_id, .. } = &task {
                     if *node_id == node {
                         self.deferred.remove(&node);
                         if parser_aborted(page) {
@@ -6214,7 +6220,7 @@ mod desktop {
             false
         }
 
-        fn next(&mut self, page: &mut LumenPage) -> Option<LumenHostTask> {
+        fn next(&mut self, page: &mut TrustJsPage) -> Option<TrustJsHostTask> {
             loop {
                 if self.events.is_some_and(|events| events.is_closed())
                     || !has_pending_host_work(page)
@@ -6256,7 +6262,7 @@ mod desktop {
                 });
                 // A host task (`None` once the frontend has gone), or the
                 // next timer's turn.
-                let wake: Option<Option<LumenHostTask>> = runtime.block_on(async {
+                let wake: Option<Option<TrustJsHostTask>> = runtime.block_on(async {
                     tokio::select! {
                         biased;
                         () = async {
@@ -6278,14 +6284,14 @@ mod desktop {
         }
     }
 
-    fn pending_resources(page: &mut LumenPage) -> usize {
+    fn pending_resources(page: &mut TrustJsPage) -> usize {
         page.engine
             .ctx()
             .host_mut::<HostState>()
             .map_or(0, |state| state.pending_resources)
     }
 
-    fn has_pending_host_work(page: &mut LumenPage) -> bool {
+    fn has_pending_host_work(page: &mut TrustJsPage) -> bool {
         page.engine
             .ctx()
             .host_mut::<HostState>()
@@ -6302,7 +6308,7 @@ mod desktop {
                             || network
                                 .body_streams
                                 .values()
-                                .any(LumenBodyStream::transferring)
+                                .any(TrustJsBodyStream::transferring)
                     })
             })
     }
@@ -6311,7 +6317,7 @@ mod desktop {
     /// resident work (see `has_resident_work`) and nothing to interact with,
     /// with its final rendering. Interaction is examined only after the
     /// cheaper conditions, and the rendering only after both.
-    fn retire_if_inert(page: &mut LumenPage) -> Option<PageEvt> {
+    fn retire_if_inert(page: &mut TrustJsPage) -> Option<PageEvt> {
         if has_resident_work(page, false) {
             return None;
         }
@@ -6335,7 +6341,7 @@ mod desktop {
         })
     }
 
-    fn has_resident_work(page: &mut LumenPage, has_interaction: bool) -> bool {
+    fn has_resident_work(page: &mut TrustJsPage, has_interaction: bool) -> bool {
         if has_interaction
             || page.dom.borrow().css_transition_work_pending()
             || page.dom.borrow().css_animations_keep_alive()
@@ -6362,7 +6368,7 @@ mod desktop {
                             || network
                                 .body_streams
                                 .values()
-                                .any(LumenBodyStream::transferring)
+                                .any(TrustJsBodyStream::transferring)
                     })
                     || state
                         .websockets
@@ -6397,14 +6403,14 @@ mod desktop {
     /// microtask checkpoint. Ordinary page tasks do not have a host-imposed
     /// wall-clock deadline; navigation and document teardown use their own
     /// explicit interrupt paths.
-    fn prepare_unbounded_task(interrupt: &Arc<lumen::RuntimeInterrupt>) {
+    fn prepare_unbounded_task(interrupt: &Arc<trust_js::RuntimeInterrupt>) {
         interrupt.set_deadline(None);
     }
 
     /// Evaluate `source` in the page as a task (tests drive pages this way; the
     /// browser reaches the prelude only through `platform_control`).
     #[cfg(test)]
-    fn evaluate_task(page: &mut LumenPage, source: &str, label: &str) -> Option<Value> {
+    fn evaluate_task(page: &mut TrustJsPage, source: &str, label: &str) -> Option<Value> {
         let evaluated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             page.engine.eval_value_interruptible(source)
         }));
@@ -6424,7 +6430,7 @@ mod desktop {
             Err(_) => {
                 page.outcome
                     .errors
-                    .push(format!("{label}: Lumen engine panic — page JS halted"));
+                    .push(format!("{label}: TRust JS engine panic — page JS halted"));
                 page.outcome.panicked = true;
                 None
             }
@@ -6432,7 +6438,7 @@ mod desktop {
     }
 
     /// One-shot transforms settle every task source before serializing.
-    fn set_one_shot(page: &mut LumenPage) {
+    fn set_one_shot(page: &mut TrustJsPage) {
         if let Ok(trust) = platform_control(page.engine.ctx()) {
             let _ = page
                 .engine
@@ -6442,7 +6448,7 @@ mod desktop {
     }
 
     fn engine_call_trust(
-        engine: &mut lumen::Engine,
+        engine: &mut trust_js::Engine,
         name: &str,
         args: &[Value],
     ) -> Result<Value, EvalError> {
@@ -6454,7 +6460,12 @@ mod desktop {
         engine.call_function_interruptible(&function, trust, args)
     }
 
-    fn call_trust(page: &mut LumenPage, name: &str, args: &[Value], label: &str) -> Option<Value> {
+    fn call_trust(
+        page: &mut TrustJsPage,
+        name: &str,
+        args: &[Value],
+        label: &str,
+    ) -> Option<Value> {
         let started = page.task_trace.as_ref().map(|_| Instant::now());
         let called = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             engine_call_trust(&mut page.engine, name, args)
@@ -6463,7 +6474,7 @@ mod desktop {
             && started.elapsed() >= Duration::from_millis(10)
         {
             eprintln!(
-                "lumen: {name} elapsed={:.3}s",
+                "trust-js: {name} elapsed={:.3}s",
                 started.elapsed().as_secs_f64()
             );
         }
@@ -6476,14 +6487,14 @@ mod desktop {
             Err(_) => {
                 page.outcome
                     .errors
-                    .push(format!("{label}: Lumen engine panic — page JS halted"));
+                    .push(format!("{label}: TRust JS engine panic — page JS halted"));
                 page.outcome.panicked = true;
                 None
             }
         }
     }
 
-    fn dispatch_timer_task(page: &mut LumenPage, deadline: f64, label: &str) -> bool {
+    fn dispatch_timer_task(page: &mut TrustJsPage, deadline: f64, label: &str) -> bool {
         let dispatched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             dispatch_timer_task_to(&mut page.engine, deadline)
         }));
@@ -6496,17 +6507,17 @@ mod desktop {
             Err(_) => {
                 page.outcome
                     .errors
-                    .push(format!("{label}: Lumen engine panic — page JS halted"));
+                    .push(format!("{label}: TRust JS engine panic — page JS halted"));
                 page.outcome.panicked = true;
                 false
             }
         }
     }
 
-    fn record_eval_error(page: &mut LumenPage, error: EvalError, label: &str) {
+    fn record_eval_error(page: &mut TrustJsPage, error: EvalError, label: &str) {
         match error {
-            EvalError::Interrupted(lumen::InterruptReason::UserNavigation) => {}
-            EvalError::Interrupted(lumen::InterruptReason::Cancelled) => {}
+            EvalError::Interrupted(trust_js::InterruptReason::UserNavigation) => {}
+            EvalError::Interrupted(trust_js::InterruptReason::Cancelled) => {}
             EvalError::Interrupted(reason) => page
                 .outcome
                 .errors
@@ -6528,7 +6539,7 @@ mod desktop {
     /// the synchronous part in each image's node document's Realm before this
     /// checkpoint performs those microtasks. Images of a Document without a
     /// browsing context (DOMParser, inert documents) wait (not fully active).
-    fn start_created_images(page: &mut LumenPage) {
+    fn start_created_images(page: &mut TrustJsPage) {
         if !page.dom.borrow().has_created_images() {
             return;
         }
@@ -6601,14 +6612,14 @@ mod desktop {
     /// HTML's popover and dialog removing steps and Fullscreen API
     /// #removing-steps, for top-layer elements the arena saw leave their
     /// Document during the task (see `Dom::take_top_layer_removals`).
-    fn sync_top_layer_removals(page: &mut LumenPage) {
+    fn sync_top_layer_removals(page: &mut TrustJsPage) {
         if !page.dom.borrow().has_top_layer_removals() {
             return;
         }
         let _ = call_trust(page, "syncTopLayerRemovals", &[], "top layer removals");
     }
 
-    fn checkpoint(page: &mut LumenPage, label: &str) {
+    fn checkpoint(page: &mut TrustJsPage, label: &str) {
         let started = Instant::now();
         sync_top_layer_removals(page);
         let mut completed = false;
@@ -6623,7 +6634,8 @@ mod desktop {
             if let Err(reason) = checkpoint
                 && !matches!(
                     reason,
-                    lumen::InterruptReason::UserNavigation | lumen::InterruptReason::Cancelled
+                    trust_js::InterruptReason::UserNavigation
+                        | trust_js::InterruptReason::Cancelled
                 )
             {
                 page.outcome.errors.push(format!(
@@ -6649,17 +6661,17 @@ mod desktop {
             && let Some(sampler) = page.engine_metrics.as_mut()
             && let Some(metrics) = sampler.maybe_dump(&mut page.engine)
         {
-            eprintln!("lumen: engine-metrics: {metrics}");
+            eprintln!("trust-js: engine-metrics: {metrics}");
         }
         if page.task_trace.is_some() && started.elapsed() >= Duration::from_millis(10) {
             eprintln!(
-                "lumen: {label} checkpoint elapsed={:.3}s",
+                "trust-js: {label} checkpoint elapsed={:.3}s",
                 started.elapsed().as_secs_f64()
             );
         }
     }
 
-    fn drain_diagnostics(page: &mut LumenPage) {
+    fn drain_diagnostics(page: &mut TrustJsPage) {
         #[cfg(feature = "architecture-diagnostics")]
         crate::dom::architecture_diagnostics::report();
         if let Some(state) = page.engine.ctx().host_mut::<HostState>() {
@@ -6715,30 +6727,33 @@ mod desktop {
         for (context, list) in rejections_by_context(handled) {
             notify_rejections_in_context(&mut page.engine, context, "notifyHandledPromises", list);
         }
-        if std::env::var_os("TRUST_LUMEN_TRACE").is_some() {
+        if std::env::var_os("TRUST_JS_TRACE").is_some() {
             for error in &page.outcome.errors[error_start..] {
-                eprintln!("lumen: {error}");
+                eprintln!("trust-js: {error}");
             }
             for message in &page.outcome.console[console_start..] {
-                eprintln!("lumen: console: {message}");
+                eprintln!("trust-js: console: {message}");
             }
         }
-        if let Ok(source) = std::env::var("TRUST_LUMEN_PROBE") {
+        if let Ok(source) = std::env::var("TRUST_JS_PROBE") {
             match page.engine.eval_value_interruptible(&source) {
                 Ok(Ok(value)) => {
-                    eprintln!("lumen: probe: {}", value_string(&mut page.engine, &value))
+                    eprintln!(
+                        "trust-js: probe: {}",
+                        value_string(&mut page.engine, &value)
+                    )
                 }
                 Ok(Err(EvalError::Throw(error))) => {
                     eprintln!(
-                        "lumen: probe threw: {}",
+                        "trust-js: probe threw: {}",
                         describe_throw(&mut page.engine, error, "probe")
                     );
                 }
                 Ok(Err(EvalError::Interrupted(reason))) => {
-                    eprintln!("lumen: probe interrupted: {}", reason.message());
+                    eprintln!("trust-js: probe interrupted: {}", reason.message());
                 }
                 Err(error) => eprintln!(
-                    "lumen: probe parse error at line {}: {}",
+                    "trust-js: probe parse error at line {}: {}",
                     error.line, error.message
                 ),
             }
@@ -6753,7 +6768,7 @@ mod desktop {
             });
     }
 
-    fn report_task_trace(page: &mut LumenPage) {
+    fn report_task_trace(page: &mut TrustJsPage) {
         let due = page
             .task_trace
             .as_ref()
@@ -6768,7 +6783,7 @@ mod desktop {
             return;
         };
         eprintln!(
-            "lumen: tasks {:.3}s turns={} interaction={} cmd={} hover={} host={} platform={}/{} idle={} timer={}/{} lifecycle={} finish={} dirty={} render={} updated={} queues={}",
+            "trust-js: tasks {:.3}s turns={} interaction={} cmd={} hover={} host={} platform={}/{} idle={} timer={}/{} lifecycle={} finish={} dirty={} render={} updated={} queues={}",
             trace.interval_started.elapsed().as_secs_f64(),
             trace.turns,
             trace.interactions,
@@ -6790,15 +6805,15 @@ mod desktop {
         trace.reset();
     }
 
-    fn trust_number(page: &mut LumenPage, name: &str) -> Option<f64> {
+    fn trust_number(page: &mut TrustJsPage, name: &str) -> Option<f64> {
         call_trust(page, name, &[], name).and_then(|value| value.as_num_opt())
     }
 
-    fn trust_bool(page: &mut LumenPage, name: &str) -> bool {
+    fn trust_bool(page: &mut TrustJsPage, name: &str) -> bool {
         call_trust(page, name, &[], name).is_some_and(|value| page.engine.ctx().to_boolean(&value))
     }
 
-    fn listener_ids(page: &mut LumenPage, name: &str) -> HashSet<usize> {
+    fn listener_ids(page: &mut TrustJsPage, name: &str) -> HashSet<usize> {
         let Some(value) = call_trust(page, name, &[], name) else {
             return HashSet::new();
         };
@@ -6811,7 +6826,7 @@ mod desktop {
             .collect()
     }
 
-    fn extract_live(page: &mut LumenPage) -> (String, crate::http::RenderedPage, bool) {
+    fn extract_live(page: &mut TrustJsPage) -> (String, crate::http::RenderedPage, bool) {
         let interaction = install_interaction_metadata(page);
         paint_live(page, interaction)
     }
@@ -6820,7 +6835,7 @@ mod desktop {
     /// and WebGL frames, SVG sprites, and the activation and hover hit-test
     /// sets. Returns the activation set and whether anything is interactive.
     fn install_interaction_metadata(
-        page: &mut LumenPage,
+        page: &mut TrustJsPage,
     ) -> (std::collections::HashSet<usize>, bool) {
         webgl_host::publish(page.engine.ctx(), true, None);
         // HTML #offscreencanvas-placeholder: this Window agent's rendering
@@ -6855,7 +6870,7 @@ mod desktop {
     /// Lay out (reusing the retained geometry) and paint the live document
     /// with the installed presentation metadata.
     fn paint_live(
-        page: &mut LumenPage,
+        page: &mut TrustJsPage,
         (clickable, has_interaction): (std::collections::HashSet<usize>, bool),
     ) -> (String, crate::http::RenderedPage, bool) {
         let (viewport, ratio, images) = page
@@ -6928,7 +6943,7 @@ mod desktop {
     /// or image-size reflows, so the body must be the settled DOM rather
     /// than the server's pre-script markup. Renders skip this serialization
     /// outside tests; an inert page pays it once, when its actor exits.
-    fn static_document_source(page: &LumenPage, rendered_html: String) -> String {
+    fn static_document_source(page: &TrustJsPage, rendered_html: String) -> String {
         if !rendered_html.is_empty() {
             return rendered_html;
         }
@@ -6943,7 +6958,7 @@ mod desktop {
     /// rendering update's script-observable steps run for it (resize and
     /// intersection observation); its layout still starts loading the
     /// resources it names, so the page is complete when shown.
-    fn render_for_frontend(page: &mut LumenPage) -> (String, crate::http::RenderedPage, bool) {
+    fn render_for_frontend(page: &mut TrustJsPage) -> (String, crate::http::RenderedPage, bool) {
         if !page.hidden {
             return render_with_observers(page);
         }
@@ -6955,7 +6970,7 @@ mod desktop {
         rendered
     }
 
-    fn render_with_observers(page: &mut LumenPage) -> (String, crate::http::RenderedPage, bool) {
+    fn render_with_observers(page: &mut TrustJsPage) -> (String, crate::http::RenderedPage, bool) {
         let _animation_sample = CssAnimationSample::new(page.engine.ctx());
         // HTML #update-the-rendering: style and layout, then the resize
         // observation rounds (each relayouts what its callbacks changed, as
@@ -6999,7 +7014,7 @@ mod desktop {
     /// present the rendering. An `img`'s own request comes from "update the
     /// image data"; requesting one here only covers an element whose request
     /// never started. Lazy images are not part of `image_sources`.
-    fn start_document_image_fetches(page: &mut LumenPage, rendered: &crate::http::RenderedPage) {
+    fn start_document_image_fetches(page: &mut TrustJsPage, rendered: &crate::http::RenderedPage) {
         let paint = &rendered.layout.paint;
         if rendered.image_sources.is_empty() && paint.image_requests.is_empty() {
             return;
@@ -7169,7 +7184,7 @@ mod desktop {
                 } else {
                     url
                 };
-                let _ = events.send(LumenHostTask::DocumentImageDone {
+                let _ = events.send(TrustJsHostTask::DocumentImageDone {
                     context,
                     url,
                     timing,
@@ -7189,7 +7204,7 @@ mod desktop {
     /// `<style>`, a CSSOM-inserted `@import`): each URL once, in no-cors
     /// mode, in the owner node's document and with its encoding as the
     /// environment encoding.
-    fn start_style_import_fetches(page: &mut LumenPage) {
+    fn start_style_import_fetches(page: &mut TrustJsPage) {
         let requests = page.dom.borrow().take_import_requests();
         if requests.is_empty() {
             return;
@@ -7240,7 +7255,7 @@ mod desktop {
                 let sheets =
                     crate::http::fetch_imported_sheet(url, client, Vec::new(), encoding, referrer)
                         .await;
-                let _ = events.send(LumenHostTask::StyleImportsDone {
+                let _ = events.send(TrustJsHostTask::StyleImportsDone {
                     traversable,
                     url: key,
                     sheets,
@@ -7255,7 +7270,7 @@ mod desktop {
     /// yet, with a CORS request in Anonymous mode from the referencing
     /// element's document. Its outcome, a network error included, is
     /// recorded once; the rendering then resolves the references again.
-    fn start_svg_resource_fetches(page: &mut LumenPage) {
+    fn start_svg_resource_fetches(page: &mut TrustJsPage) {
         let requests = page.dom.borrow().take_svg_resource_requests();
         if requests.is_empty() {
             return;
@@ -7327,7 +7342,7 @@ mod desktop {
                             .map(|response| (response.content_type.as_str(), &response.body[..])),
                     ),
                 );
-                let _ = events.send(LumenHostTask::SvgResourceDone);
+                let _ = events.send(TrustJsHostTask::SvgResourceDone);
             });
         }
     }
@@ -7335,7 +7350,7 @@ mod desktop {
     /// Referrer Policy #integration-with-css for a sheet owned by `owner`: a
     /// `<link>`'s sheet requests with its location (the link's URL), any other
     /// with its owner's document's URL, under that document's policy.
-    fn sheet_owner_referrer(page: &mut LumenPage, owner: usize) -> crate::http::SheetReferrer {
+    fn sheet_owner_referrer(page: &mut TrustJsPage, owner: usize) -> crate::http::SheetReferrer {
         let dom = page.dom.clone();
         let link = (dom.borrow().tag_name(owner) == Some("link"))
             .then(|| host_resource_url(page.engine.ctx(), owner, None))
@@ -7360,7 +7375,7 @@ mod desktop {
         }
     }
 
-    fn start_font_fetches(page: &mut LumenPage) {
+    fn start_font_fetches(page: &mut TrustJsPage) {
         let urls = page.dom.borrow().take_font_requests();
         if urls.is_empty() {
             return;
@@ -7403,7 +7418,7 @@ mod desktop {
                         .filter(|(winner, _)| *winner == name)
                         .map(|(_, bytes)| bytes)
                         .filter(|_| failure.is_none_or(|end| std::time::Instant::now() <= end));
-                    let _ = events.send(LumenHostTask::FontDone {
+                    let _ = events.send(TrustJsHostTask::FontDone {
                         traversable,
                         url: name,
                         bytes,
@@ -7412,7 +7427,7 @@ mod desktop {
                 continue;
             }
             if !crate::http::subresource_allowed(&client, &url) {
-                let _ = events.send(LumenHostTask::FontDone {
+                let _ = events.send(TrustJsHostTask::FontDone {
                     traversable,
                     url: name,
                     bytes: None,
@@ -7432,7 +7447,7 @@ mod desktop {
                     .ok()
                     .filter(|response| (200..300).contains(&response.status))
                     .map(|response| response.body.clone());
-                let _ = events.send(LumenHostTask::FontDone {
+                let _ = events.send(TrustJsHostTask::FontDone {
                     traversable,
                     url: name,
                     bytes,
@@ -7443,8 +7458,8 @@ mod desktop {
 
     /// SVG 2 §5.6: a same-origin external `<use href="sheet.svg#symbol">` obtains the external
     /// resource document before the use-element shadow tree can be rendered. Keep the resource
-    /// cache and request policy identical to the other required Lumen subresource paths.
-    fn prime_page_svg_sprites(page: &mut LumenPage) {
+    /// cache and request policy identical to the other required TRust JS subresource paths.
+    fn prime_page_svg_sprites(page: &mut TrustJsPage) {
         let urls = page
             .dom
             .borrow()
@@ -7510,7 +7525,7 @@ mod desktop {
         matches!(value, Value::Null | Value::Undefined | Value::Empty)
     }
 
-    fn value_to_string(page: &mut LumenPage, value: &Value) -> Option<String> {
+    fn value_to_string(page: &mut TrustJsPage, value: &Value) -> Option<String> {
         page.engine
             .ctx()
             .coerce_string(value)
@@ -7523,9 +7538,9 @@ mod desktop {
     // rendering-update sequence from HTML §8.1.7.3.
 
     fn dispatch_key_command(
-        page: &mut LumenPage,
+        page: &mut TrustJsPage,
         events: &tokio::sync::mpsc::Sender<PageEvt>,
-        interrupt: &Arc<lumen::RuntimeInterrupt>,
+        interrupt: &Arc<trust_js::RuntimeInterrupt>,
         node: Option<usize>,
         input: crate::core::KeyInput,
         edit_key: Option<Option<String>>,
@@ -7666,10 +7681,10 @@ mod desktop {
     }
 
     fn dispatch_command(
-        page: &mut LumenPage,
+        page: &mut TrustJsPage,
         command: PageCmd,
         events: &tokio::sync::mpsc::Sender<PageEvt>,
-        interrupt: &Arc<lumen::RuntimeInterrupt>,
+        interrupt: &Arc<trust_js::RuntimeInterrupt>,
     ) -> bool {
         match command {
             PageCmd::PointerLockResult { request, error } => {
@@ -8057,7 +8072,7 @@ mod desktop {
                 prepare_unbounded_task(interrupt);
                 let can_render = !matches!(&event, crate::ws::WsIn::Sent(_));
                 if let Err(error) =
-                    dispatch_host_task(&mut page.engine, LumenHostTask::WebSocket { id, event })
+                    dispatch_host_task(&mut page.engine, TrustJsHostTask::WebSocket { id, event })
                 {
                     page.outcome.errors.push(error);
                 }
@@ -8067,7 +8082,7 @@ mod desktop {
             PageCmd::Worker { id, event } => {
                 prepare_unbounded_task(interrupt);
                 if let Err(error) =
-                    dispatch_host_task(&mut page.engine, LumenHostTask::Worker { id, event })
+                    dispatch_host_task(&mut page.engine, TrustJsHostTask::Worker { id, event })
                 {
                     page.outcome.errors.push(error);
                 }
@@ -8363,7 +8378,7 @@ mod desktop {
     /// next `PageEvt::Selection`, and the prelude arguments naming the Text
     /// boundary point under the pointer (null and 0 where there is none).
     fn note_selection_gesture(
-        page: &mut LumenPage,
+        page: &mut TrustJsPage,
         metadata: crate::js::PointerMetadata,
     ) -> (Value, Value) {
         let Some(selection) = metadata.selection else {
@@ -8385,7 +8400,7 @@ mod desktop {
     /// changed, or the DOM changed under a selected range, report what the
     /// page's selections select (`Dom::add_selection_segments`). Unchanged
     /// reports are not sent again.
-    fn selection_report(page: &mut LumenPage) -> Option<crate::js::SelectionReport> {
+    fn selection_report(page: &mut TrustJsPage) -> Option<crate::js::SelectionReport> {
         let epoch = page.dom.borrow().epoch();
         let (dirty, serial, previous) = {
             let state = page.engine.ctx().host_mut::<HostState>()?;
@@ -8466,7 +8481,7 @@ mod desktop {
     }
 
     /// The frontend's focus of `node` (the document viewport when `None`).
-    fn run_focus(page: &mut LumenPage, node: Option<usize>) {
+    fn run_focus(page: &mut TrustJsPage, node: Option<usize>) {
         let _ = call_trust(
             page,
             "focusPage",
@@ -8479,7 +8494,7 @@ mod desktop {
     /// UI Events #handle-native-mouse-down / #handle-native-mouse-up for the
     /// frontend's button transition, with their Pointer Events mapping.
     fn run_pointer_button(
-        page: &mut LumenPage,
+        page: &mut TrustJsPage,
         node: Option<usize>,
         pressed: bool,
         x: f64,
@@ -8527,7 +8542,7 @@ mod desktop {
     /// share an ancestor), with the click's activation, else the release's
     /// own rendering update.
     fn finish_pointer_release(
-        page: &mut LumenPage,
+        page: &mut TrustJsPage,
         events: &tokio::sync::mpsc::Sender<PageEvt>,
     ) -> bool {
         let pending = call_trust(page, "pointerClickPending", &[], "pointer click")
@@ -8544,7 +8559,7 @@ mod desktop {
     /// pointer click target replaces it in the prelude), then the
     /// activation's navigation or form submission, ending the task.
     fn run_click(
-        page: &mut LumenPage,
+        page: &mut TrustJsPage,
         events: &tokio::sync::mpsc::Sender<PageEvt>,
         node: usize,
     ) -> bool {
@@ -8582,7 +8597,7 @@ mod desktop {
         true
     }
 
-    fn prepare_interaction(page: &mut LumenPage, interrupt: &Arc<lumen::RuntimeInterrupt>) {
+    fn prepare_interaction(page: &mut TrustJsPage, interrupt: &Arc<trust_js::RuntimeInterrupt>) {
         prepare_unbounded_task(interrupt);
         let _ = call_trust(page, "moResetGuard", &[], "mutation observer guard");
         let _ = page.dom.borrow_mut().take_dirty();
@@ -8625,7 +8640,7 @@ mod desktop {
     /// the always-correct fallback.
     #[cfg(test)]
     fn emit_boundary_patch(
-        page: &mut LumenPage,
+        page: &mut TrustJsPage,
         events: &tokio::sync::mpsc::Sender<PageEvt>,
     ) -> BoundaryPatchResult {
         let Some(mut targets) = page.dom.borrow_mut().take_dirty_targets() else {
@@ -8707,12 +8722,12 @@ mod desktop {
         )
     }
 
-    fn finish_task(page: &mut LumenPage, events: &tokio::sync::mpsc::Sender<PageEvt>) -> bool {
+    fn finish_task(page: &mut TrustJsPage, events: &tokio::sync::mpsc::Sender<PageEvt>) -> bool {
         finish_task_with_ack(page, events, true)
     }
 
     fn finish_task_with_ack(
-        page: &mut LumenPage,
+        page: &mut TrustJsPage,
         events: &tokio::sync::mpsc::Sender<PageEvt>,
         acknowledge_settle: bool,
     ) -> bool {
@@ -8720,7 +8735,7 @@ mod desktop {
     }
 
     fn finish_internal_task(
-        page: &mut LumenPage,
+        page: &mut TrustJsPage,
         events: &tokio::sync::mpsc::Sender<PageEvt>,
     ) -> bool {
         finish_task_maybe_render(page, events, false, false, false)
@@ -8732,7 +8747,7 @@ mod desktop {
     /// actual rendering opportunity (or a browser interaction that needs an
     /// immediate presentation acknowledgement) consumes `render_pending`.
     fn finish_task_maybe_render(
-        page: &mut LumenPage,
+        page: &mut TrustJsPage,
         events: &tokio::sync::mpsc::Sender<PageEvt>,
         acknowledge_settle: bool,
         render_now: bool,
@@ -8993,7 +9008,7 @@ mod desktop {
             let (html, rendered, _) = render_with_observers(page);
             if page.task_trace.is_some() && render_started.elapsed() >= Duration::from_millis(10) {
                 eprintln!(
-                    "lumen: rendering update elapsed={:.3}s boxes={} html={}B",
+                    "trust-js: rendering update elapsed={:.3}s boxes={} html={}B",
                     render_started.elapsed().as_secs_f64(),
                     rendered.layout.boxes.len(),
                     html.len()
@@ -9125,7 +9140,7 @@ mod desktop {
     /// for beforeunload listeners), and the page's requests to close (bit 6)
     /// or show (bit 7) its traversable.
     fn report_traversable_state(
-        page: &mut LumenPage,
+        page: &mut TrustJsPage,
         events: &tokio::sync::mpsc::Sender<PageEvt>,
     ) -> bool {
         let epoch = page.dom.borrow().epoch();
@@ -9188,7 +9203,7 @@ mod desktop {
         initiator: Option<Box<crate::http::NavigationInitiator>>,
     }
 
-    fn take_navigation(page: &mut LumenPage) -> Option<(String, NavigationAction)> {
+    fn take_navigation(page: &mut TrustJsPage) -> Option<(String, NavigationAction)> {
         let value = call_trust(page, "takeNavigationRequest", &[], "navigation")?;
         if value_is_nullish(&value) {
             return None;
@@ -9230,7 +9245,7 @@ mod desktop {
     /// submission. HTML #get-an-element's-noopener step 3 is decided here,
     /// where the navigation's `blob:` entry is resolved: an entry whose
     /// origin is not same site with the top-level origin forces noopener.
-    fn take_new_traversables(page: &mut LumenPage) -> Vec<crate::js::NewTraversable> {
+    fn take_new_traversables(page: &mut TrustJsPage) -> Vec<crate::js::NewTraversable> {
         let Some(value) = call_trust(page, "takeNewTraversablesJSON", &[], "new traversables")
             .filter(|value| !value_is_nullish(value))
         else {
@@ -9324,7 +9339,7 @@ mod desktop {
 
     /// HTML #following-hyperlinks-2: the hyperlink a click followed, as
     /// `[hyperlink referrer policy, its node document's settings context]`.
-    fn hyperlink_navigation(page: &mut LumenPage, url: String) -> (String, NavigationAction) {
+    fn hyperlink_navigation(page: &mut TrustJsPage, url: String) -> (String, NavigationAction) {
         let value = call_trust(page, "takeHyperlinkNavigation", &[], "hyperlink navigation")
             .filter(|value| !value_is_nullish(value));
         let (policy, context) = match value {
@@ -9366,7 +9381,7 @@ mod desktop {
     /// navigation obtains it without the partition check (File API
     /// #blob-url-obtain-object, Fetch #scheme-fetch).
     fn navigation_initiator(
-        page: &mut LumenPage,
+        page: &mut TrustJsPage,
         url: &str,
         policy: &str,
         context: u64,
@@ -9401,7 +9416,7 @@ mod desktop {
         }))
     }
 
-    fn take_history_updates(page: &mut LumenPage) -> Vec<(String, bool)> {
+    fn take_history_updates(page: &mut TrustJsPage) -> Vec<(String, bool)> {
         let Some(value) = call_trust(page, "takeHistoryUpdates", &[], "history update") else {
             return Vec::new();
         };
@@ -9412,7 +9427,7 @@ mod desktop {
     }
 
     fn send_navigation(
-        page: &mut LumenPage,
+        page: &mut TrustJsPage,
         events: &tokio::sync::mpsc::Sender<PageEvt>,
         url: String,
         action: NavigationAction,
@@ -9435,7 +9450,7 @@ mod desktop {
     /// submission to the frontend. Whether the actor goes on, or `None`
     /// when unloading was canceled and the page stays.
     fn send_submission(
-        page: &mut LumenPage,
+        page: &mut TrustJsPage,
         events: &tokio::sync::mpsc::Sender<PageEvt>,
         form: usize,
         submitter: Option<usize>,
@@ -9469,7 +9484,7 @@ mod desktop {
     /// page started: check if unloading is canceled, then abort the
     /// Document and its descendants.
     fn leave_for_navigation(
-        page: &mut LumenPage,
+        page: &mut TrustJsPage,
         events: &tokio::sync::mpsc::Sender<PageEvt>,
     ) -> Leave {
         match check_unload(page, events) {
@@ -9488,7 +9503,7 @@ mod desktop {
     /// confirms that they want to leave while the page waits (HTML #pause).
     /// Whether unloading continues; `None` once the frontend is gone.
     fn check_unload(
-        page: &mut LumenPage,
+        page: &mut TrustJsPage,
         events: &tokio::sync::mpsc::Sender<PageEvt>,
     ) -> Option<bool> {
         let ask = call_trust(page, "fireBeforeUnloadTree", &[], "beforeunload")
@@ -9513,7 +9528,7 @@ mod desktop {
     /// abort (XMLHttpRequest abort events, fetch() rejections) while it is
     /// still alive. The descendants' Documents, whose own tasks would come
     /// later, are aborted in tree order right after.
-    fn abort_for_navigation(page: &mut LumenPage) {
+    fn abort_for_navigation(page: &mut TrustJsPage) {
         abort_document(page.engine.ctx(), 0);
         let descendants = page
             .engine
@@ -9530,14 +9545,14 @@ mod desktop {
         checkpoint(page, "navigation abort");
     }
 
-    fn take_scroll_fragment(page: &mut LumenPage) -> Option<String> {
+    fn take_scroll_fragment(page: &mut TrustJsPage) -> Option<String> {
         let value = call_trust(page, "takeScrollFragment", &[], "fragment navigation")?;
         (!value_is_nullish(&value))
             .then(|| value_to_string(page, &value))
             .flatten()
     }
 
-    fn take_click_submit(page: &mut LumenPage) -> Option<(usize, usize, Option<FormSubmission>)> {
+    fn take_click_submit(page: &mut TrustJsPage) -> Option<(usize, usize, Option<FormSubmission>)> {
         let value = call_trust(page, "takeClickSubmit", &[], "click submission")?;
         let value = value_to_string(page, &value)?;
         let (form, submitter) = value.split_once(',')?;
@@ -9558,14 +9573,14 @@ mod desktop {
 
     /// The top-level Document's policy container referrer policy (HTML #meta-referrer).
     fn top_level_referrer_policy(
-        page: &mut LumenPage,
+        page: &mut TrustJsPage,
     ) -> Option<crate::referrer_policy::ReferrerPolicy> {
         let state = page.engine.ctx().host_mut::<HostState>()?;
         Some(environment_referrer_policy(state, 0))
     }
 
     fn take_form_submit(
-        page: &mut LumenPage,
+        page: &mut TrustJsPage,
     ) -> Option<(usize, Option<usize>, Option<FormSubmission>)> {
         let value = call_trust(page, "takeFormSubmit", &[], "form submission")?;
         let value = value_to_string(page, &value)?;
@@ -9587,7 +9602,7 @@ mod desktop {
     /// The planned submission's record, `Ok(None)` when there is none, and `Err` when its entity
     /// body cannot be read (the navigation's fetch would fail; HTML #submit-body).
     fn form_submission(
-        page: &mut LumenPage,
+        page: &mut TrustJsPage,
         form: usize,
         submitter: Option<usize>,
     ) -> Result<Option<FormSubmission>, String> {
@@ -9691,7 +9706,7 @@ mod desktop {
     /// HTML #drag-and-drop-processing-model for native files dragged in from another
     /// application. The prelude runs the model; dropped files become readable here, at the drop
     /// (the drag data store is in protected mode until then).
-    fn file_drag(page: &mut LumenPage, drag: crate::js::FileDrag) {
+    fn file_drag(page: &mut TrustJsPage, drag: crate::js::FileDrag) {
         use crate::js::FileDrag;
         let position =
             |node: Option<usize>, x: f64, y: f64, metadata: crate::js::PointerMetadata| {
@@ -9751,7 +9766,7 @@ mod desktop {
         let _ = call_trust(page, "fileDrag", &args, "file drag");
     }
 
-    fn form_method_is_dialog(page: &LumenPage, form: usize, submitter: usize) -> bool {
+    fn form_method_is_dialog(page: &TrustJsPage, form: usize, submitter: usize) -> bool {
         let dom = page.dom.borrow();
         dom.attr(submitter, "formmethod")
             .or_else(|| dom.attr(form, "method"))
@@ -11538,8 +11553,8 @@ mod desktop {
 
             let first = tokio::time::timeout(Duration::from_secs(30), events.recv())
                 .await
-                .expect("initial Lumen render timed out")
-                .expect("Lumen actor closed before initial render");
+                .expect("initial TRust JS render timed out")
+                .expect("TRust JS actor closed before initial render");
             let PageEvt::Updated { html, .. } = first else {
                 panic!("expected an interactive shell, got {first:?}");
             };
@@ -11555,7 +11570,7 @@ mod desktop {
                             break;
                         }
                         Some(_) => {}
-                        None => panic!("Lumen actor closed before load"),
+                        None => panic!("TRust JS actor closed before load"),
                     }
                 }
             })
@@ -11573,7 +11588,7 @@ mod desktop {
                             break;
                         }
                         Some(_) => {}
-                        None => panic!("Lumen actor closed before click render"),
+                        None => panic!("TRust JS actor closed before click render"),
                     }
                 }
             })
@@ -11639,7 +11654,7 @@ mod desktop {
                             panic!("image completion fixture failed: {errors:?}")
                         }
                         Some(_) => {}
-                        None => panic!("Lumen actor closed before image load event"),
+                        None => panic!("TRust JS actor closed before image load event"),
                     }
                 }
             })
@@ -11807,7 +11822,7 @@ mod desktop {
                             panic!("image decode fixture failed: {errors:?}")
                         }
                         Some(_) => {}
-                        None => panic!("Lumen actor closed before decode() settled"),
+                        None => panic!("TRust JS actor closed before decode() settled"),
                     }
                 }
             })
@@ -11862,7 +11877,7 @@ mod desktop {
                         }
                         Some(PageEvt::Trouble(errors)) => panic!("page failed: {errors:?}"),
                         Some(_) => {}
-                        None => panic!("Lumen actor closed before the page finished"),
+                        None => panic!("TRust JS actor closed before the page finished"),
                     }
                 }
             })
@@ -12047,7 +12062,7 @@ mod desktop {
                         }
                         Some(PageEvt::Trouble(errors)) => panic!("page failed: {errors:?}"),
                         Some(_) => {}
-                        None => panic!("Lumen actor closed before navigating"),
+                        None => panic!("TRust JS actor closed before navigating"),
                     }
                 }
             })
@@ -12333,7 +12348,7 @@ mod desktop {
                             panic!("blob resources failed: {errors:?}")
                         }
                         Some(_) => {}
-                        None => panic!("Lumen actor closed before the blob resources loaded"),
+                        None => panic!("TRust JS actor closed before the blob resources loaded"),
                     }
                 }
             })
@@ -12393,7 +12408,7 @@ mod desktop {
                             panic!("timeline fixture failed: {errors:?}")
                         }
                         Some(_) => {}
-                        None => panic!("Lumen actor closed before the frames ran"),
+                        None => panic!("TRust JS actor closed before the frames ran"),
                     }
                 }
             })
@@ -12501,7 +12516,7 @@ mod desktop {
                             panic!("picture fixture failed: {errors:?}")
                         }
                         Some(_) => {}
-                        None => panic!("Lumen actor closed before the picture images loaded"),
+                        None => panic!("TRust JS actor closed before the picture images loaded"),
                     }
                 }
             })
@@ -12530,7 +12545,7 @@ mod desktop {
                 let mut env = PageEnv::bare(DEFAULT_URL);
                 env.terminal_presentation = terminal_presentation;
                 env.cell_px = (8, 16);
-                let interrupt = Arc::new(lumen::RuntimeInterrupt::default());
+                let interrupt = Arc::new(trust_js::RuntimeInterrupt::default());
                 let (host_tx, mut host_rx) = tokio::sync::mpsc::unbounded_channel();
                 let mut page = load_page(html, env, host_tx, &mut host_rx, None, interrupt, None)
                     .unwrap_or_else(|outcome| panic!("fixture load failed: {outcome:?}"));
@@ -12564,7 +12579,7 @@ mod desktop {
                         observed.push(entries.map(entry => entry.contentRect.height).join(','));
                     }).observe(document.getElementById('second'));
                 </script>"#;
-            let interrupt = Arc::new(lumen::RuntimeInterrupt::default());
+            let interrupt = Arc::new(trust_js::RuntimeInterrupt::default());
             let (host_tx, mut host_rx) = tokio::sync::mpsc::unbounded_channel();
             let mut page = load_page(
                 html,
@@ -12718,7 +12733,7 @@ mod desktop {
                             panic!("requestSubmit actor errors: {errors:?}")
                         }
                         Some(_) => {}
-                        None => panic!("Lumen actor closed before requestSubmit navigation"),
+                        None => panic!("TRust JS actor closed before requestSubmit navigation"),
                     }
                 }
             })
@@ -12732,7 +12747,7 @@ mod desktop {
 
         #[test]
         fn ordinary_task_completion_defers_resize_observers_until_rendering_opportunity() {
-            fn read(page: &mut LumenPage, source: &str) -> String {
+            fn read(page: &mut TrustJsPage, source: &str) -> String {
                 let value = evaluate_task(page, source, "observe task state")
                     .expect("task state expression must evaluate");
                 value_string(&mut page.engine, &value)
@@ -12754,7 +12769,7 @@ mod desktop {
                         result.textContent = seen.join(',');
                     }).observe(box);
                 </script></body></html>"#;
-            let interrupt = Arc::new(lumen::RuntimeInterrupt::default());
+            let interrupt = Arc::new(trust_js::RuntimeInterrupt::default());
             let (host_tx, mut host_rx) = tokio::sync::mpsc::unbounded_channel();
             let mut page = load_page(
                 html,
@@ -12881,11 +12896,11 @@ mod desktop {
                         panic!("initial page task failed: {errors:?}")
                     }
                     Some(other) => panic!("expected live page update, got {other:?}"),
-                    None => panic!("Lumen actor closed before initial render"),
+                    None => panic!("TRust JS actor closed before initial render"),
                 }
             })
             .await
-            .expect("initial Lumen render timed out");
+            .expect("initial TRust JS render timed out");
 
             handle.try_send_navigation_click(target).unwrap();
             let navigated = tokio::time::timeout(Duration::from_secs(10), async {
@@ -12894,7 +12909,7 @@ mod desktop {
                         Some(PageEvt::Navigate(url, ..)) => break url,
                         Some(PageEvt::Trouble(errors)) => panic!("click task failed: {errors:?}"),
                         Some(_) => {}
-                        None => panic!("Lumen actor closed during slotted link click"),
+                        None => panic!("TRust JS actor closed during slotted link click"),
                     }
                 }
             })
@@ -12940,7 +12955,7 @@ mod desktop {
                             panic!("written scripts failed: {errors:?}")
                         }
                         Some(_) => {}
-                        None => panic!("Lumen actor closed before the written scripts ran"),
+                        None => panic!("TRust JS actor closed before the written scripts ran"),
                     }
                 }
             })
@@ -12974,7 +12989,7 @@ mod desktop {
                             panic!("document.write failed: {errors:?}")
                         }
                         Some(_) => {}
-                        None => panic!("Lumen actor closed before document.write rendered"),
+                        None => panic!("TRust JS actor closed before document.write rendered"),
                     }
                 }
             })
@@ -13031,7 +13046,7 @@ mod desktop {
                 }
             })
             .await
-            .expect("initial Lumen render timed out");
+            .expect("initial TRust JS render timed out");
 
             handle.try_send_user(PageCmd::Click(target)).unwrap();
             let navigated = tokio::time::timeout(Duration::from_secs(10), async {
@@ -13040,7 +13055,7 @@ mod desktop {
                         Some(PageEvt::Navigate(url, ..)) => break url,
                         Some(PageEvt::Trouble(errors)) => panic!("click task failed: {errors:?}"),
                         Some(_) => {}
-                        None => panic!("Lumen actor closed during click task"),
+                        None => panic!("TRust JS actor closed during click task"),
                     }
                 }
             })
@@ -13148,7 +13163,7 @@ mod desktop {
                 }
             })
             .await
-            .expect("initial Lumen render timed out");
+            .expect("initial TRust JS render timed out");
 
             handle.try_send_user(PageCmd::Click(target)).unwrap();
             let (url, replace) = tokio::time::timeout(Duration::from_secs(10), async {
@@ -13160,7 +13175,7 @@ mod desktop {
                         }
                         Some(PageEvt::Trouble(errors)) => panic!("click task failed: {errors:?}"),
                         Some(_) => {}
-                        None => panic!("Lumen actor closed during SPA click"),
+                        None => panic!("TRust JS actor closed during SPA click"),
                     }
                 }
             })
@@ -13203,7 +13218,7 @@ mod desktop {
                             panic!("document URL test failed: {errors:?}")
                         }
                         Some(_) => {}
-                        None => panic!("Lumen actor closed before rendering the document URL"),
+                        None => panic!("TRust JS actor closed before rendering the document URL"),
                     }
                 }
             })
@@ -13247,7 +13262,7 @@ document.body.appendChild(injected);
                             panic!("stack URL test failed: {errors:?}")
                         }
                         Some(_) => {}
-                        None => panic!("Lumen actor closed before rendering the stack"),
+                        None => panic!("TRust JS actor closed before rendering the stack"),
                     }
                 }
             })
@@ -13296,7 +13311,7 @@ document.body.appendChild(injected);
                             panic!("idle callback failed: {errors:?}")
                         }
                         Some(_) => {}
-                        None => panic!("Lumen actor closed before its idle period"),
+                        None => panic!("TRust JS actor closed before its idle period"),
                     }
                 }
             })
@@ -13338,7 +13353,7 @@ document.body.appendChild(injected);
                 }
             })
             .await
-            .expect("initial Lumen render timed out");
+            .expect("initial TRust JS render timed out");
 
             // Let the interval become overdue before queuing the browser task. Each callback
             // takes longer than its repeat interval, so the timer queue remains continuously due.
@@ -13364,7 +13379,7 @@ document.body.appendChild(injected);
                             panic!("viewport command failed: {errors:?}")
                         }
                         Some(_) => {}
-                        None => panic!("Lumen actor closed before viewport command"),
+                        None => panic!("TRust JS actor closed before viewport command"),
                     }
                 }
             })
@@ -13404,7 +13419,7 @@ document.body.appendChild(injected);
                 }
             })
             .await
-            .expect("initial Lumen render timed out");
+            .expect("initial TRust JS render timed out");
 
             handle.cmds.send(PageCmd::Click(target)).await.unwrap();
             for _ in 0..16 {
@@ -13431,7 +13446,7 @@ document.body.appendChild(injected);
                             panic!("timer fairness fixture failed: {errors:?}")
                         }
                         Some(_) => {}
-                        None => panic!("Lumen actor closed before the timer task"),
+                        None => panic!("TRust JS actor closed before the timer task"),
                     }
                 }
             })
@@ -13512,7 +13527,7 @@ document.body.appendChild(injected);
                         }
                         Some(PageEvt::Trouble(errors)) => panic!("frame load failed: {errors:?}"),
                         Some(_) => {}
-                        None => panic!("Lumen actor closed before the frame loaded"),
+                        None => panic!("TRust JS actor closed before the frame loaded"),
                     }
                 }
             })
@@ -13577,8 +13592,8 @@ document.body.appendChild(injected);
 
             let first = tokio::time::timeout(Duration::from_secs(30), events.recv())
                 .await
-                .expect("initial Lumen render timed out")
-                .expect("Lumen actor closed before initial render");
+                .expect("initial TRust JS render timed out")
+                .expect("TRust JS actor closed before initial render");
             let PageEvt::Updated { html, .. } = first else {
                 panic!("expected an interactive shell, got {first:?}");
             };
@@ -13598,7 +13613,7 @@ document.body.appendChild(injected);
                             break;
                         }
                         Some(_) => {}
-                        None => panic!("Lumen actor closed before frame/parent load"),
+                        None => panic!("TRust JS actor closed before frame/parent load"),
                     }
                 }
             })
@@ -13883,7 +13898,7 @@ document.body.appendChild(injected);
                             panic!("iframe module lifecycle failed: {errors:?}")
                         }
                         Some(_) => {}
-                        None => panic!("Lumen actor closed before iframe load"),
+                        None => panic!("TRust JS actor closed before iframe load"),
                     }
                 }
             })
@@ -13946,7 +13961,7 @@ document.body.appendChild(injected);
                             panic!("recreated iframe module-map test failed: {errors:?}")
                         }
                         Some(_) => {}
-                        None => panic!("Lumen actor closed before the second iframe module"),
+                        None => panic!("TRust JS actor closed before the second iframe module"),
                     }
                 }
             })
@@ -13985,7 +14000,9 @@ document.body.appendChild(injected);
                 loop {
                     match events.recv().await {
                         Some(PageEvt::Updated { html, .. }) => {
-                            if html.contains("<output id=\"result\">1|2|3|TypeError|TypeError</output>") {
+                            if html.contains(
+                                "<output id=\"result\">1|2|3|TypeError|TypeError</output>",
+                            ) {
                                 break;
                             }
                             last_html = html;
@@ -13994,7 +14011,7 @@ document.body.appendChild(injected);
                             panic!("JSON module test failed: {errors:?}")
                         }
                         Some(_) => {}
-                        None => panic!("Lumen actor closed before the JSON module result"),
+                        None => panic!("TRust JS actor closed before the JSON module result"),
                     }
                 }
             })
@@ -14057,7 +14074,7 @@ document.body.appendChild(injected);
                             panic!("iframe module once-only check failed: {errors:?}")
                         }
                         Some(_) => {}
-                        None => panic!("Lumen actor closed before iframe module settled"),
+                        None => panic!("TRust JS actor closed before iframe module settled"),
                     }
                 }
             })
@@ -14141,14 +14158,14 @@ fn routed_host_call(
     with_traversable(ctx, target, |ctx| operation(ctx, this, args))
 }
 
-/// Lumen's implemented subset of the canonical TRust host boundary. Keep this declarative: tests
+/// TRust JS's implemented subset of the canonical TRust host boundary. Keep this declarative: tests
 /// compare every entry with `js_host_boundary::HOST_BOUNDARY_SIGNATURES`, while the table remains
 /// the single source used to install functions into each new realm. The node arguments of each
 /// function (an arena id or a Node wrapper) name the top-level traversable it addresses; a
 /// function without one addresses its calling Realm's (`routed_host_call`).
 macro_rules! host_functions {
     ($(($name:literal, $len:literal, $function:path, [$($node:literal),*])),* $(,)?) => {
-        const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[$((
+        const TRUST_JS_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[$((
             $name,
             $len,
             {
@@ -14398,46 +14415,46 @@ host_functions! {
     ("__dom_top_layer_removals", 0, host_dom_top_layer_removals, []),
     ("__dom_inert", 1, guarded_inert, [0]),
     ("__dom_open_dialogs", 1, guarded_open_dialogs, [0]),
-    ("__wasm_validate", 1, lumen_wasm::host_validate, []),
-    ("__wasm_compile", 1, lumen_wasm::host_compile, []),
-    ("__wasm_module_imports", 1, lumen_wasm::host_module_imports, []),
-    ("__wasm_module_exports", 1, lumen_wasm::host_module_exports, []),
-    ("__wasm_module_custom_sections", 2, lumen_wasm::host_module_custom_sections, []),
-    ("__wasm_instantiate", 3, lumen_wasm::host_instantiate, []),
-    ("__wasm_instance_exports", 2, lumen_wasm::host_instance_exports, []),
-    ("__wasm_call_export", 2, lumen_wasm::host_call_export, []),
-    ("__wasm_function_cache", 2, lumen_wasm::host_function_cache, []),
-    ("__wasm_global_new", 3, lumen_wasm::host_global_new, []),
-    ("__wasm_global_get", 1, lumen_wasm::host_global_get, []),
-    ("__wasm_global_set", 2, lumen_wasm::host_global_set, []),
-    ("__wasm_memory_new", 2, lumen_wasm::host_memory_new, []),
-    ("__wasm_memory_size", 1, lumen_wasm::host_memory_size, []),
-    ("__wasm_memory_grow", 2, lumen_wasm::host_memory_grow, []),
-    ("__wasm_memory_buffer", 1, lumen_wasm::host_memory_buffer, []),
-    ("__wasm_table_new", 4, lumen_wasm::host_table_new, []),
-    ("__wasm_table_length", 1, lumen_wasm::host_table_length, []),
-    ("__wasm_table_get", 2, lumen_wasm::host_table_get, []),
-    ("__wasm_table_set", 3, lumen_wasm::host_table_set, []),
-    ("__wasm_table_grow", 3, lumen_wasm::host_table_grow, []),
-    ("__wasm_exception_binding", 3, lumen_wasm::host_exception_binding, []),
+    ("__wasm_validate", 1, trust_js_wasm::host_validate, []),
+    ("__wasm_compile", 1, trust_js_wasm::host_compile, []),
+    ("__wasm_module_imports", 1, trust_js_wasm::host_module_imports, []),
+    ("__wasm_module_exports", 1, trust_js_wasm::host_module_exports, []),
+    ("__wasm_module_custom_sections", 2, trust_js_wasm::host_module_custom_sections, []),
+    ("__wasm_instantiate", 3, trust_js_wasm::host_instantiate, []),
+    ("__wasm_instance_exports", 2, trust_js_wasm::host_instance_exports, []),
+    ("__wasm_call_export", 2, trust_js_wasm::host_call_export, []),
+    ("__wasm_function_cache", 2, trust_js_wasm::host_function_cache, []),
+    ("__wasm_global_new", 3, trust_js_wasm::host_global_new, []),
+    ("__wasm_global_get", 1, trust_js_wasm::host_global_get, []),
+    ("__wasm_global_set", 2, trust_js_wasm::host_global_set, []),
+    ("__wasm_memory_new", 2, trust_js_wasm::host_memory_new, []),
+    ("__wasm_memory_size", 1, trust_js_wasm::host_memory_size, []),
+    ("__wasm_memory_grow", 2, trust_js_wasm::host_memory_grow, []),
+    ("__wasm_memory_buffer", 1, trust_js_wasm::host_memory_buffer, []),
+    ("__wasm_table_new", 4, trust_js_wasm::host_table_new, []),
+    ("__wasm_table_length", 1, trust_js_wasm::host_table_length, []),
+    ("__wasm_table_get", 2, trust_js_wasm::host_table_get, []),
+    ("__wasm_table_set", 3, trust_js_wasm::host_table_set, []),
+    ("__wasm_table_grow", 3, trust_js_wasm::host_table_grow, []),
+    ("__wasm_exception_binding", 3, trust_js_wasm::host_exception_binding, []),
     ("__promise_is_handled", 1, host_promise_is_handled, []),
     ("__promise_mark_outstanding", 1, host_promise_mark_outstanding, []),
     ("__promise_react", 3, host_promise_react, []),
     ("__promise_resolved_with", 1, host_promise_resolved_with, []),
 }
 
-fn install_host_boundary(engine: &mut lumen::Engine) {
+fn install_host_boundary(engine: &mut trust_js::Engine) {
     install_agent_host_hooks(engine);
-    for &(name, len, host_fn) in LUMEN_HOST_FUNCTIONS {
+    for &(name, len, host_fn) in TRUST_JS_HOST_FUNCTIONS {
         engine.define_global(name, len, host_fn);
     }
 }
 
 /// The Agent-wide half of the host boundary: HostState tracing and the
 /// settings-object job hooks. It installs nothing in any Realm.
-fn install_agent_host_hooks(engine: &mut lumen::Engine) {
+fn install_agent_host_hooks(engine: &mut trust_js::Engine) {
     engine.ctx().op_state().register_gc::<HostState>();
-    debug_assert!(lumen_registry_matches_canonical_boundary());
+    debug_assert!(trust_js_registry_matches_canonical_boundary());
     engine.set_host_job_context_hooks(host_enter_job_context, host_leave_job_context);
     engine.set_job_callback_script_caller_capture(true);
 }
@@ -14826,18 +14843,18 @@ fn host_invoke_callback(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
     })
 }
 
-fn lumen_registry_matches_canonical_boundary() -> bool {
+fn trust_js_registry_matches_canonical_boundary() -> bool {
     let canonical: std::collections::HashMap<_, _> =
         crate::js::host_boundary_signatures().collect();
     let mut implemented = std::collections::HashSet::new();
-    LUMEN_HOST_FUNCTIONS.iter().all(|(name, len, _)| {
+    TRUST_JS_HOST_FUNCTIONS.iter().all(|(name, len, _)| {
         implemented.insert(*name) && canonical.get(name).copied() == Some(*len)
     })
 }
 
 fn host_dom(ctx: &mut Ctx) -> Rc<RefCell<Dom>> {
     ctx.host_mut::<HostState>()
-        .expect("HostState installed before any Lumen host call")
+        .expect("HostState installed before any TRust JS host call")
         .dom
         .clone()
 }
@@ -15322,10 +15339,10 @@ fn guarded_doc_element(ctx: &mut Ctx, this: Value, args: &[Value]) -> Result<Val
     host_doc_element(ctx, this, args)
 }
 
-/// Web IDL DOMString argument, kept as Lumen engine text: TRust stores DOM strings (text,
+/// Web IDL DOMString argument, kept as TRust JS engine text: TRust stores DOM strings (text,
 /// attributes, CSSOM, storage, messages) in that form, so lone surrogates and plane-16
 /// private-use characters round-trip exactly. Return such strings with
-/// `Value::from_engine_text`; convert with `lumen::embed::engine_to_text` before treating them
+/// `Value::from_engine_text`; convert with `trust_js::embed::engine_to_text` before treating them
 /// as Rust text (rendering, URLs, network, encoders). See `host_arg_usv` and `dom_text_in`.
 fn host_arg_string(ctx: &mut Ctx, args: &[Value], index: usize) -> String {
     args.get(index)
@@ -15345,12 +15362,12 @@ fn host_arg_usv(ctx: &mut Ctx, args: &[Value], index: usize) -> String {
 /// Rust text entering DOM storage (a decoded document or message) in engine text form; see
 /// `host_arg_string`.
 pub(crate) fn dom_text_in(text: &str) -> std::borrow::Cow<'_, str> {
-    lumen::embed::text_to_engine(text)
+    trust_js::embed::text_to_engine(text)
 }
 
 /// DOM engine text as Rust text for rendering and other text consumers; see `host_arg_string`.
 pub(crate) fn dom_text_out(text: &str) -> std::borrow::Cow<'_, str> {
-    lumen::embed::engine_to_text(text)
+    trust_js::embed::engine_to_text(text)
 }
 
 fn host_id_value(id: Option<usize>) -> Value {
@@ -15607,7 +15624,7 @@ fn native_live_collections_enabled() -> bool {
 }
 
 /// The arena holding `node`: the selected traversable's, unless a parked
-/// one's holds it. Lumen calls a live collection's callbacks directly, not
+/// one's holds it. TRust JS calls a live collection's callbacks directly, not
 /// through `routed_host_call`.
 fn arena_holding(state: &HostState, node: usize) -> Rc<RefCell<Dom>> {
     if !SEVERAL_TRAVERSABLES.with(Cell::get) || state.dom.borrow().is_valid(node) {
@@ -16291,7 +16308,7 @@ fn prepare_uncounted_client_request(
     Some((network.handle.clone(), network.cache.clone(), request))
 }
 
-fn lumen_fetch_result(response: crate::http::Response) -> LumenFetchResult {
+fn trust_js_fetch_result(response: crate::http::Response) -> TrustJsFetchResult {
     if std::env::var_os("TRUST_TRACE_FETCH").is_some() {
         eprintln!(
             "[fetch-trace] result status={} type={} len={}",
@@ -16310,7 +16327,7 @@ fn lumen_fetch_result(response: crate::http::Response) -> LumenFetchResult {
     ))
 }
 
-fn lumen_cached_result(response: &crate::http::CachedResp) -> LumenFetchResult {
+fn trust_js_cached_result(response: &crate::http::CachedResp) -> TrustJsFetchResult {
     if std::env::var_os("TRUST_TRACE_FETCH").is_some() {
         eprintln!(
             "[fetch-trace] cached status={} type={} len={}",
@@ -16332,7 +16349,7 @@ fn lumen_cached_result(response: &crate::http::CachedResp) -> LumenFetchResult {
     ))
 }
 
-fn host_fetch_result_value(ctx: &mut Ctx, result: LumenFetchResult) -> Value {
+fn host_fetch_result_value(ctx: &mut Ctx, result: TrustJsFetchResult) -> Value {
     let Some((status, content_type, body, headers, url, status_text)) = result else {
         return Value::Null;
     };
@@ -16371,11 +16388,11 @@ fn timed_fetch_result(
     name: String,
     initiator: &'static str,
     started: f64,
-) -> (LumenFetchResult, Option<LumenResourceTiming>) {
+) -> (TrustJsFetchResult, Option<TrustJsResourceTiming>) {
     let (result, timing) = match result {
         Ok(mut response) => {
             let timing = response.timing.take();
-            (lumen_fetch_result(response), timing)
+            (trust_js_fetch_result(response), timing)
         }
         Err(error) => (None, error.timing),
     };
@@ -16388,7 +16405,7 @@ fn timed_fetch_result(
         } else {
             timing.redirect_start = started;
         }
-        LumenResourceTiming {
+        TrustJsResourceTiming {
             name,
             initiator,
             timing,
@@ -16409,7 +16426,7 @@ fn resource_initiator(ctx: &mut Ctx, args: &[Value]) -> &'static str {
     }
 }
 
-fn record_resource_timing(ctx: &mut Ctx, report: Option<LumenResourceTiming>) {
+fn record_resource_timing(ctx: &mut Ctx, report: Option<TrustJsResourceTiming>) {
     let Some(report) = report else { return };
     record_resource_timing_ref(ctx, &report);
 }
@@ -16418,9 +16435,9 @@ fn record_resource_timing(ctx: &mut Ctx, report: Option<LumenResourceTiming>) {
 /// `context` (a request's client), which can differ from the running Realm.
 /// A retired Document's global no longer receives entries.
 fn record_resource_timing_in(
-    engine: &mut lumen::Engine,
+    engine: &mut trust_js::Engine,
     context: u64,
-    report: Option<LumenResourceTiming>,
+    report: Option<TrustJsResourceTiming>,
 ) -> Result<(), String> {
     let Some(report) = report else {
         return Ok(());
@@ -16441,7 +16458,7 @@ fn record_resource_timing_in(
         .map_err(|_| String::from("resource timing Realm is unavailable"))
 }
 
-fn record_resource_timing_ref(ctx: &mut Ctx, report: &LumenResourceTiming) {
+fn record_resource_timing_ref(ctx: &mut Ctx, report: &TrustJsResourceTiming) {
     let data = report.data();
     // Resource Timing #marking-resource-timing creates the entry in the
     // initiating global, including WorkerGlobalScope (not its owner Window).
@@ -16621,7 +16638,7 @@ fn host_http_navigate_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
         network.next_fetch_id += 1;
         network.pending_fetches.insert(
             id,
-            LumenPendingFetch {
+            TrustJsPendingFetch {
                 context,
                 resolve: resolve.clone(),
                 native_lease: None,
@@ -16649,7 +16666,7 @@ fn host_http_navigate_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
             .await
             .ok()
             .map(Box::new);
-        let _ = events.send(LumenHostTask::NavigateDone {
+        let _ = events.send(TrustJsHostTask::NavigateDone {
             id,
             details,
             node,
@@ -16699,7 +16716,7 @@ fn navigation_result_value(
         }
         _ => Value::Null,
     };
-    let result = lumen_fetch_result(details.response);
+    let result = trust_js_fetch_result(details.response);
     let result = host_fetch_result_value(ctx, result);
     ctx.member_set(&result, "5", Value::from_string(final_url))?;
     ctx.member_set(&result, "6", Value::from_string(referrer))?;
@@ -16896,7 +16913,7 @@ fn host_http_fetch_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
                 network.next_fetch_id += 1;
                 network.pending_fetches.insert(
                     id,
-                    LumenPendingFetch {
+                    TrustJsPendingFetch {
                         context,
                         resolve: resolve.clone(),
                         native_lease: None,
@@ -16950,14 +16967,14 @@ fn host_http_fetch_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
                                 resource_response_status: response.status,
                                 ..Default::default()
                             });
-                            LumenResourceTiming {
+                            TrustJsResourceTiming {
                                 name: resource_name,
                                 initiator,
                                 timing,
                                 cached: true,
                             }
                         });
-                    (lumen_cached_result(&response), timing)
+                    (trust_js_cached_result(&response), timing)
                 }
                 Err(()) => (None, None),
             },
@@ -16986,7 +17003,7 @@ fn host_http_fetch_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
                 )
             }
         };
-        let _ = events.send(LumenHostTask::FetchDone { id, result, timing });
+        let _ = events.send(TrustJsHostTask::FetchDone { id, result, timing });
     };
     let task = cache.task_scope().spawn_abortable(&handle, work, keepalive);
     // HTML #abort-a-document aborts this task with the document's other
@@ -17008,22 +17025,22 @@ fn host_http_fetch_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
 /// unpulled, and stops when the fetch is aborted or its stream canceled.
 async fn stream_fetch_body(
     id: usize,
-    result: LumenFetchResult,
-    timing: Option<LumenResourceTiming>,
+    result: TrustJsFetchResult,
+    timing: Option<TrustJsResourceTiming>,
     mut body: crate::http::BodyStream,
-    events: LumenTaskSender,
+    events: TrustJsTaskSender,
 ) {
     /// A transfer abandoned by its task (the document stopped loading or
     /// was unloaded) ends its body with a network error, as Fetch
     /// #fetch-controller-terminate requires, instead of leaving it pending.
     struct EndOnDrop {
         id: usize,
-        events: Option<LumenTaskSender>,
+        events: Option<TrustJsTaskSender>,
     }
     impl Drop for EndOnDrop {
         fn drop(&mut self) {
             if let Some(events) = self.events.take() {
-                let _ = events.send(LumenHostTask::FetchBodyEnd {
+                let _ = events.send(TrustJsHostTask::FetchBodyEnd {
                     id: self.id,
                     ok: false,
                     timing: None,
@@ -17033,7 +17050,7 @@ async fn stream_fetch_body(
     }
     let flow = crate::http::BodyFlow::new();
     if events
-        .send(LumenHostTask::FetchHead {
+        .send(TrustJsHostTask::FetchHead {
             id,
             result,
             flow: flow.clone(),
@@ -17048,7 +17065,7 @@ async fn stream_fetch_body(
     };
     let outcome = crate::http::pump(&mut body, &flow, |bytes| {
         events
-            .send(LumenHostTask::FetchBodyChunk { id, bytes })
+            .send(TrustJsHostTask::FetchBodyChunk { id, bytes })
             .is_ok()
     })
     .await;
@@ -17072,7 +17089,7 @@ async fn stream_fetch_body(
         report.timing.decoded_body_size = body.decoded_size();
         report
     });
-    let _ = events.send(LumenHostTask::FetchBodyEnd { id, ok, timing });
+    let _ = events.send(TrustJsHostTask::FetchBodyEnd { id, ok, timing });
 }
 
 fn body_stream_id(args: &[Value]) -> Option<usize> {
@@ -17183,7 +17200,7 @@ fn stop_loading_navigable(ctx: &mut Ctx, context: u64) -> bool {
     };
     if let Some(events) = events {
         for descendant in descendants {
-            let _ = events.send(LumenHostTask::AbortDocument {
+            let _ = events.send(TrustJsHostTask::AbortDocument {
                 context: descendant,
             });
         }
@@ -17282,11 +17299,11 @@ fn abort_document_fetches(ctx: &mut Ctx, context: u64) -> bool {
         .filter(|(_, pending)| pending.context == context && !pending.keepalive)
         .map(|(&id, _)| id)
         .collect();
-    let pending: Vec<LumenPendingFetch> = ids
+    let pending: Vec<TrustJsPendingFetch> = ids
         .iter()
         .filter_map(|id| network.pending_fetches.remove(id))
         .collect();
-    let streams: Vec<LumenBodyStream> = {
+    let streams: Vec<TrustJsBodyStream> = {
         let ids: Vec<usize> = network
             .body_streams
             .iter()
@@ -17361,10 +17378,10 @@ fn abort_active_parser(ctx: &mut Ctx) -> bool {
 /// Run `run` in the Realm of the environment `context`; a task for an
 /// environment whose Document is no longer active does not run.
 fn run_in_context_realm(
-    engine: &mut lumen::Engine,
+    engine: &mut trust_js::Engine,
     context: u64,
     label: &str,
-    run: impl FnOnce(&mut lumen::Engine) -> Result<(), String>,
+    run: impl FnOnce(&mut trust_js::Engine) -> Result<(), String>,
 ) -> Result<(), String> {
     if context == engine.ctx().host_job_context() {
         return run(engine);
@@ -17391,7 +17408,7 @@ fn run_in_context_realm(
 
 /// Settle fetch `id`'s pending body pull when bytes or the end are available
 /// (#concept-http-network-fetch pullAlgorithm: pull from bytes into stream).
-fn settle_body_pull(engine: &mut lumen::Engine, id: usize) -> Result<(), String> {
+fn settle_body_pull(engine: &mut trust_js::Engine, id: usize) -> Result<(), String> {
     let ready = {
         let Some(network) = engine
             .ctx()
@@ -17467,7 +17484,7 @@ fn host_call_trust_interruptible(
 fn host_task_failure(ctx: &mut Ctx, error: EvalError, label: &str) -> Result<(), String> {
     match error {
         EvalError::Interrupted(
-            lumen::InterruptReason::UserNavigation | lumen::InterruptReason::Cancelled,
+            trust_js::InterruptReason::UserNavigation | trust_js::InterruptReason::Cancelled,
         ) => Ok(()),
         EvalError::Interrupted(reason) => Err(format!("{label} interrupted: {}", reason.message())),
         EvalError::Throw(error) => Err(ctx
@@ -17552,7 +17569,7 @@ fn main_window_config(
             .map(|parallelism| parallelism.get())
             .unwrap_or(8),
         crate::http::GLOBAL_PRIVACY_CONTROL,
-        lumen_potentially_trustworthy(response_url),
+        trust_js_potentially_trustworthy(response_url),
         traces.frames,
         traces.challenge_messages,
         navigation_timing,
@@ -17574,14 +17591,14 @@ fn platform_prelude_snapshot() -> Result<&'static [u8], String> {
     // is implementation code, not an author script; do not expose its JS bodies.
     // This policy also follows nested functions created after initial bootstrap.
     match SNAPSHOT.get_or_init(|| {
-        lumen::compile_host_snapshot(&crate::js::private_bootstrap(platform_prelude()))
+        trust_js::compile_host_snapshot(&crate::js::private_bootstrap(platform_prelude()))
     }) {
         Ok(snapshot) => Ok(snapshot.as_slice()),
         Err(error) => Err(error.clone()),
     }
 }
 
-fn eval_platform_prelude(engine: &mut lumen::Engine) -> Result<(), String> {
+fn eval_platform_prelude(engine: &mut trust_js::Engine) -> Result<(), String> {
     let snapshot = platform_prelude_snapshot()?;
     #[cfg(test)]
     let config = test_bootstrap_config(engine.ctx());
@@ -17633,7 +17650,7 @@ fn expose_platform_internals_for_tests(ctx: &mut Ctx, worker: bool, config: Valu
     if matches!(config, Value::Obj(_)) {
         let _ = ctx.member_set(&global, "__trust_cfg", config);
     }
-    for &(name, len, host_fn) in LUMEN_HOST_FUNCTIONS {
+    for &(name, len, host_fn) in TRUST_JS_HOST_FUNCTIONS {
         if TEST_EXPOSED_HOST_FUNCTIONS.contains(&name) {
             ctx.define_embed_global(name, len, host_fn);
         }
@@ -17642,7 +17659,7 @@ fn expose_platform_internals_for_tests(ctx: &mut Ctx, worker: bool, config: Valu
     // property names. The platform itself only reads its internal slots.
     static ACCESSORS: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     let accessors = ACCESSORS.get_or_init(|| {
-        lumen::compile_host_snapshot(TEST_INTERNAL_ACCESSORS).expect("test accessors parse")
+        trust_js::compile_host_snapshot(TEST_INTERNAL_ACCESSORS).expect("test accessors parse")
     });
     let maps = ctx.host_mut::<HostState>().map(|state| {
         [
@@ -17702,7 +17719,7 @@ const TEST_INTERNAL_ACCESSORS: &str = r#"(function (nodeIds, internals) {
 /// their own Realm instead of using `eval_platform_prelude`.
 #[cfg(test)]
 fn eval_test_bootstrap(
-    engine: &mut lumen::Engine,
+    engine: &mut trust_js::Engine,
     source: &str,
     label: &str,
     worker: bool,
@@ -17718,7 +17735,7 @@ fn worker_prelude_snapshot() -> Result<&'static [u8], String> {
     match SNAPSHOT.get_or_init(|| {
         let override_source = std::env::var_os("TRUST_WORKER_PRELUDE_FILE")
             .and_then(|path| std::fs::read_to_string(path).ok());
-        lumen::compile_host_snapshot(&crate::js::private_bootstrap(
+        trust_js::compile_host_snapshot(&crate::js::private_bootstrap(
             override_source
                 .as_deref()
                 .unwrap_or_else(|| crate::js::worker_prelude()),
@@ -17874,7 +17891,7 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
         // start their fetches as they run (`begin_dynamic_module_fetch`),
         // with the settings `queue_dynamic_module_load` will use.
         if let (Some(network), Some(events)) = (state.network.as_ref(), state.task_events.clone()) {
-            let loader = LumenDynamicModuleLoader {
+            let loader = TrustJsDynamicModuleLoader {
                 context,
                 page: client_url.clone(),
                 cookie_context: cookie_context.clone(),
@@ -17883,7 +17900,7 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
                 environment: ModuleFetchEnvironment::default(),
                 events,
                 import_map: state.import_maps.entry(context).or_default().clone(),
-                network: Some(LumenDynamicModuleNetwork {
+                network: Some(TrustJsDynamicModuleNetwork {
                     handle: network.handle.clone(),
                     cache: network.cache.clone(),
                     fetched: network.fetched.clone(),
@@ -17927,7 +17944,7 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
     }
     let installed = ctx.with_embed_realm(&realm, |realm_ctx| {
         realm_ctx.set_host_job_context(context);
-        for &(name, len, host_fn) in LUMEN_HOST_FUNCTIONS {
+        for &(name, len, host_fn) in TRUST_JS_HOST_FUNCTIONS {
             realm_ctx.define_embed_global(name, len, host_fn);
         }
 
@@ -18133,7 +18150,7 @@ fn host_create_auxiliary_traversable(
     }
     let installed = ctx.with_embed_realm(&realm, |realm_ctx| {
         realm_ctx.set_host_job_context(context);
-        for &(name, len, host_fn) in LUMEN_HOST_FUNCTIONS {
+        for &(name, len, host_fn) in TRUST_JS_HOST_FUNCTIONS {
             realm_ctx.define_embed_global(name, len, host_fn);
         }
         let config = realm_ctx.new_object_with_proto(&Value::Null);
@@ -18477,7 +18494,7 @@ fn data_url_content_type(url: &str) -> String {
     }
 }
 
-fn data_resource_result(url: &str) -> LumenResourceResult {
+fn data_resource_result(url: &str) -> TrustJsResourceResult {
     crate::img::decode_data_url(url.trim())
         .map(|body| (200, data_url_content_type(url), body, Vec::new()))
 }
@@ -18487,7 +18504,7 @@ fn data_resource_result(url: &str) -> LumenResourceResult {
 /// blob URL entry (File API #blob-url-obtain-object, same partition only) and the response is
 /// the Blob's byte sequence with its Content-Length and Content-Type. A missing entry, another
 /// partition's entry or an unreadable selected file is a network error.
-fn blob_resource_result(ctx: &mut Ctx, node_id: usize, url: &str) -> LumenResourceResult {
+fn blob_resource_result(ctx: &mut Ctx, node_id: usize, url: &str) -> TrustJsResourceResult {
     let calling = ctx.host_job_context();
     let state = ctx.host_mut::<HostState>()?;
     let context = {
@@ -18513,13 +18530,13 @@ fn send_resource_completion(
     ctx: &mut Ctx,
     node_id: usize,
     name: String,
-    kind: LumenResourceKind,
-    result: LumenResourceResult,
+    kind: TrustJsResourceKind,
+    result: TrustJsResourceResult,
     external: bool,
 ) -> bool {
     let context = ctx.host_job_context();
     let text = match (&kind, &result) {
-        (LumenResourceKind::ClassicScript, Some((_, content_type, body, _))) => {
+        (TrustJsResourceKind::ClassicScript, Some((_, content_type, body, _))) => {
             let fallback = dom_fallback_encoding(&host_dom(ctx).borrow(), node_id);
             Some(crate::document_encoding::decode_classic_script(
                 content_type,
@@ -18542,7 +18559,7 @@ fn send_resource_completion(
         return false;
     };
     if events
-        .send(LumenHostTask::ResourceDone {
+        .send(TrustJsHostTask::ResourceDone {
             context,
             traversable,
             node_id,
@@ -18613,7 +18630,14 @@ fn host_preload_link(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
         } else {
             blob_resource_result(ctx, node_id, &href)
         };
-        if !send_resource_completion(ctx, node_id, href, LumenResourceKind::Preload, result, true) {
+        if !send_resource_completion(
+            ctx,
+            node_id,
+            href,
+            TrustJsResourceKind::Preload,
+            result,
+            true,
+        ) {
             host_fire_script_event(ctx, node_id, "error");
         }
         return Ok(Value::Undefined);
@@ -18621,7 +18645,7 @@ fn host_preload_link(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
     let fetched = prepare_element_request(ctx, node_id, &href, destination, false)
         .is_some_and(|request| spawn_preload_fetch(ctx, node_id, destination, request));
     if !fetched {
-        queue_resource_error(ctx, node_id, LumenResourceKind::Preload, href);
+        queue_resource_error(ctx, node_id, TrustJsResourceKind::Preload, href);
     }
     Ok(Value::Undefined)
 }
@@ -18736,7 +18760,7 @@ fn spawn_preload_fetch(
                 // Resource Timing: a preload that started the fetch reports it
                 // with the `link` initiator type; its consumer reports none.
                 let timing = if preloaded {
-                    LumenResourceTiming::fetched(
+                    TrustJsResourceTiming::fetched(
                         name.clone(),
                         "link",
                         response.timing.clone(),
@@ -18757,12 +18781,12 @@ fn spawn_preload_fetch(
             }
             Err(()) => (None, None),
         };
-        let _ = events.send(LumenHostTask::ResourceDone {
+        let _ = events.send(TrustJsHostTask::ResourceDone {
             context,
             traversable,
             node_id,
             name,
-            kind: LumenResourceKind::Preload,
+            kind: TrustJsResourceKind::Preload,
             result,
             text: None,
             sheet: None,
@@ -18776,7 +18800,7 @@ fn spawn_preload_fetch(
 fn spawn_resource_fetch(
     ctx: &mut Ctx,
     node_id: usize,
-    kind: LumenResourceKind,
+    kind: TrustJsResourceKind,
     request: crate::http::Request,
 ) -> bool {
     let started = crate::performance::now_ms();
@@ -18784,10 +18808,12 @@ fn spawn_resource_fetch(
     let client = element_request_client_url(ctx, node_id);
     // Preloads use `spawn_preload_fetch`; navigation obtained parsed sheets.
     let (destination, initiator) = match kind {
-        LumenResourceKind::Stylesheet
-        | LumenResourceKind::ParsedStylesheet { .. }
-        | LumenResourceKind::Preload => ("style", "css"),
-        LumenResourceKind::ClassicScript | LumenResourceKind::ModuleScript => ("script", "script"),
+        TrustJsResourceKind::Stylesheet
+        | TrustJsResourceKind::ParsedStylesheet { .. }
+        | TrustJsResourceKind::Preload => ("style", "css"),
+        TrustJsResourceKind::ClassicScript | TrustJsResourceKind::ModuleScript => {
+            ("script", "script")
+        }
     };
     let credentials = request
         .fetch_policy
@@ -18816,7 +18842,7 @@ fn spawn_resource_fetch(
     let cors_mode = credentials.is_some();
     // A module script's descendants are fetched when its own fetch completes
     // (`speculate_module_graph`), as `speculate_engine_imports` permits.
-    let module_graph = (matches!(kind, LumenResourceKind::ModuleScript)
+    let module_graph = (matches!(kind, TrustJsResourceKind::ModuleScript)
         && !request_cookie_context(ctx).cross_site_ancestor)
         .then(|| {
             let state = ctx.host_mut::<HostState>()?;
@@ -18842,7 +18868,7 @@ fn spawn_resource_fetch(
                     let timing = if preloaded {
                         None
                     } else {
-                        LumenResourceTiming::cached(
+                        TrustJsResourceTiming::cached(
                             name.clone(),
                             initiator,
                             response.timing.as_deref(),
@@ -18867,7 +18893,7 @@ fn spawn_resource_fetch(
             None => match crate::http::fetch_with_timing(&request, Default::default()).await {
                 Ok(details) => {
                     let response = details.response;
-                    let timing = LumenResourceTiming::fetched(
+                    let timing = TrustJsResourceTiming::fetched(
                         name.clone(),
                         initiator,
                         response.timing,
@@ -18886,13 +18912,13 @@ fn spawn_resource_fetch(
                 }
                 Err(error) => (
                     None,
-                    LumenResourceTiming::fetched(name.clone(), initiator, error.timing, started),
+                    TrustJsResourceTiming::fetched(name.clone(), initiator, error.timing, started),
                 ),
             },
         };
         let (text, sheet) = match &result {
             Some((status, content_type, body, headers))
-                if matches!(kind, LumenResourceKind::Stylesheet)
+                if matches!(kind, TrustJsResourceKind::Stylesheet)
                     && crate::http::stylesheet_response_allowed(*status, content_type, headers) =>
             {
                 let (css, encoding) = crate::document_encoding::decode_stylesheet(
@@ -18916,7 +18942,7 @@ fn spawn_resource_fetch(
             // The script's charset attribute and node document were read
             // when the element was prepared, as the fallback encoding is.
             Some((_, content_type, body, _))
-                if matches!(kind, LumenResourceKind::ClassicScript) =>
+                if matches!(kind, TrustJsResourceKind::ClassicScript) =>
             {
                 (
                     Some(crate::document_encoding::decode_classic_script(
@@ -18952,7 +18978,7 @@ fn spawn_resource_fetch(
                 None => eprintln!("[fetch-trace] resource-done url={name} FAILED"),
             }
         }
-        let _ = events.send(LumenHostTask::ResourceDone {
+        let _ = events.send(TrustJsHostTask::ResourceDone {
             context,
             traversable,
             node_id,
@@ -18968,7 +18994,7 @@ fn spawn_resource_fetch(
     true
 }
 
-fn queue_resource_error(ctx: &mut Ctx, node_id: usize, kind: LumenResourceKind, name: String) {
+fn queue_resource_error(ctx: &mut Ctx, node_id: usize, kind: TrustJsResourceKind, name: String) {
     if !send_resource_completion(ctx, node_id, name, kind, None, true) {
         host_fire_script_event(ctx, node_id, "error");
     }
@@ -18997,7 +19023,7 @@ fn host_eval_inline_classic(ctx: &mut Ctx, node_id: usize, name: &str, source: S
     // Error stacks name an inline script by its document's URL, as browsers do. The element's
     // starting line within the document is not recorded, so lines count from the script text.
     let document_url = element_request_client_url(ctx, node_id).to_string();
-    let origin = lumen::SourceOrigin::new(&document_url);
+    let origin = trust_js::SourceOrigin::new(&document_url);
     match ctx.eval_classic_script_interruptible_with_origin(&source, Some(&origin)) {
         Ok(Ok(_)) => {}
         Ok(Err(EvalError::Throw(error))) => {
@@ -19051,7 +19077,7 @@ fn host_run_classic_script(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resul
         };
         node_id
     };
-    // Script source is text for Lumen's source entry point, not a DOM string.
+    // Script source is text for TRust JS's source entry point, not a DOM string.
     let source = host_arg_usv(ctx, args, 1);
     let name = host_arg_string(ctx, args, 2);
     host_eval_inline_classic(ctx, node_id, &name, source);
@@ -19094,7 +19120,7 @@ fn host_run_injected_script(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
         (
             node_id,
             dom.attr(node_id, "src").map(str::to_string),
-            // Script source is text for Lumen's source entry points (see `dom_text_out`).
+            // Script source is text for TRust JS's source entry points (see `dom_text_out`).
             dom_text_out(&dom.text_content(node_id)).into_owned(),
             dom.attr(node_id, "type")
                 .is_some_and(|value| value.trim().eq_ignore_ascii_case("module")),
@@ -19109,7 +19135,7 @@ fn host_run_injected_script(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
             queue_resource_error(
                 ctx,
                 node_id,
-                LumenResourceKind::ClassicScript,
+                TrustJsResourceKind::ClassicScript,
                 String::new(),
             );
             return Ok(Value::Undefined);
@@ -19141,9 +19167,9 @@ fn host_run_injected_script(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
             ctx,
             node_id,
             if module {
-                LumenResourceKind::ModuleScript
+                TrustJsResourceKind::ModuleScript
             } else {
-                LumenResourceKind::ClassicScript
+                TrustJsResourceKind::ClassicScript
             },
             String::new(),
         );
@@ -19169,9 +19195,9 @@ fn host_run_injected_script(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
                 node_id,
                 src,
                 if module {
-                    LumenResourceKind::ModuleScript
+                    TrustJsResourceKind::ModuleScript
                 } else {
-                    LumenResourceKind::ClassicScript
+                    TrustJsResourceKind::ClassicScript
                 },
                 result,
                 true,
@@ -19188,9 +19214,9 @@ fn host_run_injected_script(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
             );
         }
         let kind = if module {
-            LumenResourceKind::ModuleScript
+            TrustJsResourceKind::ModuleScript
         } else {
-            LumenResourceKind::ClassicScript
+            TrustJsResourceKind::ClassicScript
         };
         match request {
             Some(request) => {
@@ -19204,7 +19230,7 @@ fn host_run_injected_script(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
         let base = state_base(ctx);
         // HTML §4.12.1.1 creates a new JavaScript module script for each
         // inline script element. Its document URL is the base URL used to
-        // resolve imports, not a shared module-map identity. Give Lumen a
+        // resolve imports, not a shared module-map identity. Give TRust JS a
         // stable per-element fragment so sibling inline modules cannot alias
         // one another while relative imports still resolve against `base`.
         let name = url::Url::parse(&base)
@@ -19217,7 +19243,7 @@ fn host_run_injected_script(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
             ctx,
             node_id,
             name,
-            LumenResourceKind::ModuleScript,
+            TrustJsResourceKind::ModuleScript,
             Some((
                 200,
                 String::from("text/javascript"),
@@ -19272,7 +19298,7 @@ fn host_load_injected_stylesheet(
             ctx,
             node_id,
             href.clone(),
-            LumenResourceKind::Stylesheet,
+            TrustJsResourceKind::Stylesheet,
             result,
             true,
         ) {
@@ -19283,11 +19309,11 @@ fn host_load_injected_stylesheet(
     let request = prepare_element_request(ctx, node_id, &href, "style", false);
     match request {
         Some(request) => {
-            if !spawn_resource_fetch(ctx, node_id, LumenResourceKind::Stylesheet, request) {
-                queue_resource_error(ctx, node_id, LumenResourceKind::Stylesheet, href);
+            if !spawn_resource_fetch(ctx, node_id, TrustJsResourceKind::Stylesheet, request) {
+                queue_resource_error(ctx, node_id, TrustJsResourceKind::Stylesheet, href);
             }
         }
-        None => queue_resource_error(ctx, node_id, LumenResourceKind::Stylesheet, href),
+        None => queue_resource_error(ctx, node_id, TrustJsResourceKind::Stylesheet, href),
     }
     Ok(Value::Undefined)
 }
@@ -19388,7 +19414,7 @@ fn host_ws_close(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, V
     Ok(Value::Undefined)
 }
 
-fn lumen_potentially_trustworthy(url: &url::Url) -> bool {
+fn trust_js_potentially_trustworthy(url: &url::Url) -> bool {
     match url.scheme() {
         "https" | "wss" | "file" => true,
         "http" => url.host_str().is_some_and(|host| {
@@ -19415,9 +19441,9 @@ fn host_worker_spawn(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
         None => (false, requested.as_str()),
     };
     let kind = if kind == "module" {
-        LumenWorkerKind::Module
+        TrustJsWorkerKind::Module
     } else {
-        LumenWorkerKind::Classic
+        TrustJsWorkerKind::Classic
     };
     let name = host_arg_string(ctx, args, 2);
     let context = ctx.host_job_context();
@@ -19440,7 +19466,7 @@ fn host_worker_spawn(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
         Some((origin, secure, base, policy)) => (origin, secure, Some(base), policy),
         None => {
             let page = request_client_url(ctx);
-            let secure = lumen_potentially_trustworthy(&page);
+            let secure = trust_js_potentially_trustworthy(&page);
             // Fetch #determine-requests-referrer for the owning Window's environment: its
             // Document's URL (none for an opaque origin) under its policy container's policy.
             let (source, policy) = ctx
@@ -19460,7 +19486,7 @@ fn host_worker_spawn(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
         .join(&target)
         .map_err(|_| ctx.make_error("SyntaxError", "invalid worker script URL"))?;
     let secure_context = owner_secure
-        && (script_url.scheme() == "blob" || lumen_potentially_trustworthy(&script_url));
+        && (script_url.scheme() == "blob" || trust_js_potentially_trustworthy(&script_url));
     // URL #concept-url-parser: parsing the script URL resolved its blob URL entry; the
     // worker's script fetch obtains the Blob for the outside settings (File API
     // #blob-url-obtain-object), so another partition's URL is a network error.
@@ -19510,8 +19536,8 @@ fn host_worker_spawn(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
     if let Some(key) = shared_key {
         workers.shared.insert(key, (id, kind, secure_context));
     }
-    let (ctl, ctl_rx) = LumenWorkerInbox::new();
-    let launch = LumenWorkerLaunch {
+    let (ctl, ctl_rx) = TrustJsWorkerInbox::new();
+    let launch = TrustJsWorkerLaunch {
         id,
         owner_page,
         cookie_context,
@@ -19527,7 +19553,7 @@ fn host_worker_spawn(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
         agent_cluster: state.agent_cluster,
         port_registry: state.message_ports.registry.clone(),
         port_wake: message_port_host::Wake::Worker(Arc::downgrade(&ctl)),
-        task_sender: LumenTaskSender::Worker(Arc::downgrade(&ctl)),
+        task_sender: TrustJsTaskSender::Worker(Arc::downgrade(&ctl)),
         storage: state.storage.clone(),
         permission_store: state.permission_store.clone(),
     };
@@ -19535,13 +19561,13 @@ fn host_worker_spawn(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
     let tasks = workers.tasks.child();
     let events = workers.events.clone();
 
-    let interrupt = Arc::new(lumen::RuntimeInterrupt::default());
+    let interrupt = Arc::new(trust_js::RuntimeInterrupt::default());
     let worker_interrupt = interrupt.clone();
     // Register the outside port before starting the agent, including on failure:
     // its asynchronous error task must reach the constructor's owning Realm.
     workers.workers.insert(
         id,
-        LumenWorkerHandle {
+        TrustJsWorkerHandle {
             ctl,
             interrupt,
             tasks: tasks.clone(),
@@ -19549,9 +19575,9 @@ fn host_worker_spawn(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
         },
     );
     let thread_events = events.clone();
-    let spawned = spawn_lumen_worker_thread(id, move || {
+    let spawned = spawn_trust_js_worker_thread(id, move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_lumen_worker(
+            run_trust_js_worker(
                 launch,
                 handle,
                 tasks,
@@ -19561,19 +19587,19 @@ fn host_worker_spawn(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
             );
         }));
         if result.is_err() {
-            send_lumen_worker_error(&thread_events, id, "Lumen worker engine panic");
+            send_trust_js_worker_error(&thread_events, id, "TRust JS worker engine panic");
         }
-        let _ = thread_events.send(LumenHostTask::WorkerExited { id });
+        let _ = thread_events.send(TrustJsHostTask::WorkerExited { id });
     });
     if let Err(error) = spawned {
         // HTML #worker-processing-model startup failure is an asynchronous error,
         // not a successful constructor returning an inert, unregistered Worker.
-        send_lumen_worker_error(
+        send_trust_js_worker_error(
             &events,
             id,
             format!("worker thread creation failed: {error}"),
         );
-        let _ = events.send(LumenHostTask::WorkerExited { id });
+        let _ = events.send(TrustJsHostTask::WorkerExited { id });
     }
     Ok(Value::Num(id as f64))
 }
@@ -19585,7 +19611,7 @@ thread_local! {
     static WORKER_SPAWN_FAILURE: std::cell::Cell<Option<std::io::ErrorKind>> = const { std::cell::Cell::new(None) };
 }
 
-fn spawn_lumen_worker_thread(
+fn spawn_trust_js_worker_thread(
     id: usize,
     task: impl FnOnce() + Send + 'static,
 ) -> std::io::Result<()> {
@@ -19594,12 +19620,12 @@ fn spawn_lumen_worker_thread(
         return Err(error.into());
     }
     // No worker-count quota or oversized per-worker stack reservation. Use the
-    // platform/Rust thread default; Lumen grows native execution stack segments
+    // platform/Rust thread default; TRust JS grows native execution stack segments
     // only when needed and releases them on return (ECMA-262 #sec-execution-contexts).
     // Each agent remains independently schedulable and blocks on its inbox when
     // idle. Thread creation is constrained by actual OS/memory resources.
     std::thread::Builder::new()
-        .name(format!("trust-lumen-worker-{id}"))
+        .name(format!("trust-js-worker-{id}"))
         .spawn(task)
         .map(drop)
 }
@@ -19620,7 +19646,7 @@ fn host_worker_post(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
             worker
                 .ctl
                 .sender
-                .send(LumenWorkerCtl::Message(message))
+                .send(TrustJsWorkerCtl::Message(message))
                 .is_ok()
         });
     Ok(Value::Bool(sent))
@@ -19649,7 +19675,7 @@ fn host_worker_self_post(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
         .host_mut::<HostState>()
         .and_then(|state| state.worker_self.as_ref())
     {
-        let _ = worker.events.send(LumenHostTask::Worker {
+        let _ = worker.events.send(TrustJsHostTask::Worker {
             id: worker.id,
             event: crate::js::WorkerOut::Message(message),
         });
@@ -19665,7 +19691,7 @@ fn host_worker_self_post(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
 fn host_classic_script_run(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let source = host_arg_usv(ctx, args, 0);
     let url = host_arg_string(ctx, args, 1);
-    let origin = lumen::SourceOrigin::new(&url);
+    let origin = trust_js::SourceOrigin::new(&url);
     match ctx.eval_classic_script_interruptible_with_origin(&source, Some(&origin)) {
         Ok(Ok(_)) => Ok(Value::Undefined),
         Ok(Err(EvalError::Throw(error))) => Err(error),
@@ -19687,7 +19713,7 @@ fn host_worker_self_close(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Resul
     Ok(Value::Undefined)
 }
 
-fn install_lumen_worker_boundary(engine: &mut lumen::Engine) {
+fn install_trust_js_worker_boundary(engine: &mut trust_js::Engine) {
     engine.define_global("__geometry_bind", 2, geometry_host::bind);
     engine.define_global("__message_port_binding", 3, message_port_host::call);
     engine.ctx().op_state().register_gc::<HostState>();
@@ -19773,120 +19799,124 @@ fn install_lumen_worker_boundary(engine: &mut lumen::Engine) {
         ("__text_decode", 6, host_text_decode as NativeFn),
         ("__body_buffer", 1, host_body_buffer as NativeFn),
         ("__base64_convert", 2, host_base64_convert as NativeFn),
-        ("__wasm_validate", 1, lumen_wasm::host_validate as NativeFn),
-        ("__wasm_compile", 1, lumen_wasm::host_compile as NativeFn),
+        (
+            "__wasm_validate",
+            1,
+            trust_js_wasm::host_validate as NativeFn,
+        ),
+        ("__wasm_compile", 1, trust_js_wasm::host_compile as NativeFn),
         (
             "__wasm_module_imports",
             1,
-            lumen_wasm::host_module_imports as NativeFn,
+            trust_js_wasm::host_module_imports as NativeFn,
         ),
         (
             "__wasm_module_exports",
             1,
-            lumen_wasm::host_module_exports as NativeFn,
+            trust_js_wasm::host_module_exports as NativeFn,
         ),
         (
             "__wasm_module_custom_sections",
             2,
-            lumen_wasm::host_module_custom_sections as NativeFn,
+            trust_js_wasm::host_module_custom_sections as NativeFn,
         ),
         (
             "__wasm_instantiate",
             3,
-            lumen_wasm::host_instantiate as NativeFn,
+            trust_js_wasm::host_instantiate as NativeFn,
         ),
         (
             "__wasm_instance_exports",
             2,
-            lumen_wasm::host_instance_exports as NativeFn,
+            trust_js_wasm::host_instance_exports as NativeFn,
         ),
         (
             "__wasm_call_export",
             2,
-            lumen_wasm::host_call_export as NativeFn,
+            trust_js_wasm::host_call_export as NativeFn,
         ),
         (
             "__wasm_function_cache",
             2,
-            lumen_wasm::host_function_cache as NativeFn,
+            trust_js_wasm::host_function_cache as NativeFn,
         ),
         (
             "__wasm_global_new",
             3,
-            lumen_wasm::host_global_new as NativeFn,
+            trust_js_wasm::host_global_new as NativeFn,
         ),
         (
             "__wasm_global_get",
             1,
-            lumen_wasm::host_global_get as NativeFn,
+            trust_js_wasm::host_global_get as NativeFn,
         ),
         (
             "__wasm_global_set",
             2,
-            lumen_wasm::host_global_set as NativeFn,
+            trust_js_wasm::host_global_set as NativeFn,
         ),
         (
             "__wasm_memory_new",
             2,
-            lumen_wasm::host_memory_new as NativeFn,
+            trust_js_wasm::host_memory_new as NativeFn,
         ),
         (
             "__wasm_memory_size",
             1,
-            lumen_wasm::host_memory_size as NativeFn,
+            trust_js_wasm::host_memory_size as NativeFn,
         ),
         (
             "__wasm_memory_grow",
             2,
-            lumen_wasm::host_memory_grow as NativeFn,
+            trust_js_wasm::host_memory_grow as NativeFn,
         ),
         (
             "__wasm_memory_buffer",
             1,
-            lumen_wasm::host_memory_buffer as NativeFn,
+            trust_js_wasm::host_memory_buffer as NativeFn,
         ),
         (
             "__wasm_table_new",
             4,
-            lumen_wasm::host_table_new as NativeFn,
+            trust_js_wasm::host_table_new as NativeFn,
         ),
         (
             "__wasm_table_length",
             1,
-            lumen_wasm::host_table_length as NativeFn,
+            trust_js_wasm::host_table_length as NativeFn,
         ),
         (
             "__wasm_table_get",
             2,
-            lumen_wasm::host_table_get as NativeFn,
+            trust_js_wasm::host_table_get as NativeFn,
         ),
         (
             "__wasm_table_set",
             3,
-            lumen_wasm::host_table_set as NativeFn,
+            trust_js_wasm::host_table_set as NativeFn,
         ),
         (
             "__wasm_table_grow",
             3,
-            lumen_wasm::host_table_grow as NativeFn,
+            trust_js_wasm::host_table_grow as NativeFn,
         ),
         (
             "__wasm_exception_binding",
             3,
-            lumen_wasm::host_exception_binding as NativeFn,
+            trust_js_wasm::host_exception_binding as NativeFn,
         ),
     ] {
         engine.define_global(name, len, function);
     }
 }
 
-fn lumen_same_origin(left: &url::Url, right: &url::Url) -> bool {
+fn trust_js_same_origin(left: &url::Url, right: &url::Url) -> bool {
     left.scheme() == right.scheme()
         && left.host_str() == right.host_str()
         && left.port_or_known_default() == right.port_or_known_default()
 }
 
-struct LumenWorkerScript {
+struct TrustJsWorkerScript {
     url: url::Url,
     source: String,
     /// HTML #run-a-worker: the policy container's referrer policy from the script response
@@ -19894,7 +19924,7 @@ struct LumenWorkerScript {
     referrer_policy: Option<crate::referrer_policy::ReferrerPolicy>,
 }
 
-struct LumenWorkerModuleFetch {
+struct TrustJsWorkerModuleFetch {
     page: url::Url,
     cookie_context: crate::http::CookieContext,
     handle: tokio::runtime::Handle,
@@ -19906,22 +19936,22 @@ struct LumenWorkerModuleFetch {
 /// HTML §8.1.4.2 classic/module worker fetch. Top-level HTTP(S) worker requests are same-origin;
 /// classic HTTP(S) responses and all module responses require a JavaScript MIME type. `data:` and
 /// active same-partition `blob:` entries are fetched without applying the HTTP MIME gate.
-fn fetch_lumen_worker_script(
-    launch: &LumenWorkerLaunch,
+fn fetch_trust_js_worker_script(
+    launch: &TrustJsWorkerLaunch,
     handle: &tokio::runtime::Handle,
     cache: &Arc<crate::http::PageCache>,
-) -> Option<LumenWorkerScript> {
+) -> Option<TrustJsWorkerScript> {
     if launch.script_url.scheme() == "blob" {
         // Fetch #scheme-fetch "blob": the entry the constructor's URL parse resolved; a
         // selected file's range is read now. Without one, a network error.
         let entry = launch.script_blob.as_ref()?;
-        if launch.kind == LumenWorkerKind::Module
+        if launch.kind == TrustJsWorkerKind::Module
             && !crate::http::module_script_response_allowed(200, &entry.content_type)
         {
             return None;
         }
         let body = entry.read().ok()?;
-        return Some(LumenWorkerScript {
+        return Some(TrustJsWorkerScript {
             url: launch.script_url.clone(),
             source: String::from_utf8_lossy(&body).into_owned(),
             // HTML #initialize-worker-policy-container: a blob: worker's container is the
@@ -19931,20 +19961,20 @@ fn fetch_lumen_worker_script(
     }
     if launch.script_url.scheme() == "data" {
         let content_type = data_url_content_type(launch.script_url.as_str());
-        if launch.kind == LumenWorkerKind::Module
+        if launch.kind == TrustJsWorkerKind::Module
             && !crate::http::module_script_response_allowed(200, &content_type)
         {
             return None;
         }
         let body = crate::img::decode_data_url(launch.script_url.as_str())?;
-        return Some(LumenWorkerScript {
+        return Some(TrustJsWorkerScript {
             url: launch.script_url.clone(),
             source: String::from_utf8_lossy(&body).into_owned(),
             referrer_policy: None,
         });
     }
     if !matches!(launch.script_url.scheme(), "http" | "https")
-        || !lumen_same_origin(&launch.owner_page, &launch.script_url)
+        || !trust_js_same_origin(&launch.owner_page, &launch.script_url)
         || !crate::http::subresource_allowed(&launch.owner_page, &launch.script_url)
     {
         return None;
@@ -19980,20 +20010,20 @@ fn fetch_lumen_worker_script(
         let _ = sender.send(result);
     });
     let (response_url, status, content_type, body, policy) = receiver.recv().ok().flatten()?;
-    if !lumen_same_origin(&launch.owner_page, &response_url)
+    if !trust_js_same_origin(&launch.owner_page, &response_url)
         || !crate::http::module_script_response_allowed(status, &content_type)
     {
         return None;
     }
-    Some(LumenWorkerScript {
+    Some(TrustJsWorkerScript {
         url: response_url,
         source: String::from_utf8_lossy(&body).into_owned(),
         referrer_policy: Some(policy.unwrap_or_default()),
     })
 }
 
-fn send_lumen_worker_error(events: &LumenTaskSender, id: usize, message: impl Into<String>) {
-    let _ = events.send(LumenHostTask::Worker {
+fn send_trust_js_worker_error(events: &TrustJsTaskSender, id: usize, message: impl Into<String>) {
+    let _ = events.send(TrustJsHostTask::Worker {
         id,
         event: crate::js::WorkerOut::Error(message.into()),
     });
@@ -20002,8 +20032,8 @@ fn send_lumen_worker_error(events: &LumenTaskSender, id: usize, message: impl In
 /// Trusted bootstrap runs before author code but still observes a cancellation which raced with
 /// realm construction. `Ok(false)` is the silent HTML termination path; parse/throw failures are
 /// genuine platform bootstrap defects and are reported to the owner.
-fn eval_lumen_worker_setup(
-    engine: &mut lumen::Engine,
+fn eval_trust_js_worker_setup(
+    engine: &mut trust_js::Engine,
     source: &str,
     label: &str,
 ) -> Result<bool, String> {
@@ -20018,7 +20048,7 @@ fn eval_lumen_worker_setup(
     }
 }
 
-fn eval_lumen_worker_platform_setup(engine: &mut lumen::Engine) -> Result<bool, String> {
+fn eval_trust_js_worker_platform_setup(engine: &mut trust_js::Engine) -> Result<bool, String> {
     let snapshot = worker_prelude_snapshot()?;
     const LABEL: &str = "worker platform prelude";
     match engine.eval_snapshot_value_interruptible(snapshot) {
@@ -20037,19 +20067,19 @@ fn eval_lumen_worker_platform_setup(engine: &mut lumen::Engine) -> Result<bool, 
 }
 
 /// `label` is the worker script's URL, which its stack frames report.
-fn eval_lumen_worker_classic(
-    engine: &mut lumen::Engine,
+fn eval_trust_js_worker_classic(
+    engine: &mut trust_js::Engine,
     source: &str,
     label: &str,
-    events: &LumenTaskSender,
+    events: &TrustJsTaskSender,
     id: usize,
 ) -> bool {
-    let origin = lumen::SourceOrigin::new(label);
+    let origin = trust_js::SourceOrigin::new(label);
     match engine.eval_value_interruptible_with_origin(source, Some(&origin)) {
         // HTML #run-a-worker: a script whose error to rethrow is a parse error
         // fires a plain "error" event at the Worker object.
         Err(error) => {
-            send_lumen_worker_error(
+            send_trust_js_worker_error(
                 events,
                 id,
                 format!(
@@ -20060,7 +20090,7 @@ fn eval_lumen_worker_classic(
         }
         // An uncaught exception is reported in the worker global first.
         Ok(Err(EvalError::Throw(error))) => {
-            match lumen_worker_internal_call(
+            match trust_js_worker_internal_call(
                 engine,
                 "reportException",
                 std::slice::from_ref(&error),
@@ -20068,7 +20098,7 @@ fn eval_lumen_worker_classic(
                 Ok(_) => {}
                 Err(EvalError::Interrupted(_)) => return false,
                 Err(EvalError::Throw(_)) => {
-                    send_lumen_worker_error(events, id, describe_throw(engine, error, label));
+                    send_trust_js_worker_error(events, id, describe_throw(engine, error, label));
                 }
             }
         }
@@ -20081,11 +20111,11 @@ fn eval_lumen_worker_classic(
     true
 }
 
-fn eval_lumen_worker_module(
-    engine: &mut lumen::Engine,
-    script: &LumenWorkerScript,
-    fetch: LumenWorkerModuleFetch,
-    events: &LumenTaskSender,
+fn eval_trust_js_worker_module(
+    engine: &mut trust_js::Engine,
+    script: &TrustJsWorkerScript,
+    fetch: TrustJsWorkerModuleFetch,
+    events: &TrustJsTaskSender,
     id: usize,
 ) -> bool {
     let loader_page = fetch.page;
@@ -20120,7 +20150,7 @@ fn eval_lumen_worker_module(
             loaded
         },
     ) {
-        Err(error) => send_lumen_worker_error(
+        Err(error) => send_trust_js_worker_error(
             events,
             id,
             format!(
@@ -20129,33 +20159,33 @@ fn eval_lumen_worker_module(
             ),
         ),
         // HTML #run-a-worker runs the module script, which reports its exception.
-        Ok(lumen::ExecutionOutcome::Throw { name, message })
+        Ok(trust_js::ExecutionOutcome::Throw { name, message })
             if missing_dependency.load(std::sync::atomic::Ordering::Relaxed) =>
         {
-            send_lumen_worker_error(
+            send_trust_js_worker_error(
                 events,
                 id,
                 format!("\u{1}fail {} threw {name}: {message}", script.url),
             );
         }
-        Ok(lumen::ExecutionOutcome::Throw { name, message }) => {
+        Ok(trust_js::ExecutionOutcome::Throw { name, message }) => {
             let error = engine.ctx().make_error(&name, message.clone());
-            if lumen_worker_internal_call(engine, "reportException", &[error]).is_err() {
-                send_lumen_worker_error(
+            if trust_js_worker_internal_call(engine, "reportException", &[error]).is_err() {
+                send_trust_js_worker_error(
                     events,
                     id,
                     format!("{} threw {name}: {message}", script.url),
                 );
             }
         }
-        Ok(lumen::ExecutionOutcome::Interrupted { .. }) => return false,
-        Ok(lumen::ExecutionOutcome::Value(_)) => {}
+        Ok(trust_js::ExecutionOutcome::Interrupted { .. }) => return false,
+        Ok(trust_js::ExecutionOutcome::Value(_)) => {}
     }
     true
 }
 
-fn lumen_worker_internal_call(
-    engine: &mut lumen::Engine,
+fn trust_js_worker_internal_call(
+    engine: &mut trust_js::Engine,
     name: &str,
     args: &[Value],
 ) -> Result<Value, EvalError> {
@@ -20181,7 +20211,7 @@ fn rejections_by_context(records: Vec<(u64, Value, Value)>) -> Vec<(u64, Vec<(Va
 }
 
 /// Whether `context` is the engine's active settings context or a live Window's.
-fn is_page_context(engine: &mut lumen::Engine, context: u64) -> bool {
+fn is_page_context(engine: &mut trust_js::Engine, context: u64) -> bool {
     let ctx = engine.ctx();
     context == ctx.host_job_context()
         || ctx
@@ -20194,7 +20224,7 @@ fn is_page_context(engine: &mut lumen::Engine, context: u64) -> bool {
 /// Window that is gone has no event loop task to queue (its Document is not fully active), so
 /// its records are dropped. False when the operation could not run.
 fn notify_rejections_in_context(
-    engine: &mut lumen::Engine,
+    engine: &mut trust_js::Engine,
     context: u64,
     method: &str,
     list: Vec<(Value, Value)>,
@@ -20223,9 +20253,9 @@ fn notify_rejections_in_context(
         .unwrap_or(false)
 }
 
-fn lumen_worker_report_buffered_errors(
-    engine: &mut lumen::Engine,
-    events: &LumenTaskSender,
+fn trust_js_worker_report_buffered_errors(
+    engine: &mut trust_js::Engine,
+    events: &TrustJsTaskSender,
     id: usize,
 ) -> bool {
     // HTML #notify-about-rejected-promises after the task's microtask checkpoint.
@@ -20237,7 +20267,7 @@ fn lumen_worker_report_buffered_errors(
             .collect();
         let list = engine.ctx().make_array(pairs);
         if let Err(EvalError::Interrupted(_)) =
-            lumen_worker_internal_call(engine, "notifyRejectedPromises", &[list])
+            trust_js_worker_internal_call(engine, "notifyRejectedPromises", &[list])
         {
             return false;
         }
@@ -20251,16 +20281,16 @@ fn lumen_worker_report_buffered_errors(
             .collect();
         let list = engine.ctx().make_array(pairs);
         if let Err(EvalError::Interrupted(_)) =
-            lumen_worker_internal_call(engine, "notifyHandledPromises", &[list])
+            trust_js_worker_internal_call(engine, "notifyHandledPromises", &[list])
         {
             return false;
         }
     }
-    match lumen_worker_internal_call(engine, "takeConsole", &[]) {
+    match trust_js_worker_internal_call(engine, "takeConsole", &[]) {
         Ok(value) => {
             let lines = value_string(engine, &value);
             if !lines.is_empty() {
-                let _ = events.send(LumenHostTask::Worker {
+                let _ = events.send(TrustJsHostTask::Worker {
                     id,
                     event: crate::js::WorkerOut::Console(lines),
                 });
@@ -20269,17 +20299,17 @@ fn lumen_worker_report_buffered_errors(
         Err(EvalError::Interrupted(_)) => return false,
         Err(EvalError::Throw(_)) => {}
     }
-    match lumen_worker_internal_call(engine, "takeErrors", &[]) {
+    match trust_js_worker_internal_call(engine, "takeErrors", &[]) {
         Ok(value) => {
             let errors = value_string(engine, &value);
             for error in errors.split('\u{1e}').filter(|error| !error.is_empty()) {
-                send_lumen_worker_error(events, id, error.to_string());
+                send_trust_js_worker_error(events, id, error.to_string());
             }
             true
         }
         Err(EvalError::Interrupted(_)) => false,
         Err(EvalError::Throw(error)) => {
-            send_lumen_worker_error(
+            send_trust_js_worker_error(
                 events,
                 id,
                 describe_throw(engine, error, "worker error reporting"),
@@ -20289,7 +20319,7 @@ fn lumen_worker_report_buffered_errors(
     }
 }
 
-fn lumen_worker_closed(engine: &mut lumen::Engine) -> bool {
+fn trust_js_worker_closed(engine: &mut trust_js::Engine) -> bool {
     engine
         .ctx()
         .host_mut::<HostState>()
@@ -20297,8 +20327,8 @@ fn lumen_worker_closed(engine: &mut lumen::Engine) -> bool {
         .is_some_and(|worker| worker.closed)
 }
 
-fn lumen_worker_deadline(engine: &mut lumen::Engine) -> Option<f64> {
-    match lumen_worker_internal_call(engine, "nextDeadline", &[]) {
+fn trust_js_worker_deadline(engine: &mut trust_js::Engine) -> Option<f64> {
+    match trust_js_worker_internal_call(engine, "nextDeadline", &[]) {
         Ok(Value::Num(deadline)) if deadline.is_finite() => Some(deadline),
         _ => None,
     }
@@ -20307,8 +20337,8 @@ fn lumen_worker_deadline(engine: &mut lumen::Engine) -> Option<f64> {
 /// HTML #event-loop-processing-model (worker event loop): the next rendering
 /// opportunity of a DedicatedWorkerGlobalScope with animation frame
 /// callbacks (HTML #animationframeprovider).
-fn lumen_worker_frame_deadline(engine: &mut lumen::Engine) -> Option<f64> {
-    match lumen_worker_internal_call(engine, "animationFrameDeadline", &[]) {
+fn trust_js_worker_frame_deadline(engine: &mut trust_js::Engine) -> Option<f64> {
+    match trust_js_worker_internal_call(engine, "animationFrameDeadline", &[]) {
         Ok(Value::Num(deadline)) if deadline.is_finite() => Some(deadline),
         _ => None,
     }
@@ -20318,7 +20348,7 @@ fn lumen_worker_frame_deadline(engine: &mut lumen::Engine) -> Option<f64> {
 /// steps of its 2D OffscreenCanvas contexts, then present WebGL frames and
 /// push changed bitmaps to their placeholder canvas elements. Returns false
 /// when the worker was interrupted.
-fn lumen_worker_update_rendering(engine: &mut lumen::Engine) -> bool {
+fn trust_js_worker_update_rendering(engine: &mut trust_js::Engine) -> bool {
     let lost = engine.ctx().host_mut::<HostState>().is_some_and(|state| {
         state.offscreen_canvases.values().any(|canvas| {
             let canvas = canvas.borrow();
@@ -20331,7 +20361,7 @@ fn lumen_worker_update_rendering(engine: &mut lumen::Engine) -> bool {
     });
     if lost {
         if let Err(EvalError::Interrupted(_)) =
-            lumen_worker_internal_call(engine, "runCanvasContextLost", &[])
+            trust_js_worker_internal_call(engine, "runCanvasContextLost", &[])
         {
             return false;
         }
@@ -20351,25 +20381,25 @@ fn lumen_worker_update_rendering(engine: &mut lumen::Engine) -> bool {
     true
 }
 
-fn lumen_worker_now(engine: &mut lumen::Engine) -> f64 {
-    match lumen_worker_internal_call(engine, "now", &[]) {
+fn trust_js_worker_now(engine: &mut trust_js::Engine) -> f64 {
+    match trust_js_worker_internal_call(engine, "now", &[]) {
         Ok(Value::Num(now)) if now.is_finite() => now,
         _ => 0.0,
     }
 }
 
-/// One Lumen realm per dedicated worker agent. No engine value crosses the thread boundary;
+/// One TRust JS realm per dedicated worker agent. No engine value crosses the thread boundary;
 /// messages are structured-clone wire strings, and every selected message/timer task is followed
 /// by its own microtask checkpoint before the loop parks or selects another task.
-fn run_lumen_worker(
-    launch: LumenWorkerLaunch,
+fn run_trust_js_worker(
+    launch: TrustJsWorkerLaunch,
     handle: tokio::runtime::Handle,
     tasks: Arc<crate::http::PageTaskScope>,
-    events: LumenTaskSender,
-    ctl_rx: std::sync::mpsc::Receiver<LumenWorkerCtl>,
-    interrupt: Arc<lumen::RuntimeInterrupt>,
+    events: TrustJsTaskSender,
+    ctl_rx: std::sync::mpsc::Receiver<TrustJsWorkerCtl>,
+    interrupt: Arc<trust_js::RuntimeInterrupt>,
 ) {
-    let _task_lifetime = LumenWorkerTaskLifetime(tasks.clone());
+    let _task_lifetime = TrustJsWorkerTaskLifetime(tasks.clone());
     let nested_tasks = tasks.clone();
     let cache = Arc::new(crate::http::PageCache::with_task_scope(tasks));
     let clock = Rc::new(RealmClock::new());
@@ -20396,7 +20426,7 @@ fn run_lumen_worker(
     state.permission_store = launch.permission_store.clone();
     state.message_ports.registry = launch.port_registry.clone();
     state.message_ports.wake = launch.port_wake.clone();
-    state.network = Some(LumenNetwork {
+    state.network = Some(TrustJsNetwork {
         handle: handle.clone(),
         cache: cache.clone(),
         fetched: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -20423,7 +20453,7 @@ fn run_lumen_worker(
     // fetches use this worker's origin, and it lives in this worker's owner
     // set, so ending this agent (dropping its handles) terminates it too
     // (#the-worker's-lifetime: an orphan is no longer permissible).
-    state.workers = Some(LumenPageWorkers {
+    state.workers = Some(TrustJsPageWorkers {
         handle: handle.clone(),
         page: worker_origin.clone(),
         tasks: nested_tasks,
@@ -20432,7 +20462,7 @@ fn run_lumen_worker(
         next_id: 1,
         shared: HashMap::new(),
     });
-    state.worker_self = Some(LumenWorkerSelf {
+    state.worker_self = Some(TrustJsWorkerSelf {
         id: launch.id,
         events: events.clone(),
         closed: false,
@@ -20444,7 +20474,7 @@ fn run_lumen_worker(
         referrer_policy: launch.referrer_policy,
     });
 
-    let mut engine = lumen::Engine::new_with_interrupt(interrupt);
+    let mut engine = trust_js::Engine::new_with_interrupt(interrupt);
     let engine_clock = clock.clone();
     engine.set_wall_clock(move || engine_clock.now_ms());
     state.configure_module_loading(&mut engine);
@@ -20452,9 +20482,9 @@ fn run_lumen_worker(
         .ctx()
         .op_state()
         .put_retained_memory_with_external_memory(state);
-    install_lumen_worker_boundary(&mut engine);
+    install_trust_js_worker_boundary(&mut engine);
 
-    let worker_type = if launch.kind == LumenWorkerKind::Module {
+    let worker_type = if launch.kind == TrustJsWorkerKind::Module {
         "module"
     } else {
         "classic"
@@ -20485,22 +20515,22 @@ fn run_lumen_worker(
     );
     for platform in [false, true] {
         let setup = if platform {
-            eval_lumen_worker_platform_setup(&mut engine)
+            eval_trust_js_worker_platform_setup(&mut engine)
         } else {
-            eval_lumen_worker_setup(&mut engine, &config, "worker configuration")
+            eval_trust_js_worker_setup(&mut engine, &config, "worker configuration")
         };
         match setup {
             Ok(true) => {}
             Ok(false) => return,
             Err(error) => {
-                send_lumen_worker_error(&events, launch.id, error);
+                send_trust_js_worker_error(&events, launch.id, error);
                 return;
             }
         }
     }
 
-    let Some(script) = fetch_lumen_worker_script(&launch, &handle, &cache) else {
-        send_lumen_worker_error(
+    let Some(script) = fetch_trust_js_worker_script(&launch, &handle, &cache) else {
+        send_trust_js_worker_error(
             &events,
             launch.id,
             format!(
@@ -20520,14 +20550,14 @@ fn run_lumen_worker(
         worker.referrer_policy = policy;
     }
     let continued = match launch.kind {
-        LumenWorkerKind::Classic => eval_lumen_worker_classic(
+        TrustJsWorkerKind::Classic => eval_trust_js_worker_classic(
             &mut engine,
             &script.source,
             script.url.as_str(),
             &events,
             launch.id,
         ),
-        LumenWorkerKind::Module => {
+        TrustJsWorkerKind::Module => {
             let fetched = engine
                 .ctx()
                 .host_mut::<HostState>()
@@ -20535,10 +20565,10 @@ fn run_lumen_worker(
                 .map(|network| network.fetched.clone())
                 .unwrap_or_default();
             let environment = ModuleFetchEnvironment::of(engine.ctx(), 0);
-            eval_lumen_worker_module(
+            eval_trust_js_worker_module(
                 &mut engine,
                 &script,
-                LumenWorkerModuleFetch {
+                TrustJsWorkerModuleFetch {
                     page: launch.owner_page.clone(),
                     cookie_context: launch.cookie_context.clone(),
                     handle: handle.clone(),
@@ -20552,8 +20582,8 @@ fn run_lumen_worker(
         }
     };
     if !continued
-        || !lumen_worker_report_buffered_errors(&mut engine, &events, launch.id)
-        || lumen_worker_closed(&mut engine)
+        || !trust_js_worker_report_buffered_errors(&mut engine, &events, launch.id)
+        || trust_js_worker_closed(&mut engine)
     {
         return;
     }
@@ -20561,12 +20591,12 @@ fn run_lumen_worker(
     // errors are reported within the worker (and possibly a developer console), never to
     // the SharedWorker objects. Their channel is closed, so those reports are discarded.
     let events = if launch.shared {
-        LumenTaskSender::Worker(std::sync::Weak::new())
+        TrustJsTaskSender::Worker(std::sync::Weak::new())
     } else {
         events
     };
     enum WorkerTask {
-        Command(LumenWorkerCtl),
+        Command(TrustJsWorkerCtl),
         Timer,
         Port,
         Bitmap,
@@ -20575,13 +20605,13 @@ fn run_lumen_worker(
         Frame,
     }
     let wall_origin = Instant::now();
-    let virtual_origin = lumen_worker_now(&mut engine);
+    let virtual_origin = trust_js_worker_now(&mut engine);
     let mut queued_command = None;
     let mut source_cursor = 0;
     loop {
         let now = virtual_origin + wall_origin.elapsed().as_secs_f64() * 1000.0;
-        let deadline = lumen_worker_deadline(&mut engine);
-        let frame = lumen_worker_frame_deadline(&mut engine);
+        let deadline = trust_js_worker_deadline(&mut engine);
+        let frame = trust_js_worker_frame_deadline(&mut engine);
         if queued_command.is_none() {
             queued_command = match ctl_rx.try_recv() {
                 Ok(command) => Some(command),
@@ -20590,19 +20620,19 @@ fn run_lumen_worker(
             };
         }
         let port_ready = matches!(
-            lumen_worker_internal_call(&mut engine, "hasPortTask", &[]),
+            trust_js_worker_internal_call(&mut engine, "hasPortTask", &[]),
             Ok(Value::Bool(true))
         );
         let bitmap_ready = matches!(
-            lumen_worker_internal_call(&mut engine, "hasBitmapTask", &[]),
+            trust_js_worker_internal_call(&mut engine, "hasBitmapTask", &[]),
             Ok(Value::Bool(true))
         );
         let performance_ready = matches!(
-            lumen_worker_internal_call(&mut engine, "hasPerformanceTask", &[]),
+            trust_js_worker_internal_call(&mut engine, "hasPerformanceTask", &[]),
             Ok(Value::Bool(true))
         );
         let platform_ready = matches!(
-            lumen_worker_internal_call(&mut engine, "hasPlatformTask", &[]),
+            trust_js_worker_internal_call(&mut engine, "hasPlatformTask", &[]),
             Ok(Value::Bool(true))
         );
         // Distinct task sources all make progress. A busy implicit worker port
@@ -20656,57 +20686,61 @@ fn run_lumen_worker(
             }
         };
         let now = virtual_origin + wall_origin.elapsed().as_secs_f64() * 1000.0;
-        let _ = lumen_worker_internal_call(&mut engine, "advanceClock", &[Value::Num(now)]);
+        let _ = trust_js_worker_internal_call(&mut engine, "advanceClock", &[Value::Num(now)]);
         let task_result = match task {
-            WorkerTask::Command(LumenWorkerCtl::Terminate) => break,
-            WorkerTask::Command(LumenWorkerCtl::PortReady(pending)) => {
+            WorkerTask::Command(TrustJsWorkerCtl::Terminate) => break,
+            WorkerTask::Command(TrustJsWorkerCtl::PortReady(pending)) => {
                 pending.store(false, std::sync::atomic::Ordering::Release);
                 Ok(Value::Undefined)
             }
-            WorkerTask::Command(LumenWorkerCtl::Message(message)) => lumen_worker_internal_call(
-                &mut engine,
-                "message",
-                &[Value::from_engine_text(message)],
-            ),
-            WorkerTask::Command(LumenWorkerCtl::HostTask(task)) => {
+            WorkerTask::Command(TrustJsWorkerCtl::Message(message)) => {
+                trust_js_worker_internal_call(
+                    &mut engine,
+                    "message",
+                    &[Value::from_engine_text(message)],
+                )
+            }
+            WorkerTask::Command(TrustJsWorkerCtl::HostTask(task)) => {
                 if let Err(error) = dispatch_host_task(&mut engine, *task) {
-                    send_lumen_worker_error(&events, launch.id, error);
+                    send_trust_js_worker_error(&events, launch.id, error);
                 }
                 Ok(Value::Undefined)
             }
-            WorkerTask::Port => lumen_worker_internal_call(&mut engine, "runPortTask", &[]),
-            WorkerTask::Bitmap => lumen_worker_internal_call(&mut engine, "runBitmapTask", &[]),
+            WorkerTask::Port => trust_js_worker_internal_call(&mut engine, "runPortTask", &[]),
+            WorkerTask::Bitmap => trust_js_worker_internal_call(&mut engine, "runBitmapTask", &[]),
             WorkerTask::Performance => {
-                lumen_worker_internal_call(&mut engine, "runPerformanceTask", &[])
+                trust_js_worker_internal_call(&mut engine, "runPerformanceTask", &[])
             }
-            WorkerTask::Platform => lumen_worker_internal_call(&mut engine, "runPlatformTask", &[]),
+            WorkerTask::Platform => {
+                trust_js_worker_internal_call(&mut engine, "runPlatformTask", &[])
+            }
             WorkerTask::Timer => {
-                lumen_worker_internal_call(&mut engine, "tick", &[Value::Num(now)])
+                trust_js_worker_internal_call(&mut engine, "tick", &[Value::Num(now)])
             }
             WorkerTask::Frame => {
-                lumen_worker_internal_call(&mut engine, "runAnimationFrames", &[Value::Num(now)])
+                trust_js_worker_internal_call(&mut engine, "runAnimationFrames", &[Value::Num(now)])
             }
         };
         match task_result {
             Ok(_) => {}
             Err(EvalError::Interrupted(_)) => break,
-            Err(EvalError::Throw(error)) => send_lumen_worker_error(
+            Err(EvalError::Throw(error)) => send_trust_js_worker_error(
                 &events,
                 launch.id,
                 describe_throw(&mut engine, error, "worker task"),
             ),
         }
         if engine.run_microtasks_interruptible().is_err()
-            || !lumen_worker_report_buffered_errors(&mut engine, &events, launch.id)
-            || lumen_worker_closed(&mut engine)
-            || !lumen_worker_update_rendering(&mut engine)
+            || !trust_js_worker_report_buffered_errors(&mut engine, &events, launch.id)
+            || trust_js_worker_closed(&mut engine)
+            || !trust_js_worker_update_rendering(&mut engine)
         {
             break;
         }
     }
 }
 
-fn install_context_module_loader(engine: &mut lumen::Engine, context: u64) {
+fn install_context_module_loader(engine: &mut trust_js::Engine, context: u64) {
     let import_map = context_import_map(engine.ctx(), context);
     let page = request_context_url(engine.ctx(), context);
     let cookie_context = cookie_context_for_id(engine.ctx(), context);
@@ -20873,7 +20907,7 @@ fn data_dynamic_module_result(
 /// and HTML module-script MIME checks happen off-thread; parsing, linking, evaluation, promise
 /// settlement, and the following microtask checkpoint remain serialized in the JS realm.
 fn queue_dynamic_module_load(
-    loader: &LumenDynamicModuleLoader,
+    loader: &TrustJsDynamicModuleLoader,
     request_id: u64,
     specifier: &str,
     referrer: &str,
@@ -20886,7 +20920,7 @@ fn queue_dynamic_module_load(
         .unwrap_or_else(|e| e.into_inner())
         .resolve(specifier, &base)
     else {
-        let _ = loader.events.send(LumenHostTask::DynamicModule {
+        let _ = loader.events.send(TrustJsHostTask::DynamicModule {
             context: loader.context,
             request_id,
             result: None,
@@ -20904,7 +20938,7 @@ fn queue_dynamic_module_load(
             crate::img::decode_data_url(resolved.as_str())
                 .is_some_and(|bytes| crate::import_maps::integrity_matches(&integrity, &bytes))
         });
-        let _ = loader.events.send(LumenHostTask::DynamicModule {
+        let _ = loader.events.send(TrustJsHostTask::DynamicModule {
             context: loader.context,
             request_id,
             result,
@@ -20916,7 +20950,7 @@ fn queue_dynamic_module_load(
         let result = loader
             .environment
             .blob_module(&resolved, &integrity, module_type);
-        let _ = loader.events.send(LumenHostTask::DynamicModule {
+        let _ = loader.events.send(TrustJsHostTask::DynamicModule {
             context: loader.context,
             request_id,
             result,
@@ -20924,7 +20958,7 @@ fn queue_dynamic_module_load(
         return;
     }
     let Some(network) = loader.network.as_ref() else {
-        let _ = loader.events.send(LumenHostTask::DynamicModule {
+        let _ = loader.events.send(TrustJsHostTask::DynamicModule {
             context: loader.context,
             request_id,
             result: None,
@@ -20934,7 +20968,7 @@ fn queue_dynamic_module_load(
     if !matches!(resolved.scheme(), "http" | "https")
         || !crate::http::subresource_allowed(&loader.page, &resolved)
     {
-        let _ = loader.events.send(LumenHostTask::DynamicModule {
+        let _ = loader.events.send(TrustJsHostTask::DynamicModule {
             context: loader.context,
             request_id,
             result: None,
@@ -20983,8 +21017,7 @@ fn queue_dynamic_module_load(
                 response.status,
                 &response.content_type,
                 module_type.as_deref(),
-            )
-                && crate::import_maps::integrity_matches(&integrity, &response.body))
+            ) && crate::import_maps::integrity_matches(&integrity, &response.body))
             .then(|| {
                 (
                     resolved.to_string(),
@@ -20992,7 +21025,7 @@ fn queue_dynamic_module_load(
                 )
             })
         });
-        let _ = events.send(LumenHostTask::DynamicModule {
+        let _ = events.send(TrustJsHostTask::DynamicModule {
             context,
             request_id,
             result,
@@ -21008,7 +21041,11 @@ fn queue_dynamic_module_load(
 /// that task. Start the same request here, as import() runs, so the task's
 /// `queue_dynamic_module_load` joins it in the page cache; its static graph
 /// is fetched as the response arrives.
-fn begin_dynamic_module_fetch(loader: &LumenDynamicModuleLoader, specifier: &str, referrer: &str) {
+fn begin_dynamic_module_fetch(
+    loader: &TrustJsDynamicModuleLoader,
+    specifier: &str,
+    referrer: &str,
+) {
     let Some(network) = loader.network.as_ref() else {
         return;
     };
@@ -21041,7 +21078,7 @@ fn begin_dynamic_module_fetch(loader: &LumenDynamicModuleLoader, specifier: &str
     }
     if std::env::var_os("TRUST_NET_TRACE").is_some() {
         eprintln!(
-            "lumen: @{:>6}ms dynamic import {resolved}",
+            "trust-js: @{:>6}ms dynamic import {resolved}",
             crate::http::trace_ms()
         );
     }
@@ -21079,7 +21116,7 @@ fn begin_dynamic_module_fetch(loader: &LumenDynamicModuleLoader, specifier: &str
     });
 }
 
-fn speculate_engine_imports(engine: &mut lumen::Engine, base: &url::Url, body: &[u8]) {
+fn speculate_engine_imports(engine: &mut trust_js::Engine, base: &url::Url, body: &[u8]) {
     if request_cookie_context(engine.ctx()).cross_site_ancestor {
         return;
     }
@@ -21099,7 +21136,7 @@ fn speculate_engine_imports(engine: &mut lumen::Engine, base: &url::Url, body: &
     speculate_module_imports(&page, &handle, &cache, &fetched, base, body);
 }
 
-/// HTML §4.12.1 fetches a module script and its dependencies in parallel. Lumen's graph loader
+/// HTML §4.12.1 fetches a module script and its dependencies in parallel. TRust JS's graph loader
 /// intentionally stays synchronous and atomic, so warm every statically named dependency in the
 /// shared page cache before that loader asks for them in source order.
 ///
@@ -21149,7 +21186,7 @@ fn speculate_module_imports(
         }
         if std::env::var_os("TRUST_NET_TRACE").is_some() {
             eprintln!(
-                "lumen: @{:>6}ms module prefetch {resolved}",
+                "trust-js: @{:>6}ms module prefetch {resolved}",
                 crate::http::trace_ms()
             );
         }
@@ -21169,7 +21206,7 @@ fn speculate_module_imports(
 /// module script's own fetch completes, "fetch the descendants of and link"
 /// it fetches each of its static dependencies, and theirs in turn, in
 /// parallel with the parser and every other script; only linking waits for
-/// the whole graph. Lumen's graph loader fetches and links when the module
+/// the whole graph. TRust JS's graph loader fetches and links when the module
 /// is about to run, which for a deferred module is after the parser's last
 /// script. Walk the static graph here instead, on the network runtime as each
 /// response arrives, so the loader finds every dependency already fetched.
@@ -21199,7 +21236,7 @@ pub(crate) fn speculate_module_graph(
     }
 }
 
-fn push_engine_error(engine: &mut lumen::Engine, message: String) {
+fn push_engine_error(engine: &mut trust_js::Engine, message: String) {
     host_push_injected_error(engine.ctx(), message);
 }
 
@@ -21222,7 +21259,7 @@ fn classic_script_errors_muted(ctx: &mut Ctx, node_id: usize, url: &str) -> bool
     !cors && !crate::http::same_origin_for_host(&document, &script)
 }
 
-fn fire_engine_script_event(engine: &mut lumen::Engine, node_id: usize, event_type: &str) {
+fn fire_engine_script_event(engine: &mut trust_js::Engine, node_id: usize, event_type: &str) {
     host_fire_script_event(engine.ctx(), node_id, event_type);
 }
 
@@ -21230,7 +21267,7 @@ fn fire_engine_script_event(engine: &mut lumen::Engine, node_id: usize, event_ty
 /// top-level await. Retaining this as a pending resource also keeps the document load event behind
 /// parser-inserted module evaluation. Each reaction runs during the owning realm's microtask
 /// checkpoint and performs the element's success/failure steps exactly once.
-fn track_module_evaluation(engine: &mut lumen::Engine, node_id: usize, name: &str) -> bool {
+fn track_module_evaluation(engine: &mut trust_js::Engine, node_id: usize, name: &str) -> bool {
     let Some(promise) = engine.module_evaluation_promise(name) else {
         return false;
     };
@@ -21310,7 +21347,7 @@ fn track_module_evaluation(engine: &mut lumen::Engine, node_id: usize, name: &st
 /// Run a parser-inserted or fetched classic script. `url` is what its stack frames report: the
 /// script's URL, or the document's for an inline script.
 fn run_injected_classic_task(
-    engine: &mut lumen::Engine,
+    engine: &mut trust_js::Engine,
     node_id: usize,
     name: &str,
     url: &str,
@@ -21319,7 +21356,7 @@ fn run_injected_classic_task(
     let trust = host_trust(engine.ctx()).map_err(|_| "read the platform control".to_string())?;
     let document_base = state_base(engine.ctx());
     // HTML #prepare-the-script-element: a fetched classic script's base URL is its URL; an
-    // inline one's is its node document's document base URL. Lumen keeps it as the referrer of
+    // inline one's is its node document's document base URL. TRust JS keeps it as the referrer of
     // the script's import() calls, including later ones from functions the script created.
     let script_base = if name == url {
         name.to_string()
@@ -21345,7 +21382,7 @@ fn run_injected_classic_task(
     );
     let current = classic_current_script(engine.ctx(), node_id);
     let _ = engine.ctx().member_set(&trust, "currentScript", current);
-    let origin = lumen::SourceOrigin::new(url);
+    let origin = trust_js::SourceOrigin::new(url);
     let evaluated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         engine.eval_value_interruptible_with_origin(source, Some(&origin))
     }));
@@ -21382,7 +21419,7 @@ fn run_injected_classic_task(
                 );
             }
         }
-        Err(_) => push_engine_error(engine, format!("{name}: Lumen engine panic")),
+        Err(_) => push_engine_error(engine, format!("{name}: TRust JS engine panic")),
     }
     // HTML clean-up after running script performs a checkpoint once the script stack is empty.
     let checkpoint = engine
@@ -21397,7 +21434,7 @@ fn run_injected_classic_task(
 }
 
 fn run_injected_module_task(
-    engine: &mut lumen::Engine,
+    engine: &mut trust_js::Engine,
     node_id: usize,
     name: &str,
     source: &str,
@@ -21424,7 +21461,7 @@ fn run_injected_module_task(
         ))
     });
     // HTML runs a module with its preparation-time Document's realm/settings.
-    // TRust multiplexes same-agent nested Window realms through one Lumen
+    // TRust multiplexes same-agent nested Window realms through one TRust JS
     // global, so enter the script element's owning frame for evaluation and
     // the immediately-following microtask checkpoint. This is the module
     // counterpart of `run_injected_classic_task` above.
@@ -21464,7 +21501,7 @@ fn run_injected_module_task(
             }
         }));
         match evaluated {
-            Ok(Ok(lumen::ExecutionOutcome::Value(_))) => {
+            Ok(Ok(trust_js::ExecutionOutcome::Value(_))) => {
                 if !track_module_evaluation(engine, node_id, name) {
                     fire_engine_script_event(engine, node_id, "load");
                 }
@@ -21472,11 +21509,11 @@ fn run_injected_module_task(
                     format!("module {name} microtasks interrupted: {}", reason.message())
                 })?;
             }
-            Ok(Ok(lumen::ExecutionOutcome::Throw { name: ty, message })) => {
+            Ok(Ok(trust_js::ExecutionOutcome::Throw { name: ty, message })) => {
                 push_engine_error(engine, format!("module {name}: {ty}: {message}"));
                 fire_engine_script_event(engine, node_id, "error");
             }
-            Ok(Ok(lumen::ExecutionOutcome::Interrupted { reason })) => {
+            Ok(Ok(trust_js::ExecutionOutcome::Interrupted { reason })) => {
                 return Err(format!("module {name} interrupted: {}", reason.message()));
             }
             Ok(Err(error)) => {
@@ -21490,7 +21527,7 @@ fn run_injected_module_task(
                 fire_engine_script_event(engine, node_id, "error");
             }
             Err(_) => {
-                push_engine_error(engine, format!("module {name}: Lumen engine panic"));
+                push_engine_error(engine, format!("module {name}: TRust JS engine panic"));
                 fire_engine_script_event(engine, node_id, "error");
             }
         }
@@ -21505,7 +21542,7 @@ fn run_injected_module_task(
 /// environment encoding of HTML #link-type-stylesheet), or else its node
 /// document's encoding.
 fn element_fallback_encoding(
-    engine: &mut lumen::Engine,
+    engine: &mut trust_js::Engine,
     node: usize,
 ) -> &'static encoding_rs::Encoding {
     let dom = engine
@@ -21532,17 +21569,17 @@ fn dom_fallback_encoding(dom: &Dom, node: usize) -> &'static encoding_rs::Encodi
 // The completed fetch's parts, as the resource task receives them.
 #[allow(clippy::too_many_arguments)]
 fn run_resource_task(
-    engine: &mut lumen::Engine,
+    engine: &mut trust_js::Engine,
     node_id: usize,
     name: String,
-    kind: LumenResourceKind,
-    result: LumenResourceResult,
+    kind: TrustJsResourceKind,
+    result: TrustJsResourceResult,
     text: Option<String>,
     sheet: Option<Box<crate::http::FetchedStyleSheet>>,
     external: bool,
 ) -> Result<(), String> {
     match kind {
-        LumenResourceKind::ClassicScript => match result {
+        TrustJsResourceKind::ClassicScript => match result {
             Some((status, content_type, body, headers))
                 if crate::http::classic_script_response_allowed(
                     status,
@@ -21561,7 +21598,7 @@ fn run_resource_task(
             }
             _ => fire_engine_script_event(engine, node_id, "error"),
         },
-        LumenResourceKind::ModuleScript => match result {
+        TrustJsResourceKind::ModuleScript => match result {
             Some((status, content_type, body, _headers))
                 if crate::http::module_script_response_allowed(status, &content_type) =>
             {
@@ -21595,7 +21632,7 @@ fn run_resource_task(
                 fire_engine_script_event(engine, node_id, "error");
             }
         },
-        LumenResourceKind::Stylesheet => match result {
+        TrustJsResourceKind::Stylesheet => match result {
             Some((status, content_type, body, headers))
                 if crate::http::stylesheet_response_allowed(status, &content_type, &headers) =>
             {
@@ -21649,11 +21686,11 @@ fn run_resource_task(
         },
         // HTML #link-type-stylesheet "process the linked resource": the sheet
         // is already attached; only the element's event remains.
-        LumenResourceKind::ParsedStylesheet { obtained } => {
+        TrustJsResourceKind::ParsedStylesheet { obtained } => {
             fire_engine_script_event(engine, node_id, if obtained { "load" } else { "error" });
         }
         // HTML #link-type-preload: `error` only for a network error.
-        LumenResourceKind::Preload => {
+        TrustJsResourceKind::Preload => {
             fire_engine_script_event(
                 engine,
                 node_id,
@@ -21665,7 +21702,7 @@ fn run_resource_task(
 }
 
 fn dispatch_websocket_task(
-    engine: &mut lumen::Engine,
+    engine: &mut trust_js::Engine,
     id: usize,
     event: crate::ws::WsIn,
 ) -> Result<(), String> {
@@ -21736,7 +21773,7 @@ fn dispatch_websocket_task(
 /// loop's microtask checkpoint after this returns, before selecting another task.
 #[allow(dead_code)] // The networked test realm uses this before the resident actor is switched.
 fn settle_network_task(
-    engine: &mut lumen::Engine,
+    engine: &mut trust_js::Engine,
     id: usize,
     value: impl FnOnce(&mut Ctx) -> Value,
 ) -> Result<(), String> {
@@ -21750,7 +21787,7 @@ fn settle_network_task(
     };
     let context = pending.context;
     let native_lease = pending.native_lease;
-    let run = move |engine: &mut lumen::Engine| {
+    let run = move |engine: &mut trust_js::Engine| {
         let _native_lease = native_lease;
         let value = value(engine.ctx());
         engine
@@ -21777,7 +21814,7 @@ fn settle_network_task(
 /// player, a fetch's or worker's owner, or the traversable that queued it.
 /// Its handler then finds that traversable's arena and presentation state
 /// selected; other tasks reach only shared state and their Realm's script.
-fn host_task_traversable(state: &HostState, task: &LumenHostTask) -> Option<TraversableId> {
+fn host_task_traversable(state: &HostState, task: &TrustJsHostTask) -> Option<TraversableId> {
     let fetch = |id: &usize| {
         let network = state.network.as_ref()?;
         network
@@ -21789,41 +21826,41 @@ fn host_task_traversable(state: &HostState, task: &LumenHostTask) -> Option<Trav
     let context = match task {
         // The traversable whose count the fetch joined, also when its element
         // has moved to another traversable since.
-        LumenHostTask::FontDone { traversable, .. }
-        | LumenHostTask::StyleImportsDone { traversable, .. }
-        | LumenHostTask::ParserResourceTiming { traversable, .. }
-        | LumenHostTask::ResourceDone { traversable, .. } => return Some(*traversable),
-        LumenHostTask::CanvasFrame { node } => return state.traversable_of_node(*node),
-        LumenHostTask::Media { id, .. } => {
+        TrustJsHostTask::FontDone { traversable, .. }
+        | TrustJsHostTask::StyleImportsDone { traversable, .. }
+        | TrustJsHostTask::ParserResourceTiming { traversable, .. }
+        | TrustJsHostTask::ResourceDone { traversable, .. } => return Some(*traversable),
+        TrustJsHostTask::CanvasFrame { node } => return state.traversable_of_node(*node),
+        TrustJsHostTask::Media { id, .. } => {
             return state.traversable_of_node(state.media.player_node(*id)?);
         }
-        LumenHostTask::DocumentImageDone { context, .. }
-        | LumenHostTask::DynamicModuleStart { context, .. }
-        | LumenHostTask::DynamicModule { context, .. }
-        | LumenHostTask::AbortDocument { context } => *context,
-        LumenHostTask::ImageDone { timing_context, .. } => *timing_context,
-        LumenHostTask::FetchDone { id, .. }
-        | LumenHostTask::FetchHead { id, .. }
-        | LumenHostTask::FetchBodyChunk { id, .. }
-        | LumenHostTask::FetchBodyEnd { id, .. }
-        | LumenHostTask::NavigateDone { id, .. } => fetch(id)?,
-        LumenHostTask::Worker { id, .. } | LumenHostTask::WorkerExited { id } => {
+        TrustJsHostTask::DocumentImageDone { context, .. }
+        | TrustJsHostTask::DynamicModuleStart { context, .. }
+        | TrustJsHostTask::DynamicModule { context, .. }
+        | TrustJsHostTask::AbortDocument { context } => *context,
+        TrustJsHostTask::ImageDone { timing_context, .. } => *timing_context,
+        TrustJsHostTask::FetchDone { id, .. }
+        | TrustJsHostTask::FetchHead { id, .. }
+        | TrustJsHostTask::FetchBodyChunk { id, .. }
+        | TrustJsHostTask::FetchBodyEnd { id, .. }
+        | TrustJsHostTask::NavigateDone { id, .. } => fetch(id)?,
+        TrustJsHostTask::Worker { id, .. } | TrustJsHostTask::WorkerExited { id } => {
             state.workers.as_ref()?.workers.get(id)?.context
         }
-        LumenHostTask::PortReady
-        | LumenHostTask::WebAudio(_)
-        | LumenHostTask::SvgResourceDone
-        | LumenHostTask::WebSocket { .. } => return None,
+        TrustJsHostTask::PortReady
+        | TrustJsHostTask::WebAudio(_)
+        | TrustJsHostTask::SvgResourceDone
+        | TrustJsHostTask::WebSocket { .. } => return None,
     };
     Some(state.traversable_of_context(context))
 }
 
-fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result<(), String> {
+fn dispatch_host_task(engine: &mut trust_js::Engine, task: TrustJsHostTask) -> Result<(), String> {
     match task {
-        LumenHostTask::PortReady => {}
-        LumenHostTask::Media { id, task } => media_host::dispatch(engine, id, task)?,
-        LumenHostTask::WebAudio(task) => webaudio_host::dispatch(engine, task)?,
-        LumenHostTask::CanvasFrame { node } => {
+        TrustJsHostTask::PortReady => {}
+        TrustJsHostTask::Media { id, task } => media_host::dispatch(engine, id, task)?,
+        TrustJsHostTask::WebAudio(task) => webaudio_host::dispatch(engine, task)?,
+        TrustJsHostTask::CanvasFrame { node } => {
             let dom = engine
                 .ctx()
                 .host_mut::<HostState>()
@@ -21832,7 +21869,7 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
                 .clone();
             canvas_host::present_frames(&mut dom.borrow_mut(), Some(node));
         }
-        LumenHostTask::SvgResourceDone => {
+        TrustJsHostTask::SvgResourceDone => {
             // The next rendering opportunity resolves the references again,
             // in whichever traversable's Documents make them.
             if let Some(state) = engine.ctx().host_mut::<HostState>() {
@@ -21841,7 +21878,7 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
                 }
             }
         }
-        LumenHostTask::FontDone { url, bytes, .. } => {
+        TrustJsHostTask::FontDone { url, bytes, .. } => {
             let dom = engine
                 .ctx()
                 .host_mut::<HostState>()
@@ -21850,7 +21887,7 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
                 .clone();
             dom.borrow_mut().install_downloaded_font(&url, bytes);
         }
-        LumenHostTask::StyleImportsDone { url, sheets, .. } => {
+        TrustJsHostTask::StyleImportsDone { url, sheets, .. } => {
             let dom = {
                 let state = engine
                     .ctx()
@@ -21872,10 +21909,10 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
             // associate them and hand the cascade their rules.
             let _ = host_call_trust(engine.ctx(), "styleImportsArrived", &[]);
         }
-        LumenHostTask::ParserResourceTiming { timing, .. } => {
+        TrustJsHostTask::ParserResourceTiming { timing, .. } => {
             record_resource_timing_ref(engine.ctx(), &timing);
         }
-        LumenHostTask::ImageDone {
+        TrustJsHostTask::ImageDone {
             id,
             result,
             timing,
@@ -21884,7 +21921,7 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
             record_resource_timing_in(engine, timing_context, timing)?;
             settle_network_task(engine, id, move |ctx| image_host::result_value(ctx, result))?;
         }
-        LumenHostTask::DocumentImageDone {
+        TrustJsHostTask::DocumentImageDone {
             context,
             url,
             timing,
@@ -21910,7 +21947,7 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
             }
             record_resource_timing_in(engine, context, timing)?;
         }
-        LumenHostTask::NavigateDone {
+        TrustJsHostTask::NavigateDone {
             id,
             details,
             node,
@@ -21923,7 +21960,7 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
                 None => Value::Null,
             })?;
         }
-        LumenHostTask::FetchHead { id, result, flow } => {
+        TrustJsHostTask::FetchHead { id, result, flow } => {
             let pending = engine
                 .ctx()
                 .host_mut::<HostState>()
@@ -21950,7 +21987,7 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
             {
                 network.body_streams.insert(
                     id,
-                    LumenBodyStream {
+                    TrustJsBodyStream {
                         context,
                         flow,
                         buffer: Vec::new(),
@@ -21976,7 +22013,7 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
                     .map_err(|error| describe_eval_error(engine, error, "fetch networking task"))
             })?;
         }
-        LumenHostTask::FetchBodyChunk { id, bytes } => {
+        TrustJsHostTask::FetchBodyChunk { id, bytes } => {
             let Some(network) = engine
                 .ctx()
                 .host_mut::<HostState>()
@@ -21994,7 +22031,7 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
             }
             settle_body_pull(engine, id)?;
         }
-        LumenHostTask::FetchBodyEnd { id, ok, timing } => {
+        TrustJsHostTask::FetchBodyEnd { id, ok, timing } => {
             let context = {
                 let Some(network) = engine
                     .ctx()
@@ -22015,7 +22052,7 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
             })?;
             settle_body_pull(engine, id)?;
         }
-        LumenHostTask::FetchDone { id, result, timing } => {
+        TrustJsHostTask::FetchDone { id, result, timing } => {
             let pending = engine
                 .ctx()
                 .host_mut::<HostState>()
@@ -22031,7 +22068,7 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
             // object's relevant global, including its ArrayBuffer intrinsics.
             let context = pending.context;
             let resolve = pending.resolve;
-            let run = move |engine: &mut lumen::Engine| {
+            let run = move |engine: &mut trust_js::Engine| {
                 record_resource_timing(engine.ctx(), timing);
                 let value = host_fetch_result_value(engine.ctx(), result);
                 engine
@@ -22065,7 +22102,7 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
                 }
             }
         }
-        LumenHostTask::ResourceDone {
+        TrustJsHostTask::ResourceDone {
             context,
             node_id,
             name,
@@ -22127,7 +22164,7 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
                 }
             }
         }
-        LumenHostTask::DynamicModuleStart {
+        TrustJsHostTask::DynamicModuleStart {
             request_id,
             context,
             specifier,
@@ -22136,7 +22173,7 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
         } => {
             if std::env::var_os("TRUST_NET_TRACE").is_some() {
                 eprintln!(
-                    "lumen: @{:>6}ms dynamic import task {specifier}",
+                    "trust-js: @{:>6}ms dynamic import task {specifier}",
                     crate::http::trace_ms()
                 );
             }
@@ -22148,7 +22185,7 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
                 .host_mut::<HostState>()
                 .expect("module host state");
             if let Some(events) = state.task_events.clone() {
-                let loader = LumenDynamicModuleLoader {
+                let loader = TrustJsDynamicModuleLoader {
                     context,
                     page,
                     cookie_context,
@@ -22158,7 +22195,7 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
                     network: state
                         .network
                         .as_ref()
-                        .map(|network| LumenDynamicModuleNetwork {
+                        .map(|network| TrustJsDynamicModuleNetwork {
                             handle: network.handle.clone(),
                             cache: network.cache.clone(),
                             fetched: network.fetched.clone(),
@@ -22173,7 +22210,7 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
                 );
             }
         }
-        LumenHostTask::DynamicModule {
+        TrustJsHostTask::DynamicModule {
             context,
             request_id,
             result,
@@ -22193,19 +22230,20 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
                 .map_or(0, |state| state.top_context);
             install_context_module_loader(engine, top_context);
         }
-        LumenHostTask::WebSocket { id, event } => {
+        TrustJsHostTask::WebSocket { id, event } => {
             dispatch_websocket_task(engine, id, event)?;
         }
-        LumenHostTask::Worker { id, event } => {
+        TrustJsHostTask::Worker { id, event } => {
             let (name, payload) = match event {
                 crate::js::WorkerOut::Message(message) => ("workerMessage", message),
                 crate::js::WorkerOut::Error(message) => ("workerError", message),
                 crate::js::WorkerOut::Console(lines) => ("workerConsole", lines),
             };
-            dispatch_lumen_worker_task(engine, id, name, Value::from_engine_text(payload))?;
+            dispatch_trust_js_worker_task(engine, id, name, Value::from_engine_text(payload))?;
         }
-        LumenHostTask::WorkerExited { id } => {
-            let result = dispatch_lumen_worker_task(engine, id, "workerExited", Value::Undefined);
+        TrustJsHostTask::WorkerExited { id } => {
+            let result =
+                dispatch_trust_js_worker_task(engine, id, "workerExited", Value::Undefined);
             if let Some(workers) = engine
                 .ctx()
                 .host_mut::<HostState>()
@@ -22216,7 +22254,7 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
             }
             result?;
         }
-        LumenHostTask::AbortDocument { context } => {
+        TrustJsHostTask::AbortDocument { context } => {
             // A navigable whose Document is no longer active has none to abort.
             run_in_context_realm(engine, context, "abort document", move |engine| {
                 abort_document(engine.ctx(), context);
@@ -22227,8 +22265,8 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
     Ok(())
 }
 
-fn dispatch_lumen_worker_task(
-    engine: &mut lumen::Engine,
+fn dispatch_trust_js_worker_task(
+    engine: &mut trust_js::Engine,
     id: usize,
     name: &str,
     payload: Value,
@@ -22242,7 +22280,7 @@ fn dispatch_lumen_worker_task(
     let Some(context) = context else {
         return Ok(());
     };
-    let run = move |engine: &mut lumen::Engine| match host_call_trust_interruptible(
+    let run = move |engine: &mut trust_js::Engine| match host_call_trust_interruptible(
         engine.ctx(),
         name,
         &[Value::Num(id as f64), payload],
@@ -23018,7 +23056,7 @@ fn host_window_names_epoch(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Resu
     Ok(Value::Num(epoch as f64))
 }
 
-/// Install Lumen's native Web IDL indexed-property internal methods on a freshly-created
+/// Install TRust JS's native Web IDL indexed-property internal methods on a freshly-created
 /// platform object.
 fn host_install_readonly_indexed(
     ctx: &mut Ctx,
@@ -24685,7 +24723,7 @@ fn host_doc_element(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Valu
 }
 
 /// ECMA-262 Annex B.3.6 requires the host-defined `document.all` exotic to participate in
-/// language-level `typeof`, truthiness, and loose-equality exceptions. Lumen owns those semantics;
+/// language-level `typeof`, truthiness, and loose-equality exceptions. TRust JS owns those semantics;
 /// the browser adapter only requests the realm-local exotic.
 /// HTML #all-named-elements: the elements whose `name` attribute names them
 /// in an HTMLAllCollection.
@@ -25445,7 +25483,7 @@ fn host_url_set(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Va
 fn host_layout_environment(ctx: &mut Ctx) -> (url::Url, crate::layout2::Viewport, f32) {
     let state = ctx
         .host_mut::<HostState>()
-        .expect("HostState installed before any Lumen host call");
+        .expect("HostState installed before any TRust JS host call");
     (
         state.base.clone(),
         state.viewport.get(),
@@ -25501,7 +25539,7 @@ fn host_animation_events(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result
     ))
 }
 
-fn ensure_host_geom_cache(ctx: &mut Ctx, reason: &'static str) -> Rc<RefCell<LumenGeomCache>> {
+fn ensure_host_geom_cache(ctx: &mut Ctx, reason: &'static str) -> Rc<RefCell<TrustJsGeomCache>> {
     ensure_host_geometry(ctx, reason, None)
 }
 
@@ -25509,13 +25547,13 @@ fn ensure_host_geometry(
     ctx: &mut Ctx,
     reason: &'static str,
     requested_box: Option<crate::dom::NodeId>,
-) -> Rc<RefCell<LumenGeomCache>> {
+) -> Rc<RefCell<TrustJsGeomCache>> {
     sync_css_transitions(ctx);
     let top_key = top_hit_key(ctx);
     let (dom_handle, base, viewport, cache, images) = {
         let state = ctx
             .host_mut::<HostState>()
-            .expect("HostState installed before any Lumen host call");
+            .expect("HostState installed before any TRust JS host call");
         (
             state.dom.clone(),
             state.base.clone(),
@@ -25640,7 +25678,7 @@ fn ensure_host_geometry(
 
 /// CSSOM View #scrolling-area for every scroll container of the cached
 /// layout, projected from its fragments on the first read that needs one.
-fn project_scrolling_areas(cache: &Rc<RefCell<LumenGeomCache>>, dom: &Dom) {
+fn project_scrolling_areas(cache: &Rc<RefCell<TrustJsGeomCache>>, dom: &Dom) {
     let mut cached = cache.borrow_mut();
     if cached.scrolling_areas_current {
         return;
@@ -25651,7 +25689,7 @@ fn project_scrolling_areas(cache: &Rc<RefCell<LumenGeomCache>>, dom: &Dom) {
     cached.scrolling_areas_current = true;
 }
 
-fn ensure_host_hit_test_cache(ctx: &mut Ctx) -> Rc<RefCell<LumenGeomCache>> {
+fn ensure_host_hit_test_cache(ctx: &mut Ctx) -> Rc<RefCell<TrustJsGeomCache>> {
     let cache = ensure_host_geom_cache(ctx, "elements-from-point");
     let top_key = top_hit_key(ctx);
     let (dom, base, viewport, images) = {
@@ -25697,7 +25735,7 @@ fn ensure_host_hit_test_cache(ctx: &mut Ctx) -> Rc<RefCell<LumenGeomCache>> {
 
 /// Re-sample only retained scroll properties. Commands, text shaping, clips,
 /// image handles and layout remain valid.
-fn resample_hit_test_scroll(cached: &mut LumenGeomCache, dom: &Dom) {
+fn resample_hit_test_scroll(cached: &mut TrustJsGeomCache, dom: &Dom) {
     if cached.paint_scroll_epoch == dom.scroll_epoch() {
         return;
     }
@@ -25715,7 +25753,7 @@ fn resample_hit_test_scroll(cached: &mut LumenGeomCache, dom: &Dom) {
 /// The retained hit-testing paint for a top-level `elementsFromPoint`, when
 /// only nested Documents changed since it was produced. Samples CSS
 /// animations first, as the geometry transaction would.
-fn reusable_top_hit_test_cache(ctx: &mut Ctx) -> Option<Rc<RefCell<LumenGeomCache>>> {
+fn reusable_top_hit_test_cache(ctx: &mut Ctx) -> Option<Rc<RefCell<TrustJsGeomCache>>> {
     sync_css_transitions(ctx);
     let key = top_hit_key(ctx);
     let (cache, dom) = {
@@ -25779,7 +25817,7 @@ fn host_elements_from_point(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
     } else {
         return Ok(ctx.make_array(Vec::new()));
     };
-    let LumenGeomCache {
+    let TrustJsGeomCache {
         paint, hit_index, ..
     } = &mut *cached;
     let hits = hit_index
@@ -25968,7 +26006,7 @@ fn host_rect(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value
     let dom_handle = host_dom(ctx);
     let cache = ctx
         .host_mut::<HostState>()
-        .expect("HostState installed before any Lumen host call")
+        .expect("HostState installed before any TRust JS host call")
         .geom_cache
         .clone();
     let (id, epoch, presentation_epoch, top_level_frame, requested_box) = {
@@ -26387,7 +26425,7 @@ fn host_storage_bucket(ctx: &mut Ctx, args: &[Value]) -> (crate::js::WebStorage,
     let bucket = host_arg_string(ctx, args, 0);
     let state = ctx
         .host_mut::<HostState>()
-        .expect("HostState installed before any Lumen host call");
+        .expect("HostState installed before any TRust JS host call");
     (state.storage.clone(), bucket)
 }
 
@@ -26865,7 +26903,7 @@ fn blob_environment(ctx: &mut Ctx) -> (crate::blob_url_store::Environment, Strin
     let realm = ctx.host_job_context();
     let state = ctx
         .host_mut::<HostState>()
-        .expect("HostState installed before any Lumen host call");
+        .expect("HostState installed before any TRust JS host call");
     let origin = match state.worker_self.as_ref() {
         Some(worker) => worker.settings_origin.clone(),
         None => realm_origin(state, realm),
@@ -27187,7 +27225,7 @@ fn crypto_material(
 /// BufferSource; this performs the operation's cryptographic step on those
 /// copies. `args` is (operation, [operands…]). A step that throws returns the
 /// DOMException name as a string, which the prelude throws in its own Realm
-/// (Lumen owns only ECMAScript errors); no successful result is a string.
+/// (TRust JS owns only ECMAScript errors); no successful result is a string.
 fn host_crypto_operation(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     use crate::crypto::keys::{self, Curve, Failure, Family, Hash, RsaPrivateJwk, Scheme};
     let operation = host_arg_string(ctx, args, 0);
@@ -27550,7 +27588,7 @@ fn host_text_decode(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
     };
     let decoded = ctx
         .host_mut::<HostState>()
-        .expect("HostState installed before any Lumen host call")
+        .expect("HostState installed before any TRust JS host call")
         .text_decoders
         .decode(&name, &bytes, flag(2), flag(3), flag(4), handle)
         .ok_or_else(|| ctx.make_error("RangeError", "The encoding is not supported"))?;
@@ -27790,12 +27828,12 @@ fn host_dom_inert(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
     ))
 }
 
-fn eval(engine: &mut lumen::Engine, source: &str, label: &str) -> Result<(), String> {
+fn eval(engine: &mut trust_js::Engine, source: &str, label: &str) -> Result<(), String> {
     eval_value(engine, source, label).map(|_| ())
 }
 
 fn eval_main_page_diagnostic_init(
-    engine: &mut lumen::Engine,
+    engine: &mut trust_js::Engine,
     source: Option<&str>,
     errors: &mut Vec<String>,
 ) {
@@ -27820,7 +27858,7 @@ fn eval_main_page_diagnostic_init(
     }
 }
 
-fn main_page_diagnostic_reporter(engine: &mut lumen::Engine) -> Value {
+fn main_page_diagnostic_reporter(engine: &mut trust_js::Engine) -> Value {
     const MAX_REPORT_BYTES: usize = 4 * 1024 * 1024;
     let attempted = Cell::new(false);
     let error_reported = Cell::new(false);
@@ -27830,7 +27868,7 @@ fn main_page_diagnostic_reporter(engine: &mut lumen::Engine) -> Value {
         Rc::new(move |ctx, _, args| {
             let error = |ctx: &mut Ctx, message: &str| {
                 if !error_reported.replace(true) {
-                    eprintln!("lumen: diagnostic error: {message}");
+                    eprintln!("trust-js: diagnostic error: {message}");
                 }
                 Err(ctx.make_error("TypeError", message))
             };
@@ -27852,7 +27890,7 @@ fn main_page_diagnostic_reporter(engine: &mut lumen::Engine) -> Value {
             if encoded.len() > MAX_REPORT_BYTES {
                 return error(ctx, "diagnostic report exceeds the 4 MiB limit");
             }
-            eprintln!("lumen: diagnostic: {encoded}");
+            eprintln!("trust-js: diagnostic: {encoded}");
             Ok(Value::Undefined)
         }),
     )
@@ -27862,7 +27900,7 @@ fn main_page_diagnostic_reporter(engine: &mut lumen::Engine) -> Value {
 /// Realm of the page decodes it, and every nested Window Realm reuses that program and the code
 /// compiled for its functions instead of decoding and compiling the prelude again.
 fn eval_bootstrap_snapshot(
-    engine: &mut lumen::Engine,
+    engine: &mut trust_js::Engine,
     snapshot: &'static [u8],
     label: &str,
 ) -> Result<(), String> {
@@ -27876,7 +27914,7 @@ fn eval_bootstrap_snapshot(
     }
 }
 
-fn eval_value(engine: &mut lumen::Engine, source: &str, label: &str) -> Result<Value, String> {
+fn eval_value(engine: &mut trust_js::Engine, source: &str, label: &str) -> Result<Value, String> {
     match engine.eval_value_interruptible(source) {
         Err(error) => Err(format!(
             "{label} parse error at line {}: {}",
@@ -27887,14 +27925,14 @@ fn eval_value(engine: &mut lumen::Engine, source: &str, label: &str) -> Result<V
     }
 }
 
-fn describe_eval_error(engine: &mut lumen::Engine, error: EvalError, label: &str) -> String {
+fn describe_eval_error(engine: &mut trust_js::Engine, error: EvalError, label: &str) -> String {
     match error {
         EvalError::Throw(thrown) => describe_throw(engine, thrown, label),
         EvalError::Interrupted(reason) => format!("{label} interrupted: {}", reason.message()),
     }
 }
 
-fn describe_throw(engine: &mut lumen::Engine, thrown: Value, label: &str) -> String {
+fn describe_throw(engine: &mut trust_js::Engine, thrown: Value, label: &str) -> String {
     let rendered = value_string(engine, &thrown);
     let name = engine
         .ctx()
@@ -27914,7 +27952,7 @@ fn describe_throw(engine: &mut lumen::Engine, thrown: Value, label: &str) -> Str
     }
 }
 
-fn value_string(engine: &mut lumen::Engine, value: &Value) -> String {
+fn value_string(engine: &mut trust_js::Engine, value: &Value) -> String {
     engine
         .ctx()
         .coerce_string(value)
@@ -27939,7 +27977,7 @@ mod tests {
 
     #[test]
     fn main_page_diagnostic_init_is_explicit_once_and_failure_is_contained() {
-        let mut engine = lumen::Engine::new();
+        let mut engine = trust_js::Engine::new();
         let mut errors = Vec::new();
         eval_main_page_diagnostic_init(&mut engine, None, &mut errors);
         eval_main_page_diagnostic_init(&mut engine, Some("  "), &mut errors);
@@ -27965,14 +28003,14 @@ mod tests {
             "undefined"
         );
         assert_eq!(
-            string_value(&mut lumen::Engine::new(), "typeof marker"),
+            string_value(&mut trust_js::Engine::new(), "typeof marker"),
             "undefined"
         );
     }
 
     #[test]
     fn main_page_diagnostic_report_is_bounded_one_shot_and_has_no_global_binding() {
-        let mut engine = lumen::Engine::new();
+        let mut engine = trust_js::Engine::new();
         let reporter = main_page_diagnostic_reporter(&mut engine);
         assert!(
             engine
@@ -28983,7 +29021,7 @@ mod tests {
             let epoch = dom.borrow().epoch();
             dom.borrow_mut().image_changed(node);
             assert_eq!(dom.borrow().epoch(), epoch);
-            // Do not forcibly expire LumenGeomCache here: the resource
+            // Do not forcibly expire TrustJsGeomCache here: the resource
             // notification's presentation revision must make CSSOM current.
             assert_eq!(
                 string_value(
@@ -29040,7 +29078,7 @@ mod tests {
         )));
         let clock = Rc::new(RealmClock::new());
         let mut engine = configured_engine(HostState::new(dom.clone(), clock.clone()), DEFAULT_URL);
-        let color = |engine: &mut lumen::Engine| {
+        let color = |engine: &mut trust_js::Engine| {
             string_value(
                 engine,
                 "getComputedStyle(document.getElementById('box')).color",
@@ -29915,7 +29953,7 @@ mod tests {
         // makes no sound has been hidden for ten seconds, its timers fall
         // due at whole seconds of the agent clock, in their nominal order.
         let mut engine = platform_engine();
-        let number = |engine: &mut lumen::Engine, source: &str| {
+        let number = |engine: &mut trust_js::Engine, source: &str| {
             eval_value(engine, source, "timer probe")
                 .unwrap()
                 .as_num_opt()
@@ -29972,7 +30010,7 @@ mod tests {
         // The user muted the traversable (`PageCmd::AudioMuted`): its sound
         // is not heard, so it no longer keeps a hidden page's timers on time.
         let mut engine = platform_engine();
-        let number = |engine: &mut lumen::Engine, source: &str| {
+        let number = |engine: &mut trust_js::Engine, source: &str| {
             eval_value(engine, source, "timer probe")
                 .unwrap()
                 .as_num_opt()
@@ -30001,7 +30039,7 @@ mod tests {
         assert_eq!(number(&mut engine, "__trust.nextDeadline()"), due);
     }
 
-    fn platform_engine() -> lumen::Engine {
+    fn platform_engine() -> trust_js::Engine {
         let clock = Rc::new(RealmClock::new());
         configured_engine(
             HostState::new(Rc::new(RefCell::new(Dom::new())), clock),
@@ -30011,7 +30049,7 @@ mod tests {
 
     /// A Window realm whose agent cluster is cross-origin isolated, so it
     /// keeps SharedArrayBuffer (HTML's realm creation steps).
-    fn isolated_platform_engine() -> lumen::Engine {
+    fn isolated_platform_engine() -> trust_js::Engine {
         let clock = Rc::new(RealmClock::new());
         let mut engine = configured_engine_before_prelude(
             HostState::new(Rc::new(RefCell::new(Dom::new())), clock),
@@ -30157,7 +30195,7 @@ mod tests {
 
     /// A Window realm whose Document has `<html><head></head><body></body>`,
     /// for tests that need connected elements.
-    fn platform_engine_with_body() -> lumen::Engine {
+    fn platform_engine_with_body() -> trust_js::Engine {
         let mut engine = platform_engine();
         eval(
             &mut engine,
@@ -30377,7 +30415,7 @@ mod tests {
         // collection steps produce it (CSS UI 4: user-select:none content
         // left out); a canceled one writes the data its listener set.
         let mut engine = platform_engine_with_body();
-        let written = |engine: &mut lumen::Engine| {
+        let written = |engine: &mut trust_js::Engine| {
             engine
                 .ctx()
                 .host_mut::<HostState>()
@@ -30424,7 +30462,7 @@ mod tests {
         // contextmenu is not canceled; the user's bypass fires none; the menu
         // key fires it at the focused element from no pointing device.
         let mut engine = platform_engine_with_body();
-        let results = |engine: &mut lumen::Engine| {
+        let results = |engine: &mut trust_js::Engine| {
             engine
                 .ctx()
                 .host_mut::<HostState>()
@@ -32073,23 +32111,23 @@ mod tests {
         );
     }
 
-    fn worker_platform_engine() -> lumen::Engine {
+    fn worker_platform_engine() -> trust_js::Engine {
         worker_platform_engine_with(true)
     }
 
-    fn worker_platform_engine_with(test_internals: bool) -> lumen::Engine {
+    fn worker_platform_engine_with(test_internals: bool) -> trust_js::Engine {
         worker_platform_engine_configured(test_internals, "")
     }
 
-    /// `extra` adds `__worker_cfg` members (`, name: value`), as `run_lumen_worker` does.
-    fn worker_platform_engine_configured(test_internals: bool, extra: &str) -> lumen::Engine {
+    /// `extra` adds `__worker_cfg` members (`, name: value`), as `run_trust_js_worker` does.
+    fn worker_platform_engine_configured(test_internals: bool, extra: &str) -> trust_js::Engine {
         let clock = Rc::new(RealmClock::new());
         let mut state = HostState::new(Rc::new(RefCell::new(Dom::new())), clock.clone());
         state.test_hooks.internals = test_internals;
         let (events, _) = tokio::sync::mpsc::unbounded_channel();
-        state.worker_self = Some(LumenWorkerSelf {
+        state.worker_self = Some(TrustJsWorkerSelf {
             id: 1,
-            events: LumenTaskSender::Page(events),
+            events: TrustJsTaskSender::Page(events),
             closed: false,
             origin: url::Url::parse(DEFAULT_URL).unwrap(),
             secure_context: true,
@@ -32097,26 +32135,26 @@ mod tests {
             referrer_policy: Default::default(),
         });
         let origin = clock.origin_ms;
-        let mut engine = lumen::Engine::new();
+        let mut engine = trust_js::Engine::new();
         engine.set_wall_clock(move || clock.now_ms());
         engine
             .ctx()
             .op_state()
             .put_retained_memory_with_external_memory(state);
-        install_lumen_worker_boundary(&mut engine);
+        install_trust_js_worker_boundary(&mut engine);
         eval(
             &mut engine,
             &format!("globalThis.__worker_cfg={{url:'https://example.org/worker.js',timeOrigin:{origin}{extra}}}"),
             "worker config",
         )
         .unwrap();
-        assert!(eval_lumen_worker_platform_setup(&mut engine).unwrap());
+        assert!(eval_trust_js_worker_platform_setup(&mut engine).unwrap());
         engine
     }
 
     #[test]
     fn worker_storage_takes_its_owners_partition() {
-        // `run_lumen_worker` passes the owner's `CookieContext::storage_partition` as
+        // `run_trust_js_worker` passes the owner's `CookieContext::storage_partition` as
         // `__worker_cfg.storagePartition`: a worker an embed creates keys its storage blocks
         // (here BroadcastChannel; Indexed Database and Cache Storage use the same key) by the
         // owner's top-level site, and one without a storage key reaches only itself.
@@ -33983,7 +34021,7 @@ mod tests {
     }
 
     /// Run the platform's queued tasks and their microtask checkpoints.
-    fn settle_platform_tasks(engine: &mut lumen::Engine) {
+    fn settle_platform_tasks(engine: &mut trust_js::Engine) {
         run_microtask_checkpoint(engine);
         eval(
             engine,
@@ -34596,7 +34634,7 @@ mod tests {
                     ),
                     "pending"
                 );
-                let settle = |engine: &mut lumen::Engine| {
+                let settle = |engine: &mut trust_js::Engine| {
                     run_microtask_checkpoint(engine);
                     eval(
                         engine,
@@ -36095,7 +36133,7 @@ mod tests {
 
     /// A Window realm over `html`, for the close request, dialog, popover and
     /// fullscreen conformance tests below.
-    fn top_layer_engine(html: &str) -> lumen::Engine {
+    fn top_layer_engine(html: &str) -> trust_js::Engine {
         configured_engine(
             HostState::new(
                 Rc::new(RefCell::new(Dom::parse_document(html))),
@@ -36480,7 +36518,7 @@ mod tests {
         let mut engine = top_layer_engine("<body><div id=player>video</div></body>");
         // One task, its microtask checkpoint, the queued tasks with theirs,
         // then a rendering update (which runs the fullscreen steps).
-        let step = |engine: &mut lumen::Engine, source: &str| {
+        let step = |engine: &mut trust_js::Engine, source: &str| {
             eval(engine, source, "fullscreen step").unwrap();
             run_microtask_checkpoint(engine);
             while string_value(engine, "__trust.hasPlatformTask()") == "true" {
@@ -37014,7 +37052,7 @@ mod tests {
         );
     }
 
-    pub(super) fn configured_engine(state: HostState, url: &str) -> lumen::Engine {
+    pub(super) fn configured_engine(state: HostState, url: &str) -> trust_js::Engine {
         let mut engine = configured_engine_before_prelude(state, url);
         eval_platform_prelude(&mut engine).unwrap();
         engine
@@ -37023,12 +37061,12 @@ mod tests {
     pub(super) fn configured_engine_before_prelude(
         mut state: HostState,
         url: &str,
-    ) -> lumen::Engine {
+    ) -> trust_js::Engine {
         state.test_hooks.internals = true;
         state
             .window_request_urls
             .insert(0, url::Url::parse(url).unwrap());
-        let mut engine = lumen::Engine::new();
+        let mut engine = trust_js::Engine::new();
         engine.set_tier(Tier::Interp);
         let clock = state.clock.clone();
         let engine_clock = clock.clone();
@@ -37125,7 +37163,7 @@ mod tests {
         }
     }
 
-    pub(super) fn run_microtask_checkpoint(engine: &mut lumen::Engine) {
+    pub(super) fn run_microtask_checkpoint(engine: &mut trust_js::Engine) {
         engine
             .run_microtasks_interruptible()
             .unwrap_or_else(|reason| {
@@ -37133,7 +37171,7 @@ mod tests {
             });
     }
 
-    fn call_trust_method(engine: &mut lumen::Engine, name: &str, args: &[Value]) -> Value {
+    fn call_trust_method(engine: &mut trust_js::Engine, name: &str, args: &[Value]) -> Value {
         let trust = platform_control(engine.ctx())
             .unwrap_or_else(|_| panic!("read the platform control object"));
         let method = engine
@@ -37146,7 +37184,7 @@ mod tests {
         }
     }
 
-    pub(super) fn string_value(engine: &mut lumen::Engine, expression: &str) -> String {
+    pub(super) fn string_value(engine: &mut trust_js::Engine, expression: &str) -> String {
         let value = eval_value(engine, expression, expression).unwrap();
         value_string(engine, &value)
     }
@@ -37226,7 +37264,7 @@ mod tests {
     }
 
     #[test]
-    fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
+    fn trust_js_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
         assert_eq!(canonical.len(), 262, "canonical host boundary changed");
         assert_eq!(
@@ -37238,8 +37276,8 @@ mod tests {
             canonical.len(),
             "canonical host boundary contains a duplicate name"
         );
-        assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 262);
+        assert!(trust_js_registry_matches_canonical_boundary());
+        assert_eq!(TRUST_JS_HOST_FUNCTIONS.len(), 262);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(
@@ -37249,7 +37287,7 @@ mod tests {
             ),
             DEFAULT_URL,
         );
-        for &(name, length, _) in LUMEN_HOST_FUNCTIONS {
+        for &(name, length, _) in TRUST_JS_HOST_FUNCTIONS {
             let actual = eval_value(&mut engine, &format!("{name}.length"), name).unwrap();
             assert_eq!(actual.as_num_opt(), Some(length as f64), "{name}.length");
         }
@@ -37373,7 +37411,7 @@ mod tests {
     }
 
     /// A production-configured top-level Window: no test internals are republished.
-    fn sealed_platform_engine(url: &str) -> lumen::Engine {
+    fn sealed_platform_engine(url: &str) -> trust_js::Engine {
         let mut engine = configured_engine_before_prelude(
             HostState::new(
                 Rc::new(RefCell::new(Dom::new())),
@@ -37534,7 +37572,7 @@ mod tests {
             (frames, documents, realms)
         };
         let id = |node: usize| Value::Num(node as f64);
-        let serialize = |engine: &mut lumen::Engine, node: usize| {
+        let serialize = |engine: &mut trust_js::Engine, node: usize| {
             let value = guarded_outer_html(engine.ctx(), Value::Undefined, &[id(node)])
                 .unwrap_or_else(|_| panic!("outerHTML threw"));
             value_string(engine, &value)
@@ -37684,7 +37722,7 @@ mod tests {
             attempt('post', () => (parent.postMessage('hello', '*'), 'sent'));
             return result.join(' ');
         })()"#;
-        let run = |engine: &mut lumen::Engine, realm: &Value| {
+        let run = |engine: &mut trust_js::Engine, realm: &Value| {
             engine
                 .with_embed_realm(realm, |engine| string_value(engine, probe))
                 .unwrap_or_else(|_| panic!("enter child Realm"))
@@ -37718,7 +37756,7 @@ mod tests {
         );
     }
 
-    fn serialize_native(engine: &mut lumen::Engine, node: usize) -> String {
+    fn serialize_native(engine: &mut trust_js::Engine, node: usize) -> String {
         let state = engine.ctx().host_mut::<HostState>().unwrap();
         state.dom.borrow().serialize_js(node)
     }
@@ -38711,23 +38749,23 @@ mod tests {
     /// A Window realm whose host tasks (Web Audio rendering threads'
     /// reports) arrive on `tasks`.
     fn audio_engine() -> (
-        lumen::Engine,
-        tokio::sync::mpsc::UnboundedReceiver<LumenHostTask>,
+        trust_js::Engine,
+        tokio::sync::mpsc::UnboundedReceiver<TrustJsHostTask>,
     ) {
         let (sender, tasks) = tokio::sync::mpsc::unbounded_channel();
         let mut state = HostState::new(
             Rc::new(RefCell::new(Dom::new())),
             Rc::new(RealmClock::new()),
         );
-        state.task_events = Some(LumenTaskSender::Page(sender));
+        state.task_events = Some(TrustJsTaskSender::Page(sender));
         (configured_engine(state, DEFAULT_URL), tasks)
     }
 
     /// Run host and platform tasks until `condition` is true (or panic
     /// after `seconds`).
     fn pump_audio_until(
-        engine: &mut lumen::Engine,
-        tasks: &mut tokio::sync::mpsc::UnboundedReceiver<LumenHostTask>,
+        engine: &mut trust_js::Engine,
+        tasks: &mut tokio::sync::mpsc::UnboundedReceiver<TrustJsHostTask>,
         condition: &str,
         seconds: u64,
     ) {
@@ -38938,7 +38976,7 @@ mod tests {
         state
             .window_request_urls
             .insert(0, url::Url::parse(DEFAULT_URL).unwrap());
-        let mut engine = lumen::Engine::new();
+        let mut engine = trust_js::Engine::new();
         engine.set_tier(Tier::Interp);
         let clock = state.clock.clone();
         engine.set_wall_clock(move || clock.now_ms());
@@ -39678,7 +39716,7 @@ mod tests {
 
     /// Run queued tasks of a Window (`__trust`) or a worker harness
     /// (`__wkr`) until `done` evaluates true.
-    fn run_canvas_tasks(engine: &mut lumen::Engine, worker: bool, done: &str) {
+    fn run_canvas_tasks(engine: &mut trust_js::Engine, worker: bool, done: &str) {
         for _ in 0..256 {
             run_microtask_checkpoint(engine);
             if string_value(engine, &format!("String({done})")) == "true" {
@@ -39800,7 +39838,7 @@ mod tests {
             "temporary OffscreenCanvas",
         )
         .unwrap();
-        let live = |engine: &mut lumen::Engine| {
+        let live = |engine: &mut trust_js::Engine| {
             engine
                 .ctx()
                 .host_mut::<HostState>()
@@ -41302,7 +41340,7 @@ mod tests {
                 badMemory, badTable, keyedTransfer, descriptors
             ].join('|');
             "#,
-            "WebAssembly Lumen boundary",
+            "WebAssembly TRust JS boundary",
         )
         .unwrap();
 
@@ -41315,7 +41353,7 @@ mod tests {
             .host_mut::<HostState>()
             .map(|state| {
                 let mut allocations = Vec::new();
-                lumen::embed::RetainedExternalMemory::retained_external_memory(
+                trust_js::embed::RetainedExternalMemory::retained_external_memory(
                     state,
                     &mut |allocation| allocations.push(allocation),
                 );
@@ -42210,7 +42248,7 @@ mod tests {
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
-    fn install_wasm_test_fixture(engine: &mut lumen::Engine, source: &str) {
+    fn install_wasm_test_fixture(engine: &mut trust_js::Engine, source: &str) {
         let bytes = wat::parse_str(source).unwrap();
         let fixture = engine
             .ctx()
@@ -42223,7 +42261,7 @@ mod tests {
             .unwrap_or_else(|_| panic!("install WASM test fixture"));
     }
 
-    fn collect_wasm_test_garbage(engine: &mut lumen::Engine) {
+    fn collect_wasm_test_garbage(engine: &mut trust_js::Engine) {
         // Clear kept objects, collect, deliver finalizers, then collect their held values.
         // Compare heap counts at the same completed host boundary in every test batch.
         for _ in 0..3 {
@@ -42232,7 +42270,7 @@ mod tests {
         }
     }
 
-    fn cached_wasm_functions(engine: &mut lumen::Engine) -> usize {
+    fn cached_wasm_functions(engine: &mut trust_js::Engine) -> usize {
         engine
             .ctx()
             .host_mut::<HostState>()
@@ -43409,14 +43447,14 @@ mod tests {
                 }
                 checkRefs();
             "#, "WASM externref warmup").unwrap();
-            let before = lumen_wasm::externref_allocations();
+            let before = trust_js_wasm::externref_allocations();
             eval(
                 &mut engine,
                 "for (let i = 0; i < 128; ++i) checkRefs();",
                 "repeat WASM externrefs",
             )
             .unwrap();
-            let after = lumen_wasm::externref_allocations();
+            let after = trust_js_wasm::externref_allocations();
             assert_eq!(
                 after, before,
                 "{tier:?}: repeated existing values allocated new native externrefs"
@@ -44380,7 +44418,7 @@ mod tests {
             );
             dispatch_host_task(
                 &mut engine,
-                LumenHostTask::Worker {
+                TrustJsHostTask::Worker {
                     id: worker_id,
                     event: crate::js::WorkerOut::Error("stale".into()),
                 },
@@ -44402,20 +44440,20 @@ mod tests {
                     let mut state =
                         HostState::new(Rc::new(RefCell::new(Dom::new())), clock.clone());
                     state.test_hooks.internals = true;
-                    let mut engine = lumen::Engine::new();
+                    let mut engine = trust_js::Engine::new();
                     engine.set_wall_clock(move || clock.now_ms());
                     engine
                         .ctx()
                         .op_state()
                         .put_retained_memory_with_external_memory(state);
-                    install_lumen_worker_boundary(&mut engine);
+                    install_trust_js_worker_boundary(&mut engine);
                     eval(
                         &mut engine,
                         "globalThis.__worker_cfg={url:'https://example.org/worker.js'}",
                         "worker config",
                     )
                     .unwrap();
-                    assert!(eval_lumen_worker_platform_setup(&mut engine).unwrap());
+                    assert!(eval_trust_js_worker_platform_setup(&mut engine).unwrap());
                     engine
                 } else {
                     platform_engine()
@@ -44534,13 +44572,13 @@ mod tests {
             let origin = clock.origin_ms;
             let mut state = HostState::new(Rc::new(RefCell::new(Dom::new())), clock.clone());
             state.test_hooks.internals = true;
-            let mut engine = lumen::Engine::new();
+            let mut engine = trust_js::Engine::new();
             engine.set_wall_clock(move || clock.now_ms());
             engine
                 .ctx()
                 .op_state()
                 .put_retained_memory_with_external_memory(state);
-            install_lumen_worker_boundary(&mut engine);
+            install_trust_js_worker_boundary(&mut engine);
             eval(
                 &mut engine,
                 &format!(
@@ -44549,7 +44587,7 @@ mod tests {
                 "worker creation time",
             )
             .unwrap();
-            assert!(eval_lumen_worker_platform_setup(&mut engine).unwrap());
+            assert!(eval_trust_js_worker_platform_setup(&mut engine).unwrap());
             engine.set_tier(tier);
             engine.set_tier_threshold(0);
             assert_eq!(
@@ -44996,7 +45034,7 @@ mod tests {
 
     /// Run microtasks, queued platform tasks and due timers until the fixture
     /// stores `globalThis.result` or no work remains.
-    fn settle_fixture(engine: &mut lumen::Engine, worker: bool) -> String {
+    fn settle_fixture(engine: &mut trust_js::Engine, worker: bool) -> String {
         let control = if worker { "__wkr" } else { "__trust" };
         let tick = if worker {
             "__wkr.tick(1e12)"
@@ -45710,16 +45748,24 @@ mod tests {
         .unwrap();
         run_microtask_checkpoint(&mut worker);
         let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
-        let events = LumenTaskSender::Page(events);
-        assert!(lumen_worker_report_buffered_errors(&mut worker, &events, 7));
+        let events = TrustJsTaskSender::Page(events);
+        assert!(trust_js_worker_report_buffered_errors(
+            &mut worker,
+            &events,
+            7
+        ));
         assert_eq!(
             settle_fixture_events(&mut worker),
             "loud:true:true,quiet:true:true"
         );
-        assert!(lumen_worker_report_buffered_errors(&mut worker, &events, 7));
+        assert!(trust_js_worker_report_buffered_errors(
+            &mut worker,
+            &events,
+            7
+        ));
         let mut console = Vec::new();
         while let Ok(task) = received.try_recv() {
-            if let LumenHostTask::Worker {
+            if let TrustJsHostTask::Worker {
                 id: 7,
                 event: crate::js::WorkerOut::Console(lines),
             } = task
@@ -45789,12 +45835,20 @@ mod tests {
         .unwrap();
         run_microtask_checkpoint(&mut worker);
         let (events, _received) = tokio::sync::mpsc::unbounded_channel();
-        let events = LumenTaskSender::Page(events);
-        assert!(lumen_worker_report_buffered_errors(&mut worker, &events, 7));
+        let events = TrustJsTaskSender::Page(events);
+        assert!(trust_js_worker_report_buffered_errors(
+            &mut worker,
+            &events,
+            7
+        ));
         assert_eq!(settle_fixture_events(&mut worker), "unhandled:late");
         eval(&mut worker, "late.catch(() => {});", "late handler").unwrap();
         run_microtask_checkpoint(&mut worker);
-        assert!(lumen_worker_report_buffered_errors(&mut worker, &events, 7));
+        assert!(trust_js_worker_report_buffered_errors(
+            &mut worker,
+            &events,
+            7
+        ));
         assert_eq!(
             settle_fixture_events(&mut worker),
             "unhandled:late,handled:late:true:true"
@@ -45861,7 +45915,7 @@ mod tests {
     }
 
     /// Run a worker's queued platform tasks, then read `events`.
-    fn settle_fixture_events(worker: &mut lumen::Engine) -> String {
+    fn settle_fixture_events(worker: &mut trust_js::Engine) -> String {
         for _ in 0..100 {
             run_microtask_checkpoint(worker);
             if string_value(worker, "String(__wkr.hasPlatformTask())") != "true" {
@@ -45946,11 +46000,11 @@ mod tests {
 
     #[test]
     fn worker_inbox_preserves_bursts_and_coalesces_only_port_wakes() {
-        let (inbox, receiver) = LumenWorkerInbox::new();
+        let (inbox, receiver) = TrustJsWorkerInbox::new();
         for index in 0..1024 {
             inbox
                 .sender
-                .send(LumenWorkerCtl::Message(index.to_string()))
+                .send(TrustJsWorkerCtl::Message(index.to_string()))
                 .unwrap();
             inbox.wake_ports();
         }
@@ -45958,16 +46012,16 @@ mod tests {
         let mut wakes = 0;
         while let Ok(command) = receiver.try_recv() {
             match command {
-                LumenWorkerCtl::Message(message) => {
+                TrustJsWorkerCtl::Message(message) => {
                     assert_eq!(message, messages.to_string());
                     messages += 1;
                 }
-                LumenWorkerCtl::PortReady(pending) => {
+                TrustJsWorkerCtl::PortReady(pending) => {
                     pending.store(false, std::sync::atomic::Ordering::Release);
                     wakes += 1;
                 }
-                LumenWorkerCtl::Terminate => panic!("unexpected termination"),
-                LumenWorkerCtl::HostTask(_) => panic!("unexpected host task"),
+                TrustJsWorkerCtl::Terminate => panic!("unexpected termination"),
+                TrustJsWorkerCtl::HostTask(_) => panic!("unexpected host task"),
             }
         }
         assert_eq!(messages, 1024);
@@ -45975,7 +46029,7 @@ mod tests {
         inbox.wake_ports();
         assert!(matches!(
             receiver.try_recv(),
-            Ok(LumenWorkerCtl::PortReady(_))
+            Ok(TrustJsWorkerCtl::PortReady(_))
         ));
         drop(inbox);
         assert!(matches!(
@@ -45986,7 +46040,7 @@ mod tests {
 
     /// [`settle_fixture`] that also runs a worker's port message tasks, which
     /// its event loop selects separately from its platform tasks.
-    fn settle_fixture_with_ports(engine: &mut lumen::Engine, worker: bool) -> String {
+    fn settle_fixture_with_ports(engine: &mut trust_js::Engine, worker: bool) -> String {
         for _ in 0..20_000 {
             run_microtask_checkpoint(engine);
             if string_value(engine, "typeof globalThis.result") != "undefined" {
@@ -46052,8 +46106,8 @@ mod tests {
     /// tasks and the host tasks its workers send until `done` is true.
     fn pump_page_with_workers(
         runtime: &tokio::runtime::Runtime,
-        engine: &mut lumen::Engine,
-        task_rx: &mut tokio::sync::mpsc::UnboundedReceiver<LumenHostTask>,
+        engine: &mut trust_js::Engine,
+        task_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TrustJsHostTask>,
         done: &str,
         log: &str,
         timeout: Duration,
@@ -46077,8 +46131,8 @@ mod tests {
     /// Keep a Window realm's event loop running for `duration`.
     fn pump_page_for(
         runtime: &tokio::runtime::Runtime,
-        engine: &mut lumen::Engine,
-        task_rx: &mut tokio::sync::mpsc::UnboundedReceiver<LumenHostTask>,
+        engine: &mut trust_js::Engine,
+        task_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TrustJsHostTask>,
         duration: Duration,
     ) {
         let deadline = Instant::now() + duration;
@@ -46091,8 +46145,8 @@ mod tests {
 
     fn pump_page_task(
         runtime: &tokio::runtime::Runtime,
-        engine: &mut lumen::Engine,
-        task_rx: &mut tokio::sync::mpsc::UnboundedReceiver<LumenHostTask>,
+        engine: &mut trust_js::Engine,
+        task_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TrustJsHostTask>,
     ) {
         // Like the resident actor, never let a busy platform task source
         // starve the tasks worker agents send (HTML #event-loop-processing-model).
@@ -46606,8 +46660,8 @@ mod tests {
 
     fn worker_test_environment() -> (
         tokio::runtime::Runtime,
-        lumen::Engine,
-        tokio::sync::mpsc::UnboundedReceiver<LumenHostTask>,
+        trust_js::Engine,
+        tokio::sync::mpsc::UnboundedReceiver<TrustJsHostTask>,
     ) {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -46781,7 +46835,7 @@ mod tests {
                 .unwrap();
             assert!(matches!(
                 task,
-                LumenHostTask::Worker {
+                TrustJsHostTask::Worker {
                     event: crate::js::WorkerOut::Message(_),
                     ..
                 }
@@ -46812,7 +46866,7 @@ mod tests {
                 })
                 .expect("every worker exits")
                 .unwrap();
-            assert!(matches!(task, LumenHostTask::WorkerExited { .. }));
+            assert!(matches!(task, TrustJsHostTask::WorkerExited { .. }));
             dispatch_host_task(&mut engine, task).unwrap();
         }
         assert!(
@@ -47016,7 +47070,7 @@ mod tests {
                 })
                 .expect("termination interrupts the fetch wait")
                 .unwrap();
-            let exited = matches!(task, LumenHostTask::WorkerExited { .. });
+            let exited = matches!(task, TrustJsHostTask::WorkerExited { .. });
             dispatch_host_task(&mut engine, task).unwrap();
             if exited {
                 break;
@@ -47043,7 +47097,7 @@ mod tests {
     }
 
     #[test]
-    fn workers_use_lumen_realms_and_preserve_task_microtask_order() {
+    fn workers_use_trust_js_realms_and_preserve_task_microtask_order() {
         // HTML §10.2.4/§10.2.6 and §8.1.7: each Worker gets a distinct dedicated agent;
         // incoming port messages and timers are tasks with a microtask checkpoint between them.
         // MessagePort post-message steps clone immediately and dispatch trusted MessageEvents with
@@ -47333,9 +47387,9 @@ mod tests {
             let script = page.join("worker.js").unwrap();
             state.base = script.clone();
             let (events, _) = tokio::sync::mpsc::unbounded_channel();
-            state.worker_self = Some(LumenWorkerSelf {
+            state.worker_self = Some(TrustJsWorkerSelf {
                 id: 1,
-                events: LumenTaskSender::Page(events),
+                events: TrustJsTaskSender::Page(events),
                 closed: false,
                 origin: script.clone(),
                 secure_context: true,
@@ -47346,23 +47400,23 @@ mod tests {
                 page.clone(),
                 runtime.handle(),
                 &cache,
-                LumenTaskSender::Page(task_tx),
+                TrustJsTaskSender::Page(task_tx),
             );
-            let mut engine = lumen::Engine::new();
+            let mut engine = trust_js::Engine::new();
             let origin = clock.origin_ms;
             engine.set_wall_clock(move || clock.now_ms());
             engine
                 .ctx()
                 .op_state()
                 .put_retained_memory_with_external_memory(state);
-            install_lumen_worker_boundary(&mut engine);
+            install_trust_js_worker_boundary(&mut engine);
             eval(
                 &mut engine,
                 &format!("globalThis.__worker_cfg={{url:'{script}',timeOrigin:{origin}}}"),
                 "worker config",
             )
             .unwrap();
-            assert!(eval_lumen_worker_platform_setup(&mut engine).unwrap());
+            assert!(eval_trust_js_worker_platform_setup(&mut engine).unwrap());
             engine
         } else {
             state.enable_network(page.clone(), runtime.handle().clone(), cache, task_tx);
@@ -47737,7 +47791,7 @@ mod tests {
             run_microtask_checkpoint(&mut engine);
         }
         assert_eq!(string_value(&mut engine, "sheetEvents.join()"), "load");
-        let image = |engine: &mut lumen::Engine, id: &str| {
+        let image = |engine: &mut trust_js::Engine, id: &str| {
             string_value(
                 engine,
                 &format!("getComputedStyle(document.getElementById('{id}')).backgroundImage"),
@@ -47974,7 +48028,7 @@ mod tests {
                 })
                 .expect("dynamic module task completes")
                 .expect("dynamic module channel remains open");
-            let started = matches!(&task, LumenHostTask::DynamicModuleStart { .. });
+            let started = matches!(&task, TrustJsHostTask::DynamicModuleStart { .. });
             dispatch_host_task(&mut engine, task).unwrap();
             run_microtask_checkpoint(&mut engine);
             if !started {
@@ -48073,7 +48127,7 @@ mod tests {
     }
 
     #[test]
-    fn document_all_uses_lumens_real_html_dda_exotic() {
+    fn document_all_uses_trust_js_real_html_dda_exotic() {
         let mut engine = platform_engine();
         eval(
             &mut engine,
@@ -49300,7 +49354,7 @@ mod tests {
     #[test]
     fn geometry_media_images_and_frames_use_canonical_platform_state() {
         // CSSOM §7.2/§9, CSSOM View §§4/6, and HTML §§4.8.4/4.8.5. The assertions enter through
-        // the shared prelude so wrapper behavior and the Lumen host calls are covered together.
+        // the shared prelude so wrapper behavior and the TRust JS host calls are covered together.
         let mut engine = platform_engine();
         eval(
             &mut engine,
@@ -49682,7 +49736,7 @@ mod tests {
         );
     }
 
-    fn svg_fixture_engine(tier: Tier) -> lumen::Engine {
+    fn svg_fixture_engine(tier: Tier) -> trust_js::Engine {
         let dom = Rc::new(RefCell::new(Dom::parse_document(
             "<!doctype html><html><body></body></html>",
         )));
@@ -50177,7 +50231,7 @@ mod tests {
         );
         assert_eq!(crate::http::request_cookies(&request), "cf_clearance=frame");
 
-        // run_lumen_worker installs the launch owner's cookie context at id 0.
+        // run_trust_js_worker installs the launch owner's cookie context at id 0.
         // Test that retrieval keeps that owner rather than using the worker URL.
         let mut worker = platform_engine();
         worker
@@ -50918,7 +50972,11 @@ mod tests {
     }
 
     /// Run queued platform tasks and microtasks until `result` is set or no work remains.
-    fn settle_platform_result(engine: &mut lumen::Engine, control: &str, result: &str) -> String {
+    fn settle_platform_result(
+        engine: &mut trust_js::Engine,
+        control: &str,
+        result: &str,
+    ) -> String {
         for _ in 0..500 {
             run_microtask_checkpoint(engine);
             if string_value(engine, &format!("typeof globalThis.{result}")) != "undefined"
@@ -50939,7 +50997,7 @@ mod tests {
 
     /// Run microtasks and queued platform tasks (the crypto task source among
     /// them) until neither remains.
-    fn drain_platform_tasks(engine: &mut lumen::Engine, control: &str) {
+    fn drain_platform_tasks(engine: &mut trust_js::Engine, control: &str) {
         for _ in 0..10_000 {
             run_microtask_checkpoint(engine);
             if string_value(engine, &format!("String({control}.hasPlatformTask())")) != "true" {
@@ -50956,14 +51014,14 @@ mod tests {
     }
 
     /// A dedicated-worker global with an explicit secure-context configuration.
-    fn worker_engine_with_secure_context(secure: bool) -> lumen::Engine {
+    fn worker_engine_with_secure_context(secure: bool) -> trust_js::Engine {
         let clock = Rc::new(RealmClock::new());
         let mut state = HostState::new(Rc::new(RefCell::new(Dom::new())), clock.clone());
         state.test_hooks.internals = true;
         let (events, _) = tokio::sync::mpsc::unbounded_channel();
-        state.worker_self = Some(LumenWorkerSelf {
+        state.worker_self = Some(TrustJsWorkerSelf {
             id: 1,
-            events: LumenTaskSender::Page(events),
+            events: TrustJsTaskSender::Page(events),
             closed: false,
             origin: url::Url::parse(DEFAULT_URL).unwrap(),
             secure_context: secure,
@@ -50971,13 +51029,13 @@ mod tests {
             referrer_policy: Default::default(),
         });
         let origin = clock.origin_ms;
-        let mut engine = lumen::Engine::new();
+        let mut engine = trust_js::Engine::new();
         engine.set_wall_clock(move || clock.now_ms());
         engine
             .ctx()
             .op_state()
             .put_retained_memory_with_external_memory(state);
-        install_lumen_worker_boundary(&mut engine);
+        install_trust_js_worker_boundary(&mut engine);
         eval(
             &mut engine,
             &format!(
@@ -50986,7 +51044,7 @@ mod tests {
             "worker config",
         )
         .unwrap();
-        assert!(eval_lumen_worker_platform_setup(&mut engine).unwrap());
+        assert!(eval_trust_js_worker_platform_setup(&mut engine).unwrap());
         engine
     }
 
@@ -51544,16 +51602,28 @@ mod tests {
             environment("https://a.test").blob_module(&url, "", None),
             Some((url.to_string(), String::from("export default 1;")))
         );
-        assert_eq!(environment("https://b.test").blob_module(&url, "", None), None);
-        let text = url::Url::parse("blob:https://a.test/2").unwrap();
-        assert_eq!(environment("https://a.test").blob_module(&text, "", None), None);
         assert_eq!(
-            environment("https://a.test")
-                .blob_module(&url, "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", None),
+            environment("https://b.test").blob_module(&url, "", None),
+            None
+        );
+        let text = url::Url::parse("blob:https://a.test/2").unwrap();
+        assert_eq!(
+            environment("https://a.test").blob_module(&text, "", None),
+            None
+        );
+        assert_eq!(
+            environment("https://a.test").blob_module(
+                &url,
+                "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+                None
+            ),
             None
         );
         let gone = url::Url::parse("blob:https://a.test/3").unwrap();
-        assert_eq!(environment("https://a.test").blob_module(&gone, "", None), None);
+        assert_eq!(
+            environment("https://a.test").blob_module(&gone, "", None),
+            None
+        );
     }
 
     #[test]
@@ -51590,11 +51660,11 @@ mod tests {
             localStorage.setItem("beta", "two");
             const stored = [localStorage.length, localStorage.getItem("alpha")].join(":");
             localStorage.removeItem("beta");
-            document.cookie = "lumen_port_cookie=ready; Path=/";
+            document.cookie = "trust_js_port_cookie=ready; Path=/";
 
             const blobUrl = URL.createObjectURL(new Blob([
                 new Uint8Array([0, 128, 255])
-            ], { type: "application/x-lumen-port" }));
+            ], { type: "application/x-trust-js-port" }));
             globalThis.blobPortUrl = blobUrl;
 
             const popover = document.createElement("div");
@@ -51606,7 +51676,7 @@ mod tests {
             globalThis.hostStateResult = [
                 stored,
                 localStorage.length,
-                document.cookie.includes("lumen_port_cookie=ready"),
+                document.cookie.includes("trust_js_port_cookie=ready"),
                 open,
                 popover.matches(":popover-open")
             ].join("|");
@@ -51639,7 +51709,7 @@ mod tests {
             .expect("the blob URL store has the entry");
         assert_eq!(
             (entry.read().unwrap(), entry.content_type.as_str()),
-            (vec![0, 128, 255], "application/x-lumen-port")
+            (vec![0, 128, 255], "application/x-trust-js-port")
         );
     }
 
@@ -52196,7 +52266,7 @@ mod tests {
 
     #[test]
     fn web_crypto_aes_gcm_worker_boundary_and_buffer_brands() {
-        let mut engine = lumen::Engine::new();
+        let mut engine = trust_js::Engine::new();
         let mut state = HostState::new(
             Rc::new(RefCell::new(Dom::new())),
             Rc::new(RealmClock::new()),
@@ -52206,7 +52276,7 @@ mod tests {
             .ctx()
             .op_state()
             .put_retained_memory_with_external_memory(state);
-        install_lumen_worker_boundary(&mut engine);
+        install_trust_js_worker_boundary(&mut engine);
         eval(
             &mut engine,
             "globalThis.__worker_cfg = { crossOriginIsolated: true, secureContext: true };",
@@ -53613,20 +53683,20 @@ mod tests {
         ] {
             let clock = Rc::new(RealmClock::new());
             let state = HostState::new(Rc::new(RefCell::new(Dom::new())), clock.clone());
-            let mut engine = lumen::Engine::new();
+            let mut engine = trust_js::Engine::new();
             engine.set_wall_clock(move || clock.now_ms());
             engine
                 .ctx()
                 .op_state()
                 .put_retained_memory_with_external_memory(state);
-            install_lumen_worker_boundary(&mut engine);
+            install_trust_js_worker_boundary(&mut engine);
             eval(
                 &mut engine,
                 &format!("globalThis.__worker_cfg={{url:{url:?}}}"),
                 "worker config",
             )
             .unwrap();
-            assert!(eval_lumen_worker_platform_setup(&mut engine).unwrap());
+            assert!(eval_trust_js_worker_platform_setup(&mut engine).unwrap());
             assert_eq!(
                 string_value(
                     &mut engine,
@@ -55386,7 +55456,7 @@ mod tests {
             ),
             DEFAULT_URL,
         );
-        assert!(eval_lumen_worker_platform_setup(&mut engine).unwrap());
+        assert!(eval_trust_js_worker_platform_setup(&mut engine).unwrap());
         assert_eq!(
             string_value(
                 &mut engine,
@@ -55517,7 +55587,7 @@ mod tests {
     #[test]
     fn dom_strings_keep_lone_surrogates_and_plane_16_characters() {
         // DOM §4.10/§4.9 and Web IDL §3.2.10: DOM strings are code-unit sequences, so lone
-        // surrogates set from script round-trip exactly; the host keeps them as Lumen engine
+        // surrogates set from script round-trip exactly; the host keeps them as TRust JS engine
         // text. Characters in U+10F800..U+10FFFF stay characters, including parsed markup.
         let mut engine = platform_engine();
         eval(
@@ -55568,7 +55638,7 @@ mod tests {
 
     #[test]
     fn utf8_codecs_carry_plane_16_private_use_characters() {
-        // Encoding §7.4/§8.1: U+10F800..U+10FFFF are ordinary scalar values. Lumen stores lone
+        // Encoding §7.4/§8.1: U+10F800..U+10FFFF are ordinary scalar values. TRust JS stores lone
         // surrogates in that range, so the host boundary must encode and decode these characters
         // as themselves, while TextEncoder still replaces a lone surrogate with U+FFFD.
         let mut engine = platform_engine();
@@ -55963,7 +56033,7 @@ mod tests {
         // below is an engine lifetime test, not a promise of prompt Web GC.
         // Web IDL #invoke-a-callback-function (8f182624) also requires the native
         // boundary to preserve the original receiver/argument behavior.
-        let mut engine = lumen::Engine::new();
+        let mut engine = trust_js::Engine::new();
         let owner = eval_value(
             &mut engine,
             "(() => { const owner = {value: 42}; owner.operation = function(source, receiver, args) { return owner.value + receiver.extra + args[0]; }; return owner; })()",
@@ -56452,7 +56522,7 @@ mod tests {
         }
         let mut engine = platform_engine();
         eval(&mut engine,"globalThis.collectionRoot=document.createElement('div');collectionRoot.innerHTML='<i></i>'.repeat(128);", "collection setup").unwrap();
-        let id_arrays = |engine: &mut lumen::Engine| {
+        let id_arrays = |engine: &mut trust_js::Engine| {
             engine
                 .ctx()
                 .host_mut::<HostState>()
@@ -56566,7 +56636,7 @@ mod tests {
             "query setup",
         )
         .unwrap();
-        let id_arrays = |engine: &mut lumen::Engine| {
+        let id_arrays = |engine: &mut trust_js::Engine| {
             engine
                 .ctx()
                 .host_mut::<HostState>()
@@ -56626,7 +56696,7 @@ mod tests {
         }
         let mut engine = platform_engine();
         eval(&mut engine, "globalThis.edgeRoot=document.createElement('div');edgeRoot.innerHTML='<i></i>'.repeat(128);edgeRoot.firstChild;edgeRoot.lastChild;", "edge setup").unwrap();
-        let count = |engine: &mut lumen::Engine| {
+        let count = |engine: &mut trust_js::Engine| {
             engine
                 .ctx()
                 .host_mut::<HostState>()
@@ -57814,10 +57884,10 @@ mod tests {
         // HTML §8.7 invokes the Function handler itself with WindowProxy as
         // callback-this. A top-level task needs no nested-navigable state
         // switch; routing it through two extra JS callbacks made otherwise
-        // valid author recursion hit Lumen's bounded call-stack guard early.
+        // valid author recursion hit TRust JS's bounded call-stack guard early.
         // Rust's test harness provisions a much smaller native stack than the 64 MiB resident
         // page thread. Exercise meaningful author depth on an explicitly sized host stack, as
-        // Lumen's configurable recursion-budget test does, so the native guard page cannot win
+        // TRust JS's configurable recursion-budget test does, so the native guard page cannot win
         // before the JavaScript assertion on otherwise loaded test runs.
         std::thread::Builder::new()
             .name(String::from("trust-timer-depth-test"))
@@ -57998,7 +58068,7 @@ mod tests {
 
     /// Run queued platform tasks and microtasks until both queues are empty.
     fn settle_picker(
-        engine: &mut lumen::Engine,
+        engine: &mut trust_js::Engine,
         request: u64,
         files: Option<Vec<std::path::PathBuf>>,
     ) {
@@ -58009,7 +58079,7 @@ mod tests {
         }
     }
 
-    fn take_file_pickers(engine: &mut lumen::Engine) -> Vec<crate::js::FilePickerRequest> {
+    fn take_file_pickers(engine: &mut trust_js::Engine) -> Vec<crate::js::FilePickerRequest> {
         std::mem::take(
             &mut engine
                 .ctx()
@@ -59739,7 +59809,7 @@ mod tests {
                 y: 0.0,
                 metadata: Default::default(),
             });
-            let handle = crate::js::PageHandle::from_lumen_parts(
+            let handle = crate::js::PageHandle::from_trust_js_parts(
                 commands,
                 interactions,
                 hover,
@@ -59841,7 +59911,7 @@ mod tests {
             .eval_value_interruptible("marker = 99")
             .expect("navigation probe parses")
         {
-            Err(EvalError::Interrupted(lumen::InterruptReason::UserNavigation)) => {}
+            Err(EvalError::Interrupted(trust_js::InterruptReason::UserNavigation)) => {}
             _ => panic!("old realm did not yield to navigation"),
         }
 
@@ -59857,7 +59927,7 @@ mod tests {
             .eval_value_interruptible("marker = 100")
             .expect("teardown probe parses")
         {
-            Err(EvalError::Interrupted(lumen::InterruptReason::Cancelled)) => {}
+            Err(EvalError::Interrupted(trust_js::InterruptReason::Cancelled)) => {}
             _ => panic!("torn-down realm accepted another author task"),
         }
         drop(old_realm);

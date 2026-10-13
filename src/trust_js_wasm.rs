@@ -1,4 +1,4 @@
-//! WebAssembly JavaScript host boundary for the Lumen backend.
+//! WebAssembly JavaScript host boundary for the TRust JS backend.
 //!
 //! The observable classes and promise APIs live in the shared platform prelude. This module owns
 //! one wasmi store per JavaScript agent and translates the prelude's integer handles according to
@@ -20,14 +20,14 @@
 //! exception tag. Host interruptions are no JavaScript exceptions and stay uncatchable traps.
 
 use super::HostState;
-use lumen::embed::{
-    ArrayBufferBytes, Ctx, HostGc, HostGcVisitor, HostRetainedMemoryVisitor,
-    RetainedExternalAllocation, RetainedExternalMemory, RetainedManagedAllocation, Value,
-};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use trust_js::embed::{
+    ArrayBufferBytes, Ctx, HostGc, HostGcVisitor, HostRetainedMemoryVisitor,
+    RetainedExternalAllocation, RetainedExternalMemory, RetainedManagedAllocation, Value,
+};
 
 static WASM_CALL_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -372,7 +372,7 @@ fn trace_exception_objects(state: &WasmState, visitor: &mut dyn HostGcVisitor) {
             visitor.root(wrapper);
         }
         // Edges through uncached exceptions end at the next cached one, whose own outgoing
-        // edges Lumen's mark queue follows.
+        // edges TRust JS's mark queue follows.
         let mut pending = fields.get(address).cloned().unwrap_or_default();
         let mut seen = HashSet::new();
         while let Some(target) = pending.pop() {
@@ -388,7 +388,7 @@ fn trace_exception_objects(state: &WasmState, visitor: &mut dyn HostGcVisitor) {
 }
 
 /// Reach an exported wrapper through native-only intermediate modules as well. Stop at
-/// another cached representative: its outgoing JS edges are handled by Lumen's mark queue.
+/// another cached representative: its outgoing JS edges are handled by TRust JS's mark queue.
 fn visit_cached_function_targets(
     start: usize,
     links: &HashMap<usize, Vec<usize>>,
@@ -467,7 +467,7 @@ impl RetainedExternalMemory for PageWasm {
             return;
         };
         for slot in &state.memories {
-            // The Data Block identity lets Lumen count an exposed Memory.buffer only once.
+            // The Data Block identity lets TRust JS count an exposed Memory.buffer only once.
             visit(RetainedExternalAllocation::wasm_array_buffer(&slot.storage));
         }
     }
@@ -642,11 +642,11 @@ fn share_memory(
 ) -> Option<ArrayBufferBytes> {
     // SAFETY: wasmi::Memory::share's contract.
     // - The store lives in this agent's `PageWasm` (an `Rc`, so it never leaves the agent
-    //   thread), and Lumen keeps the returned `Rc` in ArrayBuffers of the same agent.
-    // - Lumen touches the bytes only while JavaScript or a host operation runs: outside Wasm
+    //   thread), and TRust JS keeps the returned `Rc` in ArrayBuffers of the same agent.
+    // - TRust JS touches the bytes only while JavaScript or a host operation runs: outside Wasm
     //   execution, or inside an imported-function callback, after which Wasmi reloads its
     //   view of memory 0 (other memories are resolved per access). This module never holds a
-    //   slice of Wasm memory across a call into Lumen.
+    //   slice of Wasm memory across a call into TRust JS.
     let storage = unsafe { memory.share(context) };
     if storage.is_none() {
         wasm_trace!("memory share failed (static buffer)");
@@ -1161,7 +1161,7 @@ fn pending_trap(error: Value) -> wasmi::Error {
 ///
 /// An `Exception` object throws its own exception address (step 3.10.2); any other value
 /// becomes the `externref` payload of a new exception of the JavaScript exception tag (step
-/// 3.10.3). A host interruption is no JavaScript exception (Lumen's `RuntimeInterrupt`): no
+/// 3.10.3). A host interruption is no JavaScript exception (TRust JS's `RuntimeInterrupt`): no
 /// Wasm handler may catch it, so it unwinds as a trap and resumes in JavaScript.
 fn thrown_to_wasm(ctx: &mut Ctx, thrown: Value) -> wasmi::Error {
     if ctx.pending_interrupt().is_some() {

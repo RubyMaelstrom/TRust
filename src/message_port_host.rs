@@ -2,7 +2,7 @@
 //! ownership of the queue, not its messages, and the receiving queue starts disabled.
 //! Local WHATWG HTML snapshot e5071a20 (2026-09-06), #transferMessagePort.
 
-use super::{Ctx, HostState, LumenHostTask, LumenWorkerInbox, Value, host_arg_string};
+use super::{Ctx, HostState, TrustJsHostTask, TrustJsWorkerInbox, Value, host_arg_string};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{
     Arc, Mutex, Weak,
@@ -16,8 +16,8 @@ const MAX_QUEUED_BYTES: usize = 64 * 1024 * 1024;
 pub(super) enum Wake {
     #[default]
     None,
-    Page(tokio::sync::mpsc::WeakUnboundedSender<LumenHostTask>),
-    Worker(Weak<LumenWorkerInbox>),
+    Page(tokio::sync::mpsc::WeakUnboundedSender<TrustJsHostTask>),
+    Worker(Weak<TrustJsWorkerInbox>),
     /// An AudioWorkletGlobalScope: wake its context's rendering thread.
     Callback(Arc<dyn Fn() + Send + Sync>),
 }
@@ -28,7 +28,7 @@ impl Wake {
             Self::None => {}
             Self::Page(sender) => {
                 if let Some(sender) = sender.upgrade() {
-                    let _ = sender.send(LumenHostTask::PortReady);
+                    let _ = sender.send(TrustJsHostTask::PortReady);
                 }
             }
             Self::Worker(sender) => {
@@ -132,7 +132,10 @@ impl Agent {
         }
     }
 
-    pub fn scan_retained_memory(&self, visitor: &mut dyn lumen::embed::HostRetainedMemoryVisitor) {
+    pub fn scan_retained_memory(
+        &self,
+        visitor: &mut dyn trust_js::embed::HostRetainedMemoryVisitor,
+    ) {
         let registry = self.registry.lock().unwrap();
         let bytes = registry.ports.capacity() * std::mem::size_of::<(u64, Endpoint)>()
             + registry
@@ -147,7 +150,7 @@ impl Agent {
                             .sum::<usize>()
                 })
                 .sum::<usize>();
-        visitor.allocation(lumen::embed::RetainedManagedAllocation::new(
+        visitor.allocation(trust_js::embed::RetainedManagedAllocation::new(
             "trust.message-port-queues",
             Arc::as_ptr(&self.registry) as usize,
             bytes,
@@ -392,8 +395,8 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
         let wake = state.task_events.as_ref().map_or_else(
             || agent.wake.clone(),
             |sender| match sender {
-                super::LumenTaskSender::Page(sender) => Wake::Page(sender.downgrade()),
-                super::LumenTaskSender::Worker(inbox) => Wake::Worker(inbox.clone()),
+                super::TrustJsTaskSender::Page(sender) => Wake::Page(sender.downgrade()),
+                super::TrustJsTaskSender::Worker(inbox) => Wake::Worker(inbox.clone()),
             },
         );
         agent.registry.lock().unwrap().operation(

@@ -1,7 +1,7 @@
 Archive.org collection loading — 2026-09-28
 
 The blank main panel at https://archive.org/details/librivoxaudio was caused by
-Lumen rejecting valid ECMAScript in a dynamically imported dependency. The
+TRust JS rejecting valid ECMAScript in a dynamically imported dependency. The
 navigation loaded, but collection-page-BVnWcoTD.js depended on esm-CWeBglMZ.js,
 which failed at line 477, character 239572: expected ';' before the keyword in.
 The dependency's SHA256 is
@@ -12,14 +12,14 @@ The reduced failing shape is:
     for (let C = class { m(o) { return 'x' in o; } }; false;) {}
 
 A for initializer uses the grammar parameter [~In], but ClassExpression and
-ClassTail do not inherit that parameter. Lumen incorrectly propagated it into
+ClassTail do not inherit that parameter. TRust JS incorrectly propagated it into
 class methods. Block arrow bodies and arrow parameter defaults had related
 gaps. Ordinary functions already reset this context.
 
-The fix belongs in ../Lumen/crates/lumen/src/parser.rs. It saves and restores
+The fix belongs in ../trust-js/crates/trust-js/src/parser.rs. It saves and restores
 the outer restriction at class definitions, formal parameters and FunctionBody.
 Arrow expression bodies retain the enclosing [In] parameter. Regression cases
-in ../Lumen/crates/lumen/src/tests.rs cover valid scripts, strict scripts and
+in ../trust-js/crates/trust-js/src/tests.rs cover valid scripts, strict scripts and
 modules; methods, accessors, generators, async methods, fields and static blocks;
 arrow defaults and block bodies; nested contexts; and invalid outer expressions.
 The execution case runs in the interpreter, bytecode VM and native JIT.

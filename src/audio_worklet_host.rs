@@ -1,5 +1,5 @@
 //! AudioWorkletGlobalScope (Web Audio 1.1, local
-//! WebAudio/web-audio-api@2047f16, #AudioWorklet): a Lumen engine that lives
+//! WebAudio/web-audio-api@2047f16, #AudioWorklet): a TRust JS engine that lives
 //! on its BaseAudioContext's rendering thread.
 //!
 //! The control thread builds a [`Factory`] with what the scope needs of its
@@ -21,8 +21,8 @@ use std::sync::Arc;
 use super::message_port_host::Wake;
 use super::{
     Ctx, Dom, EvalError, HostState, ModuleFetchEnvironment, RealmClock, Value,
-    eval_lumen_worker_setup, install_lumen_worker_boundary, lumen_worker_internal_call,
-    module_dependency_loader,
+    eval_trust_js_worker_setup, install_trust_js_worker_boundary, module_dependency_loader,
+    trust_js_worker_internal_call,
 };
 use crate::webaudio::bus::Bus;
 use crate::webaudio::worklet::{Call, Factory, ProcessorError, Setup, Worklet};
@@ -67,7 +67,7 @@ pub(super) fn factory(ctx: &mut Ctx) -> Option<Factory> {
 fn worklet_prelude_snapshot() -> Result<&'static [u8], String> {
     static SNAPSHOT: std::sync::OnceLock<Result<Vec<u8>, String>> = std::sync::OnceLock::new();
     match SNAPSHOT.get_or_init(|| {
-        lumen::compile_host_snapshot(&crate::js::private_bootstrap(
+        trust_js::compile_host_snapshot(&crate::js::private_bootstrap(
             crate::js::audio_worklet_prelude(),
         ))
     }) {
@@ -77,7 +77,7 @@ fn worklet_prelude_snapshot() -> Result<&'static [u8], String> {
 }
 
 struct AudioWorkletScope {
-    engine: lumen::Engine,
+    engine: trust_js::Engine,
     launch: Launch,
     /// Modules already evaluated (#dom-worklet-addmodule reuses the module
     /// responses map: a module runs once per scope).
@@ -93,14 +93,14 @@ impl AudioWorkletScope {
         state.message_ports.registry = launch.registry.clone();
         let waker = setup.waker.clone();
         state.message_ports.wake = Wake::Callback(Arc::new(move || waker()));
-        let mut engine = lumen::Engine::new();
+        let mut engine = trust_js::Engine::new();
         let engine_clock = clock.clone();
         engine.set_wall_clock(move || engine_clock.now_ms());
         engine
             .ctx()
             .op_state()
             .put_retained_memory_with_external_memory(state);
-        install_lumen_worker_boundary(&mut engine);
+        install_trust_js_worker_boundary(&mut engine);
         let config = format!(
             "globalThis.__worker_cfg = {{ id: 0, name: \"\", type: \"module\", url: {}, ua: {}, \
              navigatorMode: {}, platform: {}, language: {}, languages: [{}, {}], hwc: 1, \
@@ -119,7 +119,7 @@ impl AudioWorkletScope {
             setup.rate,
             setup.quantum,
         );
-        if !eval_lumen_worker_setup(&mut engine, &config, "audio worklet configuration")? {
+        if !eval_trust_js_worker_setup(&mut engine, &config, "audio worklet configuration")? {
             return Err(String::from("audio worklet setup was interrupted"));
         }
         let snapshot = worklet_prelude_snapshot()?;
@@ -150,7 +150,7 @@ impl AudioWorkletScope {
     }
 
     fn call(&mut self, name: &str, args: &[Value]) -> Result<Value, EvalError> {
-        lumen_worker_internal_call(&mut self.engine, name, args)
+        trust_js_worker_internal_call(&mut self.engine, name, args)
     }
 
     fn error_of(&mut self, text: &str) -> ProcessorError {
@@ -245,11 +245,11 @@ impl Worklet for AudioWorkletScope {
             }
             // A module that does not parse is a script whose error to
             // rethrow is set.
-            Ok(lumen::ExecutionOutcome::Throw { name, message }) if name == "SyntaxError" => {
+            Ok(trust_js::ExecutionOutcome::Throw { name, message }) if name == "SyntaxError" => {
                 return Err(format!("SyntaxError:{message}"));
             }
             // "Run a module script": an exception is reported, not rejected.
-            Ok(lumen::ExecutionOutcome::Throw { name, message }) => {
+            Ok(trust_js::ExecutionOutcome::Throw { name, message }) => {
                 eprintln!("trust: audio worklet {resolved}: uncaught {name}: {message}");
             }
             Ok(_) => {}

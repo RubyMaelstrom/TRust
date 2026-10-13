@@ -52,7 +52,7 @@ pub(crate) struct EditableModel {
 }
 
 /// UTF-16 length of engine text: a smuggled lone surrogate (U+10F800 to
-/// U+10FFFF, see `lumen::embed::text_to_engine`) is one code unit, any other
+/// U+10FFFF, see `trust_js::embed::text_to_engine`) is one code unit, any other
 /// supplementary character two.
 fn units(text: &str) -> usize {
     text.chars()

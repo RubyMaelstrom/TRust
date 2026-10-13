@@ -11,8 +11,8 @@
 //! decoders the oldest is dropped, and its next chunk starts a fresh decoder.
 
 use encoding_rs::{CoderResult, Decoder, DecoderResult, Encoding};
-use lumen::embed::{HostRetainedMemoryVisitor, RetainedManagedAllocation};
 use std::collections::{HashMap, VecDeque};
+use trust_js::embed::{HostRetainedMemoryVisitor, RetainedManagedAllocation};
 
 /// Live streaming decoders kept per Agent before the oldest is dropped.
 const MAX_STREAMS: usize = 1024;

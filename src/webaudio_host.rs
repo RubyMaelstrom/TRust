@@ -2,7 +2,7 @@
 //! block (the control thread) drives each BaseAudioContext's rendering
 //! thread (`crate::webaudio::engine`) through `__audio_context_binding`,
 //! and the threads' reports come back as host tasks
-//! (`LumenHostTask::WebAudio`) that run `trust.webAudioEvent(context, kind,
+//! (`TrustJsHostTask::WebAudio`) that run `trust.webAudioEvent(context, kind,
 //! a, b, c)` in the context's Window realm.
 //!
 //! Script owns the API objects and their validation; this side owns the
@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use super::{Ctx, HostState, LumenHostTask, Value, host_arg_string};
+use super::{Ctx, HostState, TrustJsHostTask, Value, host_arg_string};
 use crate::webaudio::AudioData;
 use crate::webaudio::bus::{ChannelConfig, CountMode, Interpretation};
 use crate::webaudio::engine::{Command, Engine, Notice, Realtime};
@@ -748,7 +748,7 @@ fn create(ctx: &mut Ctx, realtime: bool, args: &[Value]) -> Value {
         if let Ok(sender) = sender.lock()
             && let Some(sender) = sender.as_ref()
         {
-            let _ = sender.send(LumenHostTask::WebAudio(WebAudioTask {
+            let _ = sender.send(TrustJsHostTask::WebAudio(WebAudioTask {
                 context: id,
                 notices,
             }));
@@ -935,7 +935,7 @@ fn decode(ctx: &mut Ctx, context: u64, args: &[Value]) -> Value {
     let sender = state.task_events.clone();
     crate::webaudio::decode::spawn(bytes, rate, move |data| {
         if let Some(sender) = sender {
-            let _ = sender.send(LumenHostTask::WebAudio(WebAudioTask {
+            let _ = sender.send(TrustJsHostTask::WebAudio(WebAudioTask {
                 context,
                 notices: vec![Notice::Decoded {
                     job,
@@ -985,7 +985,7 @@ fn buffer(ctx: &mut Ctx, args: &[Value]) -> Value {
 }
 
 /// Keep `data` as a content for an AudioBuffer: (id, length, channels).
-fn store(engine: &mut lumen::Engine, data: Arc<AudioData>) -> Option<(f64, f64, f64)> {
+fn store(engine: &mut trust_js::Engine, data: Arc<AudioData>) -> Option<(f64, f64, f64)> {
     let (length, channels) = (data.length as f64, data.channels.len() as f64);
     let state = engine.ctx().host_mut::<HostState>()?;
     let id = state.webaudio.next();
@@ -994,7 +994,7 @@ fn store(engine: &mut lumen::Engine, data: Arc<AudioData>) -> Option<(f64, f64, 
 }
 
 /// Deliver a context's notices to its realm.
-pub(super) fn dispatch(engine: &mut lumen::Engine, task: WebAudioTask) -> Result<(), String> {
+pub(super) fn dispatch(engine: &mut trust_js::Engine, task: WebAudioTask) -> Result<(), String> {
     let Some(realm) = engine
         .ctx()
         .host_mut::<HostState>()

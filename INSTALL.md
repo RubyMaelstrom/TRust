@@ -1,8 +1,8 @@
 # Installing TRust
 
-You'll need Rust, a C compiler, and the matching [Lumen checkout](https://github.com/RubyMaelstrom/Lumen)
-next to TRust at `../Lumen`. Use Lumen revision
-`04cf52652738e813e025c3cf8aef80450d91a7f5`.
+You'll need Rust, a C compiler, and the matching [TRust JS checkout](https://github.com/RubyMaelstrom/trust-js)
+next to TRust at `../trust-js`. The engine checkout must provide
+`crates/trust-js`; Cargo loads this package directly.
 
 From the TRust directory:
 

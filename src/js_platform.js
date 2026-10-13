@@ -2712,7 +2712,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             lastHistoryActionActivation: Infinity,
             closeWatcherManager: null,
             // HTML has a 1:1 mapping between a realm, global object, and
-            // environment settings object. Lumen uses this opaque token both
+            // environment settings object. TRust JS uses this opaque token both
             // to restore promise-job settings and to partition module maps.
             hostSettingsContext: context === undefined
                 ? (frame ? allocateWindowSettingsContext() : 0)
@@ -5346,7 +5346,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             resetFrameWindowState(frame);
         }
 
-        // Lumen exposes the same-Agent Realm boundary here; the legacy
+        // TRust JS exposes the same-Agent Realm boundary here; the legacy
         // comparison backend returns null and retains the scoped single-Realm
         // fallback below.
         const childWindow = createFrameWindowRealm(frame, frameUrl, contentType, navigationTiming);
@@ -18835,7 +18835,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             rememberFrameViewport(frame, width, height);
             if (!old || (old[0] === width && old[1] === height)) continue;
             changed++;
-            // Lumen creates a genuine child Realm for each navigable. Its
+            // TRust JS creates a genuine child Realm for each navigable. Its
             // Window/EventTarget and listener registry therefore live in the
             // child global, not in this parent Realm's scoped facade. Route
             // the resize steps through that Window when present; the
@@ -20406,7 +20406,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         return !!(child && parent && (inherited ||
             (child[8] !== "null" && child[8] === parent[8])));
     }
-    // A Window owns its AnimationFrameProvider methods. Until Lumen-backed
+    // A Window owns its AnimationFrameProvider methods. Until TRust JS-backed
     // nested navigables receive independent engine globals, preserve these
     // writable Window properties at the same scoped-Window boundary used for
     // document/location. In particular, monkey-patching requestAnimationFrame
@@ -20603,7 +20603,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         windowAttributes.scrollX = state.scrollX; windowAttributes.scrollY = state.scrollY;
         baseHrefCache = state.base;
     }
-    // Each Lumen-backed nested Window owns this entire platform Realm. Internal
+    // Each TRust JS-backed nested Window owns this entire platform Realm. Internal
     // task records use null for "the Realm's Window" in a few generic paths,
     // while DOM-owned callbacks retain `realmRootFrame`. They are the same
     // Window/GlobalEnvironment (HTML §7.3.2.1; ECMA-262 §9.3), not two logical
@@ -23723,7 +23723,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             resolve,
         };
         NODE_LIST_DATA.set(target, data);
-        // Lumen installs Web IDL's indexed legacy-platform-object internal methods directly.
+        // TRust JS installs Web IDL's indexed legacy-platform-object internal methods directly.
         // Comparison engines without that audited hook return false and use the equivalent Proxy
         // below. Keeping the fallback here preserves one shared browser contract.
         if (!resolve && __dom_install_readonly_indexed(target, ids.length, nodeListIndexedGetter))
@@ -23872,7 +23872,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     const HTML_COLLECTION_TOKEN = {};
     const HTML_COLLECTION_DATA = new WeakMap();
-    // Lumen answers tag/class membership natively, recomputed once per DOM
+    // TRust JS answers tag/class membership natively, recomputed once per DOM
     // mutation epoch, instead of through the Proxy-based fallback below.
     function nativeQueryCollection(root, classes, query, extra) {
         if (typeof installNativeQueryCollection !== "function") return null;
@@ -37776,7 +37776,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     g.clearInterval = {clearInterval(id = 0) { clearTimer(id); }}.clearInterval;
     // A browser host invokes a queued timer handler as the entry point of its
     // task, with no platform JavaScript execution context underneath it
-    // (ECMA-262 §9.5 and HTML §8.7). These two hooks let the Lumen host perform
+    // (ECMA-262 §9.5 and HTML §8.7). These two hooks let the TRust JS host perform
     // that call directly while this prelude retains the normative timer
     // bookkeeping. The synchronous fallback below uses the same hooks for
     // embedders which still drive tick()/tickTo() entirely from JavaScript.
@@ -37962,7 +37962,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         }]);
     }, "queueMicrotask", 1);
     imageTask = g.setTimeout;
-    // FinalizationRegistry and its cleanup hooks are provided by Lumen.
+    // FinalizationRegistry and its cleanup hooks are provided by TRust JS.
     // The HTML structured-clone algorithm — via the SAME wire codec workers
     // use (`__sc_serialize`/`__sc_deserialize`, defined below; single source
     // of truth). Cycles, Map/Set, ArrayBuffer/typed arrays/DataView, Date/
@@ -38302,7 +38302,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     const bufferByteLength = getOwn(ArrayBuffer.prototype, "byteLength").get;
     // SharedArrayBuffer's brand check is looked up on first use: a realm that
     // is not cross-origin isolated deletes the global during its bootstrap,
-    // and capturing its intrinsics here keeps that Realm alive in Lumen.
+    // and capturing its intrinsics here keeps that Realm alive in TRust JS.
     let sharedByteLength;
     function isSharedBuffer(value) {
         if (sharedByteLength === undefined) {
@@ -41979,7 +41979,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             g.document.getAnimations = function () { return []; };
         }
     }
-    // ECMA-402: Intl and Number/Date locale methods are provided by Lumen.
+    // ECMA-402: Intl and Number/Date locale methods are provided by TRust JS.
     /*__URL_BEGIN__*/
     // URL Standard §6 "API" (local whatwg/url@55d6699): the URL and
     // URLSearchParams interfaces, shared verbatim by Window and Worker realms
@@ -52032,7 +52032,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
 
     // ============================ WebAssembly =============================
 // The `WebAssembly` namespace (js-api / web-api specs) over the pure-Rust wasmi
-// engine. The Rust side (`lumen_wasm.rs`) owns the agent's store and GC-traced
+// engine. The Rust side (`trust_js_wasm.rs`) owns the agent's store and GC-traced
 // function cache behind the integer-handle boundary:
 // compile/validate/introspect modules by id. Everything observable — the
 // classes, the error hierarchy, the BufferSource handling — lives here, so the
@@ -52173,7 +52173,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // Identity cache: a wasm function address maps to ONE Exported Function JS
     // object (js-api), so reading the same export twice — and (Stage 6) a
     // funcref round-tripped through a Table/Global — yields the same function.
-    // The per-agent native cache participates in Lumen's collector. It traces
+    // The per-agent native cache participates in TRust JS's collector. It traces
     // Wasm-held references before dropping unreachable wrappers; a JS WeakRef
     // cache alone would lose properties/identity on table-only references.
     // A Memory, Table or Global keeps its store address in an internal slot
@@ -52465,7 +52465,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // of the spec repository 37d6b059). A Tag object's [[Address]] and an
     // Exception object's [[Address]], [[Type]] and [[Stack]] are internal slots
     // shared by this Agent's Realms. Both object caches are agent-wide and live
-    // natively (`lumen_wasm.rs`), like the Exported Function cache: a Wasm
+    // natively (`trust_js_wasm.rs`), like the Exported Function cache: a Wasm
     // exception thrown out to JavaScript again yields the same Exception object.
     const ErrorConstructor = Error;
     const objectCreate = Object.create;
@@ -52557,7 +52557,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     });
 
     // "create an Exception object" for an exception that Wasm threw out to
-    // JavaScript (`lumen_wasm.rs` caches the result). [[Stack]] is undefined.
+    // JavaScript (`trust_js_wasm.rs` caches the result). [[Stack]] is undefined.
     function makeException(address, tagId) {
         const exception = objectCreate(Exception.prototype);
         setWasmAddress(exception, "wasmExn", address);

@@ -321,8 +321,8 @@ enum InsertedKind {
     },
 }
 
-/// DOM strings (text, attributes, CSSOM values) live as Lumen engine text (see
-/// `lumen_backend::host_arg_string`): a character in U+10F800..=U+10FFFF is the pair of
+/// DOM strings (text, attributes, CSSOM values) live as TRust JS engine text (see
+/// `trust_js_backend::host_arg_string`): a character in U+10F800..=U+10FFFF is the pair of
 /// private-use scalars that encodes its surrogate pair, and a lone surrogate is one such scalar.
 /// For display, combine each pair into the character it encodes. A single scalar is left as it
 /// is: documents built without the script boundary may hold that real private-use character.
@@ -1282,7 +1282,7 @@ impl Dom {
     /// The boolean marks standard-library/external container layouts whose public API exposes
     /// entries and capacities but not complete bucket/control-byte allocation details. The final
     /// count is the number of genuinely unavailable nested owners. This method deliberately has
-    /// no JavaScript-engine dependency. It is consumed by Lumen's host visitor.
+    /// no JavaScript-engine dependency. It is consumed by TRust JS's host visitor.
     pub(crate) fn retained_memory(&self) -> (usize, bool, usize) {
         // This pattern is a compile-time ownership tripwire: no `..` means a new field must be
         // classified before the crate builds.
@@ -26483,7 +26483,7 @@ mod tests {
     #[test]
     fn display_text_shows_plane_16_characters_stored_as_engine_text() {
         // Engine text stores U+10FFFD as the scalars for its surrogates DBFF DFFD.
-        let stored = lumen::embed::text_to_engine("a\u{10FFFD}b\u{10F800}");
+        let stored = trust_js::embed::text_to_engine("a\u{10FFFD}b\u{10F800}");
         assert_eq!(display_text(&stored), "a\u{10FFFD}b\u{10F800}");
         // A lone surrogate (one scalar) and plain text stay as they are.
         assert_eq!(display_text("x\u{10F800}y"), "x\u{10F800}y");

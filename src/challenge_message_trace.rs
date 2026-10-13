@@ -5,9 +5,9 @@
 //! never the author's original object: inspecting it again could invoke getters.
 //! Local WHATWG HTML snapshot e5071a20 (2026-09-06), web-messaging.html.
 
-use lumen::embed::{Ctx, Value};
 use serde_json::{Value as Json, json};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use trust_js::embed::{Ctx, Value};
 
 const CHALLENGE_ORIGIN: &str = "https://challenges.cloudflare.com";
 const MAX_WIRE_BYTES: usize = 64 * 1024;

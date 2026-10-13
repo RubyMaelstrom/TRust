@@ -20,4 +20,4 @@ verification remain RustCrypto's implementations.
 TRust enables the upstream hazmat feature only to support Web Crypto's
 specified 32- and 64-bit authentication tags, in addition to 96..128 bits.
 Regressions in src/crypto.rs cover NIST vectors and input authentication;
-src/lumen_backend.rs covers Web Crypto's observable API behavior.
+src/trust_js_backend.rs covers Web Crypto's observable API behavior.

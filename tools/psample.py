@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""User-space CPU sampler for TRust and Lumen, built directly on perf_event_open.
+"""User-space CPU sampler for TRust and TRust JS, built directly on perf_event_open.
 
     tools/psample.py OUT.txt [--freq HZ] [--depth N] [--jitmap] -- COMMAND [ARGS...]
 
@@ -15,12 +15,12 @@ the ELF symbol tables of the mapped executables (`nm`, `readelf`; names demangle
   * with PSAMPLE_HOT=<substring>: a per-instruction histogram for matching functions
     (addresses are executable virtual addresses for `objdump --start-address`);
   * with --jitmap and PSAMPLE_JITHOT=<substring>: a per-offset histogram inside matching
-    Lumen JIT functions (offsets line up with a LUMEN_JIT_CODEDUMP of the same function);
+    TRust JS JIT functions (offsets line up with a TRUST_JS_JIT_CODEDUMP of the same function);
   * with PSAMPLE_FOCUS=<substring>: the callers of the outermost matching frame, and the
     direct callees and inclusive costs beneath it, as percentages of all samples.
 
 Anonymous executable mappings are reported as `[jit]`. With --jitmap the child runs with
-LUMEN_JIT_MAP=1, its stderr goes to OUT.txt.jitmap, and JIT samples are attributed to
+TRUST_JS_JIT_MAP=1, its stderr goes to OUT.txt.jitmap, and JIT samples are attributed to
 `[jit <first local names>] pc<N> <bytecode op>` (the region between two op offsets is charged to
 the earlier op, so fused templates and shared stubs appear under a neighbouring op).
 
@@ -57,7 +57,7 @@ def parse_args(argv):
     parser.add_argument("out", help="report path")
     parser.add_argument("--freq", type=int, default=4000, help="samples per second (default 4000)")
     parser.add_argument("--depth", type=int, default=24, help="call-chain frames kept (default 24)")
-    parser.add_argument("--jitmap", action="store_true", help="attribute Lumen JIT code by op")
+    parser.add_argument("--jitmap", action="store_true", help="attribute TRust JS JIT code by op")
     parser.add_argument("--thread", help="report only samples from threads whose name contains this")
     args = parser.parse_args(argv[:split])
     args.command = argv[split + 1:]
@@ -123,7 +123,7 @@ def run(args):
     pid = os.fork()
     if pid == 0:
         if args.jitmap:
-            os.environ["LUMEN_JIT_MAP"] = "1"
+            os.environ["TRUST_JS_JIT_MAP"] = "1"
             err = os.open(jitmap_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
             os.dup2(err, 2)
         os.kill(os.getpid(), signal.SIGSTOP)
@@ -304,13 +304,13 @@ def demangle(names):
 def simplify(name):
     name = re.sub(r"::h[0-9a-f]{16}$", "", name)
     name = re.sub(r"\[[0-9a-f]{16}\]", "", name)
-    return name.replace("lumen::", "")[:150]
+    return name.replace("trust_js::", "")[:150]
 
 
 # Approximate rollup by function name; the first matching rule wins.
 CATEGORIES = [
     ("jit code", r"^\[jit"),
-    ("js parse/compile", r"lumen::parser|lumen::lexer|bytecode::compile|Compiler|scope_analysis|lumen::ast"
+    ("js parse/compile", r"trust_js::parser|trust_js::lexer|bytecode::compile|Compiler|scope_analysis|trust_js::ast"
                          r"|^parser::|^lexer::"),
     ("html parse", r"html5ever|markup5ever|tokenizer::|tree_builder"),
     ("style/selectors", r"rule_index|computed_cache|prop_index|cascade|Cascade|selector|Selector"
@@ -319,7 +319,7 @@ CATEGORIES = [
     ("layout/text", r"trust::layout2|lay_out|Fragment|skrifa|swash|harfrust|shaping|parley|fontique"
                     r"|glyph|trust::text"),
     ("paint/raster", r"paint|vello|raster|trust::render"),
-    ("dom/host", r"trust::dom|Dom>::|NodeCache|lumen_backend|trust::js::|host_dom|js_host"),
+    ("dom/host", r"trust::dom|Dom>::|NodeCache|trust_js_backend|trust::js::|host_dom|js_host"),
     ("net/tls/crypto", r"rustls|ring::|aws_lc|h2::|quinn|hyper|tokio|openssl|sha2|aes|chacha|flate"
                        r"|brotli|zstd|trust::http"),
     ("images", r"image::|png::|jpeg|webp|zune|gif::|trust::img"),

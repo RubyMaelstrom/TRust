@@ -2,7 +2,7 @@
 //!
 //! TRust deliberately advertises US English regardless of the host's language,
 //! region, or geographic location. These are build defaults, not OS-derived
-//! preferences. Lumen's native ECMA-402 default is also en-US; the integration
+//! preferences. TRust JS's native ECMA-402 default is also en-US; the integration
 //! test below keeps it aligned with HTTP and NavigatorLanguage.
 
 /// The user's most-preferred language (WHATWG HTML, NavigatorLanguage).

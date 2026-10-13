@@ -1,11 +1,11 @@
-use lumen::bytecode::Tier;
 use std::path::PathBuf;
+use trust_js::bytecode::Tier;
 
 const DEFAULT_BENCHMARK: &str = "/usr/share/cry/benchmarks/js-engine-benchmark/run.js";
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("trust-lumen-spike: {error}");
+        eprintln!("trust-js-spike: {error}");
         std::process::exit(1);
     }
 }
@@ -19,7 +19,7 @@ fn run() -> Result<(), String> {
         match arg.as_str() {
             "--tier" => {
                 let value = args.next().ok_or("--tier requires a value")?;
-                tier = trust::lumen_backend::parse_tier(&value)?;
+                tier = trust::trust_js_backend::parse_tier(&value)?;
             }
             "--threshold" => {
                 let value = args.next().ok_or("--threshold requires a value")?;
@@ -32,7 +32,7 @@ fn run() -> Result<(), String> {
             }
             "--help" | "-h" => {
                 println!(
-                    "usage: trust-lumen-spike [--tier interp|bytecode|jit] [--threshold N] [--benchmark PATH]"
+                    "usage: trust-js-spike [--tier interp|bytecode|jit] [--threshold N] [--benchmark PATH]"
                 );
                 return Ok(());
             }
@@ -40,9 +40,9 @@ fn run() -> Result<(), String> {
         }
     }
 
-    let report = trust::lumen_backend::run_benchmark(&benchmark, tier, threshold)?;
+    let report = trust::trust_js_backend::run_benchmark(&benchmark, tier, threshold)?;
     println!("{}", report.logs);
-    println!("---- TRust/Lumen integration ----");
+    println!("---- TRust/TRust JS integration ----");
     println!("tier: {:?} (threshold {threshold})", report.tier);
     println!("prelude: {:.3}s", report.prelude_time.as_secs_f64());
     println!(

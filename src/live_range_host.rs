@@ -7,8 +7,8 @@
 //! each WeakRef's prototype retains its creating Realm. Native weak handles
 //! have neither a prototype nor an associated Realm.
 
-use lumen::embed::{HostRetainedMemoryVisitor, RetainedManagedAllocation, Value, WeakValue};
 use std::cell::Cell;
+use trust_js::embed::{HostRetainedMemoryVisitor, RetainedManagedAllocation, Value, WeakValue};
 
 const COMPACT_FLOOR: usize = 256;
 
@@ -150,7 +150,7 @@ mod tests {
 
     #[test]
     fn range_registry_snapshots_own_handles_only_until_the_snapshot_is_dropped() {
-        let mut engine = lumen::Engine::new();
+        let mut engine = trust_js::Engine::new();
         let value = Value::Obj(engine.ctx().new_object());
         let weak = engine.ctx().downgrade_object_value(&value).unwrap();
         let mut registry = Registry::default();
@@ -167,7 +167,7 @@ mod tests {
 
     #[test]
     fn range_registry_minor_only_and_acyclic_churn_keep_metadata_bounded() {
-        let mut engine = lumen::Engine::new();
+        let mut engine = trust_js::Engine::new();
         let mut registry = Registry::default();
         for minor in [false, true] {
             for _ in 0..4096 {
@@ -185,7 +185,7 @@ mod tests {
 
     #[test]
     fn range_registry_minor_sweep_does_not_rescan_stable_old_ranges() {
-        let mut engine = lumen::Engine::new();
+        let mut engine = trust_js::Engine::new();
         let mut registry = Registry::default();
         let value = Value::Obj(engine.ctx().new_object());
         registry.register(engine.ctx().downgrade_object_value(&value).unwrap());

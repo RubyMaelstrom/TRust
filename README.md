@@ -2,7 +2,7 @@
 
 A terminal-based (and GUI) browser written in Rust, that's why it's called TRust.
 Oh wait, did you know it also supports telnet, gopher, gemini, finger, and whois?
-Oh, and HTTP. With the pure-Rust Lumen-forked JavaScript engine integrated directly.
+Oh, and HTTP. With the pure-Rust TRust JS engine integrated directly.
 Image support? We got it. Live JS rendering? Yup. Full CSS implementation? Yeah.
 
 Browse the web, connect to MUDs/BBSes, and check out your favorite gopher holes and

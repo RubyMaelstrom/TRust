@@ -9,9 +9,9 @@
 use super::{
     Ctx, HostGcVisitor, HostRetainedMemoryVisitor, HostState, RetainedManagedAllocation, Value,
 };
-use lumen::embed::WeakValue;
 use rustc_hash::FxHashMap;
 use std::cell::Cell;
+use trust_js::embed::WeakValue;
 
 const COMPACT_FLOOR: usize = 256;
 const ATTRIBUTES: [&str; 8] = [

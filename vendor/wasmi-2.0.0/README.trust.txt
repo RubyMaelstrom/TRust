@@ -6,7 +6,7 @@ Local changes, carried over from TRust's Wasmi 1.1.0 fork and adapted to the
 
 wasmi_core
 - Memory: `share` (unsafe) moves the bytes into an `Rc<RefCell<Vec<u8>>>`
-  (`SharedBytes`, Lumen's ArrayBuffer Data Block type) without copying, so the
+  (`SharedBytes`, TRust JS's ArrayBuffer Data Block type) without copying, so the
   embedder's `Memory.buffer` is identified with the memory (WebAssembly JS API
   #memories). A shared buffer reads the live `Vec` header on every access and
   grows by resizing the shared `Vec`; it fails growth instead of aliasing a
@@ -82,7 +82,7 @@ wasmi
 - Native hot-region compiler (`native-jit` feature, little-endian 64-bit
   AArch64/x86-64; cfg `wasmi_native_jit` from build.rs): src/engine/native_jit*
   compiles runs of supported operators starting at control-flow entries with
-  Cranelift =0.136.2 (kept in lockstep with Lumen's optional optimizing JIT);
+  Cranelift =0.136.2 (kept in lockstep with TRust JS's optional optimizing JIT);
   src/engine/executor/handler/native.rs observes branch targets, callee entries,
   return addresses and execution starts, and runs compiled regions. Once the
   region cap is reached the compiled set is final: entries test its bit filter

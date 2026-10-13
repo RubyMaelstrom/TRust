@@ -19,9 +19,9 @@
 //! data, and at the end of the input when the compressed data is incomplete.
 
 use flate2::{Compress, Compression, Crc, Decompress, FlushCompress, FlushDecompress, Status};
-use lumen::embed::{HostRetainedMemoryVisitor, RetainedManagedAllocation};
 use std::collections::{HashMap, VecDeque};
 use std::io::Write as _;
+use trust_js::embed::{HostRetainedMemoryVisitor, RetainedManagedAllocation};
 
 /// Live compression contexts kept per Agent before the oldest is dropped.
 const MAX_CONTEXTS: usize = 256;

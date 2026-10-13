@@ -1,6 +1,6 @@
 // Headless harness for an Emscripten em-dosbox build (archive.org's DOS emulation: Emscripten
 // 1.37.3 asm.js, `dosbox-sync.js` and its `.mem` file). Runs the emulator's own JavaScript with
-// stub DOM/canvas/audio objects under node or lumen-cli, so engine changes can be timed without
+// stub DOM/canvas/audio objects under node or trust-js-cli, so engine changes can be timed without
 // a browser. See DIAGNOSTICS.md, "DOS emulation benchmark".
 //
 //   DOSBOX_JS=dosbox-sync.js DOSBOX_MEM=dosbox-sync.mem GAME_DIR=./c [EXIT_ON_GFX=1] \

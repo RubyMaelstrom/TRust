@@ -707,7 +707,7 @@ impl PagePaint {
         wake
     }
 
-    // The Lumen host visitor consumes this inventory.
+    // The TRust JS host visitor consumes this inventory.
     pub(crate) fn retained_memory(&self) -> (usize, bool) {
         let PagePaint {
             width,

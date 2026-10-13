@@ -9,7 +9,7 @@
 //! again. Each request reports Resource Timing to its node document's global
 //! (Fetch #fetch-finale, Resource Timing #marking-resource-timing); only
 //! HTTP(S) requests produce entries (Fetch #fetch-finale's report timing steps).
-use super::{Ctx, HostState, LumenHostTask, LumenPendingFetch, Value, host_arg_string};
+use super::{Ctx, HostState, TrustJsHostTask, TrustJsPendingFetch, Value, host_arg_string};
 use crate::http::{CredentialsMode, RequestMode};
 use crate::page_images::{ImageFailure, ImageJoin, ImageRequestKey, SharedImageFetch};
 use crate::performance::ResourceTiming;
@@ -400,7 +400,7 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
     network.next_fetch_id += 1;
     network.pending_fetches.insert(
         request_id,
-        LumenPendingFetch {
+        TrustJsPendingFetch {
             context: calling,
             resolve,
             native_lease,
@@ -443,7 +443,7 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
         };
         let _ = events
             .expect("checked events")
-            .send(LumenHostTask::ImageDone {
+            .send(TrustJsHostTask::ImageDone {
                 id: request_id,
                 result,
                 timing,

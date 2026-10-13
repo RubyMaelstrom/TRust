@@ -582,7 +582,7 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
                 id,
                 Box::new(move || {
                     if let Some(events) = &wake {
-                        let _ = events.send(super::LumenHostTask::CanvasFrame { node: id });
+                        let _ = events.send(super::TrustJsHostTask::CanvasFrame { node: id });
                     }
                 }),
             ));

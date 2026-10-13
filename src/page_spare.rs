@@ -1,11 +1,11 @@
 //! A pre-warmed spare page engine, after Chromium's spare renderer.
 //!
-//! Every navigation runs its document in a new Lumen engine (one ECMAScript
+//! Every navigation runs its document in a new TRust JS engine (one ECMAScript
 //! Agent) on its own page-actor thread, and nothing of an earlier document
 //! survives into it. What a new Agent lacks is work that is identical for
 //! every document: decoding the platform-prelude snapshot into the Agent's
 //! shared program table and compiling bytecode and native code for it. Window
-//! Realms of one Agent share that table (Lumen's
+//! Realms of one Agent share that table (TRust JS's
 //! `eval_shared_classic_snapshot_interruptible`), which is why a child Window
 //! bootstraps in a fraction of the time a new Agent needs.
 //!
@@ -19,7 +19,7 @@
 //! secure context, cookie/storage partitions, viewport, devicePixelRatio,
 //! navigation timing, time origin) and the default Realm's own platform
 //! bootstrap are all created at claim time, by the same code as a cold load.
-//! Only the object-free compiled code, which Lumen validates against the live
+//! Only the object-free compiled code, which TRust JS validates against the live
 //! Realm on every use, is shared with the warm-up.
 //!
 //! Invariants:
@@ -61,14 +61,14 @@ fn state_name(state: u8) -> &'static str {
 /// navigation claims it.
 pub(super) struct SpareEngine {
     claims: mpsc::Sender<desktop::PageStart>,
-    interrupt: Arc<lumen::RuntimeInterrupt>,
+    interrupt: Arc<trust_js::RuntimeInterrupt>,
     state: Arc<AtomicU8>,
 }
 
 impl SpareEngine {
     /// Start a spare actor thread; it warms its engine immediately.
     pub(super) fn spawn() -> Option<Self> {
-        let interrupt = Arc::new(lumen::RuntimeInterrupt::default());
+        let interrupt = Arc::new(trust_js::RuntimeInterrupt::default());
         let state = Arc::new(AtomicU8::new(PREPARING));
         let (claims, receiver) = mpsc::channel();
         let actor_interrupt = interrupt.clone();
@@ -91,7 +91,7 @@ impl SpareEngine {
     }
 
     /// The engine's interrupt, which the claiming page's handles keep.
-    pub(super) fn interrupt(&self) -> Arc<lumen::RuntimeInterrupt> {
+    pub(super) fn interrupt(&self) -> Arc<trust_js::RuntimeInterrupt> {
         self.interrupt.clone()
     }
 
@@ -124,7 +124,7 @@ impl SpareEngine {
         self,
         start: desktop::PageStart,
         cache: &Arc<crate::http::PageCache>,
-    ) -> Result<Arc<lumen::RuntimeInterrupt>, Box<desktop::PageStart>> {
+    ) -> Result<Arc<trust_js::RuntimeInterrupt>, Box<desktop::PageStart>> {
         crate::page_threads::attach_cache(&self.interrupt, cache);
         match self.claims.send(start) {
             Ok(()) => Ok(self.interrupt),
@@ -138,7 +138,7 @@ impl SpareEngine {
 /// or policy change) ends a waiting spare.
 fn run(
     claims: mpsc::Receiver<desktop::PageStart>,
-    interrupt: Arc<lumen::RuntimeInterrupt>,
+    interrupt: Arc<trust_js::RuntimeInterrupt>,
     state: Arc<AtomicU8>,
 ) {
     // A spare whose thread ends without a claim (a panic, or shutdown) must
@@ -156,7 +156,7 @@ fn run(
     let _cold_on_exit = ColdOnExit(state.clone());
     let trace = std::env::var_os("TRUST_NET_TRACE").is_some();
     let started = Instant::now();
-    let mut engine = lumen::Engine::new_with_interrupt(interrupt.clone());
+    let mut engine = trust_js::Engine::new_with_interrupt(interrupt.clone());
     let engine_ms = started.elapsed().as_millis();
     // The process-wide prelude snapshot is compiled once, by whichever engine
     // asks first; any claimed page needs it, so this is never wasted.
@@ -182,10 +182,10 @@ fn run(
                 // Shutdown cancels a warming spare; that needs no report.
                 let cancelled = matches!(
                     interrupt.current_reason(),
-                    Some(lumen::InterruptReason::Cancelled)
+                    Some(trust_js::InterruptReason::Cancelled)
                 );
-                if !cancelled && (trace || std::env::var_os("TRUST_LUMEN_TRACE").is_some()) {
-                    eprintln!("lumen: spare page engine discarded: {error}");
+                if !cancelled && (trace || std::env::var_os("TRUST_JS_TRACE").is_some()) {
+                    eprintln!("trust-js: spare page engine discarded: {error}");
                 }
                 None
             }
@@ -207,7 +207,7 @@ fn run(
         return;
     };
     drop(claims);
-    let engine = engine.unwrap_or_else(|| lumen::Engine::new_with_interrupt(interrupt.clone()));
+    let engine = engine.unwrap_or_else(|| trust_js::Engine::new_with_interrupt(interrupt.clone()));
     desktop::page_actor(start, interrupt, Some(engine));
 }
 
@@ -218,7 +218,7 @@ const MAX_WARM_UP_JOBS: usize = 100_000;
 /// Fill `engine`'s shared program table by bootstrapping the platform prelude
 /// in a throwaway `about:blank` Window Realm, then remove every trace of that
 /// Realm. The default Realm is not touched.
-fn warm(engine: &mut lumen::Engine, snapshot: &'static [u8]) -> Result<(), String> {
+fn warm(engine: &mut trust_js::Engine, snapshot: &'static [u8]) -> Result<(), String> {
     let blank = url::Url::parse("about:blank").expect("about:blank parses");
     let dom = Rc::new(RefCell::new(Dom::parse_document("")));
     let mut state = HostState::new(dom, Rc::new(RealmClock::new()));
@@ -226,7 +226,7 @@ fn warm(engine: &mut lumen::Engine, snapshot: &'static [u8]) -> Result<(), Strin
     state.window_request_urls.insert(0, blank.clone());
     // Host tasks the bootstrap queues belong to the throwaway Realm.
     let (task_tx, task_rx) = tokio::sync::mpsc::unbounded_channel();
-    state.task_events = Some(LumenTaskSender::Page(task_tx));
+    state.task_events = Some(TrustJsTaskSender::Page(task_tx));
     engine
         .ctx()
         .op_state()
@@ -257,7 +257,7 @@ fn warm(engine: &mut lumen::Engine, snapshot: &'static [u8]) -> Result<(), Strin
     };
     let warm_up_global = Rc::downgrade(global);
     let bootstrap = engine.with_embed_realm(&realm, |engine| {
-        for &(name, len, host_fn) in LUMEN_HOST_FUNCTIONS {
+        for &(name, len, host_fn) in TRUST_JS_HOST_FUNCTIONS {
             engine.define_global(name, len, host_fn);
         }
         eval(engine, &config, "spare engine configuration")?;
@@ -298,7 +298,7 @@ fn warm(engine: &mut lumen::Engine, snapshot: &'static [u8]) -> Result<(), Strin
     Ok(())
 }
 
-fn drain_jobs(engine: &mut lumen::Engine) -> Result<(), String> {
+fn drain_jobs(engine: &mut trust_js::Engine) -> Result<(), String> {
     for _ in 0..MAX_WARM_UP_JOBS {
         match engine.run_one_job_interruptible() {
             Ok(true) => {}
@@ -449,8 +449,8 @@ mod tests {
         let mut engines = Vec::new();
         let mut last = compiled;
         for index in 0..4 {
-            let interrupt = Arc::new(lumen::RuntimeInterrupt::default());
-            let mut engine = lumen::Engine::new_with_interrupt(interrupt);
+            let interrupt = Arc::new(trust_js::RuntimeInterrupt::default());
+            let mut engine = trust_js::Engine::new_with_interrupt(interrupt);
             let created = resident_mib();
             warm(&mut engine, snapshot).unwrap();
             let warmed = resident_mib();
@@ -652,13 +652,13 @@ mod tests {
             .spawn(|| {
                 const SURFACE: &str = "Reflect.ownKeys(globalThis).map(String).join() + \
                     '|' + Reflect.ownKeys(Object.prototype).map(String).join()";
-                let mut fresh = lumen::Engine::new();
+                let mut fresh = trust_js::Engine::new();
                 let expected = eval_value(&mut fresh, SURFACE, "fresh surface")
                     .map(|value| value_string(&mut fresh, &value))
                     .unwrap();
 
                 // `warm` itself proves that its Realm was collected.
-                let mut engine = lumen::Engine::new();
+                let mut engine = trust_js::Engine::new();
                 warm(&mut engine, platform_prelude_snapshot().unwrap()).unwrap();
                 assert!(engine.ctx().host_mut::<HostState>().is_none());
                 assert!(!engine.has_pending_jobs());

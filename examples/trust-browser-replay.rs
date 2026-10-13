@@ -1,4 +1,4 @@
-//! Deterministic, no-network browser-pipeline replay runner for Lumen optimization gates.
+//! Deterministic, no-network browser-pipeline replay runner for TRust JS optimization gates.
 
 use serde_json::json;
 use sha2::{Digest, Sha256};

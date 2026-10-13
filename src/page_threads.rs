@@ -14,7 +14,7 @@ struct State {
 
 struct PageThread {
     thread: JoinHandle<()>,
-    interrupt: Arc<lumen::RuntimeInterrupt>,
+    interrupt: Arc<trust_js::RuntimeInterrupt>,
     /// A spare page engine has no document yet; its claim attaches one.
     cache: Weak<crate::http::PageCache>,
 }
@@ -26,7 +26,7 @@ impl PageThreads {
     fn spawn(
         &self,
         builder: Builder,
-        interrupt: Arc<lumen::RuntimeInterrupt>,
+        interrupt: Arc<trust_js::RuntimeInterrupt>,
         cache: Option<&Arc<crate::http::PageCache>>,
         task: impl FnOnce() + Send + 'static,
     ) -> std::io::Result<()> {
@@ -60,7 +60,7 @@ impl PageThreads {
     /// must cancel alongside it.
     fn attach_cache(
         &self,
-        interrupt: &Arc<lumen::RuntimeInterrupt>,
+        interrupt: &Arc<trust_js::RuntimeInterrupt>,
         cache: &Arc<crate::http::PageCache>,
     ) {
         let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -111,7 +111,7 @@ static THREADS: PageThreads = PageThreads(Mutex::new(State {
 
 pub(crate) fn spawn(
     builder: Builder,
-    interrupt: Arc<lumen::RuntimeInterrupt>,
+    interrupt: Arc<trust_js::RuntimeInterrupt>,
     cache: Option<&Arc<crate::http::PageCache>>,
     task: impl FnOnce() + Send + 'static,
 ) -> std::io::Result<()> {
@@ -119,7 +119,7 @@ pub(crate) fn spawn(
 }
 
 pub(crate) fn attach_cache(
-    interrupt: &Arc<lumen::RuntimeInterrupt>,
+    interrupt: &Arc<trust_js::RuntimeInterrupt>,
     cache: &Arc<crate::http::PageCache>,
 ) {
     THREADS.attach_cache(interrupt, cache);
@@ -152,7 +152,7 @@ mod tests {
         let cleaned = Arc::new(AtomicBool::new(false));
         let cleanup = Cleanup(cleaned.clone());
         let cache = Arc::new(crate::http::PageCache::default());
-        let interrupt = Arc::new(lumen::RuntimeInterrupt::default());
+        let interrupt = Arc::new(trust_js::RuntimeInterrupt::default());
         let (release, wait) = mpsc::channel();
         threads
             .spawn(Builder::new(), interrupt.clone(), Some(&cache), move || {
@@ -173,7 +173,7 @@ mod tests {
         assert!(cleaned.load(Ordering::Acquire));
         assert_eq!(
             interrupt.current_reason(),
-            Some(lumen::InterruptReason::Cancelled)
+            Some(trust_js::InterruptReason::Cancelled)
         );
         assert_eq!(
             threads
@@ -190,7 +190,7 @@ mod tests {
     #[test]
     fn a_spare_thread_receives_its_documents_cache_when_claimed() {
         let threads = PageThreads::default();
-        let interrupt = Arc::new(lumen::RuntimeInterrupt::default());
+        let interrupt = Arc::new(trust_js::RuntimeInterrupt::default());
         let (release, wait) = mpsc::channel::<()>();
         threads
             .spawn(Builder::new(), interrupt.clone(), None, move || {

@@ -3,9 +3,9 @@
 //! cannot run author code take this path; the complete JS binding handles all
 //! other values, lost contexts, foreign objects, and sequence overloads.
 use super::{Ctx, HostState, Reply, Value, execute};
-use lumen::embed::WeakValue;
 use rustc_hash::FxHashMap;
 use std::rc::Rc;
+use trust_js::embed::WeakValue;
 
 /// Memoized brand checks of the fast path, by object address. A weak handle
 /// keeps each address from being reused while it is cached. Context records
@@ -13,7 +13,7 @@ use std::rc::Rc;
 /// forget them; resource records never change after creation and are checked
 /// against their context's current epoch.
 #[derive(Default)]
-pub(in crate::lumen_backend) struct Cache {
+pub(in crate::trust_js_backend) struct Cache {
     contexts: FxHashMap<usize, CachedContext>,
     resources: FxHashMap<usize, CachedResource>,
 }
@@ -39,13 +39,13 @@ const MAX_CACHED_RESOURCES: usize = 8192;
 
 impl Cache {
     /// A context was lost or restored: its record's `lost` and `epoch` changed.
-    pub(in crate::lumen_backend) fn forget_contexts(&mut self) {
+    pub(in crate::trust_js_backend) fn forget_contexts(&mut self) {
         self.contexts.clear();
     }
 
     /// The tables' own storage. A weak handle also keeps a collected
     /// object's allocation until its entry is dropped.
-    pub(in crate::lumen_backend) fn retained_bytes(&self) -> usize {
+    pub(in crate::trust_js_backend) fn retained_bytes(&self) -> usize {
         self.contexts.capacity() * size_of::<(usize, CachedContext)>()
             + self.resources.capacity() * size_of::<(usize, CachedResource)>()
     }

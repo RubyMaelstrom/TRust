@@ -20,7 +20,7 @@ comment/example in the same change.
   opt-in because they use a network, a local capture, or a large external
   input. Run them from the repository root with `cargo test --release ...
   -- --ignored --nocapture`.
-* Every build uses Lumen. HTTP, layout, and JavaScript diagnostics are shared
+* Every build uses TRust JS. HTTP, layout, and JavaScript diagnostics are shared
   across frontends unless noted otherwise.
 * Diagnostics print to stderr unless a variable explicitly names an output
   file/directory. Use a local or authorized test endpoint; avoid repeatedly
@@ -35,7 +35,7 @@ screen/client/target-relative coordinates, user activation, capture transitions,
 and click counts, including a same-origin iframe. It does not synthesize input:
 
 ```sh
-TRUST_LUMEN_TRACE=1 target/release/trust-desktop src/fixtures/native_input.html
+TRUST_JS_TRACE=1 target/release/trust-desktop src/fixtures/native_input.html
 cargo test --release --lib pointer_
 cargo test --release --lib user_activation
 cargo test --release --lib worker_fetch
@@ -179,7 +179,7 @@ directive, which are only those needing typed function references or GC rec
 groups (proposals Wasmi does not implement).
 
 The official WebAssembly JS API tag and exception tests
-(`test/js-api/tag/*` and `test/js-api/exception/*`) run in every Lumen tier with
+(`test/js-api/tag/*` and `test/js-api/exception/*`) run in every TRust JS tier with
 a minimal testharness:
 
 ```sh
@@ -203,10 +203,10 @@ aborts with a stack overflow when this regresses. In a release binary's
 disassembly, such a handler dispatches with an indirect call followed by a
 return instead of an indirect jump.
 
-Trace a normal Lumen page load and its network requests:
+Trace a normal TRust JS page load and its network requests:
 
 ```sh
-TRUST_NET_TRACE=1 TRUST_LUMEN_TRACE=1 target/release/trust https://example.test/
+TRUST_NET_TRACE=1 TRUST_JS_TRACE=1 target/release/trust https://example.test/
 ```
 
 Network trace lines include `protocol=h3` / `h2` / `http/1.1` and
@@ -296,7 +296,7 @@ TRUST_NET_DIAG=https://example.test/ \
 
 ### Spare page engine
 
-Each navigation runs its document in a new Lumen engine. `trust`,
+Each navigation runs its document in a new TRust JS engine. `trust`,
 `trust-desktop` and `trust-headless` keep one pre-warmed spare engine on its
 own page thread (see [`src/page_spare.rs`](src/page_spare.rs)): it bootstraps
 the platform prelude once in a throwaway `about:blank` Realm, discards that
@@ -538,8 +538,8 @@ It lives under `target/release/examples/` and is not part of the distributed bro
 
 | Binary and input | Meaning | Default |
 |---|---|---:|
-| `trust-browser-replay [--warmups N] [--samples N] [--external NAME=PATH] [--sheet NAME=PATH] FIXTURE.html [...]` | Deterministically replays one or more local HTML fixtures through the shared Lumen browser pipeline. `--external` and `--sheet` may be repeated to provide named local script/style resources. | warmups `1`, samples `5`; at least one fixture required |
-| `trust-lumen-spike [--tier interp\|bytecode\|jit] [--threshold N] [--benchmark PATH]` | Runs the synthetic Lumen/`js-engine-benchmark` harness and prints timing, GC, event-loop, and score data. Requires the `lumen-spike` Cargo feature. | tier `jit`, threshold `0`, benchmark `/usr/share/cry/benchmarks/js-engine-benchmark/run.js` |
+| `trust-browser-replay [--warmups N] [--samples N] [--external NAME=PATH] [--sheet NAME=PATH] FIXTURE.html [...]` | Deterministically replays one or more local HTML fixtures through the shared TRust JS browser pipeline. `--external` and `--sheet` may be repeated to provide named local script/style resources. | warmups `1`, samples `5`; at least one fixture required |
+| `trust-js-spike [--tier interp\|bytecode\|jit] [--threshold N] [--benchmark PATH]` | Runs the synthetic TRust JS/`js-engine-benchmark` harness and prints timing, GC, event-loop, and score data. Requires the `trust-js-spike` Cargo feature. | tier `jit`, threshold `0`, benchmark `/usr/share/cry/benchmarks/js-engine-benchmark/run.js` |
 
 Both binaries support `-h`/`--help`.
 
@@ -549,7 +549,7 @@ fixture passes when it sets `data-replay-state="complete"` and matching nonempty
 `data-replay-checksum`/`data-replay-expected` attributes without a JavaScript error
 or panic; any failure exits nonzero. `--external` names must equal a script's `src`
 attribute exactly, and only parser-inserted classic scripts are served: module
-scripts, dynamically inserted scripts and `fetch`/XHR requests fail offline. Lumen's
+scripts, dynamically inserted scripts and `fetch`/XHR requests fail offline. TRust JS's
 `benchmarks/browser-replays/` holds the current fixtures and their run command.
 
 ## Live runtime diagnostics
@@ -558,7 +558,7 @@ scripts, dynamically inserted scripts and `fetch`/XHR requests fail offline. Lum
 
 | Input | Value | Effect and output |
 |---|---|---|
-| `TRUST_NET_TRACE` | presence flag | Adds timestamped request/subresource timing to stderr. The `net:` lines use one shared millisecond origin; DOM mutation and JavaScript phase markers may use the same timeline. `lumen: @<ms>ms module prefetch <url>` marks a module dependency's fetch starting as its importer's response arrives, `lumen: @<ms>ms dynamic import <url>` an `import()` fetch starting as `import()` runs, and `lumen: @<ms>ms dynamic import task <specifier>` the page thread taking that import's task. |
+| `TRUST_NET_TRACE` | presence flag | Adds timestamped request/subresource timing to stderr. The `net:` lines use one shared millisecond origin; DOM mutation and JavaScript phase markers may use the same timeline. `trust-js: @<ms>ms module prefetch <url>` marks a module dependency's fetch starting as its importer's response arrives, `trust-js: @<ms>ms dynamic import <url>` an `import()` fetch starting as `import()` runs, and `trust-js: @<ms>ms dynamic import task <specifier>` the page thread taking that import's task. |
 | `TRUST_COOKIE_TRACE` | presence flag | Traces response receipt, jar accept/reject/delete, script access and selected request-cookie counts. Reports `cf_clearance` counts separately, with numeric status/time and a hashed origin identifier, never cookie values or arbitrary names/URLs. `[cookie-attributes]` reports only Secure/HttpOnly/Partitioned booleans and a normalized SameSite category for clearance cookies. `stored-cross-site-challenge` and `request-cross-site-challenge` identify the cross-site challenge-cookie exception; the latter can have count zero. `[cookie-integrity]` compares outgoing clearance values byte-for-byte against bounded in-process receipt copies (64 records, at most 8192 value bytes each); `unknown` includes altered, oversized or evicted receipts, not just mismatches. The flag itself does not change cookie policy. It does **not** redact URLs or other sensitive data emitted by other enabled diagnostics. |
 | `TRUST_DIAG_FRAME` | presence flag | Enables the terminal frame report (`DIAGFRAME`) and related page/layout reports (`DIAGGEOM`, `DIAGROUTE`, `DIAGRELAY`). It includes redraws, draw time, page-event work, full replacements, image relayout/render counts, load phases, scroll state, and cascade/layout costs. `DIAGINVALID` lines name each whole-document style invalidation (`all-styles caller=FILE:LINE`) and the attribute, child-list or live-state change that could not prove a narrower one. `DIAGGEOM projection` names the geometry read (and its element) that needed every box projected because the single-border-box index could not answer it. |
 | `TRUST_DIAG_PATCH` | presence flag | Adds timing output for incremental region/subtree layout patches. |
@@ -575,7 +575,7 @@ scripts, dynamically inserted scripts and `fetch`/XHR requests fail offline. Lum
 | `TRUST_PANIC_LOG` | file path | Appends every panic, including background-thread panics, with thread name, terminal-owner status, message, and forced backtrace. The normal terminal panic hook remains separate. |
 | `TRUST_UA_FIREFOX` | affirmative value (`1`, `true`, `yes`, `on`) | Replaces TRust's own User-Agent (`Mozilla/5.0 (X11; Linux x86_64) TRust/0.2`) with Firefox's current one (`Mozilla/5.0 (X11; Linux x86_64; rv:153.0) Gecko/20100101 Firefox/153.0`) for diagnostics. Selection happens once per process, so the header on every HTTP/1.1, HTTP/2 and HTTP/3 request, fetch/XHR, WebSocket handshake and download matches `navigator.userAgent` in the page, every frame and every worker. Both are in HTML's Gecko navigator compatibility mode (`appVersion` `5.0 (X11)`, `productSub` `20100101`, empty `vendor`, `oscpu` and `taintEnabled()`), and neither sends `Sec-CH-UA*` client hints. Prints one stderr line naming the active string. TRust's `Accept`, `Accept-Language`, `Sec-Fetch-*` and `Sec-GPC` values are unchanged. Unset, empty or `0` keeps TRust's User-Agent. |
 | `TRUST_WEBGL_TRACE` | presence flag | Prints why a page's WebGL context could not be created. |
-| `TRUST_NO_SPARE_ENGINE` | presence flag | Disables the pre-warmed spare page engine in every frontend, so each navigation builds its Lumen engine cold. Read once per process. With `TRUST_NET_TRACE`, the spare's warm-up and claims appear as `js :` lines (see [Spare page engine](#spare-page-engine)). |
+| `TRUST_NO_SPARE_ENGINE` | presence flag | Disables the pre-warmed spare page engine in every frontend, so each navigation builds its TRust JS engine cold. Read once per process. With `TRUST_NET_TRACE`, the spare's warm-up and claims appear as `js :` lines (see [Spare page engine](#spare-page-engine)). |
 | `TRUST_TRACE_PAGE_EVENTS` | presence flag | Prints a `[trace-event] <variant>` line to stderr for every page event the shared controller handles (`Updated`, `Static`, `Patched`, `Trouble`, navigation/settle events). Useful for proving which render path a page reached and in what order. |
 | `TRUST_MEDIA_LOG` | presence flag (`0` disables) | Prints `trust-media:` lines to stderr from the page actor's media host: each media element load (URL; `load (deferred)` for a player waiting for a playback request under `preload="none"`), MediaSource attachment, every Media Source Extensions operation (`add`, `prepare`, `append`, `process` with the SourceBuffer's buffered ranges, `remove`, `endOfStream`, `detach`, …), append errors with the byte stream violation that caused them, and player reports (metadata, ready states, waiting/playing, seeks, the end, errors) except the periodic time and progress reports. |
 | `TRUST_MEDIA_DUMP` | directory path | Appends the bytes every SourceBuffer receives to `ms<id>-sb<n>.bin` in the directory (which must exist), so a site's MSE byte stream can be replayed offline. |
@@ -621,45 +621,45 @@ fragment, `rv:` and product tokens. To imitate a newer Firefox, update the
 Firefox's `Accept`, `Sec-*`, or plugin-flavoured metadata, which stays TRust's
 own by design.
 
-### Lumen diagnostics
+### TRust JS diagnostics
 
 | Input | Value | Effect and output |
 |---|---|---|
-| `TRUST_LUMEN_TRACE` | presence flag | Logs Lumen script start/completion, JavaScript errors, console messages, and unhandled rejection details to stderr. |
-| `TRUST_LUMEN_TASK_TRACE` | presence flag | Emits a once-per-second resident page-actor task census: turns, commands, interactions, host/platform/timer/lifecycle work, render passes, updates, finishes, and queue state. |
-| `TRUST_LUMEN_PROBE` | JavaScript source | Evaluates the supplied expression/source in the resident page after a task and prints its value, throw, interruption, or parse error. This is a diagnostic probe, not page content. It runs as author script: host bindings and the platform's private control object are not reachable from it. |
-| `TRUST_LUMEN_DIAGNOSTIC_INIT` | JavaScript function body | Opt-in instrumentation called once after the resident main-page platform bootstrap, before author scripts. It receives the lexical parameter `__trustDiagnosticReport`, never a Window property. This callback accepts exactly one valid JSON object string, at most 4 MiB, and prints one `lumen: diagnostic:` line; malformed, oversized or repeated submissions throw/report diagnostic errors. It is not installed in child frames, workers, or replay-only engines, and is never rerun by diagnostic drains. Initializer errors do not skip author scripts. A one-shot `load` listener can capture the callback, install a completion hook and start a benchmark after setup. For controlled timing, disable both `TRUST_LUMEN_PROBE` and `TRUST_LUMEN_TRACE`; retain `--js-diagnostics` for errors at exit. Leave this flag unset for ordinary acceptance browsing; hooks can alter page behavior and may emit private data. |
-| `TRUST_PRELUDE_FILE` | file path | Replaces the embedded platform prelude (`js_platform.js`) with the given file's contents for the process, read once on first use. Intended for rapid iteration on prelude code: edit `src/js_platform.js`, set this to that path, and the *next page load* picks the change up — no rebuild or relink is needed. The override is read in the Lumen backend at prelude evaluation time, independently of `__trust_cfg`. Release/shipped builds keep the embedded prelude; leave this unset. An unreadable path falls back to the embedded prelude. The override is still enclosed by `js::private_bootstrap`, which captures the host bindings lexically and deletes every `__`-prefixed global before author code runs. |
+| `TRUST_JS_TRACE` | presence flag | Logs TRust JS script start/completion, JavaScript errors, console messages, and unhandled rejection details to stderr. |
+| `TRUST_JS_TASK_TRACE` | presence flag | Emits a once-per-second resident page-actor task census: turns, commands, interactions, host/platform/timer/lifecycle work, render passes, updates, finishes, and queue state. |
+| `TRUST_JS_PROBE` | JavaScript source | Evaluates the supplied expression/source in the resident page after a task and prints its value, throw, interruption, or parse error. This is a diagnostic probe, not page content. It runs as author script: host bindings and the platform's private control object are not reachable from it. |
+| `TRUST_JS_DIAGNOSTIC_INIT` | JavaScript function body | Opt-in instrumentation called once after the resident main-page platform bootstrap, before author scripts. It receives the lexical parameter `__trustDiagnosticReport`, never a Window property. This callback accepts exactly one valid JSON object string, at most 4 MiB, and prints one `trust-js: diagnostic:` line; malformed, oversized or repeated submissions throw/report diagnostic errors. It is not installed in child frames, workers, or replay-only engines, and is never rerun by diagnostic drains. Initializer errors do not skip author scripts. A one-shot `load` listener can capture the callback, install a completion hook and start a benchmark after setup. For controlled timing, disable both `TRUST_JS_PROBE` and `TRUST_JS_TRACE`; retain `--js-diagnostics` for errors at exit. Leave this flag unset for ordinary acceptance browsing; hooks can alter page behavior and may emit private data. |
+| `TRUST_PRELUDE_FILE` | file path | Replaces the embedded platform prelude (`js_platform.js`) with the given file's contents for the process, read once on first use. Intended for rapid iteration on prelude code: edit `src/js_platform.js`, set this to that path, and the *next page load* picks the change up — no rebuild or relink is needed. The override is read in the TRust JS backend at prelude evaluation time, independently of `__trust_cfg`. Release/shipped builds keep the embedded prelude; leave this unset. An unreadable path falls back to the embedded prelude. The override is still enclosed by `js::private_bootstrap`, which captures the host bindings lexically and deletes every `__`-prefixed global before author code runs. |
 | `TRUST_WORKER_PRELUDE_FILE` | file path | Replaces the complete assembled worker prelude, including shared platform blocks, for diagnostic iteration. Read once on first worker creation; an unreadable path uses the embedded prelude. Leave unset for acceptance testing and normal browsing. The assembly order is defined by `js::worker_prelude()`; `js::private_bootstrap` encloses the override exactly as it does the embedded source. |
 | `TRUST_TRACE_NODE_ACCESS` | presence flag | Logs each DOM host operation that refused a node because the calling Window Realm's origin is not same origin-domain with the node's Document (`[node-access] <operation>: context <id> denied node <id>`). Single-Realm pages and workers never check. Use it to diagnose a frame feature that stops working; the refusal itself is the intended defense in depth. |
 | `TRUST_TRACE_FRAMES` | presence flag | Requests the prelude's gated frame-flow trace, emitted as `FT ...` console lines (`log: FT …` under `--js-diagnostics`): frame hydration, navigation, resource completion, native click target paths, and script discovery. Includes Window message origins/target origins, serialized lengths, frame IDs, transfer counts, and MessagePort queue enablement/delivery (not message contents). The trace flag travels through `__trust_cfg.frameTrace`, including child Window Realms. |
 | `TRUST_TRACE_CHALLENGE_MESSAGES` | presence flag | Emits `[challenge-message]` records for Window messages to/from the exact `https://challenges.cloudflare.com` origin. Records send, target-origin drop, deserialize failure, dispatch start and dispatch return, with network-correlated timestamps and frame IDs. Reads the already-serialized wire, not author objects: no additional getters, serialization, or message listeners. Logs only allowlisted event/retry/reason names, bounded numeric error codes/intervals, and presence flags for opaque result/token fields; no token/cookie values, arbitrary field names, URLs or widget IDs. Unknown strings are redacted. Parsing is limited to 64 KiB per wire; output to 4,096 records per process. The flag is inherited by child Window Realms and is off by default. `dispatched` means event dispatch returned, not that the challenge succeeded. |
-| `LUMEN_TRACE_ERRORS` | `1` or diagnostic substring | Opt-in engine diagnostics for native errors, including caught exceptions. Bounded to 1024 matching errors per process. Feature probes often intentionally catch errors; this is not an uncaught-error counter. |
-| `LUMEN_TRACE_ERROR_SOURCE` | presence flag or character limit | With `LUMEN_TRACE_ERRORS`, include up to four interpreted stack frames' source prefixes (default 800 characters each; numeric limits capped at 16,384). Non-callable primitive diagnostics also include up to 32 bounded callee previews and argument types. May contain private page/script data; keep logs local and inspect before sharing. No author getters or `toString` methods are invoked. |
-| `LUMEN_TRACE_UNDEFINED_PROPERTIES` | presence flag | Records the last 32 slow-path property reads returning `undefined` on each execution thread. Matching `LUMEN_TRACE_ERRORS` diagnostics print their bounded property/function names and receiver types; named reads include the native object kind and up to eight own descriptor names. This is a partial history, not proof of absent properties: getters and proxies can return `undefined`. It never repeats a lookup or invokes author diagnostic hooks. Logs may contain private names; keep them local. |
-| `LUMEN_TRACE_BOUND_CALLS` | presence flag | Records the last 256 bound-function call/return events per execution thread; matching `LUMEN_TRACE_ERRORS` diagnostics print parent call IDs and bounded native argument/result previews. Does not replace browser functions, invoke author accessors/traps, or retain returned objects. A diagnostic run still incurs logging overhead and may expose private script data; keep its logs local. |
-| `LUMEN_TRACE_BOUND_ARRAYS` | presence flag | With bound-call tracing, records native descriptor changes in small arrays owned by the first saved argument, before and after calls. Scans at most 16 own fields, 4 arrays of 16–512 entries, and retains at most 16 preview snapshots without retaining JS values. Useful for tracking corrupted working state without replacing JavaScript functions or arrays; keep the potentially private output local. |
-| `LUMEN_FN_PROFILE` | presence flag | Opt-in interpreted function timing, including compiled execution entered through the interpreter; reports inclusive/self time and callers. Each reported entry also includes its internal compilation, activation, scope and same-realm state sampled on the first entry in that batch; this is not a count of fast-path misses. Adds overhead and is not an uninstrumented wall-time benchmark. `LUMEN_FN_PROFILE_FLUSH_SECONDS` sets the minimum elapsed time before a completed call can flush a batch. |
-| `LUMEN_FN_PROFILE_SOURCE` | presence flag | With function profiling, include up to 16,384 source characters for each reported hot function (at most 32 per batch). This can expose private page code; keep captures local. |
-| `LUMEN_JIT_CODE_BUDGET_MB` | integer, 1–1024 MiB | Process-wide requested executable-byte cap shared by JavaScript and native RegExp code. Read once; invalid values use the default (128 MiB). It does not reserve that much memory up front. The cap excludes page rounding and non-executable metadata. Function profiles and `LUMEN_PERF_METRICS` report live requested bytes, limit and rejected reservations. JavaScript bodies deferred for budget pressure retry only when their requested capacity becomes available; unsupported bodies remain on the checked VM. No live code is evicted or patched. |
-| `LUMEN_JIT_NO_JSCVT` | presence flag | ARM64 generated code uses the portable guarded ToInt32 sequence (with its checked-helper fallback) for bitwise operators even when the CPU implements FEAT_JSCVT (`fjcvtzs`). Read once per process. Use it to compare the two code paths or to rule out the instruction when diagnosing a numeric difference; results must be identical. |
-| `LUMEN_JIT_INLINE_STUBS` | presence flag | ARM64 generated code emits name-cache validation, generic property-cache probes, secondary call-cache probes and direct-call sequences at every site instead of in per-chunk shared stubs (by default only loop bodies keep name validation and direct calls in line). Read once per process. A code-size and performance comparison only; results must be identical. |
-| `LUMEN_JIT_HOT_LOOP_OPS` | positive integer | Bytecode-op bound on loops that keep ARM64 name checks and direct-call sequences in line (default 512). Larger loops, such as flattened dispatch loops in obfuscated code, use the shared stubs. Read once per process; a code-size and performance comparison only. |
-| `LUMEN_JIT_CHUNK_STUBS` | presence flag | Each ARM64 chunk carries its own copy of the shared stubs instead of a veneer into the process-wide stub table. Read once per process. A code-size comparison only; results must be identical. |
-| `LUMEN_TAIL_CALL_DEPTH` | non-negative integer | Execution-context depth below which a strict-mode tail call runs as an ordinary call (default 1024); at or past it the call is staged as a proper tail call, so unbounded tail recursion stays bounded. `0` stages every tail call. Read once per process. Diagnostic: legacy `caller` values and stack traces can differ between the two paths. |
-| `LUMEN_GC_LOG` | presence flag | Logs post-collection object counts at allocation and task-boundary collections, with retained Realm, template, pin and host-settings counts. A task-boundary reclaimed count excludes objects already released by reference counting while the task unwound. |
-| `LUMEN_GC_DUMP` | presence flag | Dumps bounded root-property/scope-name samples, object-kind and initial-root counts, root-array size buckets, kept/pool counts, largest array length and the current stack. Reports the six most frequent function bodies among at most 1,024 sampled distinct bodies, with omitted-instance counts and names capped at 80 characters. Counts describe the pre-sweep snapshot, not the final live graph. Uses internal metadata without invoking author hooks; may expose private names, so keep captures local. Adds diagnostic traversal overhead. |
-| `LUMEN_GC_DUMP_MIN_OBJECTS` | non-negative integer | With `LUMEN_GC_DUMP`, skip snapshots below this object count. Missing/invalid values use zero. Useful for restricting output to large-heap pressure events. |
-| `LUMEN_GC_DUMP_ROOT_LIMIT` | positive integer | Maximum object-root records per dump, default 60, clamped to 1–16,384. Includes internal object identity and external-reference counts (excluding diagnostic temporaries). `LUMEN_GC_DUMP` also reports native DOM roots, allocation leases and resource leases grouped by owner document on each full host trace, independently of the engine object-count floor. |
-| `LUMEN_GC_RETAINING_PATHS` | presence flag | Independently traverses full-GC snapshots of 15,000–500,000 objects and logs root-to-Realm retaining witnesses (at most 128 links each). Includes environments, native graph, explicit captures, internal slots and ephemerons; an ephemeron label requires both its inputs live but displays only one path. Diagnostic only: adds substantial traversal/storage work, exposes private property/binding names, and never changes collector marks or executes author hooks. |
-| `LUMEN_TRACE_CODE_POINT_ERRORS` | presence flag | Logs the already-converted invalid number, argument index and argument count for at most 32 `String.fromCodePoint` errors per process. Does not repeat coercion or alter exception behavior. Diagnostic numeric inputs may be private; keep captures local. |
-| `TRUST_TRACE_FETCH` | presence flag | Logs every page fetch to stderr as `[fetch-trace] @<ms>ms sync|async <METHOD> <url>` (the time the request reached the host, on the `TRUST_NET_TRACE` timeline), followed by `[fetch-trace] result status=<N> type=<TYPE> len=<N>` when the response resolves through the unbuffered result path (`len=0` for a body that streams), and `[fetch-trace] body id=<N> end=<outcome> encoded=<N> decoded=<N>` when a streamed body ends. With `TRUST_NET_TRACE`, a response whose body streams is marked `(body streams)` and its line is printed at the header section. Pair with `TRUST_LUMEN_TRACE` and `--js-diagnostics` to reconstruct a page's script/fetch timeline. |
+| `TRUST_JS_TRACE_ERRORS` | `1` or diagnostic substring | Opt-in engine diagnostics for native errors, including caught exceptions. Bounded to 1024 matching errors per process. Feature probes often intentionally catch errors; this is not an uncaught-error counter. |
+| `TRUST_JS_TRACE_ERROR_SOURCE` | presence flag or character limit | With `TRUST_JS_TRACE_ERRORS`, include up to four interpreted stack frames' source prefixes (default 800 characters each; numeric limits capped at 16,384). Non-callable primitive diagnostics also include up to 32 bounded callee previews and argument types. May contain private page/script data; keep logs local and inspect before sharing. No author getters or `toString` methods are invoked. |
+| `TRUST_JS_TRACE_UNDEFINED_PROPERTIES` | presence flag | Records the last 32 slow-path property reads returning `undefined` on each execution thread. Matching `TRUST_JS_TRACE_ERRORS` diagnostics print their bounded property/function names and receiver types; named reads include the native object kind and up to eight own descriptor names. This is a partial history, not proof of absent properties: getters and proxies can return `undefined`. It never repeats a lookup or invokes author diagnostic hooks. Logs may contain private names; keep them local. |
+| `TRUST_JS_TRACE_BOUND_CALLS` | presence flag | Records the last 256 bound-function call/return events per execution thread; matching `TRUST_JS_TRACE_ERRORS` diagnostics print parent call IDs and bounded native argument/result previews. Does not replace browser functions, invoke author accessors/traps, or retain returned objects. A diagnostic run still incurs logging overhead and may expose private script data; keep its logs local. |
+| `TRUST_JS_TRACE_BOUND_ARRAYS` | presence flag | With bound-call tracing, records native descriptor changes in small arrays owned by the first saved argument, before and after calls. Scans at most 16 own fields, 4 arrays of 16–512 entries, and retains at most 16 preview snapshots without retaining JS values. Useful for tracking corrupted working state without replacing JavaScript functions or arrays; keep the potentially private output local. |
+| `TRUST_JS_FN_PROFILE` | presence flag | Opt-in interpreted function timing, including compiled execution entered through the interpreter; reports inclusive/self time and callers. Each reported entry also includes its internal compilation, activation, scope and same-realm state sampled on the first entry in that batch; this is not a count of fast-path misses. Adds overhead and is not an uninstrumented wall-time benchmark. `TRUST_JS_FN_PROFILE_FLUSH_SECONDS` sets the minimum elapsed time before a completed call can flush a batch. |
+| `TRUST_JS_FN_PROFILE_SOURCE` | presence flag | With function profiling, include up to 16,384 source characters for each reported hot function (at most 32 per batch). This can expose private page code; keep captures local. |
+| `TRUST_JS_JIT_CODE_BUDGET_MB` | integer, 1–1024 MiB | Process-wide requested executable-byte cap shared by JavaScript and native RegExp code. Read once; invalid values use the default (128 MiB). It does not reserve that much memory up front. The cap excludes page rounding and non-executable metadata. Function profiles and `TRUST_JS_PERF_METRICS` report live requested bytes, limit and rejected reservations. JavaScript bodies deferred for budget pressure retry only when their requested capacity becomes available; unsupported bodies remain on the checked VM. No live code is evicted or patched. |
+| `TRUST_JS_JIT_NO_JSCVT` | presence flag | ARM64 generated code uses the portable guarded ToInt32 sequence (with its checked-helper fallback) for bitwise operators even when the CPU implements FEAT_JSCVT (`fjcvtzs`). Read once per process. Use it to compare the two code paths or to rule out the instruction when diagnosing a numeric difference; results must be identical. |
+| `TRUST_JS_JIT_INLINE_STUBS` | presence flag | ARM64 generated code emits name-cache validation, generic property-cache probes, secondary call-cache probes and direct-call sequences at every site instead of in per-chunk shared stubs (by default only loop bodies keep name validation and direct calls in line). Read once per process. A code-size and performance comparison only; results must be identical. |
+| `TRUST_JS_JIT_HOT_LOOP_OPS` | positive integer | Bytecode-op bound on loops that keep ARM64 name checks and direct-call sequences in line (default 512). Larger loops, such as flattened dispatch loops in obfuscated code, use the shared stubs. Read once per process; a code-size and performance comparison only. |
+| `TRUST_JS_JIT_CHUNK_STUBS` | presence flag | Each ARM64 chunk carries its own copy of the shared stubs instead of a veneer into the process-wide stub table. Read once per process. A code-size comparison only; results must be identical. |
+| `TRUST_JS_TAIL_CALL_DEPTH` | non-negative integer | Execution-context depth below which a strict-mode tail call runs as an ordinary call (default 1024); at or past it the call is staged as a proper tail call, so unbounded tail recursion stays bounded. `0` stages every tail call. Read once per process. Diagnostic: legacy `caller` values and stack traces can differ between the two paths. |
+| `TRUST_JS_GC_LOG` | presence flag | Logs post-collection object counts at allocation and task-boundary collections, with retained Realm, template, pin and host-settings counts. A task-boundary reclaimed count excludes objects already released by reference counting while the task unwound. |
+| `TRUST_JS_GC_DUMP` | presence flag | Dumps bounded root-property/scope-name samples, object-kind and initial-root counts, root-array size buckets, kept/pool counts, largest array length and the current stack. Reports the six most frequent function bodies among at most 1,024 sampled distinct bodies, with omitted-instance counts and names capped at 80 characters. Counts describe the pre-sweep snapshot, not the final live graph. Uses internal metadata without invoking author hooks; may expose private names, so keep captures local. Adds diagnostic traversal overhead. |
+| `TRUST_JS_GC_DUMP_MIN_OBJECTS` | non-negative integer | With `TRUST_JS_GC_DUMP`, skip snapshots below this object count. Missing/invalid values use zero. Useful for restricting output to large-heap pressure events. |
+| `TRUST_JS_GC_DUMP_ROOT_LIMIT` | positive integer | Maximum object-root records per dump, default 60, clamped to 1–16,384. Includes internal object identity and external-reference counts (excluding diagnostic temporaries). `TRUST_JS_GC_DUMP` also reports native DOM roots, allocation leases and resource leases grouped by owner document on each full host trace, independently of the engine object-count floor. |
+| `TRUST_JS_GC_RETAINING_PATHS` | presence flag | Independently traverses full-GC snapshots of 15,000–500,000 objects and logs root-to-Realm retaining witnesses (at most 128 links each). Includes environments, native graph, explicit captures, internal slots and ephemerons; an ephemeron label requires both its inputs live but displays only one path. Diagnostic only: adds substantial traversal/storage work, exposes private property/binding names, and never changes collector marks or executes author hooks. |
+| `TRUST_JS_TRACE_CODE_POINT_ERRORS` | presence flag | Logs the already-converted invalid number, argument index and argument count for at most 32 `String.fromCodePoint` errors per process. Does not repeat coercion or alter exception behavior. Diagnostic numeric inputs may be private; keep captures local. |
+| `TRUST_TRACE_FETCH` | presence flag | Logs every page fetch to stderr as `[fetch-trace] @<ms>ms sync|async <METHOD> <url>` (the time the request reached the host, on the `TRUST_NET_TRACE` timeline), followed by `[fetch-trace] result status=<N> type=<TYPE> len=<N>` when the response resolves through the unbuffered result path (`len=0` for a body that streams), and `[fetch-trace] body id=<N> end=<outcome> encoded=<N> decoded=<N>` when a streamed body ends. With `TRUST_NET_TRACE`, a response whose body streams is marked `(body streams)` and its line is printed at the header section. Pair with `TRUST_JS_TRACE` and `--js-diagnostics` to reconstruct a page's script/fetch timeline. |
 
 ### Dedicated worker resources
 
 Dedicated workers have no fixed count quota. Each has its own native thread and
-Lumen realm, using Rust's default thread stack instead of a 64 MiB reservation;
-Lumen grows execution-stack segments on demand. Idle workers block on their inbox
+TRust JS realm, using Rust's default thread stack instead of a 64 MiB reservation;
+TRust JS grows execution-stack segments on demand. Idle workers block on their inbox
 without polling. Creation is constrained by available memory and OS thread
 resources; an OS thread-creation failure queues a Worker `error` event with the
 underlying error message.
@@ -792,7 +792,7 @@ snapshots is not permission to discard JavaScript tasks or semantic events.
 
 The normal build keeps HTTP language preferences, NavigatorLanguage, and native
 Intl defaults in US English regardless of the host environment. Exercise both
-the language contract and preservation of Lumen's native Intl/GC APIs with:
+the language contract and preservation of TRust JS's native Intl/GC APIs with:
 
 ```sh
 LANG=de_DE.UTF-8 LC_ALL=de_DE.UTF-8 LANGUAGE=de_DE:de TZ=Europe/Berlin \
@@ -1111,8 +1111,8 @@ contracts, measurements, standards references, and remaining limits.
 
 ## JavaScript engine profiling
 
-Two scripts in `tools/` measure Lumen from the outside, through either the Lumen
-CLI (`../Lumen`, `lumen FILE.js`) or a TRust binary such as `trust-headless`. They
+Two scripts in `tools/` measure TRust JS from the outside, through either the TRust JS
+CLI (`../trust-js`, `trust-js FILE.js`) or a TRust binary such as `trust-headless`. They
 add no engine input of their own and change no behavior. Both require Linux; the
 sampler needs `kernel.perf_event_paranoid` of 2 or lower (it samples only user
 space). Run timing work on an otherwise idle machine and keep losses in the record.
@@ -1121,9 +1121,9 @@ space). Run timing work on an otherwise idle machine and keep losses in the reco
 
 ```sh
 # Frame pointers make call chains usable; keep this build in its own target directory.
-(cd ../Lumen && RUSTFLAGS="-C force-frame-pointers=yes" \
-  cargo build --release -p lumen --features embed --bin lumen --target-dir target/fp)
-tools/psample.py /tmp/profile.txt --jitmap -- taskset -c 5 ../Lumen/target/fp/release/lumen bench.js
+(cd ../trust-js && RUSTFLAGS="-C force-frame-pointers=yes" \
+  cargo build --release -p trust-js --features embed --bin trust-js --target-dir target/fp)
+tools/psample.py /tmp/profile.txt --jitmap -- taskset -c 5 ../trust-js/target/fp/release/trust-js bench.js
 tools/psample.py /tmp/page.txt -- taskset -c 5 target/release/trust-headless --settle 3 "file://$PWD/page.html"
 ```
 
@@ -1144,13 +1144,13 @@ Without frame pointers only self times are reliable. The command's stdout is
 left alone. Mapping snapshots are taken every 0.5 s, so very short runs may
 misattribute late JIT code.
 
-`--jitmap` runs the command with `LUMEN_JIT_MAP=1` and redirects its stderr to
+`--jitmap` runs the command with `TRUST_JS_JIT_MAP=1` and redirects its stderr to
 `<report>.jitmap`. Samples in anonymous executable memory are then charged to
-`[jit <first local names>] pc<N> <op>`: the Lumen JIT function (named by its first
+`[jit <first local names>] pc<N> <op>`: the TRust JS JIT function (named by its first
 four local slots) and the bytecode operation whose machine code contains the
 sample. Code between two operation offsets is charged to the earlier operation, so
 fused templates and the shared call-finish stub appear under a neighboring op.
-`LUMEN_JIT_MAP` is presence-only and ARM64-only: at each native compilation it
+`TRUST_JS_JIT_MAP` is presence-only and ARM64-only: at each native compilation it
 prints `[jit-map-range] <base> <len> <names>@<start>+<length>/<ops>ops/<slots>slots`
 (the function's byte offset and length in its script, so a hot chunk can be looked up
 in the script text, and its bytecode operation and slot counts), one
@@ -1174,7 +1174,7 @@ Two environment inputs to the script add instruction-level detail:
 | `PSAMPLE_FOCUS` | substring of a symbol name | Callers of the outermost matching frame, and the direct callees and inclusive costs beneath it, as percentages of all samples. |
 
 To read generated code at those offsets, run the same script with
-`LUMEN_JIT_CODEDUMP=<substring>` (ARM64 only; also printed by `lumen --help`). It
+`TRUST_JS_JIT_CODEDUMP=<substring>` (ARM64 only; also printed by `trust-js --help`). It
 prints `[jit-codedump] fn(<names>) <N> words` followed by one hex instruction word
 per line for every chunk whose first four local names contain the substring. Any
 value also prints a `[jit-map] fn(<names>) base=<address> len=<bytes>` line per
@@ -1191,13 +1191,13 @@ about 6,300 functions over a 128 MiB heap, with an Emterpreter for the code that
 yield) and its `.mem` file. The page draws through `putImageData` on a 2D canvas and plays
 audio through an SDL2 `ScriptProcessorNode`; the game zip comes from
 `cors.archive.org/cors/doom_dos/doom.zip` through BrowserFS. The whole benchmark therefore
-measures Lumen's JIT on asm.js. Download the engine, `.mem` and zip once (archive.org
+measures TRust JS's JIT on asm.js. Download the engine, `.mem` and zip once (archive.org
 throttles repeated downloads), unzip the game into a directory, and run the emulator's own
 JavaScript without a browser:
 
 ```sh
 DOSBOX_JS=dosbox-sync.js.gz DOSBOX_MEM=dosbox-sync.mem.gz GAME_DIR=./doom-c EXIT_ON_GFX=1 \
-  taskset -c 17 target/release/lumen-cli tools/em_dosbox_harness.js 400   # or: node ...
+  taskset -c 17 ../trust-js/target/release/trust-js-cli tools/em_dosbox_harness.js 400   # or: node ...
 ```
 
 `tools/em_dosbox_harness.js` stubs the DOM, canvas and AudioContext, mounts `GAME_DIR` as `C:`
@@ -1211,15 +1211,15 @@ to the title measures the engine reliably. For engine comparisons set
 `DOSBOX_CYCLES='fixed 50000'`, which gives every emulated millisecond the same guest work, and
 count the host's user instructions to the title (`perf stat -e instructions:u`; with
 `EXIT_ON_GFX` and no `FRAME_PNG` the run ends at the title). On 2026-10-11 that repeated
-within 0.5%: Lumen 1bbc822 358-359 G instructions (79-83 s), Lumen 9b1a2cf 267 G (50-52 s),
+within 0.5%: TRust JS 1bbc822 358-359 G instructions (79-83 s), TRust JS 9b1a2cf 267 G (50-52 s),
 node 24 23 G (4.3 s). The title's frame number varies with DOSBox's real-time frame skipping,
 so the harness tests every frame, and frame counts are not comparable. Pin to one core: this host's X925 cores (5-9, 15-19) run the JIT about 1.8 times
 faster than its A725 cores, and the host's load varies run to run, so compare engines in
-concurrent runs. Measured with `cycles=max` on 2026-10-10 at Lumen eb0c9e9: node (V8) 10.1 s,
-Lumen JIT 106 s; in the browser the same page needs about 190 s to reach the title screen.
+concurrent runs. Measured with `cycles=max` on 2026-10-10 at TRust JS eb0c9e9: node (V8) 10.1 s,
+TRust JS JIT 106 s; in the browser the same page needs about 190 s to reach the title screen.
 
 Micro-benchmarks of the asm.js patterns (one iteration of a loop, ns): a typed-array element
-access costs 20-40 in Lumen against 1-2 in V8, a JavaScript call 40-56 against 1.4, a closure
+access costs 20-40 in TRust JS against 1-2 in V8, a JavaScript call 40-56 against 1.4, a closure
 variable store 16 against 1.3, and `Math.imul` through an identifier 80 against 1.4 (32 with
 inline Math intrinsics). Per-function profiles show 75-95% of the time in generated code with
 no dominant template: see `tools/jit_families.py`.
@@ -1227,8 +1227,8 @@ no dominant template: see `tools/jit_families.py`.
 ### `tools/js_ab.py`: interleaved A/B timing
 
 ```sh
-tools/js_ab.py --base ../Lumen/target/base/release/lumen \
-  --cand ../Lumen/target/release/lumen -n 5 --node bench.js other.js
+tools/js_ab.py --base ../trust-js/target/base/release/trust-js \
+  --cand ../trust-js/target/release/trust-js -n 5 --node bench.js other.js
 ```
 
 Runs every script once per engine per round (default 3, `-n`), alternating the
@@ -1239,18 +1239,18 @@ times, above 1 is better for scores). `--node` adds a Node.js reference column.
 Build the baseline and candidate with the same Cargo profile. Benchmarks should
 print through `typeof print === "function" ? print : console.log`.
 
-The Lumen CLI installs Lumen's own size-class allocator, while TRust installs
+The TRust JS CLI installs TRust JS's own size-class allocator, while TRust installs
 mimalloc (the default `mimalloc` feature). For allocation-heavy comparisons,
 measure the browser build as well: the CLI can overstate allocation costs.
 
-### Lumen allocation measurements
+### TRust JS allocation measurements
 
-From `../Lumen`, two ignored Lumen tests print object-allocation costs and type
+From `../trust-js`, two ignored TRust JS tests print object-allocation costs and type
 sizes without JavaScript dispatch:
 
 ```sh
-taskset -c 5 cargo test --release -p lumen --lib object_alloc_bench -- --ignored --nocapture
-cargo test --release -p lumen --lib object_layout_sizes -- --ignored --nocapture
+taskset -c 5 cargo test --release -p trust-js --lib object_alloc_bench -- --ignored --nocapture
+cargo test --release -p trust-js --lib object_layout_sizes -- --ignored --nocapture
 ```
 
 `object_alloc_bench` reports nanoseconds per operation for object creation and
@@ -1317,39 +1317,39 @@ When adding an input:
 
 The optional `architecture-diagnostics` Cargo feature records cumulative DOM
 tag-lookup callers, computed-style cache hits and copied bytes, style invalidation
-fanout, and Lumen allocation/call-cache observations. It is off in ordinary builds.
+fanout, and TRust JS allocation/call-cache observations. It is off in ordinary builds.
 DOM reports are sampled at existing page diagnostic drains (at most once per two
 seconds); no reporting timer or background work is added. Allocation reports occur
 at completed collections. Counters and bounded site tables retain no DOM/JS owners.
 These builds are for causal diagnosis, never controlled acceptance timing.
 
-With `lumen/optimizing-jit`, `LUMEN_OPT_JIT_DIAGNOSTICS=1` additionally records
+With `trust-js/optimizing-jit`, `TRUST_JS_OPT_JIT_DIAGNOSTICS=1` additionally records
 optimizer compiler phases, code/IR sizes, native entries, helper calls, heap guards,
 ownership transfers and frame publication. Heap guards count the explicit property
 and ownership guard routines, not every conditional branch. Transfers count logical
 retains/releases, including alias-cancelled groups; they are not allocator calls.
 Existing artifacts stay under the architecture evidence directories; use new output
 names and retain failed attempts as well as completed runs.
-`LUMEN_OPT_JIT_DIAGNOSTICS=compile` records compiler/static observations without
+`TRUST_JS_OPT_JIT_DIAGNOSTICS=compile` records compiler/static observations without
 emitting native execution counters; use that mode to attribute compilation cost.
 
 ### Representation and browser-work comparisons
 
 The following controls are enabled by default in ordinary builds. Each reads its
 environment variable once on first use; exactly `0` selects the comparison path.
-They produce no diagnostic output by themselves. Lumen controls affect every
+They produce no diagnostic output by themselves. TRust JS controls affect every
 frontend using the engine; TRust controls affect the shared browser actor or DOM.
 Use a fresh process for each setting and retain complete results, including losses.
 
 | Control | Comparison selected by `0` |
 | --- | --- |
-| `LUMEN_DENSE_ELEMENTS` | Disable extended contiguous array descriptors; earlier tiny-array storage remains available. |
-| `LUMEN_ITERATOR_RESULTS` | Allocate iterator result objects in closed native consumers. Public `next()` results remain distinct in either mode. |
-| `LUMEN_ACTIVATION_PLANS` | Reconstruct compiled activation bindings for each invocation. |
-| `LUMEN_INDEXED_ACTIVATIONS` | Use linear planned-binding lookup for wide compiled environments. |
-| `LUMEN_LAYOUT_NAME_IC` | Disable fixed-layout name-cache proofs. |
-| `LUMEN_COLD_ENV_LAYOUTS` | Disable shared cold-environment name layouts. |
-| `LUMEN_SHARED_NATIVE_OPERATIONS` | Retain the older ARM64 region operation vocabulary. |
+| `TRUST_JS_DENSE_ELEMENTS` | Disable extended contiguous array descriptors; earlier tiny-array storage remains available. |
+| `TRUST_JS_ITERATOR_RESULTS` | Allocate iterator result objects in closed native consumers. Public `next()` results remain distinct in either mode. |
+| `TRUST_JS_ACTIVATION_PLANS` | Reconstruct compiled activation bindings for each invocation. |
+| `TRUST_JS_INDEXED_ACTIVATIONS` | Use linear planned-binding lookup for wide compiled environments. |
+| `TRUST_JS_LAYOUT_NAME_IC` | Disable fixed-layout name-cache proofs. |
+| `TRUST_JS_COLD_ENV_LAYOUTS` | Disable shared cold-environment name layouts. |
+| `TRUST_JS_SHARED_NATIVE_OPERATIONS` | Retain the older ARM64 region operation vocabulary. |
 | `TRUST_NATIVE_WRAPPERS` | Use the earlier JavaScript wrapper-identity management path. |
 | `TRUST_NATIVE_DOM_TRAVERSAL` | Use the earlier traversal path instead of single-edge native queries. |
 | `TRUST_NATIVE_LIVE_COLLECTIONS` | Use the earlier child-collection representation. |
@@ -1369,7 +1369,7 @@ Leave these variables unset to exercise the ordinary default. Each control chang
 the implementation path while preserving the same required web semantics; turning
 one off does not recreate an entire historical engine or browser revision.
 Cranelift remains a separate optional build feature with opt-in runtime policies.
-`LUMEN_OPT_JIT_OSR=1` is a restricted loop-continuation experiment, independent of
-whole-function `LUMEN_OPT_JIT` admission. Neither is enabled in an ordinary release.
-See the sibling Lumen `AGENTS.md` and `docs/optimizing-tier.txt` for its limits and
+`TRUST_JS_OPT_JIT_OSR=1` is a restricted loop-continuation experiment, independent of
+whole-function `TRUST_JS_OPT_JIT` admission. Neither is enabled in an ordinary release.
+See the sibling TRust JS `AGENTS.md` and `docs/optimizing-tier.txt` for its limits and
 the retained negative application results.

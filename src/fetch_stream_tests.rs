@@ -30,8 +30,8 @@ fn page(
     runtime: &tokio::runtime::Runtime,
     page: &str,
 ) -> (
-    lumen::Engine,
-    tokio::sync::mpsc::UnboundedReceiver<LumenHostTask>,
+    trust_js::Engine,
+    tokio::sync::mpsc::UnboundedReceiver<TrustJsHostTask>,
 ) {
     let (task_tx, task_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut state = HostState::new(
@@ -49,7 +49,7 @@ fn page(
     (engine, task_rx)
 }
 
-fn log(engine: &mut lumen::Engine) -> String {
+fn log(engine: &mut trust_js::Engine) -> String {
     string_value(engine, "log.join('|')")
 }
 
@@ -57,8 +57,8 @@ fn log(engine: &mut lumen::Engine) -> String {
 /// platform tasks and microtasks, with the timer clock advancing in steps.
 fn run_until(
     runtime: &tokio::runtime::Runtime,
-    engine: &mut lumen::Engine,
-    tasks: &mut tokio::sync::mpsc::UnboundedReceiver<LumenHostTask>,
+    engine: &mut trust_js::Engine,
+    tasks: &mut tokio::sync::mpsc::UnboundedReceiver<TrustJsHostTask>,
     condition: &str,
 ) {
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -90,8 +90,8 @@ fn run_until(
 /// Dispatch host tasks for `duration` without waiting on script.
 fn run_for(
     runtime: &tokio::runtime::Runtime,
-    engine: &mut lumen::Engine,
-    tasks: &mut tokio::sync::mpsc::UnboundedReceiver<LumenHostTask>,
+    engine: &mut trust_js::Engine,
+    tasks: &mut tokio::sync::mpsc::UnboundedReceiver<TrustJsHostTask>,
     duration: Duration,
 ) {
     let deadline = Instant::now() + duration;
@@ -139,7 +139,7 @@ async fn stream_until_closed(socket: &mut TcpStream) -> bool {
     false
 }
 
-fn streams_in_flight(engine: &mut lumen::Engine) -> usize {
+fn streams_in_flight(engine: &mut trust_js::Engine) -> usize {
     engine
         .ctx()
         .host_mut::<HostState>()
@@ -1436,8 +1436,8 @@ fn stopping_the_document_leaves_its_workers_script_fetches() {
         "running worker",
     )
     .unwrap();
-    let wait_for = |engine: &mut lumen::Engine,
-                    tasks: &mut tokio::sync::mpsc::UnboundedReceiver<LumenHostTask>,
+    let wait_for = |engine: &mut trust_js::Engine,
+                    tasks: &mut tokio::sync::mpsc::UnboundedReceiver<TrustJsHostTask>,
                     count: usize| {
         let deadline = Instant::now() + Duration::from_secs(10);
         while arrived.load(std::sync::atomic::Ordering::SeqCst) < count {

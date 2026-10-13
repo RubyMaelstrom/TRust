@@ -1,0 +1,51 @@
+# Cargo build output, including standalone vendored crate builds.
+target/
+# Local scratch files and diagnostic output.
+/scratch/
+/diagnostics/
+/*.log
+# Local agent state and editor settings.
+/.claude/
+/.codex/
+/.idea/
+/.vscode/
+# Local environment settings and JavaScript dependencies.
+.env
+.env.*
+!.env.example
+# Machine-local package registry credentials.
+/.cargo/credentials
+/.cargo/credentials.toml
+/.npmrc
+/.netrc
+/.pypirc
+node_modules/
+# Local Markdown workfiles; retain maintained contributor and license documents.
+*.md
+!/README.md
+!/AGENTS.md
+!/INSTALL.md
+!/DIAGNOSTICS.md
+!/LICENSE.md
+!/docs/layout-performance.md
+# Python, editor, and operating-system temporary files.
+__pycache__/
+*.py[cod]
+*~
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+Desktop.ini
+# Crash dumps and local profiling output.
+/core
+core.[0-9]*
+*.core
+*.dmp
+perf.data
+perf.data.*
+*.profraw
+*.profdata
+callgrind.out.*
+cachegrind.out.*
+*.er/

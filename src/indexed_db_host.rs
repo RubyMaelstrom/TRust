@@ -29,7 +29,7 @@
 //! their queues.
 
 use super::message_port_host::Wake;
-use super::{Ctx, HostState, LumenTaskSender, Value};
+use super::{Ctx, HostState, TrustJsTaskSender, Value};
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::{
     Arc, Mutex, Weak,
@@ -459,8 +459,8 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
             return Ok(Value::Null);
         };
         let wake = match &state.task_events {
-            Some(LumenTaskSender::Page(sender)) => Wake::Page(sender.downgrade()),
-            Some(LumenTaskSender::Worker(inbox)) => Wake::Worker(inbox.clone()),
+            Some(TrustJsTaskSender::Page(sender)) => Wake::Page(sender.downgrade()),
+            Some(TrustJsTaskSender::Worker(inbox)) => Wake::Worker(inbox.clone()),
             None => state.message_ports.wake.clone(),
         };
         let storage = state.storage.clone();
