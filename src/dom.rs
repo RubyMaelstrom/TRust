@@ -13733,8 +13733,12 @@ impl Dom {
                             }
                             if self.tag_name(child) == Some("body") {
                                 self.write_serialized_frame_body_open(child, out);
-                                for c in self.child_iter(child) {
-                                    self.serialize_node_inner(c, None, mode, out);
+                                // CSS Shadow 1 #flattening: the BODY wrapper
+                                // retains its formatting box but renders its
+                                // shadow tree when it is a shadow host.
+                                let shadow = self.shadow_root(child);
+                                for c in self.child_iter(shadow.unwrap_or(child)) {
+                                    self.serialize_node_inner(c, shadow.map(|_| child), mode, out);
                                 }
                                 out.push_str("</div>");
                             } else {
@@ -13919,10 +13923,17 @@ impl Dom {
                     }
                     if self.tag_name(child) == Some("body") {
                         self.write_serialized_frame_body_open(child, out);
-                        for c in self.child_iter(child) {
+                        let shadow = self.shadow_root(child);
+                        for c in self.child_iter(shadow.unwrap_or(child)) {
                             // A child navigable starts a new document/tree
                             // scope, independent of its owner's shadow/anchor.
-                            self.serialize_live_node(c, None, clickable, false, out);
+                            self.serialize_live_node(
+                                c,
+                                shadow.map(|_| child),
+                                clickable,
+                                false,
+                                out,
+                            );
                         }
                         out.push_str("</div>");
                     } else {
@@ -30845,6 +30856,62 @@ mod tests {
             Some("serif"),
             "inherited child-document style must not leak or disappear at the flattening boundary"
         );
+    }
+
+    #[test]
+    fn frame_body_shadow_tree_survives_static_and_live_snapshots() {
+        // DOM #valid-shadow-host-name permits BODY. CSS Shadow 1 #flattening
+        // uses the shadow root's children for every host, including a nested
+        // document's BODY, regardless of open/closed mode (local snapshots
+        // DOM a2331a45 and CSSWG 81c27f68, 2026-09-06).
+        for closed in [false, true] {
+            let mut dom = Dom::parse_document("<body><iframe id=frame></iframe></body>");
+            let frame = dom.get_by_id("frame").unwrap();
+            let body = dom
+                .install_frame_document(
+                    frame,
+                    "<body><strong slot=label>PROJECTED_LABEL</strong>\
+                     <em>UNASSIGNED_LIGHT</em></body>",
+                    "https://frame.test/",
+                )
+                .unwrap();
+            let root = dom
+                .attach_shadow_with_options(
+                    body,
+                    shadow::ShadowRootData {
+                        closed,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let section = dom.create_element("section");
+            let text = dom.create_text("SHADOW_CONTENT");
+            dom.append(section, text);
+            for (name, fallback) in [
+                ("label", "LABEL_FALLBACK"),
+                ("absent", "EMPTY_SLOT_FALLBACK"),
+            ] {
+                let slot = dom.create_element("slot");
+                dom.set_attr(slot, "name", name);
+                let text = dom.create_text(fallback);
+                dom.append(slot, text);
+                dom.append(section, slot);
+            }
+            dom.append(root, section);
+
+            for html in [
+                dom.serialize(DOCUMENT),
+                dom.serialize_live(DOCUMENT, &std::collections::HashSet::new()),
+            ] {
+                assert!(html.contains("data-trust-frame-body"), "{html}");
+                assert!(html.contains("SHADOW_CONTENT"), "{html}");
+                assert!(html.contains("PROJECTED_LABEL"), "{html}");
+                assert!(html.contains("EMPTY_SLOT_FALLBACK"), "{html}");
+                assert!(!html.contains("LABEL_FALLBACK"), "{html}");
+                assert!(!html.contains("UNASSIGNED_LIGHT"), "{html}");
+                assert!(!html.contains("<slot"), "{html}");
+            }
+        }
     }
 
     #[test]
