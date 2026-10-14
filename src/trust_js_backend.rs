@@ -14407,6 +14407,7 @@ host_functions! {
     ("__text_decode", 6, host_text_decode, []),
     ("__body_buffer", 1, host_body_buffer, []),
     ("__base64_convert", 2, host_base64_convert, []),
+    ("__console_inspect", 1, host_console_inspect, []),
     ("__dom_popover", 2, guarded_popover, [0]),
     ("__dom_marquee", 3, guarded_marquee, [0]),
     ("__dom_dialog_modal", 2, guarded_dialog_modal, [0]),
@@ -19799,6 +19800,7 @@ fn install_trust_js_worker_boundary(engine: &mut trust_js::Engine) {
         ("__text_decode", 6, host_text_decode as NativeFn),
         ("__body_buffer", 1, host_body_buffer as NativeFn),
         ("__base64_convert", 2, host_base64_convert as NativeFn),
+        ("__console_inspect", 1, host_console_inspect as NativeFn),
         (
             "__wasm_validate",
             1,
@@ -27662,6 +27664,25 @@ fn host_body_buffer(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
     ctx.make_array_buffer(&bytes)
 }
 
+/// Console #printer permits an implementation-defined object representation.
+/// Inspect engine-owned Error data without [[Get]]/ToPrimitive; other objects
+/// remain opaque in this noninteractive console. In particular, proxies and
+/// authored Error name/message/stack accessors must never run while printing.
+fn host_console_inspect(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let value = args.first().unwrap_or(&Value::Undefined);
+    if !matches!(value, Value::Obj(_)) {
+        return Ok(Value::Null);
+    }
+    if let Some(diagnostic) = ctx.error_diagnostic(value) {
+        return Ok(Value::from_string(diagnostic));
+    }
+    Ok(Value::str(if value.is_callable() {
+        "[Function]"
+    } else {
+        "[Object]"
+    }))
+}
+
 /// HTML #atob and Infra #forgiving-base64. `null` is an internal invalid-input
 /// sentinel; the JS binding throws the invoking Realm's DOMException.
 fn host_base64_convert(_ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
@@ -27969,6 +27990,10 @@ mod media_host_tests;
 #[cfg(test)]
 #[path = "traversable_tests.rs"]
 mod traversable_tests;
+
+#[cfg(test)]
+#[path = "console_tests.rs"]
+mod console_tests;
 
 #[cfg(test)]
 mod tests {
@@ -37266,7 +37291,7 @@ mod tests {
     #[test]
     fn trust_js_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 262, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 263, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -37277,7 +37302,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(trust_js_registry_matches_canonical_boundary());
-        assert_eq!(TRUST_JS_HOST_FUNCTIONS.len(), 262);
+        assert_eq!(TRUST_JS_HOST_FUNCTIONS.len(), 263);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(

@@ -655,64 +655,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // HR Time #the-performance-attribute: [Replaceable].
     defineScopeAttribute("performance", "replaceable", function () { return workerPerformance; });
 
-    // --- console: lines reach the owner's developer console after each task ---
-    // WHATWG Console #logger: each line is the level and the stringified data;
-    // groups indent, counters and timers are per console namespace object.
-    var consoleGroupDepth = 0, consoleCounts = new Map(), consoleTimers = new Map();
-    function consoleLog(level) {
-        return function () {
-            var parts = [];
-            for (var i = 0; i < arguments.length; i++) {
-                try { parts.push(String(arguments[i])); } catch (_) { parts.push("?"); }
-            }
-            if (WK.consoleLines.length < 100)
-                WK.consoleLines.push(level + ": " + "  ".repeat(Math.min(consoleGroupDepth, 64)) + parts.join(" "));
-        };
-    }
-    function consoleLabel(label) { return label === undefined ? "default" : `${label}`; }
-    g.console = {
-        log: consoleLog("log"), info: consoleLog("info"), warn: consoleLog("warn"), error: consoleLog("error"),
-        debug: consoleLog("debug"), trace: consoleLog("trace"), dir: consoleLog("dir"), dirxml: consoleLog("dirxml"),
-        table: consoleLog("table"),
-        // Console §clear: no visible action without a clearable console; empty the group stack.
-        clear() { consoleGroupDepth = 0; },
-        assert(condition, ...data) {
-            if (condition) return;
-            if (data.length === 0 || typeof data[0] !== "string") data.unshift("Assertion failed");
-            else data[0] = "Assertion failed: " + data[0];
-            consoleLog("error").apply(null, data);
-        },
-        group(...data) { consoleLog("group").apply(null, data.length ? data : ["console group"]); consoleGroupDepth++; },
-        groupCollapsed(...data) { consoleLog("groupCollapsed").apply(null, data.length ? data : ["console group"]); consoleGroupDepth++; },
-        groupEnd() { consoleGroupDepth = Math.max(0, consoleGroupDepth - 1); },
-        count(label = "default") {
-            label = consoleLabel(label);
-            var count = (consoleCounts.get(label) || 0) + 1;
-            consoleCounts.set(label, count);
-            consoleLog("count")(label + ": " + count);
-        },
-        countReset(label = "default") {
-            label = consoleLabel(label);
-            if (!consoleCounts.has(label)) { consoleLog("warn")("Count for '" + label + "' does not exist"); return; }
-            consoleCounts.set(label, 0);
-        },
-        time(label = "default") {
-            label = consoleLabel(label);
-            if (consoleTimers.has(label)) { consoleLog("warn")("Timer '" + label + "' already exists"); return; }
-            consoleTimers.set(label, workerPerformance.now());
-        },
-        timeLog(label = "default", ...data) {
-            label = consoleLabel(label);
-            if (!consoleTimers.has(label)) { consoleLog("warn")("Timer '" + label + "' does not exist"); return; }
-            consoleLog("timeLog").apply(null, [label + ": " + (workerPerformance.now() - consoleTimers.get(label)).toFixed(3) + " ms"].concat(data));
-        },
-        timeEnd(label = "default") {
-            label = consoleLabel(label);
-            if (!consoleTimers.has(label)) { consoleLog("warn")("Timer '" + label + "' does not exist"); return; }
-            consoleLog("timeEnd")(label + ": " + (workerPerformance.now() - consoleTimers.get(label)).toFixed(3) + " ms");
-            consoleTimers.delete(label);
-        },
-    };
+    /*__CONSOLE_SHARED__*/
+    // Console lines reach the owner's developer console after each task.
+    g.console = createConsole(line => {
+        if (WK.consoleLines.length < 100) consoleAppend(WK.consoleLines, line);
+    }, workerPerformance.now).namespace;
     Object.defineProperty(g, "console", { value: g.console, writable: true, enumerable: false, configurable: true });
     Object.defineProperty(g.console, Symbol.toStringTag, { value: "console", configurable: true });
 

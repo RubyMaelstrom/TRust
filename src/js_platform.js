@@ -38205,66 +38205,149 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // stand still or run backwards.
     windowPerformance.now = () => currentTime();
 
+    /*__CONSOLE_BEGIN__*/
+    // WHATWG Console #logger / #formatter / #printer, snapshot a82403e8.
+    // Printer accepts objects, not strings coerced from them. Our bounded,
+    // noninteractive representation never runs author getters, proxy traps or
+    // conversion hooks; only explicit %s/%d/%i/%f invoke the specified intrinsics.
+    // This block is also assembled into WorkerGlobalScope.
+    const consoleDefine = Object.defineProperty, consoleCreate = Object.create;
+    function consoleAppend(array, value) {
+        // ECMA-262 #sec-object.defineproperty / #sec-topropertydescriptor:
+        // define an own index rather than Set (which invokes inherited setters).
+        // A null prototype also excludes inherited descriptor get/set hooks.
+        const descriptor = consoleCreate(null);
+        descriptor.value = value;
+        descriptor.writable = descriptor.enumerable = descriptor.configurable = true;
+        consoleDefine(array, array.length, descriptor);
+    }
+    function createConsole(emit, now) {
+        const toString = String, toInteger = parseInt, toFloat = parseFloat;
+        const TypeErrorCtor = TypeError;
+        const apply = Reflect.apply, slice = String.prototype.slice;
+        const join = Array.prototype.join, repeat = String.prototype.repeat;
+        const minimum = Math.min, maximum = Math.max, fixed = Number.prototype.toFixed;
+        const mapGet = Map.prototype.get, mapSet = Map.prototype.set;
+        const mapHas = Map.prototype.has, mapDelete = Map.prototype.delete;
+        let groupDepth = 0;
+        const counts = new Map(), timers = new Map();
+        const display = value => {
+            // Native classification also recognizes [[IsHTMLDDA]] objects,
+            // for which JavaScript's typeof reports "undefined".
+            const object = __console_inspect(value);
+            if (object !== null) return object;
+            return toString(value);
+        };
+        const format = args => {
+            if (args.length < 2 || typeof args[0] !== "string") return args;
+            let target = args[0], consumed = 1;
+            while (consumed < args.length) {
+                let at = -1, specifier;
+                for (let i = 0; i + 1 < target.length; i++) {
+                    const next = target[i + 1];
+                    if (target[i] === "%" && (next === "s" || next === "d" || next === "i" ||
+                        next === "f" || next === "o" || next === "O" || next === "c")) {
+                        at = i; specifier = next; break;
+                    }
+                }
+                if (at < 0) break;
+                const current = args[consumed++];
+                let converted;
+                if (specifier === "s") converted = toString(current);
+                else if (specifier === "d" || specifier === "i")
+                    converted = typeof current === "symbol" ? "NaN" : toString(toInteger(current, 10));
+                else if (specifier === "f")
+                    converted = typeof current === "symbol" ? "NaN" : toString(toFloat(current));
+                else if (specifier === "c") converted = ""; // No styled developer-console UI.
+                else converted = display(current);
+                target = apply(slice, target, [0, at]) + converted + apply(slice, target, [at + 2]);
+            }
+            const result = [target];
+            for (let i = consumed; i < args.length; i++) consoleAppend(result, args[i]);
+            return result;
+        };
+        const print = (level, args) => {
+            const parts = [];
+            for (let i = 0; i < args.length; i++) consoleAppend(parts, display(args[i]));
+            emit(level + ": " + apply(repeat, "  ", [minimum(groupDepth, 64)]) + apply(join, parts, [" "]));
+        };
+        const log = level => (...args) => {
+            if (args.length) print(level, format(args));
+        };
+        const labelString = label => label === undefined ? "default" : `${label}`;
+        const group = (level, data) => {
+            print(level, data.length ? format(data) : ["console group"]);
+            groupDepth++;
+        };
+        const timeOutput = (level, label, data, end) => {
+            label = labelString(label);
+            if (!apply(mapHas, timers, [label])) {
+                print("warn", ["Timer '" + label + "' does not exist"]);
+                return;
+            }
+            const elapsed = now() - apply(mapGet, timers, [label]);
+            if (end) apply(mapDelete, timers, [label]);
+            // #timelog calls Printer directly: data is not a format string.
+            const args = [label + ": " + apply(fixed, elapsed, [3]) + " ms"];
+            for (let i = 0; i < data.length; i++) consoleAppend(args, data[i]);
+            print(level, args);
+        };
+        const namespace = {
+            log: log("log"), info: log("info"), warn: log("warn"), error: log("error"),
+            debug: log("debug"), trace: log("trace"), dirxml: log("dirxml"),
+            dir(item = undefined, options = undefined) {
+                // Web IDL #js-object: optional nullable object, never coerced.
+                if (options !== undefined && options !== null && __console_inspect(options) === null)
+                    throw new TypeErrorCtor("Console options must be an object");
+                print("dir", [item]);
+            },
+            // #table permits falling back to logging the tabularData argument.
+            table(tabularData = undefined) { print("log", [tabularData]); },
+            // #clear permits retaining diagnostics when no clearable UI exists.
+            clear() { groupDepth = 0; },
+            group(...data) { group("group", data); },
+            groupCollapsed(...data) { group("groupCollapsed", data); },
+            groupEnd() { groupDepth = maximum(0, groupDepth - 1); },
+            time(label = "default") {
+                label = labelString(label);
+                if (apply(mapHas, timers, [label])) { print("warn", ["Timer '" + label + "' already exists"]); return; }
+                apply(mapSet, timers, [label, now()]);
+            },
+            timeLog(label = "default", ...data) { timeOutput("timeLog", label, data, false); },
+            timeEnd(label = "default") { timeOutput("timeEnd", label, [], true); },
+            count(label = "default") {
+                label = labelString(label);
+                const count = (apply(mapGet, counts, [label]) || 0) + 1;
+                apply(mapSet, counts, [label, count]);
+                print("count", [label + ": " + count]);
+            },
+            countReset(label = "default") {
+                label = labelString(label);
+                if (apply(mapHas, counts, [label])) apply(mapSet, counts, [label, 0]);
+                else print("countReset", ["Count for '" + label + "' does not exist"]);
+            },
+            assert(condition = false, ...data) {
+                if (condition) return;
+                if (data.length && typeof data[0] === "string") data[0] = "Assertion failed: " + data[0];
+                else {
+                    const prefixed = ["Assertion failed"];
+                    for (let i = 0; i < data.length; i++) consoleAppend(prefixed, data[i]);
+                    data = prefixed;
+                }
+                apply(log("assert"), undefined, data);
+            }
+        };
+        Object.setPrototypeOf(namespace, Object.create(Object.prototype));
+        Object.defineProperty(namespace, Symbol.toStringTag, {value: "console", configurable: true});
+        return {namespace, log};
+    }
+    /*__CONSOLE_END__*/
     // --- console into the outcome's ring ---
-    let consoleGroupDepth = 0;
-    const consoleCounts = new Map(), consoleTimers = new Map();
-    const log = (level) => (...a) => {
-        if (a.length && trust.logs.length < 100) trust.logs.push(level + ": " + "  ".repeat(Math.min(consoleGroupDepth, 64)) + a.map((x) => { try { return String(x); } catch { return "?"; } }).join(" "));
-    };
-    const consoleLabel = (label) => label === undefined ? "default" : `${label}`;
-    const consoleGroup = (level, data) => {
-        log(level)(...(data.length ? data : ["console group"]));
-        consoleGroupDepth++;
-    };
-    const consoleTimeOutput = (level, label, data, end) => {
-        label = consoleLabel(label);
-        if (!consoleTimers.has(label)) {
-            log("warn")("Timer '" + label + "' does not exist");
-            return;
-        }
-        const elapsed = currentTime() - consoleTimers.get(label);
-        if (end) consoleTimers.delete(label);
-        log(level)(label + ": " + elapsed.toFixed(3) + " ms", ...data);
-    };
-    // WHATWG Console #groupcollapsed / #countreset / #timelog: these are
-    // always callable namespace operations, even without an open devtools UI.
-    // Group, counter and timer state belongs to each Window's console object.
-    // Console §clear permits no visible action when there is no clearable console.
-    // Keep the append-only host diagnostics, but empty the group stack.
-    g.console = {
-        log: log("log"), info: log("info"), warn: log("warn"), error: log("error"),
-        debug: log("debug"), trace: log("trace"), dir: log("dir"), dirxml: log("dirxml"),
-        clear() { consoleGroupDepth = 0; },
-        group(...data) { consoleGroup("group", data); },
-        groupCollapsed(...data) { consoleGroup("groupCollapsed", data); },
-        groupEnd() { consoleGroupDepth = Math.max(0, consoleGroupDepth - 1); },
-        table: log("table"),
-        time(label = "default") {
-            label = consoleLabel(label);
-            if (consoleTimers.has(label)) { log("warn")("Timer '" + label + "' already exists"); return; }
-            consoleTimers.set(label, currentTime());
-        },
-        timeLog(label = "default", ...data) { consoleTimeOutput("timeLog", label, data, false); },
-        timeEnd(label = "default") { consoleTimeOutput("timeEnd", label, [], true); },
-        count(label = "default") {
-            label = consoleLabel(label);
-            const count = (consoleCounts.get(label) || 0) + 1;
-            consoleCounts.set(label, count);
-            log("count")(label + ": " + count);
-        },
-        countReset(label = "default") {
-            label = consoleLabel(label);
-            if (consoleCounts.has(label)) consoleCounts.set(label, 0);
-            else log("countReset")("Count for '" + label + "' does not exist");
-        },
-        assert(condition = false, ...data) {
-            if (condition) return;
-            if (typeof data[0] === "string") data[0] = "Assertion failed: " + data[0];
-            else data.unshift("Assertion failed");
-            log("assert")(...data);
-        }
-    };
-    Object.setPrototypeOf(g.console, Object.create(Object.prototype));
+    const consoleState = createConsole(line => {
+        if (trust.logs.length < 100) consoleAppend(trust.logs, line);
+    }, currentTime);
+    g.console = consoleState.namespace;
+    const log = consoleState.log;
 
     // --- small web APIs ---
     // HTML #atob / Infra #forgiving-base64: native conversion avoids a JS

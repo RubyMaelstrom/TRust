@@ -1597,6 +1597,11 @@ pub(crate) fn worker_prelude() -> &'static str {
                     "/*__HTML_EVENTS_SHARED__*/",
                     platform_block("/*__HTML_EVENTS_BEGIN__*/", "/*__HTML_EVENTS_END__*/"),
                     1,
+                )
+                .replacen(
+                    "/*__CONSOLE_SHARED__*/",
+                    platform_block("/*__CONSOLE_BEGIN__*/", "/*__CONSOLE_END__*/"),
+                    1,
                 );
             format!(
                 "{domexception}\n{worker_scope}\n{geometry}\n{string_list}\n{navigator}\n{permissions}\n{ports}\n{codec}\n{features}\n{abort}\n{streams}\n{file}\n{blob_url}\n{fetch}\n{cache_storage}\n{indexed_db}\n{xhr}\n{websocket}\n{eventsource}\n{dedicated_worker}\n{rejection}\n__rejection_bind(__rejection_api);\n{bitmap}\n{WEBGL}\n{canvas}\n{crypto}\n{urlpattern}\n{wasm}\n\
