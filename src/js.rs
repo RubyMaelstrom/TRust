@@ -238,6 +238,9 @@ pub struct PageEnv {
     /// How the frontend presents the page's top-level traversable as the
     /// document is created: its initial visibility state and system focus.
     pub(crate) traversable: TraversableState,
+    /// Test-only realm isolation; production has no COOP/COEP implementation.
+    #[cfg(test)]
+    pub(crate) test_cross_origin_isolated: bool,
 }
 
 /// The frontend's presentation of a top-level traversable, which its pages
@@ -307,6 +310,8 @@ impl PageEnv {
             referrer: String::new(),
             fullscreen_supported: true,
             traversable: TraversableState::SHOWN,
+            #[cfg(test)]
+            test_cross_origin_isolated: false,
         }
     }
 }

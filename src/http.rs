@@ -6973,6 +6973,8 @@ async fn execute_js_with_presentation(
         content_type: media.clone(),
         fullscreen_supported,
         traversable,
+        #[cfg(test)]
+        test_cross_origin_isolated: false,
     };
     // The page actor owns the engine on its own dedicated stack. Its first
     // event is `Static`

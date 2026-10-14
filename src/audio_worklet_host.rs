@@ -38,6 +38,8 @@ struct Launch {
     environment: ModuleFetchEnvironment,
     registry: Arc<std::sync::Mutex<super::message_port_host::Registry>>,
     secure_context: bool,
+    #[cfg(test)]
+    cross_origin_isolated: bool,
 }
 
 /// The factory for the AudioWorkletGlobalScope of a context created by the
@@ -58,6 +60,8 @@ pub(super) fn factory(ctx: &mut Ctx) -> Option<Factory> {
         fetched: network.fetched.clone(),
         environment,
         registry: state.message_ports.registry.clone(),
+        #[cfg(test)]
+        cross_origin_isolated: state.test_hooks.cross_origin_isolated,
     };
     Some(Box::new(move |setup: Setup| {
         AudioWorkletScope::new(launch, setup).map(|scope| Box::new(scope) as Box<dyn Worklet>)
@@ -118,6 +122,11 @@ impl AudioWorkletScope {
             clock.origin_ms,
             setup.rate,
             setup.quantum,
+        );
+        #[cfg(test)]
+        let config = format!(
+            "{config}globalThis.__worker_cfg.crossOriginIsolated = {};",
+            launch.cross_origin_isolated
         );
         if !eval_trust_js_worker_setup(&mut engine, &config, "audio worklet configuration")? {
             return Err(String::from("audio worklet setup was interrupted"));
@@ -398,5 +407,9 @@ impl Worklet for AudioWorkletScope {
             let _ = self.engine.run_microtasks_interruptible();
         }
         let _ = self.engine.run_microtasks_interruptible();
+    }
+
+    fn next_job_deadline(&self) -> Option<std::time::Instant> {
+        self.engine.next_atomics_wait_deadline()
     }
 }

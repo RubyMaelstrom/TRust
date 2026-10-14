@@ -654,6 +654,8 @@ struct TrustJsWorkerLaunch {
     /// settings object's origin (Storage #obtain-a-storage-key, Permissions #dfn-permission-store).
     storage: crate::js::WebStorage,
     permission_store: PermissionStore,
+    #[cfg(test)]
+    cross_origin_isolated: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1107,6 +1109,9 @@ impl TraversableHost {
 
 #[derive(Default)]
 struct TestHooks {
+    /// Enable isolated realms in scheduler tests without changing exposure policy.
+    #[cfg(test)]
+    cross_origin_isolated: bool,
     /// Unit-test factories republish private platform internals; see
     /// `expose_platform_internals_for_tests`.
     #[cfg(test)]
@@ -3062,6 +3067,8 @@ mod desktop {
             traversable: env.traversable,
             referrer_policy: env.referrer_policy,
             referrer: env.referrer.clone(),
+            #[cfg(test)]
+            test_cross_origin_isolated: env.test_cross_origin_isolated,
         };
         let mut page = match load_page(
             html,
@@ -3489,6 +3496,7 @@ mod desktop {
         Timer(usize),
         Render(usize),
         Lifecycle(usize),
+        Checkpoint,
         Maintenance,
     }
 
@@ -4626,6 +4634,8 @@ mod desktop {
                 .is_some_and(|started| started.elapsed() >= input_burst_budget);
             if immediate.is_some() {
                 // That Document's frontend leaving comes first.
+            } else if page.engine.has_pending_jobs() {
+                immediate = Some(Wake::Checkpoint);
             } else if !yield_interactions
                 && let Some((index, command)) = take_any_interaction(page, turn_order(page))
             {
@@ -4728,6 +4738,18 @@ mod desktop {
                 (None, Some(render)) => (Some(render), Wake::Render(render_wake_index)),
                 (None, None) => (None, Wake::Maintenance),
             };
+            // ECMA-262 #sec-hostenqueuetimeoutjob and
+            // #sec-enqueueatomicswaitasynctimeoutjob: an idle Agent must
+            // still resolve finite Atomics.waitAsync waits at their deadline.
+            // This uses the engine's monotonic clock, not the page's virtual
+            // timer clock, and runs the ordinary job checkpoint afterwards.
+            if let Some(deadline) = page.engine.next_atomics_wait_deadline() {
+                let atomics_wait = deadline.saturating_duration_since(Instant::now());
+                if wait.is_none_or(|wait| atomics_wait < wait) {
+                    wait = Some(atomics_wait);
+                    timeout_wake = Wake::Checkpoint;
+                }
+            }
             // One maintenance wake ends the hint even on an otherwise quiet
             // document. No polling or repeated idle collections are needed.
             if let Some(until) = task_gc_defer_until {
@@ -4852,6 +4874,7 @@ mod desktop {
                     Wake::Timer(_) => trace.timer_turns += 1,
                     Wake::Render(_) => {}
                     Wake::Lifecycle(_) => trace.lifecycle_turns += 1,
+                    Wake::Checkpoint => {}
                     Wake::Maintenance => {}
                 }
             }
@@ -4863,6 +4886,12 @@ mod desktop {
             let mut finish_others = true;
             match wake {
                 Wake::Maintenance => finish_others = false,
+                Wake::Checkpoint => {
+                    prepare_unbounded_task(interrupt);
+                    checkpoint(page, "engine job");
+                    ended = finish_traversables(page, None);
+                    finish_others = false;
+                }
                 Wake::Group(command) => {
                     finish_others = false;
                     run_group_command(page, command, host_tasks, host_rx, interrupt);
@@ -5398,6 +5427,10 @@ mod desktop {
         interrupt.set_deadline(None);
         let clock = Rc::new(RealmClock::new());
         let mut state = HostState::new(dom.clone(), clock.clone());
+        #[cfg(test)]
+        {
+            state.test_hooks.cross_origin_isolated = env.test_cross_origin_isolated;
+        }
         state.base = base.clone();
         // HTML #document-base-url affects resolution, never the initiating
         // environment's identity. Retain the top Window just like child
@@ -5484,6 +5517,15 @@ mod desktop {
         if let Err(error) = eval(&mut engine, &config, "TRust configuration") {
             outcome.errors.push(error);
             return Err(outcome);
+        }
+        #[cfg(test)]
+        if env.test_cross_origin_isolated {
+            eval(
+                &mut engine,
+                "globalThis.__trust_cfg.crossOriginIsolated = true;",
+                "test isolation",
+            )
+            .unwrap();
         }
         if let Err(error) = eval_platform_prelude(&mut engine) {
             outcome.errors.push(error);
@@ -6234,6 +6276,10 @@ mod desktop {
                 let deadline = trust_number(page, "nextDeadline");
                 let timer_due = deadline.is_some_and(|deadline| deadline <= now);
                 let platform_ready = trust_bool(page, "hasPlatformTask");
+                if page.engine.has_pending_jobs() {
+                    checkpoint(page, "parser engine job");
+                    continue;
+                }
                 if self.prefer_page_task && (timer_due || platform_ready) {
                     self.prefer_page_task = false;
                     if timer_due {
@@ -6252,8 +6298,12 @@ mod desktop {
                     self.prefer_page_task = true;
                     continue;
                 }
-                let wait = deadline
+                let mut wait = deadline
                     .map(|deadline| Duration::from_secs_f64((deadline - now).max(0.0) / 1000.0));
+                if let Some(deadline) = page.engine.next_atomics_wait_deadline() {
+                    let atomics_wait = deadline.saturating_duration_since(Instant::now());
+                    wait = Some(wait.map_or(atomics_wait, |wait| wait.min(atomics_wait)));
+                }
                 let runtime = self.runtime.get_or_insert_with(|| {
                     tokio::runtime::Builder::new_current_thread()
                         .enable_time()
@@ -6383,6 +6433,7 @@ mod desktop {
                     || state.webaudio.has_contexts()
             });
         host_work
+            || page.engine.next_atomics_wait_deadline().is_some()
             || trust_number(page, "nextDeadline").is_some()
             // A hidden Document's animation frame callbacks wait for its
             // next rendering opportunity, outside the timer deadlines.
@@ -10179,6 +10230,171 @@ mod desktop {
             })
             .await
             .expect("continuous rendering starved a native page key");
+        }
+
+        #[tokio::test]
+        async fn atomics_wait_async_timeouts_settle_on_an_otherwise_idle_page() {
+            // ECMA-262 #sec-enqueueatomicswaitasynctimeoutjob: neither a
+            // timer nor an incoming frontend task is needed to resolve a
+            // finite wait. The settled reactions can mutate and render DOM.
+            let html = r#"<button id=wait>Wait</button><output id=result></output><script>
+                const result = document.getElementById('result');
+                const view = new Int32Array(new SharedArrayBuffer(4));
+                document.getElementById('wait').onclick = () => {
+                    const order = [];
+                    const first = Atomics.waitAsync(view, 0, 0, 50);
+                    const second = Atomics.waitAsync(view, 0, 0, 100);
+                    if (!first.async || !second.async) throw Error('wait must be asynchronous');
+                    first.value.then(value => order.push('first:' + value));
+                    second.value.then(value => {
+                        order.push('second:' + value);
+                        result.textContent = order.join(',');
+                    });
+                };
+            </script>"#;
+            let node = Dom::parse_document(html).get_by_id("wait").unwrap();
+            let mut env = PageEnv::bare(DEFAULT_URL);
+            env.test_cross_origin_isolated = true;
+            let (handle, mut events) = spawn_page(html.into(), env);
+            tokio::time::timeout(Duration::from_secs(15), async {
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Updated { outcome, .. }) => {
+                            assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                            break;
+                        }
+                        Some(PageEvt::Trouble(errors)) => panic!("{errors:?}"),
+                        Some(_) => {}
+                        None => panic!("page closed before the wait"),
+                    }
+                }
+                handle.try_send_user(PageCmd::Click(node)).unwrap();
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Updated { html, outcome }) => {
+                            assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                            if html.contains(">first:timed-out,second:timed-out</output>") {
+                                break;
+                            }
+                        }
+                        Some(PageEvt::Trouble(errors)) => panic!("{errors:?}"),
+                        Some(_) => {}
+                        None => panic!("page closed before its asynchronous waits timed out"),
+                    }
+                }
+            })
+            .await
+            .expect("idle Atomics.waitAsync timeouts did not settle");
+        }
+
+        #[tokio::test]
+        async fn a_finite_atomics_wait_async_keeps_the_page_resident_until_it_settles() {
+            let html = r#"<output id=result>pending</output><script>
+                setTimeout(() => {
+                    const view = new Int32Array(new SharedArrayBuffer(4));
+                    Atomics.waitAsync(view, 0, 0, 250).value.then(value => {
+                        document.getElementById('result').textContent = value;
+                    });
+                }, 0);
+            </script>"#;
+            let mut env = PageEnv::bare(DEFAULT_URL);
+            env.test_cross_origin_isolated = true;
+            let (_handle, mut events) = spawn_page(html.into(), env);
+            tokio::time::timeout(Duration::from_secs(15), async {
+                let mut updated = false;
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Updated { outcome, .. }) => {
+                            updated = true;
+                            assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                        }
+                        Some(PageEvt::Static { html, outcome }) => {
+                            assert!(updated, "the page must remain resident for the wait");
+                            assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                            assert!(html.contains(">timed-out</output>"), "{html}");
+                            break;
+                        }
+                        Some(PageEvt::Trouble(errors)) => panic!("{errors:?}"),
+                        Some(_) => {}
+                        None => panic!("page closed without retiring after its wait"),
+                    }
+                }
+            })
+            .await
+            .expect("finite wait did not settle and retire the page");
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn atomics_wait_async_timeouts_settle_while_the_parser_waits_for_a_script() {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            // The blocked script is released only by the wait's reaction.
+            // No unrelated timer or completion can accidentally wake it.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin = format!("http://{}/", listener.local_addr().unwrap());
+            let (release, gate) = tokio::sync::watch::channel(false);
+            let server = tokio::spawn(async move {
+                let mut requests = tokio::task::JoinSet::new();
+                for _ in 0..2 {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let release = release.clone();
+                    let mut gate = gate.clone();
+                    requests.spawn(async move {
+                        let mut request = Vec::new();
+                        let mut buffer = [0; 2048];
+                        while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                            let count = stream.read(&mut buffer).await.unwrap();
+                            assert_ne!(count, 0);
+                            request.extend_from_slice(&buffer[..count]);
+                        }
+                        let request = String::from_utf8(request).unwrap();
+                        let body = if request.starts_with("GET /slow.js ") {
+                            gate.wait_for(|ready| *ready).await.unwrap();
+                            "document.getElementById('result').textContent = waitResult;"
+                        } else {
+                            assert!(request.starts_with("GET /ready "), "{request}");
+                            release.send(true).unwrap();
+                            ""
+                        };
+                        stream
+                            .write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes())
+                            .await
+                            .unwrap();
+                    });
+                }
+                while let Some(result) = requests.join_next().await {
+                    result.unwrap();
+                }
+            });
+            let html = r#"<output id=result>pending</output><script>
+                var waitResult = 'pending';
+                const view = new Int32Array(new SharedArrayBuffer(4));
+                Atomics.waitAsync(view, 0, 0, 50).value.then(value => {
+                    waitResult = value;
+                    fetch('/ready');
+                });
+            </script><script src='/slow.js'></script>"#;
+            let mut env = PageEnv::bare(&origin);
+            env.test_cross_origin_isolated = true;
+            env.net = Some(tokio::runtime::Handle::current());
+            let (_handle, mut events) = spawn_page(html.into(), env);
+            tokio::time::timeout(Duration::from_secs(15), async {
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Updated { html, outcome })
+                        | Some(PageEvt::Static { html, outcome }) => {
+                            assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                            assert!(html.contains(">timed-out</output>"), "{html}");
+                            break;
+                        }
+                        Some(PageEvt::Trouble(errors)) => panic!("{errors:?}"),
+                        Some(_) => {}
+                        None => panic!("page closed before its blocked script ran"),
+                    }
+                }
+            })
+            .await
+            .expect("Atomics.waitAsync stalled while the parser waited");
+            server.await.unwrap();
         }
 
         #[tokio::test]
@@ -19557,6 +19773,8 @@ fn host_worker_spawn(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
         task_sender: TrustJsTaskSender::Worker(Arc::downgrade(&ctl)),
         storage: state.storage.clone(),
         permission_store: state.permission_store.clone(),
+        #[cfg(test)]
+        cross_origin_isolated: state.test_hooks.cross_origin_isolated,
     };
     let handle = workers.handle.clone();
     let tasks = workers.tasks.child();
@@ -20407,6 +20625,10 @@ fn run_trust_js_worker(
     let clock = Rc::new(RealmClock::new());
     let mut state = HostState::new(Rc::new(RefCell::new(Dom::new())), clock.clone());
     state.base = launch.script_url.clone();
+    #[cfg(test)]
+    {
+        state.test_hooks.cross_origin_isolated = launch.cross_origin_isolated;
+    }
     state.task_events = Some(launch.task_sender.clone());
     state.window_cookie_contexts.insert(
         0,
@@ -20515,6 +20737,11 @@ fn run_trust_js_worker(
         serde_json::to_string(launch.cookie_context.storage_partition())
             .expect("storage partition serializes"),
     );
+    #[cfg(test)]
+    let config = format!(
+        "{config}globalThis.__worker_cfg.crossOriginIsolated = {};",
+        launch.cross_origin_isolated
+    );
     for platform in [false, true] {
         let setup = if platform {
             eval_trust_js_worker_platform_setup(&mut engine)
@@ -20605,6 +20832,7 @@ fn run_trust_js_worker(
         Performance,
         Platform,
         Frame,
+        Checkpoint,
     }
     let wall_origin = Instant::now();
     let virtual_origin = trust_js_worker_now(&mut engine);
@@ -20637,11 +20865,12 @@ fn run_trust_js_worker(
             trust_js_worker_internal_call(&mut engine, "hasPlatformTask", &[]),
             Ok(Value::Bool(true))
         );
+        let checkpoint_ready = engine.has_pending_jobs();
         // Distinct task sources all make progress. A busy implicit worker port
         // must not starve transferred channels or an already-due timer.
         let mut task = None;
-        for offset in 0..7 {
-            let source = (source_cursor + offset) % 7;
+        for offset in 0..8 {
+            let source = (source_cursor + offset) % 8;
             task = match source {
                 0 => queued_command.take().map(WorkerTask::Command),
                 1 if deadline.is_some_and(|deadline| deadline <= now) => Some(WorkerTask::Timer),
@@ -20650,10 +20879,11 @@ fn run_trust_js_worker(
                 4 if performance_ready => Some(WorkerTask::Performance),
                 5 if platform_ready => Some(WorkerTask::Platform),
                 6 if frame.is_some_and(|frame| frame <= now) => Some(WorkerTask::Frame),
+                7 if checkpoint_ready => Some(WorkerTask::Checkpoint),
                 _ => None,
             };
             if task.is_some() {
-                source_cursor = (source + 1) % 7;
+                source_cursor = (source + 1) % 8;
                 break;
             }
         }
@@ -20664,20 +20894,27 @@ fn run_trust_js_worker(
                     (Some(deadline), Some(frame)) => Some(deadline.min(frame)),
                     (deadline, frame) => deadline.or(frame),
                 };
-                if wake.is_none() {
+                let mut wait =
+                    wake.map(|wake| Duration::from_secs_f64((wake - now).max(0.0) / 1000.0));
+                let mut timeout_task = if frame.is_some_and(|frame| Some(frame) == wake) {
+                    WorkerTask::Frame
+                } else {
+                    WorkerTask::Timer
+                };
+                if let Some(deadline) = engine.next_atomics_wait_deadline() {
+                    let atomics_wait = deadline.saturating_duration_since(Instant::now());
+                    if wait.is_none_or(|wait| atomics_wait < wait) {
+                        wait = Some(atomics_wait);
+                        timeout_task = WorkerTask::Checkpoint;
+                    }
+                }
+                if wait.is_none() {
                     engine.collect_garbage_at_idle();
                 }
-                match wake {
-                    Some(wake) => match ctl_rx
-                        .recv_timeout(Duration::from_secs_f64((wake - now).max(0.0) / 1000.0))
-                    {
+                match wait {
+                    Some(wait) => match ctl_rx.recv_timeout(wait) {
                         Ok(command) => WorkerTask::Command(command),
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-                            if frame.is_some_and(|frame| frame <= wake) =>
-                        {
-                            WorkerTask::Frame
-                        }
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => WorkerTask::Timer,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => timeout_task,
                         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                     },
                     None => match ctl_rx.recv() {
@@ -20722,6 +20959,7 @@ fn run_trust_js_worker(
             WorkerTask::Frame => {
                 trust_js_worker_internal_call(&mut engine, "runAnimationFrames", &[Value::Num(now)])
             }
+            WorkerTask::Checkpoint => Ok(Value::Undefined),
         };
         match task_result {
             Ok(_) => {}
@@ -37092,6 +37330,7 @@ mod tests {
         url: &str,
     ) -> trust_js::Engine {
         state.test_hooks.internals = true;
+        let cross_origin_isolated = state.test_hooks.cross_origin_isolated;
         state
             .window_request_urls
             .insert(0, url::Url::parse(url).unwrap());
@@ -37108,7 +37347,7 @@ mod tests {
         install_host_boundary(&mut engine);
         eval(
             &mut engine,
-            &format!("globalThis.__trust_cfg = {{ url: {url:?}, width: 640, height: 384 }};"),
+            &format!("globalThis.__trust_cfg = {{ url: {url:?}, width: 640, height: 384, crossOriginIsolated: {cross_origin_isolated} }};"),
             "configuration",
         )
         .unwrap();
@@ -39325,6 +39564,51 @@ mod tests {
             30,
         );
         assert_eq!(string_value(&mut engine, "scriptProbe"), "ok");
+    }
+
+    #[test]
+    fn atomics_wait_async_timeouts_settle_in_suspended_audio_worklets() {
+        let (_runtime, mut engine, mut tasks) = worker_test_environment_with_isolation(true);
+        eval(
+            &mut engine,
+            r#"
+            (async () => {
+                const source = `
+                    port.onmessage = () => {
+                        const view = new Int32Array(new SharedArrayBuffer(4));
+                        Atomics.waitAsync(view, 0, 0, 50).value.then(value => {
+                            port.postMessage(value);
+                        });
+                    };
+                `;
+                const replies = [];
+                for (const context of [new OfflineAudioContext(1, 128, 8000),
+                    new AudioContext({sinkId: {type:'none'}})]) {
+                    await context.audioWorklet.addModule('data:text/javascript,' + encodeURIComponent(source));
+                    const reply = new Promise(resolve => {
+                        context.audioWorklet.port.onmessage = event => resolve(event.data);
+                    });
+                    context.audioWorklet.port.postMessage('wait');
+                    replies.push(context.state + ':' + await reply);
+                    if (context instanceof AudioContext) await context.close();
+                }
+                return replies.join(',');
+            })().then(value => globalThis.idleWorkletResult = value,
+                error => globalThis.idleWorkletResult = 'ERROR:' + error.name + ':' + error.message);
+            "#,
+            "idle audio worklet Atomics.waitAsync",
+        )
+        .unwrap();
+        pump_audio_until(
+            &mut engine,
+            &mut tasks,
+            "globalThis.idleWorkletResult !== undefined",
+            15,
+        );
+        assert_eq!(
+            string_value(&mut engine, "idleWorkletResult"),
+            "suspended:timed-out,suspended:timed-out"
+        );
     }
 
     #[test]
@@ -46692,6 +46976,16 @@ mod tests {
         trust_js::Engine,
         tokio::sync::mpsc::UnboundedReceiver<TrustJsHostTask>,
     ) {
+        worker_test_environment_with_isolation(false)
+    }
+
+    fn worker_test_environment_with_isolation(
+        cross_origin_isolated: bool,
+    ) -> (
+        tokio::runtime::Runtime,
+        trust_js::Engine,
+        tokio::sync::mpsc::UnboundedReceiver<TrustJsHostTask>,
+    ) {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -46703,6 +46997,7 @@ mod tests {
             Rc::new(RefCell::new(Dom::new())),
             Rc::new(RealmClock::new()),
         );
+        state.test_hooks.cross_origin_isolated = cross_origin_isolated;
         state.enable_network(
             page.clone(),
             runtime.handle().clone(),
@@ -47123,6 +47418,55 @@ mod tests {
             .expect("owner can still schedule work")
             .unwrap();
         server.abort();
+    }
+
+    #[test]
+    fn atomics_wait_async_timeouts_settle_in_an_otherwise_idle_worker() {
+        let (runtime, mut engine, mut task_rx) = worker_test_environment_with_isolation(true);
+        eval(
+            &mut engine,
+            r#"
+            globalThis.waitResults = [];
+            const source = `
+                const view = new Int32Array(new SharedArrayBuffer(4));
+                const immediate = Atomics.waitAsync(view, 0, 0, 0);
+                postMessage(immediate.async + ':' + immediate.value);
+                const first = Atomics.waitAsync(view, 0, 0, 50);
+                const second = Atomics.waitAsync(view, 0, 0, 100);
+                first.value.then(value => postMessage('first:' + value));
+                second.value.then(value => {
+                    postMessage('second:' + value);
+                    close();
+                });
+            `;
+            const worker = new Worker(URL.createObjectURL(new Blob([source], {type:'text/javascript'})));
+            worker.onmessage = event => waitResults.push(event.data);
+            worker.onerror = event => { throw Error(event.message); };
+            "#,
+            "worker Atomics.waitAsync",
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while string_value(&mut engine, "waitResults.length") != "3" {
+            assert!(Instant::now() < deadline, "idle worker timeouts stalled");
+            if matches!(
+                engine_call_trust_method(&mut engine, "hasPlatformTask", &[]),
+                Ok(Value::Bool(true))
+            ) {
+                engine_call_trust_method(&mut engine, "runPlatformTask", &[]).unwrap_or_else(
+                    |error| panic!("{}", describe_eval_error(&mut engine, error, "worker task")),
+                );
+            } else if let Ok(Some(task)) = runtime.block_on(async {
+                tokio::time::timeout(Duration::from_millis(200), task_rx.recv()).await
+            }) {
+                dispatch_host_task(&mut engine, task).unwrap();
+            }
+            run_microtask_checkpoint(&mut engine);
+        }
+        assert_eq!(
+            string_value(&mut engine, "waitResults.join(',')"),
+            "false:timed-out,first:timed-out,second:timed-out"
+        );
     }
 
     #[test]

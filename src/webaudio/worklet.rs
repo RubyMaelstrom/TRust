@@ -69,6 +69,10 @@ pub trait Worklet {
     fn set_time(&mut self, frame: u64);
     /// Run the scope's pending tasks (port messages) and microtasks.
     fn run_tasks(&mut self);
+    /// The next host job deadline, even when audio processing is suspended.
+    fn next_job_deadline(&self) -> Option<std::time::Instant> {
+        None
+    }
 }
 
 /// AudioWorkletNode's processing on the rendering thread.

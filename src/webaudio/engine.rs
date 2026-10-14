@@ -149,6 +149,27 @@ fn render_quantum(
     }
 }
 
+/// The associated task queue and ECMA-262 timeout jobs still progress while
+/// processing is suspended. Park until a message or the next job deadline;
+/// AudioWorkletProcessor.process is only invoked by a render quantum.
+fn park_worklet(worklet: &mut Option<Box<dyn Worklet>>, running: bool) {
+    let deadline = worklet.as_mut().and_then(|scope| {
+        let deadline = scope.next_job_deadline();
+        if !running || deadline.is_some_and(|at| at <= Instant::now()) {
+            scope.run_tasks();
+            scope.next_job_deadline()
+        } else {
+            deadline
+        }
+    });
+    match deadline {
+        Some(deadline) => {
+            std::thread::park_timeout(deadline.saturating_duration_since(Instant::now()));
+        }
+        None => std::thread::park(),
+    }
+}
+
 /// A report from the rendering thread.
 #[derive(Debug)]
 pub enum Notice {
@@ -587,7 +608,7 @@ fn run_realtime(
         {
             continue;
         }
-        std::thread::park();
+        park_worklet(&mut worklet, running);
     }
 }
 
@@ -703,7 +724,7 @@ fn run_offline(shared: &Arc<Shared>, mut graph: Graph, channels: usize, notify: 
         if shared.pending() || (running && !jobs.is_empty()) {
             continue;
         }
-        std::thread::park();
+        park_worklet(&mut worklet, running);
     }
 }
 
