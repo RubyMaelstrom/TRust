@@ -23,6 +23,10 @@
 //! - SVG 2 text.html#__svg__SVGTextContentElement__getSubStringLength: lengths
 //!   are sums of typographic character advances, without `x`/`y`/`dx`/`dy`
 //!   positioning, so the copy drops those attributes.
+//! - #__svg__SVGTextContentElement__getExtentOfChar uses usvg's retained
+//!   shaping-cluster source ranges and positioned full glyph cells. Its copy
+//!   keeps positioning and rotation, and removes transforms outside the
+//!   queried element's user coordinate system.
 //!
 //! Text content children (`tspan`, `textPath`) are only laid out inside their
 //! `text` element. Their queries copy the whole `text` with every other
@@ -175,6 +179,7 @@ enum Purpose {
     BoundingBox(BoundingBoxOptions),
     Path,
     Text,
+    TextCells,
 }
 
 impl Purpose {
@@ -367,10 +372,6 @@ impl TextMetrics {
                 .sum(),
         )
     }
-}
-
-fn utf16_len(text: &str) -> u32 {
-    u32::try_from(text.encode_utf16().count()).unwrap_or(u32::MAX)
 }
 
 impl Dom {
@@ -625,7 +626,11 @@ impl Dom {
         outer: (f64, f64),
     ) -> Option<std::rc::Rc<usvg::Tree>> {
         let markup = self.svg_geometry_document(id, purpose, outer)?;
-        crate::img::document_svg_geometry_tree(&markup, self.svg_geometry_fonts(id))
+        crate::img::document_svg_geometry_tree(
+            &markup,
+            self.svg_geometry_fonts(id),
+            matches!(purpose, Purpose::Text | Purpose::TextCells),
+        )
     }
 
     /// SVG 2 types.html#__svg__SVGGraphicsElement__getBBox: the bounding box
@@ -802,7 +807,38 @@ impl Dom {
         let Some(text) = first_text(group) else {
             return TextMetrics::empty();
         };
-        text_metrics(text, tree.fontdb())
+        text_metrics(text)
+    }
+
+    /// SVG 2 text.html#__svg__SVGTextContentElement__getExtentOfChar: the
+    /// tight bounds of the positioned typographic character's full glyph cell.
+    /// Addressing is in normalized UTF-16 code units; every code unit of a
+    /// ligature, combining sequence or surrogate pair addresses the same cell.
+    pub(crate) fn svg_text_extent(
+        &self,
+        id: NodeId,
+        charnum: u32,
+        outer: (f64, f64),
+    ) -> Option<[f64; 4]> {
+        if !self.svg_is_rendered(id) {
+            return None;
+        }
+        let tree = self.svg_geometry_tree(id, Purpose::TextCells, outer)?;
+        let usvg::Node::Group(group) = tree.node_by_id(TARGET_ID)? else {
+            return None;
+        };
+        let (text, transform) = first_positioned_text(group, usvg::Transform::identity())?;
+        let (characters, clusters) = indexed_text_clusters(text);
+        if charnum >= characters {
+            return None;
+        }
+        // #TermFindTypographicCharacterForCharacter skips an addressable
+        // character with no laid-out typographic character to the next one.
+        let (_, _, cluster) = clusters.into_iter().find(|(_, last, _)| charnum < *last)?;
+        let [x, y, width, height] = cluster.glyph_cell.map(f64::from);
+        let rect = to_affine(transform.pre_concat(cluster.transform))
+            .transform_rect_bbox(Rect::new(x, y, x + width, y + height));
+        Some([rect.x0, rect.y0, rect.width(), rect.height()])
     }
 
     /// Serialize the geometry document for `target` (see the module comment).
@@ -1067,7 +1103,9 @@ impl Dom {
             match local {
                 "style" | "class" | "visibility" | "opacity" | "filter" | "mask" => false,
                 "display" => !forced,
-                "transform" => !is_target,
+                "transform" => {
+                    !is_target && !(copy.purpose == Purpose::TextCells && copy.forced.contains(&id))
+                }
                 "clip-path" => copy.purpose.clipped(),
                 "marker" | "marker-start" | "marker-mid" | "marker-end" => copy.purpose.markers(),
                 "x" | "y" | "dx" | "dy" | "rotate" => {
@@ -1109,7 +1147,10 @@ impl Dom {
                     "visibility" | "opacity" | "filter" | "mask" => false,
                     "display" => !forced,
                     "transform" | "transform-origin" | "transform-box" | "translate" | "rotate"
-                    | "scale" => !is_target,
+                    | "scale" => {
+                        !is_target
+                            && !(copy.purpose == Purpose::TextCells && copy.forced.contains(&id))
+                    }
                     "clip-path" => copy.purpose.clipped(),
                     "marker" | "marker-start" | "marker-mid" | "marker-end" => {
                         copy.purpose.markers()
@@ -1505,14 +1546,25 @@ fn first_text(group: &usvg::Group) -> Option<&usvg::Text> {
     })
 }
 
+fn first_positioned_text(
+    group: &usvg::Group,
+    transform: usvg::Transform,
+) -> Option<(&usvg::Text, usvg::Transform)> {
+    group.children().iter().find_map(|child| match child {
+        usvg::Node::Text(text) => Some((text.as_ref(), transform)),
+        usvg::Node::Group(inner) => {
+            first_positioned_text(inner, transform.pre_concat(inner.transform()))
+        }
+        _ => None,
+    })
+}
+
 /// One typographic character of a laid-out text element: the glyph cluster
 /// usvg positioned, in logical order.
 struct Cluster {
     /// Whether its span is visible: the geometry document hides every
     /// character outside the queried element.
     visible: bool,
-    /// Addressable characters (UTF-16 code units) it corresponds to.
-    characters: u32,
     /// Its origin on the baseline, in user units, with any rotation.
     origin: usvg::Transform,
     /// Its advance in the inline direction, including letter and word
@@ -1598,7 +1650,6 @@ fn text_clusters(text: &usvg::Text, fontdb: &usvg::fontdb::Database) -> Vec<Clus
                 let (origin, own, face, scale) = *entry;
                 clusters.push(Cluster {
                     visible: span.visible,
-                    characters: utf16_len(&glyph.text),
                     origin,
                     advance: own,
                     ascent: face.ascent * scale,
@@ -1656,29 +1707,112 @@ fn text_box(
 /// The visible typographic characters of a laid-out text element (the copy
 /// hides every other character) with their advances. The geometry document
 /// drops positioning attributes, so the characters follow one another.
-fn text_metrics(text: &usvg::Text, fontdb: &usvg::fontdb::Database) -> TextMetrics {
-    let mut characters = 0;
-    for chunk in text.chunks() {
-        for span in chunk.spans().iter().filter(|span| span.is_visible()) {
-            if let Some(slice) = chunk.text().get(span.start()..span.end()) {
-                characters += utf16_len(slice);
-            }
-        }
-    }
-    let mut first = 0u32;
-    let clusters = text_clusters(text, fontdb)
+fn text_metrics(text: &usvg::Text) -> TextMetrics {
+    let (characters, indexed) = indexed_text_clusters(text);
+    let clusters = indexed
         .into_iter()
-        .filter(|cluster| cluster.visible)
-        .map(|cluster| {
-            let entry = (first, cluster.advance);
-            first = first.saturating_add(cluster.characters);
-            entry
+        .filter(|(_, _, cluster)| {
+            // #getSubStringLength assigns a cluster's advance only to its
+            // first character in document order. A tspan containing just a
+            // later character still shares its extent, but not its advance.
+            let chunk = &text.chunks()[cluster.chunk_index];
+            let byte = cluster.source_range.start;
+            let spans = chunk.spans();
+            let span = spans.partition_point(|span| span.end() <= byte);
+            spans
+                .get(span)
+                .is_some_and(|span| span.is_visible() && span.start() <= byte)
         })
+        .map(|(first, _, cluster)| (first, f64::from(cluster.advance)))
         .collect();
     TextMetrics {
         characters,
         clusters,
     }
+}
+
+/// SVG 2 #TextLayoutAlgorithm marks discarded soft hyphens and bidi controls
+/// non-addressable. usvg has already collapsed and trimmed whitespace and
+/// removed display:none descendants from each source chunk.
+fn svg_addressable_character(character: char) -> bool {
+    !matches!(character, '\u{00ad}' | '\u{061c}' | '\u{200e}' | '\u{200f}'
+        | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+/// Map the shaper's logical source ranges to the queried element's addressable
+/// UTF-16 indices. Ranges are indexed before bidi reordering; a cluster crossing
+/// a queried tspan boundary still supplies the cell of its included characters.
+/// Prefixes are retained only at cluster boundaries: one source scan, then
+/// logarithmic lookups, without an allocation per UTF-16 code unit.
+fn indexed_text_clusters(
+    text: &usvg::Text,
+) -> (u32, Vec<(u32, u32, &usvg::layout::PositionedCluster)>) {
+    let mut clusters: Vec<_> = text
+        .layouted()
+        .iter()
+        .flat_map(|span| &span.positioned_clusters)
+        .filter(|cluster| {
+            text.chunks()
+                .get(cluster.chunk_index)
+                .and_then(|chunk| chunk.text().get(cluster.source_range.clone()))
+                .is_some()
+        })
+        .collect();
+    clusters.sort_by_key(|cluster| (cluster.chunk_index, cluster.source_range.start));
+    let mut prefixes: Vec<_> = clusters
+        .iter()
+        .flat_map(|cluster| {
+            [
+                (cluster.chunk_index, cluster.source_range.start, 0u32),
+                (cluster.chunk_index, cluster.source_range.end, 0u32),
+            ]
+        })
+        .collect();
+    prefixes.sort_unstable_by_key(|&(chunk, byte, _)| (chunk, byte));
+    prefixes.dedup_by_key(|entry| (entry.0, entry.1));
+    let mut next_prefix = 0;
+    let mut characters = 0u32;
+    for (chunk_index, chunk) in text.chunks().iter().enumerate() {
+        let spans = chunk.spans();
+        let mut span_index = 0;
+        for (byte, character) in chunk.text().char_indices() {
+            while next_prefix < prefixes.len()
+                && (prefixes[next_prefix].0, prefixes[next_prefix].1) <= (chunk_index, byte)
+            {
+                prefixes[next_prefix].2 = characters;
+                next_prefix += 1;
+            }
+            while span_index < spans.len() && spans[span_index].end() <= byte {
+                span_index += 1;
+            }
+            if spans
+                .get(span_index)
+                .is_some_and(|span| span.is_visible() && span.start() <= byte && byte < span.end())
+                && svg_addressable_character(character)
+            {
+                characters = characters.saturating_add(character.len_utf16() as u32);
+            }
+        }
+        while next_prefix < prefixes.len() && prefixes[next_prefix].0 <= chunk_index {
+            prefixes[next_prefix].2 = characters;
+            next_prefix += 1;
+        }
+    }
+    let prefix = |chunk, byte| {
+        prefixes
+            .binary_search_by_key(&(chunk, byte), |&(chunk, byte, _)| (chunk, byte))
+            .ok()
+            .map(|index| prefixes[index].2)
+    };
+    let indexed = clusters
+        .into_iter()
+        .filter_map(|cluster| {
+            let first = prefix(cluster.chunk_index, cluster.source_range.start)?;
+            let last = prefix(cluster.chunk_index, cluster.source_range.end)?;
+            (last > first).then_some((first, last, cluster))
+        })
+        .collect();
+    (characters, indexed)
 }
 
 /// The group a clip or mask document applies its resource to.
@@ -1730,7 +1864,7 @@ impl SvgClipSource {
              <rect width=\"{view_width}\" height=\"{view_height}\"/></g></svg>",
             self.defs, self.id
         );
-        let tree = crate::img::document_svg_geometry_tree(&markup, self.fonts)?;
+        let tree = crate::img::document_svg_geometry_tree(&markup, self.fonts, false)?;
         // usvg does not render an element whose clipPath has no children
         // (or is otherwise in error): "An empty clipping path will
         // completely clip away the element that had the 'clip-path' property
@@ -1981,7 +2115,8 @@ impl Dom {
         };
         // Resolve the mask region as the SVG renderer does.
         let probe = document((0.0, 0.0, width, height), 0.0);
-        let tree = crate::img::document_svg_geometry_tree(&probe, self.svg_geometry_fonts(mask))?;
+        let tree =
+            crate::img::document_svg_geometry_tree(&probe, self.svg_geometry_fonts(mask), false)?;
         let Some(usvg::Node::Group(group)) = tree.node_by_id(RESOURCE_TARGET_ID) else {
             return None;
         };

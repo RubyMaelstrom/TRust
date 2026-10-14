@@ -28,6 +28,8 @@ const SUBSTRING_LENGTH: u8 = 9;
 /// SVG 2 types.html#__svg__SVGLength__value: the bases relative lengths of
 /// an element resolve against, `[viewport width, viewport height, font size]`.
 const LENGTH_CONTEXT: u8 = 10;
+/// SVG 2 text.html#__svg__SVGTextContentElement__getExtentOfChar.
+const CHAR_EXTENT: u8 = 11;
 
 fn number(args: &[Value], index: usize) -> f64 {
     args.get(index)
@@ -168,6 +170,16 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
                 Value::Num(height),
                 Value::Num(font_size),
             ])
+        }
+        CHAR_EXTENT => {
+            let charnum = number(args, 2);
+            let cell = (charnum.is_finite() && charnum >= 0.0 && charnum <= f64::from(u32::MAX))
+                .then(|| dom.svg_text_extent(id, charnum as u32, outer))
+                .flatten();
+            drop(dom);
+            cell.map_or(Value::Null, |cell| {
+                ctx.make_array(cell.into_iter().map(Value::Num).collect())
+            })
         }
         _ => Value::Null,
     })

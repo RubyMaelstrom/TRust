@@ -27996,6 +27996,10 @@ mod traversable_tests;
 mod console_tests;
 
 #[cfg(test)]
+#[path = "svg_text_extent_tests.rs"]
+mod svg_text_extent_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::dom::DOCUMENT;

@@ -25594,7 +25594,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         SVG_GEOMETRY_TOTAL_LENGTH = 3, SVG_GEOMETRY_POINT_AT_LENGTH = 4,
         SVG_GEOMETRY_IN_FILL = 5, SVG_GEOMETRY_IN_STROKE = 6, SVG_GEOMETRY_CHARS = 7,
         SVG_GEOMETRY_TEXT_LENGTH = 8, SVG_GEOMETRY_SUBSTRING_LENGTH = 9,
-        SVG_GEOMETRY_LENGTH_CONTEXT = 10;
+        SVG_GEOMETRY_LENGTH_CONTEXT = 10, SVG_GEOMETRY_CHAR_EXTENT = 11;
     const svgGetAttribute = Element.prototype.getAttribute;
     const svgSetAttribute = Element.prototype.setAttribute;
     function svgInterface(name, Base) {
@@ -26108,6 +26108,15 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 svgUnsignedLong(charnum), svgUnsignedLong(nchars));
             if (typeof length !== "number") throw new DOMException("The index is not in the allowed range", "IndexSizeError");
             return Math.fround(length);
+        },
+        // SVG 2 text.html#__svg__SVGTextContentElement__getExtentOfChar:
+        // a new detached SVGRect (Geometry 1's DOMRect alias), in user space.
+        getExtentOfChar(charnum) {
+            const id = svgElementId(this, SVG_TEXT_CONTENT_ELEMENTS);
+            svgArguments(1, arguments.length, "getExtentOfChar");
+            const cell = __svg_geometry(id, SVG_GEOMETRY_CHAR_EXTENT, svgUnsignedLong(charnum));
+            if (!cell) throw new DOMException("The index is not in the allowed range", "IndexSizeError");
+            return createDOMRect(cell[0], cell[1], cell[2], cell[3]);
         },
     });
     const SVGTextPositioningElement = svgInterface("SVGTextPositioningElement", SVGTextContentElement);

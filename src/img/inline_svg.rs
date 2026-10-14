@@ -270,7 +270,7 @@ struct GeometryParser {
     /// refers to it) into the next parse spares every SVG DOM geometry query
     /// a font file read and a database copy.
     options: Option<(u64, resvg::usvg::Options<'static>)>,
-    trees: VecDeque<(u64, String, std::rc::Rc<resvg::usvg::Tree>)>,
+    trees: VecDeque<(u64, bool, String, std::rc::Rc<resvg::usvg::Tree>)>,
 }
 
 thread_local! {
@@ -285,16 +285,20 @@ thread_local! {
 pub(crate) fn document_svg_geometry_tree(
     svg: &str,
     fonts: u64,
+    retain_text_clusters: bool,
 ) -> Option<std::rc::Rc<resvg::usvg::Tree>> {
     if svg.len() > super::MAX_SVG_BYTES {
         return None;
     }
     GEOMETRY_PARSER.with(|cell| {
         let mut parser = cell.borrow_mut();
-        if let Some((_, _, tree)) = parser
-            .trees
-            .iter()
-            .find(|(environment, markup, _)| *environment == fonts && markup == svg)
+        if let Some((_, _, _, tree)) =
+            parser
+                .trees
+                .iter()
+                .find(|(environment, retained, markup, _)| {
+                    *environment == fonts && *retained == retain_text_clusters && markup == svg
+                })
         {
             return Some(tree.clone());
         }
@@ -311,6 +315,7 @@ pub(crate) fn document_svg_geometry_tree(
             parser.trees.clear();
         }
         let (_, options) = parser.options.as_mut()?;
+        options.retain_text_clusters = retain_text_clusters;
         let tree = std::rc::Rc::new(resvg::usvg::Tree::from_str(svg, options).ok()?);
         options.fontdb = tree.fontdb().clone();
         if parser.trees.len() == GEOMETRY_TREES {
@@ -318,7 +323,7 @@ pub(crate) fn document_svg_geometry_tree(
         }
         parser
             .trees
-            .push_front((fonts, svg.to_owned(), tree.clone()));
+            .push_front((fonts, retain_text_clusters, svg.to_owned(), tree.clone()));
         Some(tree)
     })
 }

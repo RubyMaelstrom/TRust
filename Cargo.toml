@@ -317,6 +317,9 @@ tempfile = "3.27.0"
 wat = "1"
 
 [patch.crates-io]
+# Preserve usvg's exact shaping clusters for SVG DOM character geometry.
+# Optional records stay off for ordinary rendering; see vendor/usvg-0.48.1/README.trust.txt.
+usvg = { path = "vendor/usvg-0.48.1" }
 # Keep receive streams owned while reads are pending, so STOP_SENDING and
 # stream IDs remain available during cancellation; see PATCHES.md.
 h3-quinn = { path = "vendor/h3-quinn-0.0.10" }
