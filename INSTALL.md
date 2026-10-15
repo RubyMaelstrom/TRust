@@ -2,7 +2,8 @@
 
 You'll need Rust, a C compiler, and the matching [TRust JS checkout](https://github.com/RubyMaelstrom/trust-js)
 next to TRust at `../trust-js`. The engine checkout must provide
-`crates/trust-js`; Cargo loads this package directly.
+`crates/trust-js`; Cargo loads this package directly. TRust 0.3 uses TRust JS
+`main` revision `e33109935c25e291da71c082cfd03d2f24c12a12`.
 
 From the TRust directory:
 
@@ -56,3 +57,23 @@ cargo xwin build --release --locked --target x86_64-pc-windows-msvc
 
 The executables land in `target/x86_64-pc-windows-msvc/release/`.
 Windows WebGL needs a driver providing `libEGL.dll`.
+
+For the public 0.3 release builds, use the pinned TRust JS revision above and
+the `numbered-release` profile (Fat-LTO, one codegen unit, stripped symbols).
+Build Linux ARM64 and Linux x86-64 natively on the matching architecture:
+
+```sh
+cargo build --profile numbered-release --locked --bin trust --bin trust-desktop
+```
+
+The binaries land in `target/numbered-release/`. Cross-build Windows x86-64
+from Linux with:
+
+```sh
+cargo xwin build --profile numbered-release --locked --target x86_64-pc-windows-msvc --bin trust --bin trust-desktop
+```
+
+The executables land in `target/x86_64-pc-windows-msvc/numbered-release/`.
+The GitHub release packages both browsers at the archive root: Linux uses
+`trust-linux-arm64.tar.gz` or `trust-linux-x86-64.tar.gz`, and Windows uses
+`trust-windows-x86-64.zip`.

@@ -89,7 +89,7 @@ macro_rules! user_agent_platform {
 ///
 /// Fetch leaves the value implementation-defined but, "for unfortunate web
 /// compatibility reasons", strongly encourages browsers to start it with
-/// `Mozilla/5.0 (` and model it after other browsers. A bare `TRust/0.2`
+/// `Mozilla/5.0 (` and model it after other browsers. A bare `TRust/0.3`
 /// is refused outright by bot-management services before any page script
 /// runs. So TRust takes that shape and names only itself (RFC 9110 §10.1.5),
 /// in the Gecko navigator compatibility mode.
@@ -101,7 +101,7 @@ macro_rules! user_agent_platform {
 /// hints. On 2026-10-08 that identity failed DataDome's device check, which
 /// then holds the client to Chrome's own script environment, so TRust keeps
 /// the plain form until a site requires more.
-pub(crate) const USER_AGENT: &str = concat!("Mozilla/5.0 (", user_agent_platform!(), ") TRust/0.2");
+pub(crate) const USER_AGENT: &str = concat!("Mozilla/5.0 (", user_agent_platform!(), ") TRust/0.3");
 
 /// Firefox's current User-Agent string for Linux x86_64, read out of the local
 /// Firefox 153 build (`libxul.so` reports the `Firefox/153.0` product token and
@@ -21880,7 +21880,7 @@ customElements.define('lit-counter', LitCounter);
         );
         // RFC 9110 §10.1.5: after the compatibility prefix, TRust names only
         // itself, claiming no other engine's tokens.
-        assert!(USER_AGENT.ends_with(") TRust/0.2"), "{USER_AGENT}");
+        assert!(USER_AGENT.ends_with(") TRust/0.3"), "{USER_AGENT}");
         // HTML #concept-navigator-compatibility-mode follows the engine
         // tokens: Gecko's values unless the User-Agent carries Chrome's.
         assert_eq!(
@@ -21911,13 +21911,13 @@ customElements.define('lit-counter', LitCounter);
         // parameters, here TRust, a GREASE brand and the Chromium equivalence
         // class at the User-Agent's Chrome major version. #sec-ch-ua-mobile is
         // an sf-boolean; #sec-ch-ua-platform a quoted common platform value.
-        let linux = "Mozilla/5.0 (X11; Linux x86_64) TRust/0.2 Chrome/153.0.0.0 AppleWebKit/537.36 Safari/537.36";
+        let linux = "Mozilla/5.0 (X11; Linux x86_64) TRust/0.3 Chrome/153.0.0.0 AppleWebKit/537.36 Safari/537.36";
         assert_eq!(
             client_hints_for(linux),
             [
                 (
                     "Sec-CH-UA",
-                    String::from(r#""TRust";v="0.2", "Not_A Brand";v="8", "Chromium";v="153""#)
+                    String::from(r#""TRust";v="0.3", "Not_A Brand";v="8", "Chromium";v="153""#)
                 ),
                 ("Sec-CH-UA-Mobile", String::from("?0")),
                 ("Sec-CH-UA-Platform", String::from(r#""Linux""#)),
