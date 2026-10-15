@@ -1323,15 +1323,8 @@ seconds); no reporting timer or background work is added. Allocation reports occ
 at completed collections. Counters and bounded site tables retain no DOM/JS owners.
 These builds are for causal diagnosis, never controlled acceptance timing.
 
-With `trust-js/optimizing-jit`, `TRUST_JS_OPT_JIT_DIAGNOSTICS=1` additionally records
-optimizer compiler phases, code/IR sizes, native entries, helper calls, heap guards,
-ownership transfers and frame publication. Heap guards count the explicit property
-and ownership guard routines, not every conditional branch. Transfers count logical
-retains/releases, including alias-cancelled groups; they are not allocator calls.
 Existing artifacts stay under the architecture evidence directories; use new output
 names and retain failed attempts as well as completed runs.
-`TRUST_JS_OPT_JIT_DIAGNOSTICS=compile` records compiler/static observations without
-emitting native execution counters; use that mode to attribute compilation cost.
 
 ### Representation and browser-work comparisons
 
@@ -1368,8 +1361,3 @@ TRUST_PERSISTENT_STYLE_CONTEXTS=0 target/release/trust ./src/fixtures/number_inp
 Leave these variables unset to exercise the ordinary default. Each control changes
 the implementation path while preserving the same required web semantics; turning
 one off does not recreate an entire historical engine or browser revision.
-Cranelift remains a separate optional build feature with opt-in runtime policies.
-`TRUST_JS_OPT_JIT_OSR=1` is a restricted loop-continuation experiment, independent of
-whole-function `TRUST_JS_OPT_JIT` admission. Neither is enabled in an ordinary release.
-See the sibling TRust JS `AGENTS.md` and `docs/optimizing-tier.txt` for its limits and
-the retained negative application results.
