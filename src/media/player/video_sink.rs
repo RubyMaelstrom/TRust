@@ -83,6 +83,12 @@ impl VideoSurface {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).serial
     }
 
+    /// Show `frame` as a player would (tests of the presentation paths).
+    #[cfg(test)]
+    pub(crate) fn show_for_test(&self, frame: VideoFrame) {
+        self.show(Arc::new(frame));
+    }
+
     fn show(&self, frame: Arc<VideoFrame>) {
         {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());

@@ -42,6 +42,7 @@ use super::vello_cpu::{
     simple_rounded_rect, text_shadow_blur, vello_affine, vello_blend, vello_color,
     vello_css_filter, vello_rect, vello_stops, vello_stroke,
 };
+use super::video_gpu::VideoConverter;
 use super::{
     Affine2d, CssRect, DisplayCommand, ImageFit, ImageHandle, ImageResource, ImageSampling,
     PaintBrush, PaintColor, Primitive, RasterBackend, RasterFrame, RendererKind, Scene,
@@ -119,6 +120,8 @@ pub struct VelloHybridRenderer {
     /// not run (SVG filter graphs, Backdrop Root Images), created only while
     /// scenes use them, so both backends filter identical pixels.
     effects: Option<Box<VelloCpuRenderer>>,
+    /// Converts video frames into the image atlas, created with the first.
+    video: Option<VideoConverter>,
 }
 
 impl VelloHybridRenderer {
@@ -258,6 +261,7 @@ impl VelloHybridRenderer {
             device_failure: failure,
             adapter_name,
             effects: None,
+            video: None,
         })
     }
 
@@ -735,6 +739,9 @@ impl VelloHybridRenderer {
         let height = u16::try_from(size.height)
             .map_err(|_| format!("framebuffer height {} exceeds Vello limit", size.height))?;
         self.frame_id = self.frame_id.wrapping_add(1);
+        if let Some(video) = &mut self.video {
+            video.release_idle(self.frame_id);
+        }
         let live_images: HashSet<_> = scene
             .primitives
             .iter()
@@ -1284,6 +1291,11 @@ impl VelloHybridRenderer {
         sampling: ImageSampling,
         transform: [f64; 6],
     ) -> Result<(), String> {
+        if let Some(painted) =
+            self.paint_video_frame(target, encoder, handle, rect, source_rect, fit, sampling)
+        {
+            return painted;
+        }
         let store_revision = scene.image_revision(handle);
         let resource = scene.image(handle);
         let svg_size = resource
@@ -1359,29 +1371,10 @@ impl VelloHybridRenderer {
                 stale = self.images.remove(&key);
             }
         }
-        if !self.images.contains_key(&key) && self.images.len() >= MAX_REGISTERED_IMAGES {
-            let victim = self
-                .images
-                .iter()
-                .filter(|(key, image)| {
-                    !is_desktop_heart_image_handle(key.handle)
-                        && image.last_used_frame != self.frame_id
-                })
-                .min_by_key(|(_, image)| image.last_used_frame)
-                .map(|(key, _)| *key);
-            if let Some(victim) = victim
-                && let Some(CachedImage {
-                    source: ImageSource::OpaqueId { id, .. },
-                    ..
-                }) = self.images.remove(&victim)
-            {
-                self.renderer
-                    .destroy_image(&mut self.resources, encoder, id);
-            } else {
-                target.set_paint(vello_color(PaintColor::Muted));
-                target.fill_rect(&vello_rect(rect));
-                return Ok(());
-            }
+        if !self.images.contains_key(&key) && !self.make_room_for_image(encoder) {
+            target.set_paint(vello_color(PaintColor::Muted));
+            target.fill_rect(&vello_rect(rect));
+            return Ok(());
         }
         if !self.images.contains_key(&key)
             && let Some(revision) = store_revision
@@ -1429,10 +1422,151 @@ impl VelloHybridRenderer {
             self.renderer
                 .destroy_image(&mut self.resources, encoder, id);
         }
+        self.fill_cached_image(target, key, rect, source_rect, fit, sampling);
+        Ok(())
+    }
+
+    /// Make room in the image cache for one more registered image by
+    /// releasing the least recently drawn one not drawn this frame; false
+    /// when every image is in use.
+    fn make_room_for_image(&mut self, encoder: &mut wgpu::CommandEncoder) -> bool {
+        if self.images.len() < MAX_REGISTERED_IMAGES {
+            return true;
+        }
+        let victim = self
+            .images
+            .iter()
+            .filter(|(key, image)| {
+                !is_desktop_heart_image_handle(key.handle) && image.last_used_frame != self.frame_id
+            })
+            .min_by_key(|(_, image)| image.last_used_frame)
+            .map(|(key, _)| *key);
+        if let Some(victim) = victim
+            && let Some(CachedImage {
+                source: ImageSource::OpaqueId { id, .. },
+                ..
+            }) = self.images.remove(&victim)
+        {
+            self.renderer
+                .destroy_image(&mut self.resources, encoder, id);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// A video element's current frame, converted on the GPU from its
+    /// Y'CbCr planes into its atlas slot (`video_gpu`), then drawn as an
+    /// image. `None` when the converter does not take the frame: the CPU
+    /// conversion (`Scene::image`) presents it instead.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_video_frame(
+        &mut self,
+        target: &mut vello_gpu::Scene,
+        encoder: &mut wgpu::CommandEncoder,
+        handle: ImageHandle,
+        rect: CssRect,
+        source_rect: Option<CssRect>,
+        fit: ImageFit,
+        sampling: ImageSampling,
+    ) -> Option<Result<(), String>> {
+        let surface = handle.video_surface()?;
+        let (frame, serial) = crate::media::player::surface(surface)?.current()?;
+        let key = ImageCacheKey::from(handle);
+        let upload_limit = HYBRID_IMAGE_ATLAS_LIMIT
+            .min(self.device.limits().max_texture_dimension_2d)
+            .min(u32::from(u16::MAX));
+        let (width, height) = bounded_image_dimensions(frame.width, frame.height, upload_limit)?;
+        let size = (u16::try_from(width).ok()?, u16::try_from(height).ok()?);
+        if self
+            .images
+            .get(&key)
+            .is_none_or(|cached| cached.revision != serial)
+        {
+            let device = &self.device;
+            let converter = self
+                .video
+                .get_or_insert_with(|| VideoConverter::new(device));
+            let prepared =
+                converter.prepare(&self.device, encoder, surface, &frame, size, self.frame_id)?;
+            let writer = converter.writer(&prepared);
+            // A same-sized frame converts into its retained slot.
+            let in_place = match self.images.get(&key) {
+                Some(CachedImage {
+                    source: ImageSource::OpaqueId { id, .. },
+                    upload_width,
+                    upload_height,
+                    ..
+                }) if (*upload_width, *upload_height) == (width, height) => {
+                    self.renderer.update_image(
+                        &self.resources,
+                        &self.device,
+                        &self.queue,
+                        encoder,
+                        *id,
+                        &writer,
+                    )
+                }
+                _ => false,
+            };
+            if !in_place {
+                if let Some(CachedImage {
+                    source: ImageSource::OpaqueId { id, .. },
+                    ..
+                }) = self.images.remove(&key)
+                {
+                    self.renderer
+                        .destroy_image(&mut self.resources, encoder, id);
+                }
+                if !self.make_room_for_image(encoder) {
+                    return None;
+                }
+                let converter = self.video.as_ref()?;
+                let writer = converter.writer(&prepared);
+                let id = self.renderer.upload_image(
+                    &mut self.resources,
+                    &self.device,
+                    &self.queue,
+                    encoder,
+                    &writer,
+                );
+                self.images.insert(
+                    key,
+                    CachedImage {
+                        source: ImageSource::opaque_id_with_transparency_hint(id, false),
+                        upload_width: width,
+                        upload_height: height,
+                        width: frame.width,
+                        height: frame.height,
+                        revision: serial,
+                        last_used_frame: self.frame_id,
+                    },
+                );
+            }
+            if let Some(cached) = self.images.get_mut(&key) {
+                cached.width = frame.width;
+                cached.height = frame.height;
+                cached.revision = serial;
+            }
+        }
+        self.fill_cached_image(target, key, rect, source_rect, fit, sampling);
+        Some(Ok(()))
+    }
+
+    /// Draw the cached image `key` over `rect` as `fit` places it.
+    fn fill_cached_image(
+        &mut self,
+        target: &mut vello_gpu::Scene,
+        key: ImageCacheKey,
+        rect: CssRect,
+        source_rect: Option<CssRect>,
+        fit: ImageFit,
+        sampling: ImageSampling,
+    ) {
         let Some(image) = self.images.get_mut(&key) else {
             target.set_paint(vello_color(PaintColor::Muted));
             target.fill_rect(&vello_rect(rect));
-            return Ok(());
+            return;
         };
         image.last_used_frame = self.frame_id;
         let iw = image.width as f32;
@@ -1491,7 +1625,6 @@ impl VelloHybridRenderer {
             target.pop_clip();
         }
         target.reset_paint_transform();
-        Ok(())
     }
 
     fn acquire_surface(&self) -> Result<CurrentSurfaceTexture, String> {

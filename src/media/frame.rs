@@ -4,7 +4,9 @@
 //! [`VideoFrame::to_rgba`] is the CPU presentation path: an 8-bit fixed-point
 //! Y'CbCr→R'G'B' conversion (ITU-T H.273 matrices and quantization, as
 //! `img::yuv` uses at full precision for still images) with optional
-//! integer box downscaling, cheap enough to run per frame. Colour is not
+//! integer box downscaling, cheap enough to run per frame. The Hybrid
+//! renderer converts on the GPU instead (`render::video_gpu`), with the same
+//! matrices at full precision ([`VideoFrame::rgb_rows`]). Colour is not
 //! converted between primaries or transfer functions here: SDR video is
 //! shown as sRGB, as browsers do without colour management.
 
@@ -170,6 +172,47 @@ impl VideoFrame {
             self.convert_rows(&coefficients, factor, out_w, 0, &mut rgba);
         }
         Some((rgba, out_w as u32, out_h as u32))
+    }
+
+    /// The conversion of this frame's samples to R'G'B' in [0, 1], as three
+    /// rows applied to (Y', Cb, Cr, 1) in sample values at the frame's bit
+    /// depth: H.273's quantization (§8.1, equations 20–25 for narrow range
+    /// and 26–31 for full) and its KR/KB matrices (§8.3, Table 4), the ones
+    /// [`Self::to_rgba`] applies in fixed point at 8 bits. The identity
+    /// matrix (0, GBR) maps Cr, Y' and Cb to R', G' and B'.
+    pub fn rgb_rows(&self) -> [[f32; 4]; 3] {
+        let depth = f64::from(self.bit_depth.clamp(8, 16));
+        let unit = (depth - 8.0).exp2();
+        let (y_offset, y_range, c_offset, c_range) = if self.color.full_range {
+            let max = depth.exp2() - 1.0;
+            (0.0, max, (depth - 1.0).exp2(), max)
+        } else {
+            (16.0 * unit, 219.0 * unit, 128.0 * unit, 224.0 * unit)
+        };
+        let row = |y: f64, cb: f64, cr: f64, constant: f64| {
+            [y as f32, cb as f32, cr as f32, constant as f32]
+        };
+        if self.color.matrix == 0 {
+            let (scale, offset) = (1.0 / y_range, -y_offset / y_range);
+            return [
+                row(0.0, 0.0, scale, offset),
+                row(scale, 0.0, 0.0, offset),
+                row(0.0, scale, 0.0, offset),
+            ];
+        }
+        let (kr, kb) = kr_kb(self.color.matrix);
+        let kg = 1.0 - kr - kb;
+        let y = 1.0 / y_range;
+        let cr_r = 2.0 * (1.0 - kr) / c_range;
+        let cb_g = 2.0 * (1.0 - kb) * kb / kg / c_range;
+        let cr_g = 2.0 * (1.0 - kr) * kr / kg / c_range;
+        let cb_b = 2.0 * (1.0 - kb) / c_range;
+        let y0 = -y_offset * y;
+        [
+            row(y, 0.0, cr_r, y0 - cr_r * c_offset),
+            row(y, -cb_g, -cr_g, y0 + (cb_g + cr_g) * c_offset),
+            row(y, cb_b, 0.0, y0 - cb_b * c_offset),
+        ]
     }
 
     fn convert_rows(
@@ -390,18 +433,23 @@ struct Coefficients {
     identity: bool,
 }
 
+/// H.273 Table 4 KR/KB of `matrix`. Unspecified (2) and reserved code
+/// points use BT.601 for SD sizes; callers pass BT.709 for HD when
+/// unspecified.
+fn kr_kb(matrix: u8) -> (f64, f64) {
+    match matrix {
+        1 => (0.2126, 0.0722),
+        4 => (0.30, 0.11),
+        5 | 6 => (0.299, 0.114),
+        7 => (0.212, 0.087),
+        9 | 10 => (0.2627, 0.0593),
+        _ => (0.299, 0.114),
+    }
+}
+
 impl Coefficients {
     fn new(color: ColorInfo, _bit_depth: u8) -> Self {
-        // H.273 Table 4 KR/KB. Unspecified (2) and reserved code points use
-        // BT.601 for SD sizes; callers pass BT.709 for HD when unspecified.
-        let (kr, kb) = match color.matrix {
-            1 => (0.2126, 0.0722),
-            4 => (0.30, 0.11),
-            5 | 6 => (0.299, 0.114),
-            7 => (0.212, 0.087),
-            9 | 10 => (0.2627, 0.0593),
-            _ => (0.299, 0.114),
-        };
+        let (kr, kb) = kr_kb(color.matrix);
         let identity = color.matrix == 0;
         let (y_offset, y_range, c_range) = if color.full_range {
             (0.0, 255.0, 255.0)
@@ -426,8 +474,13 @@ impl Coefficients {
     #[inline]
     fn apply(&self, y: u32, u: u32, v: u32) -> (u8, u8, u8) {
         if self.identity {
-            // GBR: Y'=G, Cb=B, Cr=R.
-            return (v.min(255) as u8, y.min(255) as u8, u.min(255) as u8);
+            // GBR: Y'=G, Cb=B, Cr=R, each quantized like luma (H.273,
+            // MatrixCoefficients 0; as `img::yuv` decodes still images).
+            let channel = |sample: u32| {
+                (((sample as i32 - self.y_offset) * self.y_scale + (1 << 13)) >> 14).clamp(0, 255)
+                    as u8
+            };
+            return (channel(v), channel(y), channel(u));
         }
         let [r, g, b, _] = self.pixel(y as i32, self.terms(u as i32, v as i32));
         (r, g, b)
@@ -597,6 +650,58 @@ mod tests {
             red601[0] >= 253 && red601[1] <= 2 && red601[2] <= 2,
             "{:?}",
             &red601[..4]
+        );
+    }
+
+    /// The GPU path's rows convert as the CPU path does (to within its
+    /// 8-bit fixed-point rounding), for every matrix and range, and at high
+    /// bit depths keep their extremes exact.
+    #[test]
+    fn conversion_rows_agree_with_the_cpu_path() {
+        let apply = |rows: [[f32; 4]; 3], y: f32, cb: f32, cr: f32| {
+            rows.map(|[a, b, c, d]| ((a * y + b * cb + c * cr + d).clamp(0.0, 1.0) * 255.0).round())
+        };
+        for matrix in [0, 1, 4, 5, 6, 7, 9] {
+            for full_range in [false, true] {
+                for (y, cb, cr) in [
+                    (16, 128, 128),
+                    (235, 128, 128),
+                    (63, 102, 240),
+                    (128, 40, 200),
+                ] {
+                    let frame = frame(y, cb, cr, full_range, matrix);
+                    let (cpu, ..) = frame.to_rgba(1).unwrap();
+                    let gpu = apply(frame.rgb_rows(), y.into(), cb.into(), cr.into());
+                    for channel in 0..3 {
+                        assert!(
+                            (gpu[channel] - f32::from(cpu[channel])).abs() <= 1.0,
+                            "matrix {matrix} full {full_range} {y}/{cb}/{cr}: {gpu:?} vs {:?}",
+                            &cpu[..3]
+                        );
+                    }
+                }
+            }
+        }
+        // 10-bit narrow range, and P010's left-aligned samples read as 16-bit.
+        let ten = VideoFrame {
+            bit_depth: 10,
+            ..frame(0, 0, 0, false, 1)
+        };
+        assert_eq!(apply(ten.rgb_rows(), 940.0, 512.0, 512.0), [255.0; 3]);
+        assert_eq!(apply(ten.rgb_rows(), 64.0, 512.0, 512.0), [0.0; 3]);
+        let p010 = VideoFrame {
+            bit_depth: 16,
+            ..frame(0, 0, 0, false, 1)
+        };
+        let shifted = |value: f32| value * 64.0;
+        assert_eq!(
+            apply(
+                p010.rgb_rows(),
+                shifted(940.0),
+                shifted(512.0),
+                shifted(512.0)
+            ),
+            [255.0; 3]
         );
     }
 

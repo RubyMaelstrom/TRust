@@ -39,6 +39,7 @@ pub use unload_prompt::{
 };
 pub mod vello_cpu;
 pub mod vello_hybrid;
+mod video_gpu;
 
 #[cfg(test)]
 mod effect_raster_tests;
@@ -48,6 +49,8 @@ mod image_raster_tests;
 mod mask_raster_tests;
 #[cfg(test)]
 mod text_raster_tests;
+#[cfg(test)]
+mod video_raster_tests;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct CssRect {
