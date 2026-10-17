@@ -8,9 +8,9 @@ use std::ptr::{self, null, null_mut};
 use std::sync::Arc;
 
 use super::abi::{
-    AV_INPUT_BUFFER_PADDING_SIZE, AV_PKT_FLAG_KEY, AVCodec, AVCodecContext, AVERROR_EAGAIN,
-    AVERROR_EOF, AVFrame, AVMEDIA_TYPE_AUDIO, AVMEDIA_TYPE_VIDEO, AVPacket, FrameFields,
-    PacketHead, ParametersHead,
+    AV_INPUT_BUFFER_PADDING_SIZE, AV_PKT_FLAG_KEY, AVBufferRef, AVCodec, AVCodecContext,
+    AVERROR_EAGAIN, AVERROR_EOF, AVFrame, AVMEDIA_TYPE_AUDIO, AVMEDIA_TYPE_VIDEO, AVPacket,
+    FrameFields, PacketHead, ParametersHead,
 };
 use super::codec::CodecId;
 use super::error::Error;
@@ -45,6 +45,11 @@ pub(crate) struct Core {
     codec: *const AVCodec,
     packet: *mut AVPacket,
     frame: *mut AVFrame,
+    /// With a hardware device attached: the device's pixel format, and the
+    /// frame its pictures are copied back into (`hardware`).
+    hardware: Option<(c_int, *mut AVFrame)>,
+    /// Pictures decoded on the hardware device.
+    hardware_frames: u64,
 }
 
 // SAFETY: an AVCodecContext may be used from any thread as long as only one
@@ -61,8 +66,19 @@ impl Core {
         codec: CodecId,
         media: MediaType,
         extradata: Option<&[u8]>,
+        hardware: bool,
     ) -> Result<Core, Error> {
-        let decoder = lib.find_decoder(codec);
+        // A decoder that drives the device, when it can use it.
+        let decoder = hardware
+            .then(|| {
+                lib.hardware_device()
+                    .map(|device| (device, lib.hardware_decoder(codec)))
+            })
+            .flatten()
+            .filter(|&(device, decoder)| {
+                !decoder.is_null() && lib.hardware_format(decoder, device).is_some()
+            })
+            .map_or_else(|| lib.find_decoder(codec), |(_, decoder)| decoder);
         if decoder.is_null() {
             return Err(Error::NoDecoder(codec));
         }
@@ -78,6 +94,8 @@ impl Core {
             codec: decoder,
             packet: null_mut(),
             frame: null_mut(),
+            hardware: None,
+            hardware_frames: 0,
         };
         // SAFETY: allocation functions with valid arguments.
         unsafe {
@@ -91,7 +109,62 @@ impl Core {
         if let Some(data) = extradata {
             core.apply_extradata(codec, media, data)?;
         }
+        if hardware {
+            core.attach_hardware()?;
+        }
         Ok(core)
+    }
+
+    /// Give the context a reference to the process's hardware device, when
+    /// its decoder can use it. Libavcodec then chooses the device's pixel
+    /// format (`avcodec_default_get_format`), or software when the hwaccel
+    /// cannot start (`ff_get_format`).
+    fn attach_hardware(&mut self) -> Result<(), Error> {
+        let lib = Arc::clone(&self.lib);
+        let (Some(device), Some(offset)) = (lib.hardware_device(), lib.hw_device_offset) else {
+            return Ok(());
+        };
+        let Some(format) = lib.hardware_format(self.codec, device) else {
+            return Ok(());
+        };
+        // SAFETY: allocation and a new reference to a live device.
+        let (copy, reference) = unsafe {
+            (
+                (lib.api.av_frame_alloc)(),
+                (lib.api.av_buffer_ref)(device.buffer),
+            )
+        };
+        if copy.is_null() || reference.is_null() {
+            // SAFETY: each is null or this function's own allocation.
+            unsafe {
+                let (mut copy, mut reference) = (copy, reference);
+                (lib.api.av_frame_free)(&mut copy);
+                (lib.api.av_buffer_unref)(&mut reference);
+            }
+            return Err(Error::OutOfMemory);
+        }
+        // SAFETY: `offset` is where this release keeps `hw_device_ctx`
+        // (checked against the library when it was loaded); a context fresh
+        // from `avcodec_alloc_context3` holds NULL there, and owns the
+        // reference from now on (`avcodec_free_context` releases it).
+        unsafe {
+            self.ctx
+                .cast::<u8>()
+                .add(offset)
+                .cast::<*mut AVBufferRef>()
+                .write(reference);
+        }
+        self.hardware = Some((format, copy));
+        Ok(())
+    }
+
+    /// Whether a hardware device is attached.
+    pub(crate) fn has_hardware(&self) -> bool {
+        self.hardware.is_some()
+    }
+
+    pub(crate) fn hardware_frames(&self) -> u64 {
+        self.hardware_frames
     }
 
     /// Hands `extradata` to the context through `AVCodecParameters`, writing
@@ -208,22 +281,46 @@ impl Core {
     }
 
     /// Takes the next decoded frame, converts it with `convert` and releases
-    /// the frame.
+    /// the frame. A picture in the hardware device's memory is copied back
+    /// first, into the format the device downloads to (NV12, P010, ...),
+    /// with the picture's properties.
     fn pull<T>(
         &mut self,
         convert: fn(&Library, &FrameFields) -> Result<T, Error>,
     ) -> Result<Pulled<T>, Error> {
         let api = &self.lib.api;
-        // SAFETY: `frame` is a valid, unreferenced AVFrame; when
-        // `avcodec_receive_frame` fills it, `snapshot` reads the layout that
-        // matches this library (checked when it was loaded), and the frame
-        // is unreferenced again whatever `convert` makes of it.
+        // SAFETY: `frame` (and the copy-back frame) are valid, unreferenced
+        // AVFrames; when `avcodec_receive_frame` fills one, `snapshot` reads
+        // the layout that matches this library (checked when it was loaded),
+        // and both are unreferenced again whatever `convert` makes of them.
         unsafe {
             let ret = (api.avcodec_receive_frame)(self.ctx, self.frame);
             match ret {
                 0 => {
-                    let fields = self.lib.layout.snapshot(self.frame);
+                    let mut fields = self.lib.layout.snapshot(self.frame);
+                    let mut copied = None;
+                    if let Some((format, copy)) = self.hardware
+                        && fields.format == format
+                    {
+                        let ret = (api.av_hwframe_transfer_data)(copy, self.frame, 0);
+                        let ret = if ret < 0 {
+                            ret
+                        } else {
+                            (api.av_frame_copy_props)(copy, self.frame)
+                        };
+                        if ret < 0 {
+                            (api.av_frame_unref)(copy);
+                            (api.av_frame_unref)(self.frame);
+                            return Err(self.lib.ffmpeg_error("av_hwframe_transfer_data", ret));
+                        }
+                        self.hardware_frames += 1;
+                        fields = self.lib.layout.snapshot(copy);
+                        copied = Some(copy);
+                    }
                     let item = convert(&self.lib, &fields);
+                    if let Some(copy) = copied {
+                        (api.av_frame_unref)(copy);
+                    }
                     (api.av_frame_unref)(self.frame);
                     item.map(Pulled::Item)
                 }
@@ -246,6 +343,9 @@ impl Drop for Core {
         // SAFETY: each pointer is null or owned by this `Core`; the free
         // functions null them and tolerate null.
         unsafe {
+            if let Some((_, mut copy)) = self.hardware.take() {
+                (api.av_frame_free)(&mut copy);
+            }
             (api.av_frame_free)(&mut self.frame);
             (api.av_packet_free)(&mut self.packet);
             (api.avcodec_free_context)(&mut self.ctx);
@@ -349,5 +449,9 @@ impl<T> Pipeline<T> {
     pub(crate) fn flush(&mut self) {
         self.queue.clear();
         self.core.flush();
+    }
+
+    pub(crate) fn core(&self) -> &Core {
+        &self.core
     }
 }

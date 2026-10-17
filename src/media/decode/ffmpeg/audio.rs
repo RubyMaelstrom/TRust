@@ -61,7 +61,13 @@ impl AudioDecoder {
         if usize::from(config.channels) > MAX_CHANNELS {
             return Err(Error::InvalidInput("too many channels"));
         }
-        let mut core = Core::new(lib, codec, MediaType::Audio, config.extradata.as_deref())?;
+        let mut core = Core::new(
+            lib,
+            codec,
+            MediaType::Audio,
+            config.extradata.as_deref(),
+            false,
+        )?;
         // After the extradata: applying it resets these.
         if config.sample_rate > 0 {
             core.set_int(c"ar", i64::from(config.sample_rate))?;

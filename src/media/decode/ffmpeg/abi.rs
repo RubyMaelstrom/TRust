@@ -1,12 +1,15 @@
 //! The FFmpeg ABI surface this crate depends on.
 //!
 //! Everything version-sensitive is here and nowhere else. `AVCodecContext`
-//! is never mirrored (it is configured through `AVOption`s), and neither are
-//! `AVCodec` or `AVCodecParameters` beyond their stable first members. Three
-//! structures are touched directly, each only up to the last member needed:
+//! is configured through `AVOption`s, except for the one member no option
+//! sets, `hw_device_ctx` (see [`hw_device_ctx_offset`]), and neither
+//! `AVCodec` nor `AVCodecParameters` is mirrored beyond its stable first
+//! members. Three structures are touched directly, each only up to the last
+//! member needed:
 //!
-//! * `AVPacket` up to `flags`, `AVCodecParameters` up to `extradata_size` and
-//!   `AVCodecDescriptor` up to `id`: identical in libavcodec 59 to 63.
+//! * `AVPacket` up to `flags`, `AVCodecParameters` up to `extradata_size`,
+//!   `AVCodecDescriptor` up to `id`, `AVOption` up to `offset` and
+//!   `AVCodecHWConfig` whole: identical in libavcodec 59 to 63.
 //! * `AVFrame`, which decoders fill and the crate must read: one prefix
 //!   layout per distinct release family (see [`FrameLayout`]).
 //!
@@ -14,7 +17,8 @@
 //! `tools/ffmpeg_abi_offsets.c` against the official public headers of
 //! `n5.0.3`, `n5.1.10`, `n6.0.1`, `n6.1.6`, `n7.0.3`, `n7.1.5`, `n8.0.3`,
 //! `n8.1.3` and `n9.0.2` (libavutil/frame.h, libavutil/channel_layout.h,
-//! libavcodec/packet.h, libavcodec/codec_par.h, libavcodec/codec_desc.h).
+//! libavcodec/packet.h, libavcodec/codec_par.h, libavcodec/codec_desc.h,
+//! libavcodec/avcodec.h, libavcodec/codec.h, libavutil/opt.h).
 //! Which `AVFrame` members exist depends only on the library major version
 //! (the `FF_API_*` macros), so one table per major covers all its releases.
 
@@ -44,6 +48,8 @@ opaque! {
     AVPacket,
     /// `AVFrame`, read through [`FrameLayout::snapshot`].
     AVFrame,
+    /// `AVBufferRef`: references only ever handed back to FFmpeg.
+    AVBufferRef,
 }
 
 pub(crate) const AV_NUM_DATA_POINTERS: usize = 8;
@@ -115,6 +121,46 @@ pub(crate) struct ParametersHead {
 #[repr(C)]
 pub(crate) struct DescriptorHead {
     pub id: c_int,
+}
+
+/// `AVCodecHWConfig` (libavcodec/codec.h), unchanged in libavcodec 59 to
+/// 63: a pixel format the decoder can output through a hardware device.
+#[repr(C)]
+pub(crate) struct HwConfig {
+    pub pix_fmt: c_int,
+    /// `AV_CODEC_HW_CONFIG_METHOD_*` flags.
+    pub methods: c_int,
+    /// An `AVHWDeviceType`.
+    pub device_type: c_int,
+}
+
+/// `AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX`: the decoder uses a device
+/// given in `AVCodecContext.hw_device_ctx`.
+pub(crate) const AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX: c_int = 0x01;
+
+/// The first members of `AVOption` (libavutil/opt.h), unchanged in libavutil
+/// 57 to 61: `offset` is where the option's member lies in its object.
+#[repr(C)]
+pub(crate) struct OptionHead {
+    pub name: *const std::ffi::c_char,
+    pub help: *const std::ffi::c_char,
+    pub offset: c_int,
+}
+
+/// The byte offset of `AVCodecContext.hw_device_ctx` in libavcodec `major`
+/// (LP64), the one member of the context no `AVOption` sets. In every
+/// release the `hwaccel_flags` option's member follows it directly, which
+/// the loader checks against `av_opt_find` before writing it.
+pub(crate) fn hw_device_ctx_offset(major: u32) -> Option<usize> {
+    if cfg!(not(target_pointer_width = "64")) {
+        return None;
+    }
+    match major {
+        59 => Some(872),
+        60 => Some(864),
+        61..=63 => Some(560),
+        _ => None,
+    }
 }
 
 #[repr(C)]
@@ -568,6 +614,34 @@ mod tests {
             extradata_size = 24,
         });
         offsets!(DescriptorHead { id = 0 });
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn hardware_decoding_members_match_every_release() {
+        // tools/ffmpeg_abi_offsets.c: AVCodecContext.hw_device_ctx and
+        // .hwaccel_flags are 872/880 in n5.0.3 and n5.1.10 (libavcodec 59),
+        // 864/872 in n6.0.1 and n6.1.6 (60), and 560/568 in n7.0.3, n7.1.5,
+        // n8.0.3, n8.1.3 and n9.0.2 (61 to 63).
+        assert_eq!(hw_device_ctx_offset(58), None);
+        assert_eq!(hw_device_ctx_offset(59), Some(872));
+        assert_eq!(hw_device_ctx_offset(60), Some(864));
+        for major in 61..=63 {
+            assert_eq!(hw_device_ctx_offset(major), Some(560));
+        }
+        assert_eq!(hw_device_ctx_offset(64), None);
+        offsets!(HwConfig {
+            pix_fmt = 0,
+            methods = 4,
+            device_type = 8,
+        });
+        assert_eq!(size_of::<HwConfig>(), 12);
+        offsets!(OptionHead {
+            name = 0,
+            help = 8,
+            offset = 16,
+        });
+        assert_eq!(AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX, 1);
     }
 
     #[test]

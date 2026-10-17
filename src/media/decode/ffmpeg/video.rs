@@ -29,6 +29,10 @@ pub struct VideoConfig {
     /// the `avcC` / `hvcC` record, and the packets are length-prefixed NAL
     /// units; Annex B parameter sets are accepted too.
     pub extradata: Option<Vec<u8>>,
+    /// Decode on the process's hardware device (`hardware.rs`) when there
+    /// is one its decoder can use; pictures still come back in system
+    /// memory. Without a device this decodes in software.
+    pub hardware: bool,
 }
 
 /// The pixel layouts decoded frames are returned in.
@@ -182,7 +186,13 @@ impl VideoDecoder {
         if !codec.is_video() {
             return Err(Error::WrongMediaType(codec));
         }
-        let mut core = Core::new(lib, codec, MediaType::Video, config.extradata.as_deref())?;
+        let mut core = Core::new(
+            lib,
+            codec,
+            MediaType::Video,
+            config.extradata.as_deref(),
+            config.hardware,
+        )?;
         core.set_int(c"threads", i64::from(config.threads.min(MAX_THREADS)))?;
         // Crop exactly even when the left or top edge is unaligned; the
         // planes are copied byte-wise, so alignment does not matter.
@@ -225,6 +235,17 @@ impl VideoDecoder {
     /// packet should be a keyframe.
     pub fn flush(&mut self) {
         self.pipeline.flush();
+    }
+
+    /// Whether the decoder has the hardware device: its pictures decode
+    /// there unless the device turned out not to handle the stream.
+    pub fn hardware(&self) -> bool {
+        self.pipeline.core().has_hardware()
+    }
+
+    /// How many pictures the hardware device decoded so far.
+    pub fn hardware_frames(&self) -> u64 {
+        self.pipeline.core().hardware_frames()
     }
 }
 

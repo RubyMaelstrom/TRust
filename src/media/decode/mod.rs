@@ -82,10 +82,15 @@ pub trait AudioDecoder: Send {
 pub trait DecoderModule: Send + Sync {
     fn name(&self) -> &'static str;
     fn supports(&self, codec: &CodecString) -> bool;
-    /// Whether decoding `codec` is hardware accelerated (Media
-    /// Capabilities' `powerEfficient`).
+    /// Whether decoding `codec` is hardware accelerated: what decoder
+    /// selection prefers. May wait for the module to find out.
     fn hardware(&self, _codec: &CodecString) -> bool {
         false
+    }
+    /// [`Self::hardware`] as far as the module knows now, without waiting
+    /// (Media Capabilities' `powerEfficient`, answered on the page's thread).
+    fn hardware_now(&self, codec: &CodecString) -> bool {
+        self.hardware(codec)
     }
     fn video(&self, _track: &TrackInfo) -> Option<Result<Box<dyn VideoDecoder>, Error>> {
         None
@@ -126,19 +131,30 @@ impl Registry {
         }
     }
 
-    /// Whether some module decodes `codec` with hardware acceleration.
+    /// Whether some module decodes `codec` with hardware acceleration (the
+    /// one `video_decoder` would then use), as far as is known without
+    /// waiting for a hardware device to be probed.
     pub fn hardware(&self, codec: &CodecString) -> bool {
         self.modules
             .iter()
-            .find(|module| module.supports(codec))
-            .is_some_and(|module| module.hardware(codec))
+            .any(|module| module.supports(codec) && module.hardware_now(codec))
     }
 
-    /// Create a video decoder, falling back through the supporting modules.
+    /// Create a video decoder, falling back through the supporting modules:
+    /// those that decode the format in hardware first, as Firefox's
+    /// PDMFactory prefers a hardware decoder (FFmpeg VA-API) over a bundled
+    /// software one (dav1d), then the rest in order.
     pub fn video_decoder(&self, track: &TrackInfo) -> Result<Box<dyn VideoDecoder>, Error> {
         let query = Self::query(track);
         let mut last = Error::Unsupported(format!("no decoder for {}", track.codec_string));
-        for module in self.modules.iter().filter(|module| module.supports(&query)) {
+        let supporting: Vec<&dyn DecoderModule> = self
+            .modules()
+            .filter(|module| module.supports(&query))
+            .collect();
+        let (hardware, software): (Vec<_>, Vec<_>) = supporting
+            .into_iter()
+            .partition(|module| module.hardware(&query));
+        for module in hardware.into_iter().chain(software) {
             match module.video(track) {
                 Some(Ok(decoder)) => return Ok(decoder),
                 Some(Err(error)) => last = error,

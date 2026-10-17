@@ -7,8 +7,13 @@
 //! H.264/HEVC as length-prefixed NAL units with an avcC/hvcC record and AAC
 //! as raw frames with an AudioSpecificConfig; both are handed to FFmpeg as
 //! extradata, exactly as its own demuxers would.
+//!
+//! Video decodes on the GPU's video engine when FFmpeg has a hardware device
+//! that decodes the format (`ffmpeg::hardware`), as Firefox's FFmpeg decoder
+//! does with VA-API; a stream the device fails before its first picture
+//! continues in software from its first packet.
 
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 
 use super::ffmpeg::{self, CodecId, Library};
 use super::{AudioDecoder, DecoderModule, Error, VideoDecoder};
@@ -40,6 +45,36 @@ fn library() -> Option<Arc<Library>> {
     Library::get()
 }
 
+/// The formats a hardware device may decode for TRust.
+const HARDWARE_FORMATS: [CodecId; 4] = [CodecId::H264, CodecId::Hevc, CodecId::Vp9, CodecId::Av1];
+
+/// Whether a stream with these details is one hardware decoders handle and
+/// whose pictures come back in a format TRust presents: 4:2:0 at 8 or 10
+/// bits (what the web serves; devices differ on 4:2:2 and 4:4:4, which
+/// decode in software).
+fn hardware_eligible(details: &crate::media::codec::CodecDetails) -> bool {
+    details.bit_depth.is_none_or(|depth| depth <= 10)
+        && details.chroma_shift.is_none_or(|shift| shift == (1, 1))
+}
+
+/// Learn in the background whether the hardware device decodes each
+/// format, once video is first asked about: creating the device takes up
+/// to a second, which should not delay the first video's first frame.
+fn probe_hardware_in_background() {
+    static STARTED: Once = Once::new();
+    STARTED.call_once(|| {
+        let _ = std::thread::Builder::new()
+            .name(String::from("trust-hwdec-probe"))
+            .spawn(|| {
+                if let Some(library) = library() {
+                    for codec in HARDWARE_FORMATS {
+                        library.hardware_decodes(codec);
+                    }
+                }
+            });
+    });
+}
+
 impl DecoderModule for SystemFfmpeg {
     fn name(&self) -> &'static str {
         "system-ffmpeg"
@@ -55,9 +90,32 @@ impl DecoderModule for SystemFfmpeg {
         if !library.has_decoder(id) {
             return false;
         }
+        if id.is_video() {
+            probe_hardware_in_background();
+        }
         // FFmpeg's decoders cover every profile of these formats, but
         // TRust's presentation handles 8, 10 and 12 bits.
         codec.details.bit_depth.is_none_or(|depth| depth <= 12)
+    }
+
+    fn hardware(&self, codec: &CodecString) -> bool {
+        let Some(id) = codec_id(codec.codec).filter(|id| HARDWARE_FORMATS.contains(id)) else {
+            return false;
+        };
+        hardware_eligible(&codec.details)
+            && self.supports(codec)
+            && library().is_some_and(|library| library.hardware_decodes(id))
+    }
+
+    /// Software until the background probe has found what the device
+    /// decodes (it starts with the first video query, in `supports`).
+    fn hardware_now(&self, codec: &CodecString) -> bool {
+        let Some(id) = codec_id(codec.codec).filter(|id| HARDWARE_FORMATS.contains(id)) else {
+            return false;
+        };
+        hardware_eligible(&codec.details)
+            && self.supports(codec)
+            && library().is_some_and(|library| library.hardware_decodes_now(id) == Some(true))
     }
 
     fn video(&self, track: &TrackInfo) -> Option<Result<Box<dyn VideoDecoder>, Error>> {
@@ -90,9 +148,21 @@ fn extradata(track: &TrackInfo) -> Option<Vec<u8>> {
 /// Packets in a row that may fail to decode, producing no frame, before the
 /// stream counts as undecodable.
 const MAX_DAMAGED_PACKETS: u32 = 48;
+/// Packets kept to replay into a software decoder until the hardware device
+/// has decoded a stream's first picture (frame threads delay it by a few).
+const MAX_REPLAYED_PACKETS: usize = 64;
 
 struct SystemVideo {
     decoder: ffmpeg::VideoDecoder,
+    library: Arc<Library>,
+    id: CodecId,
+    threads: u32,
+    extradata: Option<Vec<u8>>,
+    /// While the hardware device has yet to decode a picture: the packets
+    /// sent since the stream (re)started at a keyframe, for a software
+    /// decoder to take over from (`None` once it decoded one, or in
+    /// software).
+    replay: Option<Vec<Packet>>,
     /// Consecutive packets whose decoding reported damage without a frame.
     damaged: u32,
     container_color: Option<ColorInfo>,
@@ -102,14 +172,24 @@ struct SystemVideo {
 
 impl SystemVideo {
     fn new(library: &Arc<Library>, id: CodecId, track: &TrackInfo) -> Result<Self, Error> {
+        let threads = u32::from(super::bundled::video_threads());
+        let hardware = HARDWARE_FORMATS.contains(&id)
+            && hardware_eligible(&track.details)
+            && library.hardware_decodes(id);
         let config = ffmpeg::VideoConfig {
-            threads: u32::from(super::bundled::video_threads()),
+            threads,
             extradata: extradata(track),
+            hardware,
         };
         let decoder = ffmpeg::VideoDecoder::new(library, id, config).map_err(map_error)?;
         let video = track.video.unwrap_or_default();
         Ok(Self {
+            replay: decoder.hardware().then(Vec::new),
             decoder,
+            library: Arc::clone(library),
+            id,
+            threads,
+            extradata: extradata(track),
             damaged: 0,
             container_color: video.color,
             aspect: (video.display_width != video.width || video.display_height != video.height)
@@ -244,6 +324,76 @@ impl SystemVideo {
     }
 }
 
+impl SystemVideo {
+    /// Decode `packet`; while the hardware device has not yet shown it can
+    /// decode this stream, a failure moves the stream to software.
+    fn decode_packet(&mut self, packet: &Packet) -> Result<Vec<VideoFrame>, Error> {
+        if let Some(replay) = &mut self.replay {
+            if packet.keyframe {
+                replay.clear();
+            }
+            if replay.len() < MAX_REPLAYED_PACKETS {
+                replay.push(packet.clone());
+            } else {
+                self.replay = None;
+            }
+        }
+        let result = self.send_and_collect(packet);
+        if self.replay.is_none() {
+            return result;
+        }
+        match result {
+            Ok(frames) if !frames.is_empty() => {
+                self.replay = None;
+                Ok(frames)
+            }
+            Ok(frames) if self.damaged == 0 => Ok(frames),
+            // The device failed the stream before its first picture.
+            _ => self.continue_in_software(),
+        }
+    }
+
+    /// Replace the hardware decoder with a software one and replay the
+    /// stream from its keyframe.
+    fn continue_in_software(&mut self) -> Result<Vec<VideoFrame>, Error> {
+        let packets = self.replay.take().unwrap_or_default();
+        let config = ffmpeg::VideoConfig {
+            threads: self.threads,
+            extradata: self.extradata.clone(),
+            hardware: false,
+        };
+        self.decoder =
+            ffmpeg::VideoDecoder::new(&self.library, self.id, config).map_err(map_error)?;
+        self.damaged = 0;
+        let mut frames = Vec::new();
+        for packet in &packets {
+            frames.extend(self.send_and_collect(packet)?);
+        }
+        Ok(frames)
+    }
+
+    fn send_and_collect(&mut self, packet: &Packet) -> Result<Vec<VideoFrame>, Error> {
+        match self.decoder.send(&packet.data, packet.pts, packet.keyframe) {
+            Ok(()) => {}
+            // FFmpeg took the packet and conceals the damage (as its own
+            // command line tool continues); only a run of failures without
+            // any frame ends the stream.
+            Err(error) if error.is_decode_error() => {
+                self.damaged += 1;
+                if self.damaged > MAX_DAMAGED_PACKETS {
+                    return Err(map_error(error));
+                }
+            }
+            Err(error) => return Err(map_error(error)),
+        }
+        let frames = self.collect(packet.duration)?;
+        if !frames.is_empty() {
+            self.damaged = 0;
+        }
+        Ok(frames)
+    }
+}
+
 /// FFmpeg's planes as [`Plane`]s: an interleaved chroma plane's width
 /// counts its Cb/Cr pairs, not FFmpeg's samples (`frame::Plane`).
 fn frame_planes(layout: Layout, planes: Vec<ffmpeg::Plane>) -> Vec<Plane> {
@@ -268,24 +418,7 @@ fn frame_planes(layout: Layout, planes: Vec<ffmpeg::Plane>) -> Vec<Plane> {
 
 impl VideoDecoder for SystemVideo {
     fn decode(&mut self, packet: &Packet) -> Result<Vec<VideoFrame>, Error> {
-        match self.decoder.send(&packet.data, packet.pts, packet.keyframe) {
-            Ok(()) => {}
-            // FFmpeg took the packet and conceals the damage (as its own
-            // command line tool continues); only a run of failures without
-            // any frame ends the stream.
-            Err(error) if error.is_decode_error() => {
-                self.damaged += 1;
-                if self.damaged > MAX_DAMAGED_PACKETS {
-                    return Err(map_error(error));
-                }
-            }
-            Err(error) => return Err(map_error(error)),
-        }
-        let frames = self.collect(packet.duration)?;
-        if !frames.is_empty() {
-            self.damaged = 0;
-        }
-        Ok(frames)
+        self.decode_packet(packet)
     }
 
     fn drain(&mut self) -> Result<Vec<VideoFrame>, Error> {
@@ -300,10 +433,17 @@ impl VideoDecoder for SystemVideo {
     fn flush(&mut self) {
         self.decoder.flush();
         self.damaged = 0;
+        if let Some(replay) = &mut self.replay {
+            replay.clear();
+        }
     }
 
     fn name(&self) -> &'static str {
         self.name
+    }
+
+    fn hardware(&self) -> bool {
+        self.decoder.hardware_frames() > 0
     }
 }
 

@@ -32,6 +32,14 @@ $FF $V -c:v libaom-av1 -cpu-used 8 -pix_fmt yuv420p -g 5 -f ivf av1.ivf
 $FF $V -c:v libaom-av1 -cpu-used 8 -pix_fmt yuv420p10le -g 5 -f ivf av1_10bit.ivf
 $FF $V -c:v libaom-av1 -cpu-used 8 -pix_fmt yuv420p12le -g 5 -f ivf av1_12bit.ivf
 
+# Hardware decoding compares with software on pictures every decoder's
+# minimum size admits (NVDEC: 144x144 for HEVC, 128x128 for VP9 and AV1).
+HW="-f lavfi -i testsrc2=size=256x256:rate=10 -frames:v 8 -pix_fmt yuv420p"
+$FF $HW -c:v libx264 -profile:v high -bf 2 -g 8 -f h264 hw_h264.h264
+$FF $HW -c:v libx265 -x265-params log-level=error:bframes=2:keyint=8 -f hevc hw_hevc.hevc
+$FF $HW -c:v libvpx-vp9 -g 8 -f ivf hw_vp9.ivf
+$FF $HW -c:v libaom-av1 -cpu-used 8 -g 8 -f ivf hw_av1.ivf
+
 for f in h264_*.h264 hevc_*.hevc vp*.ivf av1*.ivf; do
     ffmpeg -hide_banner -loglevel error -y -i "$f" -f framemd5 - | grep -v '^#' > "${f%.*}.md5"
 done

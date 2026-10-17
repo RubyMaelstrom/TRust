@@ -863,6 +863,12 @@ fn media_source_append_errors_fail_the_element() {
 /// configurations.
 #[test]
 fn media_capabilities_report_the_decoders() {
+    // Learn first whether the hardware device decodes AV1, which the
+    // answers below depend on, rather than racing the background probe.
+    #[cfg(target_os = "linux")]
+    if let Some(library) = crate::media::decode::ffmpeg::Library::get() {
+        library.hardware_decodes(crate::media::decode::ffmpeg::CodecId::Av1);
+    }
     let runtime = runtime();
     let base = serve(&runtime);
     let (mut engine, mut tasks) = page(&runtime, &format!("{base}/page.html"));
@@ -896,11 +902,17 @@ fn media_capabilities_report_the_decoders() {
     )
     .unwrap();
     run_until(&runtime, &mut engine, &mut tasks, "log.includes('done')");
+    // AV1 is power efficient, and smooth even at 8K, where this machine's
+    // GPU decodes it; the answer follows what the registry learned.
+    let av1 = crate::media::codec::parse("av01.0.05M.08").unwrap();
+    let hardware = crate::media::decode::Registry::get().hardware(&av1);
     assert_eq!(
         string_value(&mut engine, "log.join('|')"),
-        "true|true,true,false,,media-source|true,true,true,,file|false,false,false,,media-source|\
-         false,false,false,,webrtc|true,false,false,,file|TypeError|TypeError|TypeError|TypeError|TypeError|TypeError|\
-         encoding false powerEfficient,smooth,supported|done"
+        format!(
+            "true|true,true,{hardware},,media-source|true,true,true,,file|false,false,false,,media-source|\
+             false,false,false,,webrtc|true,{hardware},{hardware},,file|TypeError|TypeError|TypeError|TypeError|TypeError|TypeError|\
+             encoding false powerEfficient,smooth,supported|done"
+        )
     );
 }
 

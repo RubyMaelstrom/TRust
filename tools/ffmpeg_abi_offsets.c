@@ -1,7 +1,10 @@
 /*
  * Prints the byte offsets of the AVFrame, AVPacket and AVCodecParameters
  * members that ffmpeg-dl mirrors, plus the AVChannelLayout member it reads,
- * as laid out by the *official public headers* of one FFmpeg release.
+ * the AVCodecContext members of hardware decoding (`hw_device_ctx`, which it
+ * writes, and `hwaccel_flags`, whose AVOption offset confirms it at run
+ * time), and AVCodecHWConfig and the head of AVOption, as laid out by the
+ * *official public headers* of one FFmpeg release.
  *
  * The layout tests in abi.rs compare their offset_of! values with this
  * output (LP64 targets). To re-verify against a release:
@@ -24,6 +27,7 @@
 #include <libavcodec/codec_par.h>
 #include <libavcodec/packet.h>
 #include <libavcodec/codec_desc.h>
+#include <libavutil/opt.h>
 
 #define F(t, m) printf("%s.%s = %zu\n", #t, #m, offsetof(t, m))
 
@@ -79,5 +83,8 @@ int main(void) {
     F(AVCodecParameters, codec_type); F(AVCodecParameters, codec_id); F(AVCodecParameters, codec_tag);
     F(AVCodecParameters, extradata); F(AVCodecParameters, extradata_size);
     F(AVCodecDescriptor, id);
+    F(AVCodecContext, hw_device_ctx); F(AVCodecContext, hwaccel_flags);
+    F(AVCodecHWConfig, pix_fmt); F(AVCodecHWConfig, methods); F(AVCodecHWConfig, device_type);
+    F(AVOption, name); F(AVOption, help); F(AVOption, offset);
     return 0;
 }

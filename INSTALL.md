@@ -27,6 +27,10 @@ PCM decode on their own; H.264, HEVC, AAC, VP8, VP9 and Opus use the system's
 FFmpeg (libavcodec from FFmpeg 5.0 through 9.0, found at run time; install
 your distribution's `ffmpeg` or `libavcodec` package) on Linux and Media
 Foundation on Windows (HEVC and VP9 need the HEVC and VP9 Video Extensions).
+On Linux, FFmpeg decodes video on the GPU when it can open a VA-API (Mesa or
+`intel-media-driver`), NVIDIA (CUDA/NVDEC) or Vulkan Video device, AV1
+included; otherwise video decodes on the CPU (`TRUST_HWDEC` in
+`DIAGNOSTICS.md`).
 Sound goes to PulseAudio or PipeWire (through `pipewire-pulse`), else ALSA, on
 Linux and to the default WASAPI device on Windows. The terminal browser opens
 media in mpv: install mpv for audio and video playback there.

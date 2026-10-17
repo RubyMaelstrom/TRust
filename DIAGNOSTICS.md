@@ -583,6 +583,7 @@ scripts, dynamically inserted scripts and `fetch`/XHR requests fail offline. TRu
 | `TRUST_FFMPEG` | `0` | Disables the system FFmpeg decoders (libavcodec loaded at run time): only the bundled decoders remain, which changes `canPlayType()`, `MediaSource.isTypeSupported()` and Media Capabilities answers to match. |
 | `TRUST_FFMPEG_LIB` | libavcodec path | Loads exactly this libavcodec (FFmpeg 5.0–9.0, libavcodec 59–63) instead of searching the system's sonames. |
 | `TRUST_FFMPEG_LOG` | presence flag | Leaves FFmpeg's own logging on (TRust silences it by default), so its decoder messages reach stderr. |
+| `TRUST_HWDEC` | `0`, or device types such as `vulkan,cuda` | Hardware video decoding through FFmpeg's hwaccels. Unset tries `vaapi`, then `cuda` (NVDEC), then `vulkan` (Vulkan Video) and uses the first device that opens; `0` (or `off`/`none`) decodes in software. A list names the device types to try, in order. Which formats the device decodes (H.264, HEVC, VP9, AV1) is learned once per process by decoding a small keyframe, and also answers Media Capabilities' `powerEfficient`. |
 
 #### A/B-testing a site's User-Agent gate
 

@@ -110,7 +110,9 @@ The project favors:
   compositing, and terminal graphics encoding.
 - `src/media/`: inline audio/video: codec strings and MIME support
   (`codec.rs`, `container.rs`), container parsers (`isobmff.rs`, `webm.rs`,
-  `demux/`), decoders (`decode/`: bundled rav1d/Symphonia, system FFmpeg),
+  `demux/`), decoders (`decode/`: bundled rav1d/Symphonia, system FFmpeg
+  with hardware decoding through VA-API, NVDEC or Vulkan Video in
+  `decode/ffmpeg/hardware.rs`),
   audio output (`audio/`), the per-element `player/`, HTTP range resources
   (`resource.rs`), Media Source Extensions (`mse/`) and the terminal's mpv
   handoff (`external.rs`). `src/media_host.rs` is the page actor's binding

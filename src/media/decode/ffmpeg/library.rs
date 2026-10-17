@@ -16,12 +16,14 @@ use std::sync::{Arc, OnceLock};
 use libloading::os::unix::{Library as RawLibrary, RTLD_LOCAL, RTLD_NOW, Symbol};
 
 use super::abi::{
-    AV_LOG_QUIET, AV_NOPTS_VALUE, AVCOL_RANGE_UNSPECIFIED, AVCOL_UNSPECIFIED, AVCodec,
-    AVCodecContext, AVCodecParameters, AVFrame, AVPacket, DescriptorHead, FrameLayout,
+    AV_LOG_QUIET, AV_NOPTS_VALUE, AVBufferRef, AVCOL_RANGE_UNSPECIFIED, AVCOL_UNSPECIFIED, AVCodec,
+    AVCodecContext, AVCodecParameters, AVFrame, AVPacket, DescriptorHead, FrameLayout, HwConfig,
+    OptionHead, hw_device_ctx_offset,
 };
 use super::codec::CodecId;
 use super::error::{Attempt, Error, LoadError};
 use super::formats::FormatTables;
+use super::hardware::{self, Hardware};
 
 /// Library majors this crate can drive, newest first: libavcodec major,
 /// libavutil major from the same release, and the `AVFrame` layout of that
@@ -76,6 +78,9 @@ pub(super) struct Settings {
     pub(super) library: Option<PathBuf>,
     /// `TRUST_FFMPEG_LOG` is set: leave FFmpeg's own logging alone.
     pub(super) keep_logging: bool,
+    /// `TRUST_HWDEC`: the hardware device types to try, best first (none:
+    /// hardware decoding is off).
+    pub(super) hardware: Vec<std::ffi::CString>,
 }
 
 impl Settings {
@@ -86,6 +91,7 @@ impl Settings {
                 .filter(|path| !path.is_empty())
                 .map(PathBuf::from),
             keep_logging: std::env::var_os("TRUST_FFMPEG_LOG").is_some(),
+            hardware: hardware::order_from_env(),
         }
     }
 }
@@ -151,6 +157,14 @@ api! {
     av_get_sample_fmt: avutil fn(*const c_char) -> c_int;
     av_get_sample_fmt_name: avutil fn(c_int) -> *const c_char;
     av_strerror: avutil fn(c_int, *mut c_char, usize) -> c_int;
+    av_opt_find: avutil fn(*mut c_void, *const c_char, *const c_char, c_int, c_int) -> *const OptionHead;
+    avcodec_get_hw_config: avcodec fn(*const AVCodec, c_int) -> *const HwConfig;
+    av_hwdevice_find_type_by_name: avutil fn(*const c_char) -> c_int;
+    av_hwdevice_ctx_create: avutil fn(*mut *mut AVBufferRef, c_int, *const c_char, *mut c_void, c_int) -> c_int;
+    av_buffer_ref: avutil fn(*const AVBufferRef) -> *mut AVBufferRef;
+    av_buffer_unref: avutil fn(*mut *mut AVBufferRef);
+    av_hwframe_transfer_data: avutil fn(*mut AVFrame, *const AVFrame, c_int) -> c_int;
+    av_frame_copy_props: avutil fn(*mut AVFrame, *const AVFrame) -> c_int;
 }
 
 /// The system FFmpeg: libavcodec and libavutil loaded with `dlopen`, never
@@ -164,6 +178,11 @@ pub struct Library {
     codec_ids: [c_int; CodecId::ALL.len()],
     avcodec_version: Version,
     avutil_version: Version,
+    /// Where `AVCodecContext.hw_device_ctx` lies, when this release's offset
+    /// is known and checked (`check_hw_device_offset`): hardware decoding
+    /// needs it.
+    pub(crate) hw_device_offset: Option<usize>,
+    pub(crate) hardware: Hardware,
     /// Keeps the code the function pointers above point into mapped for the
     /// life of the process.
     _libs: ManuallyDrop<Libs>,
@@ -383,6 +402,7 @@ fn open_candidate(path: &Path, settings: &Settings) -> Result<Library, String> {
     let libs = Libs { avcodec, avutil };
     let api = Api::resolve(&libs)?;
     check_frame_layout(&api, layout, avutil_version)?;
+    let hw_device_offset = check_hw_device_offset(&api, avcodec_version);
     if !settings.keep_logging {
         // SAFETY: a plain setter.
         unsafe { (api.av_log_set_level)(AV_LOG_QUIET) };
@@ -404,8 +424,39 @@ fn open_candidate(path: &Path, settings: &Settings) -> Result<Library, String> {
         layout,
         avcodec_version,
         avutil_version,
+        hw_device_offset,
+        hardware: Hardware::new(settings.hardware.clone()),
         _libs: ManuallyDrop::new(libs),
     })
+}
+
+/// The offset of `AVCodecContext.hw_device_ctx` for this release, confirmed
+/// by the library itself: the `hwaccel_flags` option's member follows it in
+/// every release (`abi::hw_device_ctx_offset`), and `av_opt_find` reports
+/// where that member is. `None` (no hardware decoding) when they disagree.
+fn check_hw_device_offset(api: &Api, version: Version) -> Option<usize> {
+    let offset = hw_device_ctx_offset(version.major)?;
+    // SAFETY: a generic context is allocated, its option table searched and
+    // the context freed right here; the option entry is static data whose
+    // head `OptionHead` describes.
+    let flags_offset = unsafe {
+        let mut context = (api.avcodec_alloc_context3)(std::ptr::null());
+        if context.is_null() {
+            return None;
+        }
+        let option = (api.av_opt_find)(
+            context.cast(),
+            c"hwaccel_flags".as_ptr(),
+            std::ptr::null(),
+            0,
+            0,
+        );
+        let found = (!option.is_null()).then(|| (*option).offset);
+        (api.avcodec_free_context)(&mut context);
+        found?
+    };
+    (usize::try_from(flags_offset).ok()? == offset + size_of::<*mut AVBufferRef>())
+        .then_some(offset)
 }
 
 /// Rejects a libavutil whose `AVFrame` does not look like the layout chosen

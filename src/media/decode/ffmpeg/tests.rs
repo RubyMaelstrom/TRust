@@ -351,6 +351,7 @@ fn check_video(codec: CodecId, units: Vec<Vec<u8>>, md5_listing: &str, expect: E
         let config = VideoConfig {
             threads,
             extradata: None,
+            hardware: false,
         };
         let frames = decode_video(&lib, codec, config, &units);
         assert_eq!(
@@ -884,6 +885,108 @@ fn av1_10_and_12_bit() {
     );
 }
 
+/// A 4:2:0 picture's samples as Y, Cb and Cr planes, whatever layout it
+/// came in: NV12's interleaved chroma split, P010's samples shifted down to
+/// their 10-bit values.
+fn planar_420(frame: &VideoFrame) -> [Vec<u16>; 3] {
+    let samples = |plane: &Plane| -> Vec<u16> {
+        match &plane.data {
+            PlaneData::U8(data) => data.iter().map(|&s| u16::from(s)).collect(),
+            PlaneData::U16(data) => data.clone(),
+        }
+    };
+    match frame.format {
+        PixelFormat::Yuv420p | PixelFormat::Yuv420p10 => [
+            samples(&frame.planes[0]),
+            samples(&frame.planes[1]),
+            samples(&frame.planes[2]),
+        ],
+        PixelFormat::Nv12 | PixelFormat::P010 => {
+            let shift = if frame.format == PixelFormat::P010 {
+                6
+            } else {
+                0
+            };
+            let luma = samples(&frame.planes[0])
+                .into_iter()
+                .map(|s| s >> shift)
+                .collect();
+            let chroma = samples(&frame.planes[1]);
+            let pairs = chroma.as_chunks::<2>().0;
+            [
+                luma,
+                pairs.iter().map(|[cb, _]| cb >> shift).collect(),
+                pairs.iter().map(|[_, cr]| cr >> shift).collect(),
+            ]
+        }
+        other => panic!("not a 4:2:0 picture: {other:?}"),
+    }
+}
+
+#[test]
+fn hardware_decoding_matches_software() {
+    // The decoding processes of H.264 (§8), HEVC (§8), VP9 (§8) and AV1
+    // (§7) are exact: the hardware device's pictures, copied back, must
+    // equal software's sample for sample, in the same order.
+    let Some(lib) = library() else {
+        return;
+    };
+    let Some(device) = lib.hardware_device_name().map(str::to_owned) else {
+        eprintln!("skipped: no hardware decoding device");
+        return;
+    };
+    let streams = [
+        (CodecId::H264, h264_units(fixture!("hw_h264.h264"))),
+        (CodecId::Hevc, hevc_units(fixture!("hw_hevc.hevc"))),
+        (CodecId::Vp9, ivf_frames(fixture!("hw_vp9.ivf"))),
+        (CodecId::Av1, ivf_frames(fixture!("hw_av1.ivf"))),
+    ];
+    for (codec, units) in streams {
+        if !lib.has_decoder(codec) {
+            eprintln!("skipped {codec:?}: no software decoder to compare with");
+            continue;
+        }
+        if !lib.hardware_decodes(codec) {
+            eprintln!("skipped {codec:?}: {device} does not decode it");
+            continue;
+        }
+        let config = |hardware| VideoConfig {
+            threads: 1,
+            extradata: None,
+            hardware,
+        };
+        let software = decode_video(&lib, codec, config(false), &units);
+        let mut decoder = VideoDecoder::new(&lib, codec, config(true)).expect("decoder opens");
+        assert!(decoder.hardware());
+        let mut hardware = Vec::new();
+        for (i, unit) in units.iter().enumerate() {
+            decoder.send(unit, i as i64 * 1000, i == 0).expect("send");
+            while let Some(frame) = decoder.receive().expect("receive") {
+                hardware.push(frame);
+            }
+        }
+        hardware.extend(drained(decoder.drain()));
+        assert_eq!(software.len(), units.len(), "{codec:?}");
+        assert_eq!(hardware.len(), software.len(), "{codec:?} on {device}");
+        assert_eq!(
+            decoder.hardware_frames(),
+            hardware.len() as u64,
+            "{codec:?}: every picture decoded on {device}"
+        );
+        for (index, (hardware, software)) in hardware.iter().zip(&software).enumerate() {
+            assert_eq!(hardware.pts, software.pts, "{codec:?} picture {index}");
+            assert_eq!(
+                (hardware.width, hardware.height),
+                (software.width, software.height)
+            );
+            assert!(
+                planar_420(hardware) == planar_420(software),
+                "{codec:?} picture {index} differs on {device}"
+            );
+        }
+    }
+}
+
 #[test]
 fn pts_travels_with_the_picture() {
     let Some(lib) = library_with(CodecId::H264) else {
@@ -961,6 +1064,7 @@ fn h264_in_avcc_form_with_extradata() {
     let config = VideoConfig {
         threads: 1,
         extradata: Some(avcc),
+        hardware: false,
     };
     let frames = decode_video(&lib, CodecId::H264, config, &units);
     let hashes = framemd5_hashes(expected_md5!("h264_high_bframes"));
@@ -1160,6 +1264,7 @@ fn send_never_needs_receive_first() {
             VideoConfig {
                 threads,
                 extradata: None,
+                hardware: false,
             },
         )
         .unwrap();
@@ -1189,6 +1294,7 @@ fn a_caller_that_never_receives_gets_queue_full_not_unbounded_memory() {
         VideoConfig {
             threads: 1,
             extradata: None,
+            hardware: false,
         },
     )
     .unwrap();
@@ -1266,6 +1372,7 @@ fn thread_counts_give_identical_pictures() {
         VideoConfig {
             threads: 1,
             extradata: None,
+            hardware: false,
         },
         &units,
     ));
@@ -1273,6 +1380,7 @@ fn thread_counts_give_identical_pictures() {
         let config = VideoConfig {
             threads,
             extradata: None,
+            hardware: false,
         };
         assert_eq!(
             hashes(&decode_video(&lib, CodecId::H264, config, &units)),

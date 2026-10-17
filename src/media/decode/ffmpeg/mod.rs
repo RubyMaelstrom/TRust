@@ -35,9 +35,13 @@
 //! FFmpeg's structures change between releases, so as little of them as
 //! possible is mirrored, all of it in `abi.rs`:
 //!
-//! * `AVCodecContext` is never mirrored. It is configured through
-//!   `AVOption`s: `threads`, `flags`, `ar`, and `ch_layout` (or `ac` before
-//!   FFmpeg 5.1).
+//! * `AVCodecContext` is configured through `AVOption`s: `threads`,
+//!   `flags`, `ar`, and `ch_layout` (or `ac` before FFmpeg 5.1). Its one
+//!   member written directly is `hw_device_ctx`, which no option sets, at a
+//!   per-major offset from the same headers, confirmed when the library is
+//!   opened by `av_opt_find`'s offset for the member after it
+//!   (`hwaccel_flags`). `AVCodecHWConfig` and `AVOption` up to `offset` are
+//!   read; both are the same in every release.
 //! * Extradata goes through an `AVCodecParameters` of which only the first
 //!   five members are written (`codec_type`, `codec_id`, `codec_tag`,
 //!   `extradata`, `extradata_size`) before `avcodec_parameters_to_context`.
@@ -70,7 +74,11 @@
 //!
 //! Decoders are found by name (`h264`, `hevc`, `aac`, `libdav1d`, ...), never
 //! with `avcodec_find_decoder`, which can hand back a hardware wrapper or
-//! the built-in AV1 decoder that needs a hardware device. Video comes back as
+//! the built-in AV1 decoder that needs a hardware device. With
+//! [`VideoConfig::hardware`], FFmpeg's own decoders (and, for AV1, the
+//! built-in `av1`) decode on the process's VA-API, CUDA or Vulkan device
+//! when it handles the format, and pictures are copied back to system
+//! memory (see `hardware.rs`; `TRUST_HWDEC` chooses the device types). Video comes back as
 //! [`PixelFormat`]s of 8, 10 and 12 bits (4:2:0, 4:2:2, 4:4:4, gray, NV12,
 //! P010) and anything else is an [`Error::UnsupportedFormat`]; audio is
 //! converted to interleaved `f32`.
@@ -112,6 +120,7 @@ mod codec;
 mod decoder;
 mod error;
 mod formats;
+mod hardware;
 mod library;
 mod video;
 
