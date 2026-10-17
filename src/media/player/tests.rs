@@ -190,3 +190,52 @@ fn unusable_resources_report_src_not_supported() {
     });
     assert!(matches!(error, Event::Error(ErrorKind::SrcNotSupported, _)));
 }
+
+#[test]
+fn frames_and_ends_from_before_a_seek_do_not_stand_for_it() {
+    // HTML #seeking: the frame shown when a seek completes is the one for
+    // the new position. Decoders with frame threads still hold frames of
+    // the old position when it starts, and the old stream's end may be
+    // reported after it; neither may satisfy the seek.
+    use crate::media::frame::{Layout, Plane, VideoFrame};
+    use crate::media::track::ColorInfo;
+    let frame = |pts| VideoFrame {
+        pts,
+        duration: 100_000,
+        width: 2,
+        height: 2,
+        display_width: 2,
+        display_height: 2,
+        bit_depth: 8,
+        layout: Layout::Monochrome,
+        color: ColorInfo {
+            primaries: 1,
+            transfer: 1,
+            matrix: 1,
+            full_range: false,
+        },
+        planes: vec![Plane::u8(vec![16; 4], 2, 2, 2)],
+    };
+    let surface = VideoSurface::new();
+    let sink = VideoSink::new(
+        Arc::new(Clock::new()),
+        Arc::clone(&surface),
+        Arc::new((Mutex::new(false), Condvar::new())),
+        (Arc::default(), Arc::default()),
+    );
+    let generation = AtomicU64::new(1);
+    sink.flush(Some(750_000));
+    // The old stream's last frame and end arrive after the seek started.
+    assert!(
+        !sink.push(frame(800_000), &generation, 0),
+        "a stale frame is refused"
+    );
+    sink.set_end_of_stream(&generation, 0);
+    assert!(!sink.seek_ready(), "a stale end does not finish the seek");
+    // The new stream decodes from the keyframe before the target.
+    for pts in [500_000, 600_000, 700_000, 800_000] {
+        assert!(sink.push(frame(pts), &generation, 1));
+    }
+    assert!(sink.seek_ready());
+    assert_eq!(surface.current().unwrap().0.pts, 700_000);
+}

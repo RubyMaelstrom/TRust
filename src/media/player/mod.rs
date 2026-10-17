@@ -466,7 +466,7 @@ fn video_thread(
                         }
                     }
                 }
-                sink.set_end_of_stream();
+                sink.set_end_of_stream(&generation, current);
             }
         }
     }

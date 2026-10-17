@@ -198,6 +198,13 @@ impl VideoSink {
     pub(crate) fn push(&self, frame: VideoFrame, generation: &AtomicU64, expected: u64) -> bool {
         let frame = Arc::new(frame);
         let mut queue = self.lock();
+        // A frame decoded before a seek (decoders with frame threads or
+        // reordering still hold some when it starts) must neither stand for
+        // the seek's target nor play after it. The control thread advances
+        // the generation before `flush`, so under the lock this is final.
+        if generation.load(Ordering::Acquire) != expected {
+            return false;
+        }
         // Large pictures get a shorter queue.
         queue.capacity = if u64::from(frame.width) * u64::from(frame.height) > 1920 * 1088 {
             3
@@ -249,9 +256,13 @@ impl VideoSink {
         true
     }
 
-    /// The decoder delivered everything.
-    pub(crate) fn set_end_of_stream(&self) {
+    /// The decoder delivered everything of generation `expected`; an end
+    /// reached before a seek says nothing about the stream after it.
+    pub(crate) fn set_end_of_stream(&self, generation: &AtomicU64, expected: u64) {
         let mut queue = self.lock();
+        if generation.load(Ordering::Acquire) != expected {
+            return;
+        }
         queue.end_of_stream = true;
         if queue.seek_target.take().is_some() {
             // The target is past the last frame: show the last one.
