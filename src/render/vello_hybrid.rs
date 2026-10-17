@@ -87,6 +87,54 @@ pub enum PresentOutcome {
     Skipped,
 }
 
+/// The GPU device Hybrid renderers share: a browser's windows draw with one
+/// device, queue and driver context, as one GPU process serves every window
+/// of Chromium and Firefox. Each renderer keeps its own surface, pipelines
+/// and atlases. A lost device serves no new renderer.
+#[derive(Clone)]
+pub struct HybridDevice {
+    instance: wgpu::Instance,
+    adapter: wgpu::Adapter,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    /// The latest validation error, for the renderer that checks next.
+    failure: Arc<Mutex<Option<String>>>,
+    /// Why the device was lost: every renderer on it fails over.
+    lost: Arc<Mutex<Option<String>>>,
+}
+
+impl HybridDevice {
+    fn new(
+        instance: wgpu::Instance,
+        adapter: wgpu::Adapter,
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+    ) -> Self {
+        let failure = Arc::new(Mutex::new(None));
+        let validation_failure = Arc::clone(&failure);
+        device.on_uncaptured_error(Arc::new(move |error| {
+            *validation_failure.lock().unwrap() = Some(error.to_string());
+        }));
+        let lost = Arc::new(Mutex::new(None));
+        let device_lost = Arc::clone(&lost);
+        device.set_device_lost_callback(move |reason, message| {
+            *device_lost.lock().unwrap() = Some(format!("GPU device lost ({reason:?}): {message}"));
+        });
+        Self {
+            instance,
+            adapter,
+            device,
+            queue,
+            failure,
+            lost,
+        }
+    }
+
+    pub fn is_lost(&self) -> bool {
+        self.lost.lock().unwrap().is_some()
+    }
+}
+
 /// Retained accelerated renderer. It can either own a presentable winit
 /// surface or a reusable off-screen texture for differential tests.
 pub struct VelloHybridRenderer {
@@ -115,6 +163,7 @@ pub struct VelloHybridRenderer {
     rgba: Vec<u8>,
     presented: Vec<u32>,
     device_failure: Arc<Mutex<Option<String>>>,
+    device_lost: Arc<Mutex<Option<String>>>,
     adapter_name: String,
     /// The CPU reference renderer that rasterizes effects the GPU path does
     /// not run (SVG filter graphs, Backdrop Root Images), created only while
@@ -129,7 +178,6 @@ impl VelloHybridRenderer {
     /// covers adapter/device negotiation; rendering remains synchronous with
     /// the winit redraw callback and does not create a polling loop.
     pub async fn new_window(window: Arc<Window>) -> Result<Self, String> {
-        let size = physical_size(window.inner_size().width, window.inner_size().height);
         let instance = wgpu::Instance::default();
         let surface = instance
             .create_surface(Arc::clone(&window))
@@ -144,11 +192,51 @@ impl VelloHybridRenderer {
             .await
             .map_err(|error| format!("no compatible Hybrid adapter: {error}"))?;
         let (device, queue) = request_device(&adapter).await?;
-        let capabilities = surface.get_capabilities(&adapter);
+        let gpu = HybridDevice::new(instance, adapter, device, queue);
+        Self::for_surface(gpu, surface, window)
+    }
+
+    /// A renderer for `window` on the device `gpu` that another window's
+    /// renderer already uses (`device`), when that device can present to it.
+    pub fn new_window_on(gpu: &HybridDevice, window: Arc<Window>) -> Result<Self, String> {
+        if gpu.is_lost() {
+            return Err(String::from("the shared GPU device was lost"));
+        }
+        let surface = gpu
+            .instance
+            .create_surface(Arc::clone(&window))
+            .map_err(|error| format!("could not create Hybrid surface: {error}"))?;
+        if !gpu.adapter.is_surface_supported(&surface) {
+            return Err(String::from(
+                "the shared GPU device cannot present to this window",
+            ));
+        }
+        Self::for_surface(gpu.clone(), surface, window)
+    }
+
+    /// The device this renderer draws with, for other windows to share.
+    pub fn device(&self) -> HybridDevice {
+        HybridDevice {
+            instance: self.instance.clone(),
+            adapter: self.adapter.clone(),
+            device: self.device.clone(),
+            queue: self.queue.clone(),
+            failure: Arc::clone(&self.device_failure),
+            lost: Arc::clone(&self.device_lost),
+        }
+    }
+
+    fn for_surface(
+        gpu: HybridDevice,
+        surface: wgpu::Surface<'static>,
+        window: Arc<Window>,
+    ) -> Result<Self, String> {
+        let size = physical_size(window.inner_size().width, window.inner_size().height);
+        let capabilities = surface.get_capabilities(&gpu.adapter);
         let format = preferred_surface_format(&capabilities.formats)
             .ok_or_else(|| String::from("Hybrid surface reports no texture formats"))?;
         let mut config = surface
-            .get_default_config(&adapter, size.width.max(1), size.height.max(1))
+            .get_default_config(&gpu.adapter, size.width.max(1), size.height.max(1))
             .ok_or_else(|| String::from("Hybrid adapter cannot configure this surface"))?;
         config.format = format;
         config.present_mode = wgpu::PresentMode::AutoVsync;
@@ -158,13 +246,10 @@ impl VelloHybridRenderer {
             config.usage |= wgpu::TextureUsages::COPY_DST;
         }
         if !size.is_empty() {
-            surface.configure(&device, &config);
+            surface.configure(&gpu.device, &config);
         }
         Self::from_device(
-            instance,
-            adapter,
-            device,
-            queue,
+            gpu,
             format,
             size,
             Some(surface),
@@ -189,10 +274,7 @@ impl VelloHybridRenderer {
             .map_err(|error| format!("no headless Hybrid adapter: {error}"))?;
         let (device, queue) = request_device(&adapter).await?;
         Self::from_device(
-            instance,
-            adapter,
-            device,
-            queue,
+            HybridDevice::new(instance, adapter, device, queue),
             TextureFormat::Rgba8Unorm,
             PhysicalSize::new(1, 1),
             None,
@@ -202,12 +284,8 @@ impl VelloHybridRenderer {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn from_device(
-        instance: wgpu::Instance,
-        adapter: wgpu::Adapter,
-        device: wgpu::Device,
-        queue: wgpu::Queue,
+        gpu: HybridDevice,
         format: TextureFormat,
         size: PhysicalSize,
         surface: Option<wgpu::Surface<'static>>,
@@ -215,6 +293,14 @@ impl VelloHybridRenderer {
         window: Option<Arc<Window>>,
         surface_copy_dst: bool,
     ) -> Result<Self, String> {
+        let HybridDevice {
+            instance,
+            adapter,
+            device,
+            queue,
+            failure,
+            lost,
+        } = gpu;
         ensure_device_size(&device, size)?;
         let (renderer, resources) = vello_gpu::Renderer::new(
             &device,
@@ -224,16 +310,6 @@ impl VelloHybridRenderer {
                 height: vello_extent(size.height)?,
             },
         );
-        let failure = Arc::new(Mutex::new(None));
-        let validation_failure = Arc::clone(&failure);
-        device.on_uncaptured_error(Arc::new(move |error| {
-            *validation_failure.lock().unwrap() = Some(error.to_string());
-        }));
-        let lost_failure = Arc::clone(&failure);
-        device.set_device_lost_callback(move |reason, message| {
-            *lost_failure.lock().unwrap() =
-                Some(format!("GPU device lost ({reason:?}): {message}"));
-        });
         let adapter_name = adapter.get_info().name;
         Ok(Self {
             instance,
@@ -259,6 +335,7 @@ impl VelloHybridRenderer {
             rgba: Vec::new(),
             presented: Vec::new(),
             device_failure: failure,
+            device_lost: lost,
             adapter_name,
             effects: None,
             video: None,
@@ -1672,7 +1749,11 @@ impl VelloHybridRenderer {
     }
 
     fn take_device_failure(&self) -> Option<String> {
-        self.device_failure.lock().unwrap().take()
+        self.device_failure
+            .lock()
+            .unwrap()
+            .take()
+            .or_else(|| self.device_lost.lock().unwrap().clone())
     }
 }
 

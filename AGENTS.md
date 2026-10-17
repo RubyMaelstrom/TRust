@@ -130,11 +130,14 @@ The project favors:
   the terminal's file chooser.
 - `src/core/`: shared browser controller and event delivery for desktop and
   headless clients.
-- `src/bin/trust-desktop.rs`: winit window, native input, and presentation loop.
-  Its modules: `tabs.rs` (tabs, their sleep and mute and the pages' requests
-  for new ones), `window_chrome.rs` (the tab strip replacing the title bar
-  and its partial repaints), `unload_prompt.rs` (the "leave this page?"
-  question), `context_menu.rs` and `text_selection.rs`.
+- `src/bin/trust-desktop.rs`: a window's native input and presentation
+  loop (`DesktopWindow`). Its modules: `windowing.rs` (`DesktopApp`: the
+  process's windows, Ctrl+N, event routing, quitting every window
+  together), `tabs.rs` (a window's tabs, their sleep and mute and the
+  pages' requests for new ones), `window_chrome.rs` (the tab strip replacing
+  the title bar and its partial repaints), `unload_prompt.rs` (the "leave
+  this page?" question, closing a window and quitting), `context_menu.rs`
+  and `text_selection.rs`.
 - `src/render/`: renderer-neutral display list, Parley-shaped text, Vello CPU
   reference renderer, Hybrid wgpu backend (Vello GPU) with its GPU video
   frame conversion (`video_gpu.rs`), and windowless

@@ -175,6 +175,9 @@ enum DesktopEvent {
     },
     /// A selection drag beyond the content viewport scrolls it.
     SelectionAutoscroll,
+    /// Ctrl+N's window opens even when the window manager does not answer
+    /// its request for an activation token in time (`windowing`).
+    NewWindowDue(winit::event_loop::AsyncRequestSerial),
     /// A background tab may have stayed unseen long enough to sleep.
     SleepCheck,
 }
@@ -230,6 +233,10 @@ mod text_selection;
 mod unload_prompt;
 #[path = "trust-desktop/window_chrome.rs"]
 mod window_chrome;
+#[path = "trust-desktop/windowing.rs"]
+mod windowing;
+
+use windowing::{AppEvent, AppRequest, DesktopApp, NewWindow, WindowProxy};
 
 /// The pointer's position in the window while another application's drag holds the pointer
 /// grab (winit 0.30 delivers no motion then), in physical pixels.
@@ -428,7 +435,7 @@ struct AnimationPlayer {
 }
 
 impl AnimationPlayer {
-    fn new(proxy: EventLoopProxy<DesktopEvent>) -> Self {
+    fn new(proxy: WindowProxy) -> Self {
         let (commands, receiver) = mpsc::channel();
         let output = Arc::new(Mutex::new(AnimationOutput::default()));
         let worker_output = Arc::clone(&output);
@@ -593,13 +600,13 @@ impl WorkerAnimation {
 static MEDIA_FRAME_PENDING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-fn install_media_frame_waker(proxy: EventLoopProxy<DesktopEvent>) {
+fn install_media_frame_waker(proxy: EventLoopProxy<AppEvent>) {
     let proxy = Mutex::new(proxy);
     trust::media::player::set_frame_waker(move |_surface| {
         if !MEDIA_FRAME_PENDING.swap(true, std::sync::atomic::Ordering::AcqRel)
             && let Ok(proxy) = proxy.lock()
         {
-            let _ = proxy.send_event(DesktopEvent::MediaFrame);
+            let _ = proxy.send_event(AppEvent::MediaFrame);
         }
     });
 }
@@ -610,7 +617,7 @@ fn animation_frame_delay(delay: Duration) -> Duration {
 
 fn publish_animation_update(
     output: &Arc<Mutex<AnimationOutput>>,
-    proxy: &EventLoopProxy<DesktopEvent>,
+    proxy: &WindowProxy,
     update: AnimationUpdate,
 ) -> bool {
     let wake = {
@@ -623,13 +630,13 @@ fn publish_animation_update(
             true
         }
     };
-    !wake || proxy.send_event(DesktopEvent::AnimationWake).is_ok()
+    !wake || proxy.send_event(DesktopEvent::AnimationWake)
 }
 
 fn animation_worker(
     commands: mpsc::Receiver<AnimationCommand>,
     output: Arc<Mutex<AnimationOutput>>,
-    proxy: EventLoopProxy<DesktopEvent>,
+    proxy: WindowProxy,
 ) {
     let mut generation = 0;
     let mut image_epoch = 0;
@@ -766,12 +773,6 @@ fn animation_worker(
             AnimationCommand::SetActive { .. } => {}
             AnimationCommand::Shutdown => return,
         }
-    }
-}
-
-impl From<AccessEvent> for DesktopEvent {
-    fn from(event: AccessEvent) -> Self {
-        Self::Access(event)
     }
 }
 
@@ -1871,7 +1872,7 @@ impl SelectPopup {
     }
 }
 
-struct DesktopApp {
+struct DesktopWindow {
     /// The tab shown in the window. Every other tab is in `tabs`.
     tab: Box<tabs::Tab>,
     tabs: tabs::TabSet,
@@ -1902,6 +1903,8 @@ struct DesktopApp {
     next_file_drag: u64,
     renderer: Option<DesktopRenderer>,
     renderer_preference: RendererPreference,
+    /// The GPU device every window's Hybrid renderer shares (`windowing`).
+    shared_gpu: std::rc::Rc<std::cell::RefCell<Option<trust::render::vello_hybrid::HybridDevice>>>,
     surface: Option<Surface<OwnedDisplayHandle, Arc<Window>>>,
     context: Option<Context<OwnedDisplayHandle>>,
     window: Option<Arc<Window>>,
@@ -1932,7 +1935,8 @@ struct DesktopApp {
     downloads_in_flight: usize,
     composing: bool,
     runtime: Handle,
-    event_proxy: EventLoopProxy<DesktopEvent>,
+    /// This window's events go through it (`windowing`).
+    event_proxy: WindowProxy,
     image_store: ImageStore,
     animations: AnimationPlayer,
     window_focused: bool,
@@ -1946,6 +1950,8 @@ struct DesktopApp {
     context_menu_swallow: Option<MouseButton>,
     /// Only the overlay needs repainting (`draw_partial`).
     overlay_redraw_pending: bool,
+    /// A video the retained scene shows has a new frame (`draw_partial`).
+    video_redraw_pending: bool,
     /// Where the overlay's commands start in the retained scene, and the
     /// rectangle they painted.
     overlay_start: usize,
@@ -1959,7 +1965,16 @@ struct DesktopApp {
     /// Quitting waits for the pages' answers.
     quitting: Option<unload_prompt::Quitting>,
     clipboard: Option<arboard::Clipboard>,
-    exit_requested: bool,
+    /// The window closed: its pages unloaded, and `DesktopApp` drops it.
+    closed: bool,
+    /// What this window asked of the application (`windowing`).
+    app_requests: Vec<AppRequest>,
+    /// Ctrl+N's new windows waiting for their activation tokens, with the
+    /// size each takes.
+    pending_new_windows: Vec<(winit::event_loop::AsyncRequestSerial, Option<(f64, f64)>)>,
+    /// The native window opens with this activation token and logical size.
+    activation_token: Option<String>,
+    initial_size: Option<(f64, f64)>,
     bookmarks: Option<trust::bookmarks::Worker>,
     pressed_control: Option<ControlId>,
     chrome_tick_scheduled: bool,
@@ -2221,10 +2236,10 @@ fn native_cursor_pixels(
     ))
 }
 
-impl DesktopApp {
+impl DesktopWindow {
     fn new(
         runtime: Handle,
-        event_proxy: EventLoopProxy<DesktopEvent>,
+        event_proxy: WindowProxy,
         renderer_preference: RendererPreference,
         initial_navigation: Option<String>,
     ) -> Self {
@@ -2247,7 +2262,7 @@ impl DesktopApp {
         first: tabs::TabId,
         mut browser: BrowserController,
         runtime: Handle,
-        event_proxy: EventLoopProxy<DesktopEvent>,
+        event_proxy: WindowProxy,
         renderer_preference: RendererPreference,
         initial_navigation: Option<String>,
     ) -> Self {
@@ -2278,6 +2293,7 @@ impl DesktopApp {
             next_file_drag: 1,
             renderer: None,
             renderer_preference,
+            shared_gpu: Default::default(),
             surface: None,
             context: None,
             window: None,
@@ -2313,6 +2329,7 @@ impl DesktopApp {
             context_menu_request: None,
             context_menu_swallow: None,
             overlay_redraw_pending: false,
+            video_redraw_pending: false,
             overlay_start: 0,
             overlay_damage: None,
             unload_prompt: None,
@@ -2320,7 +2337,11 @@ impl DesktopApp {
             leaving: HashMap::new(),
             quitting: None,
             clipboard,
-            exit_requested: false,
+            closed: false,
+            app_requests: Vec::new(),
+            pending_new_windows: Vec::new(),
+            activation_token: None,
+            initial_size: None,
             bookmarks: None,
             pressed_control: None,
             chrome_tick_scheduled: false,
@@ -2562,6 +2583,26 @@ impl DesktopApp {
         if let Some(window) = &self.window {
             window.request_redraw();
         }
+    }
+
+    /// Whether a video this window last presented has shown a frame since:
+    /// players wake every window, and only those showing the video redraw.
+    fn shows_new_video_frame(&self) -> bool {
+        !self.new_video_frames().is_empty()
+    }
+
+    /// The visible videos whose players have shown a frame since this window
+    /// last presented them, with their frames' serials.
+    fn new_video_frames(&self) -> HashMap<ImageHandle, Option<u64>> {
+        self.presented_image_revisions
+            .iter()
+            .filter(|(handle, _)| handle.video_surface().is_some())
+            .map(|(&handle, &presented)| {
+                (handle, presented, trust::render::video_frame_serial(handle))
+            })
+            .filter(|(_, presented, current)| presented != current)
+            .map(|(handle, _, current)| (handle, current))
+            .collect()
     }
 
     fn set_active_animations(&mut self, handles: HashSet<ImageHandle>) {
@@ -3250,14 +3291,11 @@ impl DesktopApp {
                         batch.push(event);
                     }
                     let (acknowledged, done) = tokio::sync::oneshot::channel();
-                    if proxy
-                        .send_event(DesktopEvent::Telnet {
-                            session: id,
-                            events: batch,
-                            acknowledged,
-                        })
-                        .is_err()
-                    {
+                    if !proxy.send_event(DesktopEvent::Telnet {
+                        session: id,
+                        events: batch,
+                        acknowledged,
+                    }) {
                         break;
                     }
                     // At most one batch enters winit's unbounded user-event queue.
@@ -3801,15 +3839,27 @@ impl DesktopApp {
                 self.ensure_software_surface()?;
             }
             RendererPreference::Hybrid | RendererPreference::Auto => {
-                match self
-                    .runtime
-                    .block_on(VelloHybridRenderer::new_window(window))
-                {
+                // The browser's other windows' device, when it can present
+                // here; else a device of this window's own, shared from now.
+                let shared = self.shared_gpu.borrow().clone();
+                let renderer = shared
+                    .and_then(|gpu| {
+                        VelloHybridRenderer::new_window_on(&gpu, Arc::clone(&window)).ok()
+                    })
+                    .map_or_else(
+                        || {
+                            self.runtime
+                                .block_on(VelloHybridRenderer::new_window(window))
+                        },
+                        Ok,
+                    );
+                match renderer {
                     Ok(renderer) => {
                         eprintln!(
                             "trust-desktop: renderer=hybrid adapter={}",
                             renderer.adapter_name()
                         );
+                        *self.shared_gpu.borrow_mut() = Some(renderer.device());
                         self.renderer = Some(DesktopRenderer::Hybrid(Box::new(renderer)));
                     }
                     Err(error) if self.renderer_preference == RendererPreference::Auto => {
@@ -6152,7 +6202,7 @@ impl DesktopApp {
                 self.bookmark_command(command);
                 self.close_command();
             }
-            "q" | "quit" | "exit" => self.request_quit(),
+            "q" | "quit" | "exit" => self.app_requests.push(AppRequest::Quit),
             "back" => {
                 self.close_command();
                 self.dispatch(UserAction::Back);
@@ -9167,8 +9217,14 @@ impl DesktopApp {
     }
 }
 
-impl ApplicationHandler<DesktopEvent> for DesktopApp {
-    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+/// The window's share of the event loop's turns, which `DesktopApp`
+/// (`windowing`) routes to it.
+impl DesktopWindow {
+    /// The loop is about to wait: when this window needs it to wake.
+    fn about_to_wait(&mut self) -> Option<Instant> {
+        if self.closed {
+            return None;
+        }
         self.service_file_drag();
         if std::mem::take(&mut self.tab.browser_events_pending) {
             let outcome = self.process_browser_events();
@@ -9180,48 +9236,42 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
         // Background pages keep running; their events are drained after
         // the shown tab's, so the actor channels never back up.
         self.service_background_tabs();
-        if self.exit_requested {
-            self.release_native_pointer_lock(false);
-            event_loop.exit();
-            return;
+        if self.closed {
+            return None;
         }
         // A fullscreen request the window manager never resized for is
         // answered at its deadline.
         self.answer_fullscreen_request(false);
-        match self.fullscreen_reply {
-            Some((_, since)) => event_loop
-                .set_control_flow(ControlFlow::WaitUntil(since + FULLSCREEN_REPLY_DEADLINE)),
-            None => event_loop.set_control_flow(ControlFlow::Wait),
-        }
+        self.fullscreen_reply
+            .map(|(_, since)| since + FULLSCREEN_REPLY_DEADLINE)
     }
 
+    /// The event loop resumed, or this window was just opened: create its
+    /// native window, surface and renderer. A window that cannot present
+    /// closes.
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.closed {
+            return;
+        }
         self.force_full_raster = true;
-        event_loop.set_control_flow(ControlFlow::Wait);
         self.window_focused = true;
         self.tab.image_schedule_key = None;
         if self.window.is_none() {
-            // The tab strip replaces the system title bar (`window_chrome`).
-            let attributes = Window::default_attributes()
-                .with_title("TRust")
-                .with_decorations(false)
-                .with_visible(false)
-                .with_inner_size(LogicalSize::new(960.0, 640.0))
-                .with_min_inner_size(LogicalSize::new(480.0, 320.0));
+            let attributes = self.native_window_attributes();
             match event_loop.create_window(attributes) {
                 Ok(window) => {
                     let window = Arc::new(window);
                     self.accessibility = Some(AccessAdapter::with_event_loop_proxy(
                         event_loop,
                         &window,
-                        self.event_proxy.clone(),
+                        self.event_proxy.event_loop().clone(),
                     ));
                     window.set_visible(true);
                     self.window = Some(window);
                 }
                 Err(error) => {
                     eprintln!("trust-desktop: could not create window: {error}");
-                    event_loop.exit();
+                    self.close_now();
                     return;
                 }
             }
@@ -9231,7 +9281,7 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
                 Ok(context) => self.context = Some(context),
                 Err(error) => {
                     eprintln!("trust-desktop: could not create software context: {error}");
-                    event_loop.exit();
+                    self.close_now();
                     return;
                 }
             }
@@ -9239,7 +9289,7 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
         if self.renderer.is_none() {
             if let Err(error) = self.initialize_renderer() {
                 eprintln!("trust-desktop: could not initialize renderer: {error}");
-                event_loop.exit();
+                self.close_now();
                 return;
             }
         } else if let Some(DesktopRenderer::Hybrid(renderer)) = &mut self.renderer {
@@ -9251,13 +9301,13 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
                 self.renderer = Some(DesktopRenderer::Cpu(CpuDesktopRenderer::new()));
                 if let Err(error) = self.ensure_software_surface() {
                     eprintln!("trust-desktop: CPU fallback unavailable: {error}");
-                    event_loop.exit();
+                    self.close_now();
                     return;
                 }
             }
         } else if let Err(error) = self.ensure_software_surface() {
             eprintln!("trust-desktop: could not resume software surface: {error}");
-            event_loop.exit();
+            self.close_now();
             return;
         }
         self.update_metrics(None);
@@ -9271,7 +9321,7 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
         self.request_redraw();
     }
 
-    fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
+    fn suspended(&mut self) {
         self.release_native_pointer_lock(true);
         self.force_full_raster = true;
         self.window_focused = false;
@@ -9282,19 +9332,14 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
         self.surface = None;
     }
 
-    fn device_event(
-        &mut self,
-        _event_loop: &ActiveEventLoop,
-        _device: DeviceId,
-        event: DeviceEvent,
-    ) {
+    fn device_event(&mut self, event: &DeviceEvent) {
         if !self.window_focused {
             return;
         }
         let Some(lock) = self.pointer_lock.as_ref() else {
             return;
         };
-        if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
+        if let &DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
             if !dx.is_finite() || !dy.is_finite() {
                 return;
             }
@@ -9313,7 +9358,7 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
         }
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: DesktopEvent) {
+    fn user_event(&mut self, event: DesktopEvent) {
         match event {
             DesktopEvent::Bookmarks(completion) => self.on_bookmark(completion),
             DesktopEvent::BrowserWake(tab) => {
@@ -9368,6 +9413,7 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
             }
             DesktopEvent::FileDragTick { session } => self.file_drag_iteration(session),
             DesktopEvent::SelectionAutoscroll => self.selection_autoscroll_tick(),
+            DesktopEvent::NewWindowDue(serial) => self.open_pending_new_window(serial, None),
             DesktopEvent::SleepCheck => {
                 self.sleep_check_scheduled = None;
                 self.sleep_unseen_tabs();
@@ -9538,8 +9584,12 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
                 }
             }
             DesktopEvent::MediaFrame => {
-                MEDIA_FRAME_PENDING.store(false, std::sync::atomic::Ordering::Release);
-                self.request_redraw();
+                if self.shows_new_video_frame() {
+                    self.video_redraw_pending = true;
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                }
             }
             DesktopEvent::Access(event) => match event.window_event {
                 accesskit_winit::WindowEvent::InitialTreeRequested => {
@@ -9624,17 +9674,8 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
         }
     }
 
-    fn window_event(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-        window_id: WindowId,
-        event: WindowEvent,
-    ) {
-        if self
-            .window
-            .as_ref()
-            .is_none_or(|window| window.id() != window_id)
-        {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
+        if self.closed {
             return;
         }
         if let (Some(adapter), Some(window)) = (&mut self.accessibility, &self.window) {
@@ -9645,16 +9686,16 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
                 self.release_native_pointer_lock(false);
                 // The pages decide first (HTML
                 // #definitely-close-a-top-level-traversable).
-                self.request_quit();
-                if self.exit_requested {
-                    event_loop.exit();
-                }
+                self.request_quit(false);
             }
             WindowEvent::Destroyed => {
                 self.surface = None;
                 self.renderer = None;
                 self.window = None;
-                event_loop.exit();
+                self.close_now();
+            }
+            WindowEvent::ActivationTokenDone { serial, token } => {
+                self.activation_token_done(serial, token);
             }
             WindowEvent::Resized(_) => {
                 if std::env::var_os("TRUST_DESKTOP_TRACE").is_some() {
@@ -9688,12 +9729,13 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
             WindowEvent::RedrawRequested => {
                 let overlay = std::mem::take(&mut self.overlay_redraw_pending);
                 let strip = std::mem::take(&mut self.strip_redraw_pending);
+                let video = std::mem::take(&mut self.video_redraw_pending);
                 let result = if consume_pending_redraw(&mut self.redraw_pending) {
                     self.draw()
-                } else if overlay || strip {
-                    // Only the tab strip or the overlays changed: repaint
-                    // them over the retained page composition.
-                    self.draw_partial(strip, overlay)
+                } else if overlay || strip || video {
+                    // Only the tab strip, the overlays or video frames
+                    // changed: repaint them over the retained composition.
+                    self.draw_partial(strip, overlay, video)
                 } else {
                     return;
                 };
@@ -9735,12 +9777,7 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
                 event,
                 is_synthetic: false,
                 ..
-            } => {
-                self.handle_keyboard(event);
-                if self.exit_requested {
-                    event_loop.exit();
-                }
-            }
+            } => self.handle_keyboard(event),
             WindowEvent::Ime(event) => self.handle_ime(event),
             WindowEvent::CursorMoved { position, .. } => {
                 self.pointer_inside = true;
@@ -10536,6 +10573,8 @@ fn parse_desktop_args(args: impl IntoIterator<Item = String>) -> Result<DesktopO
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    // SAFETY: first in `main`, before any thread exists.
+    let activation_token = unsafe { windowing::take_activation_token() };
     // Unlike a terminal grid, the graphical desktop animates smoothly, and
     // its user has stated no motion preference.
     trust::dom::set_prefers_reduced_motion(false);
@@ -10560,11 +10599,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     if trust::js::enable_spare_page_engine(true) && web_start {
         trust::js::prewarm_page_engine();
     }
-    let event_loop = EventLoop::<DesktopEvent>::with_user_event().build()?;
+    let event_loop = EventLoop::<AppEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
     install_media_frame_waker(proxy.clone());
     trust::site_storage::set_wake(move || {
-        let _ = proxy.send_event(DesktopEvent::BrowserWake(None));
+        let _ = proxy.send_event(AppEvent::ServicesWake);
     });
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -10574,7 +10613,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         runtime.handle().clone(),
         event_loop.create_proxy(),
         options.renderer,
-        options.address,
+        NewWindow {
+            address: options.address,
+            activation_token,
+            size: None,
+        },
     );
     let result = event_loop.run_app(&mut app);
     drop(app);
@@ -10592,12 +10635,12 @@ fn main() -> Result<(), Box<dyn Error>> {
 mod tests {
     use super::*;
 
-    impl DesktopApp {
+    impl DesktopWindow {
         /// An app whose first tab uses `browser`, as a test configured it.
         fn for_test(
             browser: BrowserController,
             runtime: Handle,
-            event_proxy: EventLoopProxy<DesktopEvent>,
+            event_proxy: EventLoopProxy<AppEvent>,
             renderer_preference: RendererPreference,
             initial_navigation: Option<String>,
         ) -> Self {
@@ -10608,7 +10651,7 @@ mod tests {
                 first,
                 browser,
                 runtime,
-                event_proxy,
+                WindowProxy::for_test(event_proxy),
                 renderer_preference,
                 initial_navigation,
             )
@@ -10821,9 +10864,9 @@ mod tests {
 
     /// A desktop app showing `html` as a static page (no live Document),
     /// composed as `draw` composes it.
-    fn static_page_app(event_loop: &EventLoop<DesktopEvent>, html: &str) -> DesktopApp {
+    fn static_page_app(event_loop: &EventLoop<AppEvent>, html: &str) -> DesktopWindow {
         let browser = BrowserController::new(Handle::current(), || {}, CssSize::new(640.0, 480.0));
-        let mut app = DesktopApp::for_test(
+        let mut app = DesktopWindow::for_test(
             browser,
             Handle::current(),
             event_loop.create_proxy(),
@@ -10878,7 +10921,7 @@ mod tests {
         app
     }
 
-    fn recompose(app: &mut DesktopApp) {
+    fn recompose(app: &mut DesktopWindow) {
         let mut scene = desktop_chrome(
             app.metrics,
             &app.tab.browser.snapshot(),
@@ -10902,7 +10945,7 @@ mod tests {
 
     /// The window point of byte `byte` of the run laying out `text`, at
     /// its vertical middle.
-    fn text_at(app: &DesktopApp, text: &str, byte: usize) -> CssPoint {
+    fn text_at(app: &DesktopWindow, text: &str, byte: usize) -> CssPoint {
         let scene = app.scene.as_ref().unwrap();
         let content = scene.content_viewport;
         scene
@@ -10931,7 +10974,7 @@ mod tests {
     async fn desktop_page_selection_and_context_menu() {
         // winit allows one event loop per process: the scenarios share it.
         use winit::platform::wayland::EventLoopBuilderExtWayland;
-        let mut builder = EventLoop::<DesktopEvent>::with_user_event();
+        let mut builder = EventLoop::<AppEvent>::with_user_event();
         builder.with_any_thread(true).with_wayland();
         let event_loop = builder.build().unwrap();
         static_page_text_selection_gestures_and_copy(&event_loop);
@@ -10943,13 +10986,14 @@ mod tests {
         links_open_in_new_tabs(&event_loop);
         pages_open_tabs_for_new_targets(&event_loop).await;
         pages_that_ask_keep_their_tab_or_the_browser_open(&event_loop).await;
+        windows_open_and_the_browser_quits_with_all_of_them(&event_loop).await;
         popups_are_tabs_of_their_openers_group(&event_loop).await;
         media_offers_the_external_player_in_its_context_menu(&event_loop);
         // Last: it plays the rest of the process's audio silently.
         the_sound_indicator_mutes_its_tab_in_place(&event_loop).await;
     }
 
-    fn media_offers_the_external_player_in_its_context_menu(event_loop: &EventLoop<DesktopEvent>) {
+    fn media_offers_the_external_player_in_its_context_menu(event_loop: &EventLoop<AppEvent>) {
         // HTML #attr-media-controls: user agent features such as playing
         // the media elsewhere go in "the media element's context menu", and
         // "should not interfere with the page's normal rendering". Nothing
@@ -10994,7 +11038,7 @@ mod tests {
         app.close_context_menu();
     }
 
-    async fn the_sound_indicator_mutes_its_tab_in_place(event_loop: &EventLoop<DesktopEvent>) {
+    async fn the_sound_indicator_mutes_its_tab_in_place(event_loop: &EventLoop<AppEvent>) {
         // A live page's player offers mpv in its context menu, as a static
         // page's does. A tab playing sound shows its indicator in the strip;
         // pressing it mutes the tab (HTML #effective-media-volume: the user
@@ -11010,10 +11054,10 @@ mod tests {
         let (base, _log) = serve_pages(&PAGES).await;
         let browser = tabs::new_controller(
             &Handle::current(),
-            &event_loop.create_proxy(),
+            &WindowProxy::for_test(event_loop.create_proxy()),
             tabs::TabId(950),
         );
-        let mut app = DesktopApp::for_test(
+        let mut app = DesktopWindow::for_test(
             browser,
             Handle::current(),
             event_loop.create_proxy(),
@@ -11076,7 +11120,7 @@ mod tests {
             app.strip.hovered,
             Some(trust::render::TabStripPart::Sound(index))
         );
-        let muted = |app: &DesktopApp| match app.tabs.hidden(playing) {
+        let muted = |app: &DesktopWindow| match app.tabs.hidden(playing) {
             Some(tabs::Hidden::Awake(tab)) => tab.browser.is_audio_muted(),
             _ => panic!("the playing tab stays awake"),
         };
@@ -11093,7 +11137,7 @@ mod tests {
         assert_eq!(app.tab.id, shown);
     }
 
-    async fn popups_are_tabs_of_their_openers_group(event_loop: &EventLoop<DesktopEvent>) {
+    async fn popups_are_tabs_of_their_openers_group(event_loop: &EventLoop<AppEvent>) {
         // HTML #window-open-steps in a user agent with tabs: the popup is a
         // tab of its own in front, whose Documents run in its opener's page
         // engine, its next one from the network included
@@ -11113,7 +11157,7 @@ mod tests {
         let mut browser =
             BrowserController::new(Handle::current(), || {}, CssSize::new(640.0, 480.0));
         browser.set_new_traversables_available(true);
-        let mut app = DesktopApp::for_test(
+        let mut app = DesktopWindow::for_test(
             browser,
             Handle::current(),
             event_loop.create_proxy(),
@@ -11178,9 +11222,7 @@ mod tests {
         );
     }
 
-    async fn pages_that_ask_keep_their_tab_or_the_browser_open(
-        event_loop: &EventLoop<DesktopEvent>,
-    ) {
+    async fn pages_that_ask_keep_their_tab_or_the_browser_open(event_loop: &EventLoop<AppEvent>) {
         // HTML #definitely-close-a-top-level-traversable and
         // #steps-to-fire-beforeunload: closing a tab, or quitting, first asks
         // a page that listens for beforeunload; one the user has used asks
@@ -11194,10 +11236,10 @@ mod tests {
         let (base, log) = serve_pages(&PAGES).await;
         let browser = tabs::new_controller(
             &Handle::current(),
-            &event_loop.create_proxy(),
+            &WindowProxy::for_test(event_loop.create_proxy()),
             tabs::TabId(900),
         );
-        let mut app = DesktopApp::for_test(
+        let mut app = DesktopWindow::for_test(
             browser,
             Handle::current(),
             event_loop.create_proxy(),
@@ -11246,12 +11288,12 @@ mod tests {
         assert!(app.unload_prompt.is_none());
 
         // Quitting asks again; staying cancels it.
-        app.request_quit();
+        app.request_quit(false);
         wait_for_app(&mut app, "the question", |app| app.unload_prompt.is_some()).await;
         let stay = center(app.unload_prompt.as_ref().unwrap().geometry.stay);
         click(&mut app, stay, MouseButton::Left);
         wait_for_app(&mut app, "the quit to end", |app| app.quitting.is_none()).await;
-        assert!(!app.exit_requested);
+        assert!(!app.closed);
 
         // Closing it and leaving closes the tab, and the page unloads.
         app.close_tab(asking);
@@ -11278,7 +11320,123 @@ mod tests {
         }
         // The last tab, without a page that asks, quits at once.
         app.close_tab(app.tab.id);
-        assert!(app.exit_requested);
+        assert!(app.closed);
+    }
+
+    async fn windows_open_and_the_browser_quits_with_all_of_them(event_loop: &EventLoop<AppEvent>) {
+        // HTML #nav-traversal-ui: Ctrl+N creates a fresh top-level
+        // traversable in a new window. Quitting asks every window's pages
+        // (#definitely-close-a-top-level-traversable): a page that keeps
+        // the user keeps every window, and otherwise all close together.
+        const PAGE: &str = "<script>addEventListener('beforeunload', e => e.preventDefault());\
+             setInterval(() => {}, 1000);</script>";
+        static PAGES: [(&str, &str); 1] = [("/page", PAGE)];
+        let (base, _log) = serve_pages(&PAGES).await;
+        let window = |browser| {
+            let mut window = DesktopWindow::for_test(
+                browser,
+                Handle::current(),
+                event_loop.create_proxy(),
+                RendererPreference::Cpu,
+                None,
+            );
+            window.clipboard = None;
+            window.metrics =
+                ViewportMetrics::from_physical(PhysicalSize::new(640, 480), ScaleFactor::new(1.0));
+            window
+        };
+        let mut asking = window(tabs::new_controller(
+            &Handle::current(),
+            &WindowProxy::for_test(event_loop.create_proxy()),
+            tabs::TabId(970),
+        ));
+        asking.set_focus(FocusTarget::Page);
+        asking.navigate(format!("{base}/page"));
+        wait_for_app(&mut asking, "the live page", |window| {
+            window.tab.browser.unload_needs_check()
+        })
+        .await;
+        for pressed in [true, false] {
+            asking.dispatch(UserAction::PagePointerButton {
+                actor: None,
+                position: CssPoint::new(10.0, 10.0),
+                pressed,
+                button: 0,
+                metadata: Default::default(),
+            });
+        }
+        let quiet = window(BrowserController::new(
+            Handle::current(),
+            || {},
+            CssSize::new(640.0, 480.0),
+        ));
+        let mut app = DesktopApp::for_test(
+            Handle::current(),
+            event_loop.create_proxy(),
+            vec![asking, quiet],
+        );
+
+        // Ctrl+N: a third window, with COMMAND open for an address as in a
+        // new tab; its tab ids are its own.
+        app.windows()[1].run_tab_shortcut(tabs::TabShortcut::NewWindow);
+        app.serve();
+        assert_eq!(app.windows().len(), 3);
+        let tab_ids: HashSet<tabs::TabId> =
+            app.windows().iter().map(|window| window.tab.id).collect();
+        assert_eq!(tab_ids.len(), 3, "tab ids are unique across windows");
+        assert_eq!(app.windows()[2].tab.focus, FocusTarget::Command);
+
+        // Closing one window closes it alone.
+        app.windows()[2].request_quit(false);
+        app.serve();
+        assert_eq!(app.windows().len(), 2);
+
+        // Ctrl+Q asks every window; the page asks its user, and the other
+        // window waits rather than closing.
+        app.windows()[1].run_tab_shortcut(tabs::TabShortcut::Quit);
+        app.serve();
+        assert!(app.quitting());
+        wait_for_app(&mut app.windows()[0], "the question", |window| {
+            window.unload_prompt.is_some()
+        })
+        .await;
+        app.serve();
+        assert_eq!(app.windows().len(), 2, "no window closes while a page asks");
+        assert!(app.windows().iter().all(DesktopWindow::quitting_browser));
+        // Staying keeps every window open.
+        let key = |key: Key| KeyInput {
+            key,
+            code: String::new(),
+            location: 0,
+            state: KeyState::Pressed,
+            modifiers: Default::default(),
+            repeat: false,
+            composing: false,
+        };
+        assert!(app.windows()[0].unload_prompt_key(&key(Key::Escape)));
+        wait_for_app(&mut app.windows()[0], "the answer", |window| {
+            window.quitting.is_none()
+        })
+        .await;
+        app.serve();
+        assert!(!app.quitting());
+        assert_eq!(app.windows().len(), 2);
+        assert!(app.windows().iter().all(|window| window.quitting.is_none()));
+
+        // Quitting again and leaving closes them all.
+        app.windows()[0].run_tab_shortcut(tabs::TabShortcut::Quit);
+        app.serve();
+        wait_for_app(&mut app.windows()[0], "the question", |window| {
+            window.unload_prompt.is_some()
+        })
+        .await;
+        app.windows()[0].unload_prompt_key(&key(Key::Enter));
+        wait_for_app(&mut app.windows()[0], "the answer", |window| {
+            window.quit_allowed()
+        })
+        .await;
+        app.serve();
+        assert!(app.windows().is_empty(), "the browser quit");
     }
 
     /// Each request a test server answered: its path and Referer.
@@ -11329,7 +11487,11 @@ mod tests {
     }
 
     /// Process `app`'s browser events, every tab's, until `done` holds.
-    async fn wait_for_app(app: &mut DesktopApp, what: &str, done: impl Fn(&DesktopApp) -> bool) {
+    async fn wait_for_app(
+        app: &mut DesktopWindow,
+        what: &str,
+        done: impl Fn(&DesktopWindow) -> bool,
+    ) {
         let deadline = Instant::now() + Duration::from_secs(30);
         while !done(app) {
             assert!(Instant::now() < deadline, "timed out waiting for {what}");
@@ -11343,7 +11505,7 @@ mod tests {
         }
     }
 
-    async fn pages_open_tabs_for_new_targets(event_loop: &EventLoop<DesktopEvent>) {
+    async fn pages_open_tabs_for_new_targets(event_loop: &EventLoop<AppEvent>) {
         // HTML #the-rules-for-choosing-a-navigable in a user agent that
         // creates new top-level traversables: an activated `_blank`
         // hyperlink opens a tab in front, after the page's own, navigated
@@ -11356,7 +11518,7 @@ mod tests {
         let mut browser =
             BrowserController::new(Handle::current(), || {}, CssSize::new(640.0, 480.0));
         browser.set_new_traversables_available(true);
-        let mut app = DesktopApp::for_test(
+        let mut app = DesktopWindow::for_test(
             browser,
             Handle::current(),
             event_loop.create_proxy(),
@@ -11407,7 +11569,7 @@ mod tests {
     }
 
     /// The window's chrome over a page-less tab, composed as `draw` would.
-    fn recompose_chrome(app: &mut DesktopApp) {
+    fn recompose_chrome(app: &mut DesktopWindow) {
         let mut scene = desktop_chrome(
             app.metrics,
             &app.tab.browser.snapshot(),
@@ -11428,13 +11590,13 @@ mod tests {
         CssPoint::new(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0)
     }
 
-    fn click(app: &mut DesktopApp, at: CssPoint, button: MouseButton) {
+    fn click(app: &mut DesktopWindow, at: CssPoint, button: MouseButton) {
         app.pointer = at;
         app.handle_pointer_button(ElementState::Pressed, button);
         app.handle_pointer_button(ElementState::Released, button);
     }
 
-    fn tabs_open_switch_close_and_reopen(event_loop: &EventLoop<DesktopEvent>) {
+    fn tabs_open_switch_close_and_reopen(event_loop: &EventLoop<AppEvent>) {
         let mut app = static_page_app(event_loop, "<p>First tab</p>");
         let first = app.tab.id;
         assert_eq!(app.tabs.order, vec![first]);
@@ -11470,12 +11632,12 @@ mod tests {
         assert_eq!(app.tabs.order[1], app.tab.id);
         // Closing the last tab ends the browser.
         app.close_tab(app.tab.id);
-        assert!(!app.exit_requested);
+        assert!(!app.closed);
         app.close_tab(app.tab.id);
-        assert!(app.exit_requested);
+        assert!(app.closed);
     }
 
-    fn the_strip_switches_closes_and_reorders_tabs(event_loop: &EventLoop<DesktopEvent>) {
+    fn the_strip_switches_closes_and_reorders_tabs(event_loop: &EventLoop<AppEvent>) {
         let mut app = static_page_app(event_loop, "<p>Strip</p>");
         app.open_blank_tab();
         app.open_blank_tab();
@@ -11513,13 +11675,10 @@ mod tests {
         app.handle_pointer_button(ElementState::Pressed, MouseButton::Left);
         app.pointer = center(app.strip_geometry().new_tab);
         app.handle_pointer_button(ElementState::Released, MouseButton::Left);
-        assert!(!app.exit_requested);
+        assert!(!app.closed);
         let close_window = center(app.strip_geometry().close);
         click(&mut app, close_window, MouseButton::Left);
-        assert!(
-            app.exit_requested,
-            "the window's close button ends the browser"
-        );
+        assert!(app.closed, "the window's close button ends the browser");
         // `TRUST_DESKTOP_TABS_PREVIEW=DIR` writes the composed frame.
         if let Some(dir) = std::env::var_os("TRUST_DESKTOP_TABS_PREVIEW") {
             app.tabs.order.insert(0, order[1]);
@@ -11535,7 +11694,7 @@ mod tests {
         }
     }
 
-    fn links_open_in_new_tabs(event_loop: &EventLoop<DesktopEvent>) {
+    fn links_open_in_new_tabs(event_loop: &EventLoop<AppEvent>) {
         let mut app = static_page_app(
             event_loop,
             "<body style='margin:8px;font:16px/20px monospace'>\
@@ -11585,7 +11744,7 @@ mod tests {
         );
     }
 
-    fn static_page_text_selection_gestures_and_copy(event_loop: &EventLoop<DesktopEvent>) {
+    fn static_page_text_selection_gestures_and_copy(event_loop: &EventLoop<AppEvent>) {
         // Selection API §2 user interactions on a page without a live
         // Document: drag, double/triple click, Shift+click, select-all; the
         // copied text follows the rendered lines.
@@ -11594,11 +11753,11 @@ mod tests {
             "<body style='margin:8px;font:16px/20px monospace'><p id=p>Hello brave world</p>\
              <p>Second paragraph</p><p style='user-select:none'>Not this</p></body>",
         );
-        let press = |app: &mut DesktopApp, at: CssPoint| {
+        let press = |app: &mut DesktopWindow, at: CssPoint| {
             app.pointer = at;
             app.handle_pointer_button(ElementState::Pressed, MouseButton::Left);
         };
-        let release = |app: &mut DesktopApp| {
+        let release = |app: &mut DesktopWindow| {
             app.handle_pointer_button(ElementState::Released, MouseButton::Left);
             recompose(app);
         };
@@ -11659,7 +11818,7 @@ mod tests {
     }
 
     fn the_context_menu_offers_page_actions_and_takes_keys_and_pointer(
-        event_loop: &EventLoop<DesktopEvent>,
+        event_loop: &EventLoop<AppEvent>,
     ) {
         let mut app = static_page_app(event_loop, "<p>Just a page</p>");
         // The browser's current page gives the bookmark item its address.
@@ -11670,7 +11829,7 @@ mod tests {
         // Without a live page, the secondary click shows the menu at once.
         app.handle_pointer_button(ElementState::Pressed, MouseButton::Right);
         app.handle_pointer_button(ElementState::Released, MouseButton::Right);
-        let labels = |app: &DesktopApp| {
+        let labels = |app: &DesktopWindow| {
             app.context_menu
                 .as_ref()
                 .unwrap()
@@ -11747,7 +11906,7 @@ mod tests {
         assert_eq!(app.tab.command.text(), app.tab.browser.snapshot().address);
     }
 
-    fn the_context_menu_repaints_only_itself(event_loop: &EventLoop<DesktopEvent>) {
+    fn the_context_menu_repaints_only_itself(event_loop: &EventLoop<AppEvent>) {
         // Showing and highlighting the menu change only the scene's last
         // commands; the damage is the menu's rectangle, never the page.
         let mut app = static_page_app(event_loop, "<p>Just a page</p>");
@@ -11779,7 +11938,7 @@ mod tests {
         ));
     }
 
-    fn the_strip_repaints_only_itself(event_loop: &EventLoop<DesktopEvent>) {
+    fn the_strip_repaints_only_itself(event_loop: &EventLoop<AppEvent>) {
         // Hovering the strip's controls touches only the strip's commands;
         // the overlay painted after it keeps its place.
         let mut app = static_page_app(event_loop, "<p>Just a page</p>");
@@ -11891,11 +12050,11 @@ mod tests {
     async fn verification_input_can_take_pointer_focus() {
         // Pointer Events §4.1.3.2: the visible control's hit targets it.
         use winit::platform::wayland::EventLoopBuilderExtWayland;
-        let mut builder = EventLoop::<DesktopEvent>::with_user_event();
+        let mut builder = EventLoop::<AppEvent>::with_user_event();
         builder.with_any_thread(true).with_wayland();
         let event_loop = builder.build().unwrap();
         let browser = BrowserController::new(Handle::current(), || {}, CssSize::new(558.0, 625.0));
-        let mut app = DesktopApp::for_test(
+        let mut app = DesktopWindow::for_test(
             browser,
             Handle::current(),
             event_loop.create_proxy(),
@@ -12432,14 +12591,14 @@ mod tests {
     #[ignore = "requires Wayland for the native event-loop proxy; creates no window"]
     async fn terminal_line_pointer_native_hit_testing() {
         use winit::platform::wayland::EventLoopBuilderExtWayland;
-        let mut builder = EventLoop::<DesktopEvent>::with_user_event();
+        let mut builder = EventLoop::<AppEvent>::with_user_event();
         builder.with_any_thread(true).with_wayland();
         let event_loop = builder.build().unwrap();
         let (mut terminal, _remote, _events) = terminal_line_test_session().await;
         terminal.line_editor.set_text("@ ab  more text");
         terminal.view.process(b"\x1b[?1000h");
         let browser = BrowserController::new(Handle::current(), || {}, CssSize::new(960.0, 600.0));
-        let mut app = DesktopApp::for_test(
+        let mut app = DesktopWindow::for_test(
             browser,
             Handle::current(),
             event_loop.create_proxy(),
@@ -12615,7 +12774,7 @@ mod tests {
             assert_eq!(terminal.line_editor.raw_text(), text);
             assert_eq!(terminal.line_editor.selection(), 0..text.len());
         }
-        let visual = DesktopApp::editor_visual(&mut terminal.line_editor, false);
+        let visual = DesktopWindow::editor_visual(&mut terminal.line_editor, false);
         assert_eq!(visual.text, text);
         assert!(!visual.selection.is_empty());
         assert!(visual.selection.iter().all(|rect| rect.width > 0.0));
@@ -12866,7 +13025,7 @@ mod tests {
         ))
         .unwrap();
         let mut editor = TextEditor::new("private value", &TextStyle::default(), 640.0, false);
-        let visual = DesktopApp::editor_visual(&mut editor, true);
+        let visual = DesktopWindow::editor_visual(&mut editor, true);
         assert_eq!(visual.text, "•".repeat(13));
         let metrics =
             ViewportMetrics::from_physical(PhysicalSize::new(800, 600), ScaleFactor::new(1.0));
@@ -13384,7 +13543,7 @@ mod tests {
     async fn gopherus_pointer_native_hover_and_click_navigation() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use winit::platform::wayland::EventLoopBuilderExtWayland;
-        let mut builder = EventLoop::<DesktopEvent>::with_user_event();
+        let mut builder = EventLoop::<AppEvent>::with_user_event();
         builder.with_any_thread(true);
         let event_loop = builder.build().unwrap();
         for mut document in protocol_pointer_documents() {
@@ -13400,7 +13559,7 @@ mod tests {
             }
             let browser =
                 BrowserController::new(Handle::current(), || {}, CssSize::new(200.0, 400.0));
-            let mut app = DesktopApp::for_test(
+            let mut app = DesktopWindow::for_test(
                 browser,
                 Handle::current(),
                 event_loop.create_proxy(),

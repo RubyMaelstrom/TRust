@@ -44,7 +44,7 @@ struct TabDrag {
     moved: bool,
 }
 
-impl DesktopApp {
+impl DesktopWindow {
     pub(super) fn strip_geometry(&self) -> TabStripGeometry {
         TabStripGeometry::new(
             self.metrics.css.width,
@@ -350,7 +350,7 @@ impl DesktopApp {
                 }
             }
             (TabStripPart::Maximize, MouseButton::Left) => self.toggle_maximized(),
-            (TabStripPart::Close, MouseButton::Left) => self.request_quit(),
+            (TabStripPart::Close, MouseButton::Left) => self.request_quit(false),
             _ => {}
         }
         true
@@ -441,7 +441,7 @@ pub(super) struct AccessTabStrip {
     maximized: bool,
 }
 
-impl DesktopApp {
+impl DesktopWindow {
     pub(super) fn access_tab_strip(&self) -> Option<AccessTabStrip> {
         (self.strip_height() > 0.0).then(|| AccessTabStrip {
             geometry: self.strip_geometry(),
@@ -508,7 +508,7 @@ impl DesktopApp {
                     }
                 }
                 TabStripPart::Maximize => self.toggle_maximized(),
-                TabStripPart::Close => self.request_quit(),
+                TabStripPart::Close => self.request_quit(false),
                 _ => {}
             }
         }

@@ -19,10 +19,14 @@ pub(super) struct UnloadPromptUi {
     title: String,
 }
 
-/// Quitting: the tabs whose pages have yet to allow it.
+/// Closing the window, or quitting the browser: the tabs whose pages have
+/// yet to allow it.
 #[derive(Default)]
 pub(super) struct Quitting {
     waiting: HashSet<TabId>,
+    /// The whole browser quits (Ctrl+Q): once this window's pages allowed
+    /// it, the window waits for every other window's (`DesktopApp`).
+    browser: bool,
 }
 
 /// Why the window asked a tab's page whether it may be left.
@@ -34,7 +38,7 @@ pub(super) enum Leaving {
     Navigate(String),
 }
 
-impl DesktopApp {
+impl DesktopWindow {
     /// Take what tab `id`'s controller received about leaving its page:
     /// prompts to show and answers to `ask_unload`.
     pub(super) fn collect_unload_requests(&mut self, id: TabId) {
@@ -115,9 +119,9 @@ impl DesktopApp {
         {
             return;
         }
-        // Closing the last tab ends the browser.
+        // Closing the last tab closes its window.
         if self.tabs.order.len() == 1 {
-            self.request_quit();
+            self.request_quit(false);
             return;
         }
         let browser = if id == self.tab.id {
@@ -135,13 +139,18 @@ impl DesktopApp {
         }
     }
 
-    /// Quit (Ctrl+Q, the window's close button, closing the last tab): every
-    /// tab's page is asked first, and one that keeps the user cancels it.
-    pub(super) fn request_quit(&mut self) {
-        if self.quitting.is_some() {
+    /// Close the window (its close button, closing its last tab), or with
+    /// `browser` quit the browser (Ctrl+Q, for every window): every tab's
+    /// page is asked first, and one that keeps the user cancels it.
+    pub(super) fn request_quit(&mut self, browser: bool) {
+        if let Some(quit) = &mut self.quitting {
+            quit.browser |= browser;
             return;
         }
-        self.quitting = Some(Quitting::default());
+        self.quitting = Some(Quitting {
+            waiting: HashSet::new(),
+            browser,
+        });
         let ids: Vec<TabId> = self.tabs.order.clone();
         for id in ids {
             let browser = if id == self.tab.id {
@@ -176,23 +185,44 @@ impl DesktopApp {
     }
 
     fn finish_quit_if_allowed(&mut self) {
+        // The browser's windows close together (`DesktopApp::service_quit`).
         if self
             .quitting
             .as_ref()
-            .is_none_or(|quit| !quit.waiting.is_empty())
+            .is_none_or(|quit| !quit.waiting.is_empty() || quit.browser)
         {
             return;
         }
-        // Every page unloads (HTML #unload-a-document-and-its-descendants)
-        // as the browser ends.
+        self.close_now();
+    }
+
+    /// Whether this window takes part in quitting the browser.
+    pub(super) fn quitting_browser(&self) -> bool {
+        self.quitting.as_ref().is_some_and(|quit| quit.browser)
+    }
+
+    /// Whether every page of this window allowed it to close.
+    pub(super) fn quit_allowed(&self) -> bool {
+        self.closed
+            || self
+                .quitting
+                .as_ref()
+                .is_some_and(|quit| quit.waiting.is_empty())
+    }
+
+    /// Close the window now: every page unloads (HTML
+    /// #unload-a-document-and-its-descendants), and `DesktopApp` drops it.
+    pub(super) fn close_now(&mut self) {
+        if std::mem::replace(&mut self.closed, true) {
+            return;
+        }
         self.tab.browser.close();
         for tab in self.tabs.awake_tabs_mut() {
             tab.browser.close();
         }
-        self.exit_requested = true;
     }
 
-    fn cancel_quit(&mut self) {
+    pub(super) fn cancel_quit(&mut self) {
         let Some(quit) = self.quitting.take() else {
             return;
         };

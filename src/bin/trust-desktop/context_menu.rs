@@ -7,7 +7,7 @@
 //! such user agent features ("the media element's context menu").
 //!
 //! Opening, highlighting and closing it repaint only the menu: the
-//! composed page stays as it is (`DesktopApp::draw_partial`).
+//! composed page stays as it is (`DesktopWindow::draw_partial`).
 
 use super::*;
 
@@ -61,7 +61,7 @@ pub(super) fn endpoint_title(address: &str) -> String {
     }
 }
 
-impl DesktopApp {
+impl DesktopWindow {
     /// Pages have a context menu; a Telnet session keeps the secondary
     /// button for the remote host, and a locked pointer is the page's.
     pub(super) fn context_menu_available(&self) -> bool {
@@ -640,10 +640,20 @@ impl DesktopApp {
         CssRect::new(0.0, 0.0, self.metrics.css.width, self.strip_height() + 2.0)
     }
 
-    /// Repaint only the tab strip and/or the overlays over the retained
-    /// scene: their commands are replaced in place, and the raster updates
-    /// their rectangles alone. The page is neither recomposed nor relaid out.
-    pub(super) fn draw_partial(&mut self, strip: bool, overlay: bool) -> Result<(), String> {
+    /// Repaint only the tab strip, the overlays and/or new video frames over
+    /// the retained scene: the strip's and overlays' commands are replaced in
+    /// place, a video's frame is read anew where the scene draws it, and the
+    /// raster updates their rectangles alone. The page is neither recomposed
+    /// nor relaid out.
+    pub(super) fn draw_partial(
+        &mut self,
+        strip: bool,
+        overlay: bool,
+        video: bool,
+    ) -> Result<(), String> {
+        if self.force_full_raster {
+            return self.draw();
+        }
         let Some(mut scene) = self.scene.take() else {
             return self.draw();
         };
@@ -669,7 +679,24 @@ impl DesktopApp {
                 });
             }
         }
+        let mut full = false;
+        if video {
+            let frames = self.new_video_frames();
+            let changed: HashSet<ImageHandle> = frames.keys().copied().collect();
+            match trust::render::scene_damage_with_image_changes(&scene, &scene, &changed) {
+                SceneDamage::Unchanged => {}
+                SceneDamage::Partial(rect) => {
+                    damage = Some(match damage {
+                        Some(damage) => trust::render::union_css_rects(damage, rect),
+                        None => rect,
+                    });
+                }
+                SceneDamage::Full => full = true,
+            }
+            self.presented_image_revisions.extend(frames);
+        }
         let presented = match damage {
+            _ if full => self.present_scene(&scene, None),
             Some(rect) => self.present_scene(&scene, Some(rect)),
             None => Ok(true),
         };

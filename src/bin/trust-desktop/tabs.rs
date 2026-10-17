@@ -1,7 +1,7 @@
 //! Tabs: each is one top-level traversable of the user agent's top-level
 //! traversable set (HTML #top-level-traversable-set), presented in the tab
 //! strip that replaces the window's title bar. The window shows one tab at a
-//! time; `DesktopApp::tab` holds it and every other tab waits in `TabSet`.
+//! time; `DesktopWindow::tab` holds it and every other tab waits in `TabSet`.
 
 use super::*;
 use trust::render::{TAB_STRIP_HEIGHT, TabStripTab};
@@ -177,7 +177,6 @@ pub(super) struct ClosedTab {
 /// The window's tabs: their strip order and every tab that is not shown.
 #[derive(Default)]
 pub(super) struct TabSet {
-    next_id: u64,
     /// Strip order, the shown tab included.
     pub(super) order: Vec<TabId>,
     pub(super) hidden: HashMap<TabId, Hidden>,
@@ -188,9 +187,10 @@ pub(super) struct TabSet {
 }
 
 impl TabSet {
+    /// A tab id unique in the process, whichever window the tab opens in.
     pub(super) fn allocate_id(&mut self) -> TabId {
-        self.next_id += 1;
-        TabId(self.next_id)
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        TabId(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
     }
 
     /// A background tab's controller has events to process.
@@ -264,10 +264,12 @@ impl TabSet {
     }
 }
 
-/// The keyboard's tab commands.
+/// The keyboard's tab and window commands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum TabShortcut {
     New,
+    /// Ctrl+N: a new window (`windowing`).
+    NewWindow,
     Close,
     Reopen,
     Next,
@@ -290,6 +292,7 @@ impl TabShortcut {
             WinitKey::Named(NamedKey::PageUp) if !shift => Some(Self::Previous),
             WinitKey::Character(text) => match text.to_ascii_lowercase().as_str() {
                 "t" => Some(if shift { Self::Reopen } else { Self::New }),
+                "n" if !shift => Some(Self::NewWindow),
                 "w" if !shift => Some(Self::Close),
                 "q" if !shift => Some(Self::Quit),
                 digit @ ("1" | "2" | "3" | "4" | "5" | "6" | "7" | "8") if !shift => {
@@ -312,7 +315,7 @@ impl TabShortcut {
 /// tabs are serviced without waking the shown one.
 pub(super) fn new_controller(
     runtime: &Handle,
-    proxy: &EventLoopProxy<DesktopEvent>,
+    proxy: &WindowProxy,
     id: TabId,
 ) -> BrowserController {
     let proxy = proxy.clone();
@@ -439,7 +442,7 @@ pub(super) fn tab_title(tab: &Tab) -> String {
         })
 }
 
-impl DesktopApp {
+impl DesktopWindow {
     /// The strip's height: it hides while a page is fullscreen.
     pub(super) fn strip_height(&self) -> f32 {
         if self.page_fullscreen {
@@ -655,7 +658,8 @@ impl DesktopApp {
                     self.activate_tab(id);
                 }
             }
-            TabShortcut::Quit => self.request_quit(),
+            TabShortcut::NewWindow => self.open_new_window(),
+            TabShortcut::Quit => self.app_requests.push(AppRequest::Quit),
         }
         self.request_redraw();
     }
@@ -884,13 +888,13 @@ impl DesktopApp {
     /// Close tab `id` once its page allowed it (`close_tab`): its page
     /// unloads and the tab goes, to be reopened with Ctrl+Shift+T. Closing
     /// the shown one shows its right neighbor, else its left; the last tab
-    /// is never closed alone (`close_tab` quits instead).
+    /// is never closed alone (`close_tab` closes the window instead).
     pub(super) fn finish_close_tab(&mut self, id: TabId) {
         let Some(index) = self.tabs.index_of(id) else {
             return;
         };
         if self.tabs.order.len() == 1 {
-            self.request_quit();
+            self.request_quit(false);
             return;
         }
         self.leaving.remove(&id);
@@ -1098,4 +1102,37 @@ fn end_closed_tab(mut tab: Box<Tab>) {
     }
     tab.browser.close();
     drop(tab);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keyboard_shortcuts_name_tab_and_window_commands() {
+        let control = ModifiersState::CONTROL;
+        let shifted = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        let key = |text: &str| WinitKey::Character(text.into());
+        assert_eq!(
+            TabShortcut::of(&key("n"), control),
+            Some(TabShortcut::NewWindow)
+        );
+        assert_eq!(
+            TabShortcut::of(&key("N"), control),
+            Some(TabShortcut::NewWindow)
+        );
+        // Ctrl+Shift+N is the page's, as is N without Control.
+        assert_eq!(TabShortcut::of(&key("N"), shifted), None);
+        assert_eq!(TabShortcut::of(&key("n"), ModifiersState::empty()), None);
+        assert_eq!(TabShortcut::of(&key("t"), control), Some(TabShortcut::New));
+        assert_eq!(
+            TabShortcut::of(&key("T"), shifted),
+            Some(TabShortcut::Reopen)
+        );
+        assert_eq!(TabShortcut::of(&key("q"), control), Some(TabShortcut::Quit));
+        assert!(
+            !TabShortcut::NewWindow.repeats(),
+            "holding Ctrl+N opens one window"
+        );
+    }
 }

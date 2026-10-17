@@ -71,7 +71,7 @@ impl TextSelectionState {
     }
 }
 
-impl DesktopApp {
+impl DesktopWindow {
     /// The paint list the selection's boundary points are laid out in: the
     /// HTML page's, or the line document's.
     pub(super) fn selection_page(&self) -> Option<&trust::render::PagePaint> {

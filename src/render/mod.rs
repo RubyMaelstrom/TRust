@@ -616,6 +616,12 @@ impl ImageHandle {
     }
 }
 
+/// The serial of the frame a video handle's surface shows now (its image
+/// revision), while its player exists.
+pub fn video_frame_serial(handle: ImageHandle) -> Option<u64> {
+    crate::media::player::surface(handle.video_surface()?).map(|surface| surface.serial())
+}
+
 /// A video element's current frame as an image: converted to RGBA once per
 /// frame (keyed by surface and frame serial) and shared by every draw of it.
 pub(crate) fn video_frame_image(handle: ImageHandle) -> Option<(ImageResource, u64)> {
