@@ -133,7 +133,8 @@ The project favors:
 - `src/bin/trust-desktop.rs`: a window's native input and presentation
   loop (`DesktopWindow`). Its modules: `windowing.rs` (`DesktopApp`: the
   process's windows, Ctrl+N, event routing, quitting every window
-  together), `tabs.rs` (a window's tabs, their sleep and mute and the
+  together), `single_instance.rs` (a later launch hands its window to the
+  running browser), `tabs.rs` (a window's tabs, their sleep and mute and the
   pages' requests for new ones), `window_chrome.rs` (the tab strip replacing
   the title bar and its partial repaints), `unload_prompt.rs` (the "leave
   this page?" question, closing a window and quitting), `context_menu.rs`

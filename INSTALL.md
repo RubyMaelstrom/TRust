@@ -12,8 +12,10 @@ cargo build --release --locked
 ```
 
 Run `target/release/trust <address>` for the terminal browser or
-`target/release/trust-desktop <address>` for the desktop browser. On Linux,
-you can install both with:
+`target/release/trust-desktop <address>` for the desktop browser. While a
+desktop browser runs, launching the same `trust-desktop` again (same profile
+and display) opens a new window in it instead of a second browser; pass
+`--new-instance` to start a separate one. On Linux, you can install both with:
 
 ```sh
 mkdir -p ~/.local/bin

@@ -225,6 +225,8 @@ impl NativeFileDrag {
 
 #[path = "trust-desktop/context_menu.rs"]
 mod context_menu;
+#[path = "trust-desktop/single_instance.rs"]
+mod single_instance;
 #[path = "trust-desktop/tabs.rs"]
 mod tabs;
 #[path = "trust-desktop/text_selection.rs"]
@@ -10545,6 +10547,9 @@ fn consume_pending_redraw(pending: &mut bool) -> bool {
 struct DesktopOptions {
     renderer: RendererPreference,
     address: Option<String>,
+    /// Run a browser of its own rather than open a window in the running
+    /// one (`single_instance`).
+    new_instance: bool,
     help: bool,
 }
 
@@ -10554,6 +10559,8 @@ fn parse_desktop_args(args: impl IntoIterator<Item = String>) -> Result<DesktopO
     while let Some(argument) = args.next() {
         if argument == "-h" || argument == "--help" {
             options.help = true;
+        } else if argument == "--new-instance" {
+            options.new_instance = true;
         } else if let Some(renderer) = argument.strip_prefix("--renderer=") {
             options.renderer = renderer.parse()?;
         } else if argument == "--renderer" {
@@ -10582,10 +10589,27 @@ fn main() -> Result<(), Box<dyn Error>> {
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     if options.help {
         println!(
-            "Usage: {} [--renderer=auto|cpu|hybrid] [URL|FILE]",
+            "Usage: {} [--renderer=auto|cpu|hybrid] [--new-instance] [URL|FILE]\n\n\
+             A browser already running opens the window instead, unless \
+             --new-instance is given.",
             env!("CARGO_BIN_NAME")
         );
         return Ok(());
+    }
+    // A browser already running (same executable, profile and display)
+    // opens this launch's window and this process ends.
+    let mut instance = None;
+    if !options.new_instance {
+        let launch = NewWindow {
+            address: single_instance::absolute_address(options.address.clone()),
+            activation_token: activation_token.clone(),
+            size: None,
+        };
+        match single_instance::claim(&launch) {
+            Ok(single_instance::Claim::HandedOff) => return Ok(()),
+            Ok(single_instance::Claim::Primary(server)) => instance = Some(server),
+            Err(error) => eprintln!("trust-desktop: {error}; running a separate browser"),
+        }
     }
     if let Err(error) = trust::site_storage::initialize() {
         eprintln!("trust: {error}; using temporary site storage");
@@ -10609,6 +10633,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         .enable_all()
         .thread_name("trust-desktop-net")
         .build()?;
+    if let Some(server) = &mut instance {
+        let proxy = Mutex::new(event_loop.create_proxy());
+        server.serve(
+            runtime.handle(),
+            Arc::new(move |window| {
+                proxy
+                    .lock()
+                    .is_ok_and(|proxy| proxy.send_event(AppEvent::Launch(window)).is_ok())
+            }),
+        );
+    }
     let mut app = DesktopApp::new(
         runtime.handle().clone(),
         event_loop.create_proxy(),
@@ -10621,6 +10656,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
     let result = event_loop.run_app(&mut app);
     drop(app);
+    // Later launches start a browser of their own from here on.
+    drop(instance);
     // The pages unloaded as the browser ended: let their unload handlers
     // and beacons finish.
     trust::js::shutdown_page_threads_after(trust::js::PAGE_END_GRACE);
@@ -12433,6 +12470,7 @@ mod tests {
             DesktopOptions {
                 renderer: RendererPreference::Hybrid,
                 address: Some(String::from("https://example.test/")),
+                new_instance: false,
                 help: false,
             }
         );
@@ -12443,6 +12481,12 @@ mod tests {
             RendererPreference::Cpu
         );
         assert!(parse_desktop_args([String::from("--renderer=nope")]).is_err());
+        // A browser of its own rather than a window in the running one.
+        let options =
+            parse_desktop_args([String::from("--new-instance"), String::from("page.html")])
+                .unwrap();
+        assert!(options.new_instance);
+        assert_eq!(options.address.as_deref(), Some("page.html"));
     }
 
     #[test]
