@@ -544,10 +544,11 @@ impl MfVideo {
                         width,
                         height,
                     },
+                    // Cb/Cr pairs (`frame::Plane`).
                     Plane {
                         data: PlaneData::U16(words(chroma)),
                         stride: width,
-                        width,
+                        width: width.div_ceil(2),
                         height: chroma_rows,
                     },
                 ]
@@ -562,7 +563,7 @@ impl MfVideo {
                     Plane {
                         data: PlaneData::U8(chroma),
                         stride: width,
-                        width,
+                        width: width.div_ceil(2),
                         height: chroma_rows,
                     },
                 ]

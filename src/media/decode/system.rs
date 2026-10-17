@@ -182,19 +182,7 @@ impl SystemVideo {
         if picture.pts == i64::MIN {
             return None;
         }
-        let planes = picture
-            .planes
-            .into_iter()
-            .map(|plane| Plane {
-                data: match plane.data {
-                    ffmpeg::PlaneData::U8(data) => PlaneData::U8(data),
-                    ffmpeg::PlaneData::U16(data) => PlaneData::U16(data),
-                },
-                stride: plane.stride,
-                width: plane.width,
-                height: plane.height,
-            })
-            .collect();
+        let planes = frame_planes(layout, picture.planes);
         let stream = ColorInfo {
             primaries: picture.primaries,
             transfer: picture.transfer,
@@ -254,6 +242,28 @@ impl SystemVideo {
             }
         }
     }
+}
+
+/// FFmpeg's planes as [`Plane`]s: an interleaved chroma plane's width
+/// counts its Cb/Cr pairs, not FFmpeg's samples (`frame::Plane`).
+fn frame_planes(layout: Layout, planes: Vec<ffmpeg::Plane>) -> Vec<Plane> {
+    planes
+        .into_iter()
+        .enumerate()
+        .map(|(index, plane)| Plane {
+            data: match plane.data {
+                ffmpeg::PlaneData::U8(data) => PlaneData::U8(data),
+                ffmpeg::PlaneData::U16(data) => PlaneData::U16(data),
+            },
+            stride: plane.stride,
+            width: if layout == Layout::SemiPlanar && index == 1 {
+                plane.width / 2
+            } else {
+                plane.width
+            },
+            height: plane.height,
+        })
+        .collect()
 }
 
 impl VideoDecoder for SystemVideo {
@@ -379,5 +389,67 @@ impl AudioDecoder for SystemAudio {
 
     fn name(&self) -> &'static str {
         "ffmpeg-audio"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::media::track::ColorInfo;
+
+    #[test]
+    fn interleaved_chroma_planes_present() {
+        // Hardware decoders hand back NV12 or P010: FFmpeg's interleaved
+        // plane holds 2 * 3 samples a row for a 6 x 4 picture, which is 3
+        // Cb/Cr pairs, and the frame must be one the presentation takes.
+        for (wide, layout_depth) in [(false, 8), (true, 16)] {
+            let samples = |count: usize, value: u16| {
+                if wide {
+                    ffmpeg::PlaneData::U16(vec![value << 8; count])
+                } else {
+                    ffmpeg::PlaneData::U8(vec![value as u8; count])
+                }
+            };
+            let planes = vec![
+                ffmpeg::Plane {
+                    data: samples(6 * 4, 180),
+                    stride: 6,
+                    width: 6,
+                    height: 4,
+                },
+                ffmpeg::Plane {
+                    data: samples(6 * 2, 128),
+                    stride: 6,
+                    width: 6,
+                    height: 2,
+                },
+            ];
+            let frame = VideoFrame {
+                pts: 0,
+                duration: 0,
+                width: 6,
+                height: 4,
+                display_width: 6,
+                display_height: 4,
+                bit_depth: layout_depth,
+                layout: Layout::SemiPlanar,
+                color: ColorInfo {
+                    primaries: 1,
+                    transfer: 1,
+                    matrix: 1,
+                    full_range: false,
+                },
+                planes: frame_planes(Layout::SemiPlanar, planes),
+            };
+            assert_eq!(frame.planes[1].width, 3, "Cb/Cr pairs");
+            assert!(frame.valid(), "wide {wide}");
+            let (rgba, ..) = frame.to_rgba(1).expect("the frame presents");
+            assert_eq!(&rgba[..3], &[truncate(180); 3], "wide {wide}");
+        }
+    }
+
+    /// Narrow-range grey `luma` (Cb = Cr = 128) as 8-bit R'G'B'.
+    fn truncate(luma: u16) -> u8 {
+        ((f64::from(luma) - 16.0) * 255.0 / 219.0).round() as u8
     }
 }

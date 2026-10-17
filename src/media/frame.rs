@@ -20,7 +20,9 @@ pub enum PlaneData {
     U16(Vec<u16>),
 }
 
-/// One image plane. `stride` is in samples, not bytes.
+/// One image plane. `stride` is in samples, not bytes; `width` and `height`
+/// are in pixels, so the interleaved chroma plane of [`Layout::SemiPlanar`]
+/// has `width` Cb/Cr pairs, `2 * width` samples a row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Plane {
     pub data: PlaneData,

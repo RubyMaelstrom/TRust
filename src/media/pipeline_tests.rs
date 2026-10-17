@@ -38,20 +38,23 @@ fn fixture(name: &str) -> Vec<u8> {
 /// alike.
 fn frame_hash(frame: &VideoFrame) -> String {
     let mut hasher = Sha256::new();
-    let rows = |plane: &super::frame::Plane| {
+    // An interleaved chroma plane's width counts Cb/Cr pairs.
+    let rows = |plane: &super::frame::Plane, samples: usize| {
         let PlaneData::U8(data) = &plane.data else {
             panic!("8-bit fixture");
         };
         (0..plane.height)
-            .map(|row| data[row * plane.stride..row * plane.stride + plane.width].to_vec())
+            .map(|row| {
+                data[row * plane.stride..row * plane.stride + plane.width * samples].to_vec()
+            })
             .collect::<Vec<_>>()
     };
     match frame.layout {
         super::frame::Layout::SemiPlanar => {
-            for row in rows(&frame.planes[0]) {
+            for row in rows(&frame.planes[0], 1) {
                 hasher.update(&row);
             }
-            let chroma = rows(&frame.planes[1]);
+            let chroma = rows(&frame.planes[1], 2);
             for parity in 0..2 {
                 for row in &chroma {
                     let samples: Vec<u8> = row.iter().skip(parity).step_by(2).copied().collect();
@@ -61,7 +64,7 @@ fn frame_hash(frame: &VideoFrame) -> String {
         }
         _ => {
             for plane in &frame.planes {
-                for row in rows(plane) {
+                for row in rows(plane, 1) {
                     hasher.update(&row);
                 }
             }
