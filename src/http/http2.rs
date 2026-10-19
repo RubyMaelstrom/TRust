@@ -1152,23 +1152,31 @@ mod tests {
         let mut request = site.request.clone();
         request.method = "POST".into();
         request.body = Some((String::new(), vec![1; STREAM_WINDOW as usize * 4]));
-        let _server = site.serve(|request, mut respond| async move {
-            let head = http_wire::Response::builder()
-                .status(413)
-                .header("content-length", "0")
-                .body(())
-                .unwrap();
-            let _send = respond.send_response(head, true).unwrap();
-            // Retain the unread upload without granting any more credit.
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            drop(request);
+        let release = Arc::new(tokio::sync::Notify::new());
+        let hold = release.clone();
+        let _server = site.serve(move |request, mut respond| {
+            let hold = hold.clone();
+            async move {
+                let head = http_wire::Response::builder()
+                    .status(413)
+                    .header("content-length", "0")
+                    .body(())
+                    .unwrap();
+                let _send = respond.send_response(head, true).unwrap();
+                // Retain the unread upload until the client has returned. This
+                // proves independent response progress without comparing two
+                // short wall-clock sleeps on a busy test runner (RFC9113 §8.1).
+                hold.notified().await;
+                drop(request);
+            }
         });
-        let response = tokio::time::timeout(Duration::from_millis(800), fetch(&request))
+        let response = tokio::time::timeout(Duration::from_secs(10), fetch(&request))
             .await
             .unwrap()
             .unwrap();
         assert_eq!(response.status, 413);
         assert!(response.body.is_empty());
+        release.notify_one();
     }
 
     #[tokio::test]

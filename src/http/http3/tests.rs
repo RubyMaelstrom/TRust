@@ -5,7 +5,13 @@ use tokio_rustls::{TlsAcceptor, TlsConnector, rustls};
 
 type ServerStream = h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
 
+// Several fixtures simultaneously create real TLS/QUIC endpoints. Bound
+// that setup independently of the number of CPU-heavy browser tests running;
+// per-connection multiplexing tests still exercise their own concurrent work.
+static SITES: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(4)));
+
 struct Site {
+    _permit: tokio::sync::OwnedSemaphorePermit,
     request: Request,
     client: rustls::ClientConfig,
     endpoint: quinn::Endpoint,
@@ -64,6 +70,7 @@ impl Site {
         F: Fn(quinn::Connection, Arc<AtomicUsize>) -> Fut + std::marker::Send + Sync + 'static,
         Fut: Future<Output = ()> + std::marker::Send + 'static,
     {
+        let permit = SITES.clone().acquire_owned().await.unwrap();
         crate::tls::ensure_provider();
         let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let request = Request::get(
@@ -160,6 +167,7 @@ impl Site {
             })
         };
         Self {
+            _permit: permit,
             request,
             client,
             endpoint,
@@ -171,10 +179,17 @@ impl Site {
         }
     }
 
-    async fn warm(&self) {
+    async fn discover(&self) {
         let response = super::super::fetch_once(&self.request, None).await.unwrap();
         assert_eq!(response.timing.unwrap().next_hop_protocol, "h2");
         self.trust_alternative(&self.request);
+    }
+
+    async fn warm(&self) -> FetchTiming {
+        self.discover().await;
+        let mut timing = FetchTiming::new();
+        drop(self.lease_with_timing(&mut timing).await);
+        timing
     }
     fn trust_alternative(&self, request: &Request) {
         let key = PoolKey::for_request(request).unwrap();
@@ -194,12 +209,42 @@ impl Site {
         .expect("HTTP/3 exchange deadlocked")
     }
     async fn lease(&self) -> Lease {
-        acquire(
-            &PoolKey::for_request(&self.request).unwrap(),
-            &mut FetchTiming::new(),
-        )
+        self.lease_with_timing(&mut FetchTiming::new()).await
+    }
+
+    async fn lease_with_timing(&self, timing: &mut FetchTiming) -> Lease {
+        let key = PoolKey::for_request(&self.request).unwrap();
+        let origin = POOL.lock().unwrap()[&key].origin.clone();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            // Arm before starting the probe or checking its state, so a fast
+            // loopback handshake cannot signal between the check and await.
+            let connected = origin.connected.notified();
+            tokio::pin!(connected);
+            connected.as_mut().enable();
+            if let Some(lease) = acquire(&key, timing).await {
+                return lease;
+            }
+            let session = {
+                let state = origin.state.lock().unwrap();
+                match &*state {
+                    State::Ready(session) => Some(session.clone()),
+                    State::Connecting => None,
+                    State::Failed(_) => panic!("local QUIC handshake failed"),
+                    State::Idle => panic!("local QUIC probe was not admitted"),
+                }
+            };
+            if let Some(session) = session {
+                return Lease::new(origin.clone(), session, timing);
+            }
+            connected.await;
+            let state = origin.state.lock().unwrap();
+            let State::Ready(session) = &*state else {
+                panic!("local QUIC handshake failed")
+            };
+            Lease::new(origin.clone(), session.clone(), timing)
+        })
         .await
-        .expect("local QUIC handshake")
+        .expect("local QUIC handshake did not complete")
     }
 }
 
@@ -235,13 +280,17 @@ async fn http3_discovers_from_http2_authenticates_origin_and_reuses_session() {
         ok(request, stream, connection).await;
     })
     .await;
-    site.warm().await;
+    let cold = site.warm().await;
     let first = site.fetch(&site.request).await.unwrap();
     assert_eq!(first.body, b"quic");
     let timing = first.timing.unwrap();
     assert_eq!(timing.next_hop_protocol, "h3");
-    assert!(!timing.connection_reused);
-    assert_eq!(timing.connect_start, timing.secure_connection_start);
+    assert!(!cold.connection_reused);
+    assert_eq!(cold.connect_start, cold.secure_connection_start);
+    assert!(
+        timing.connection_reused,
+        "fixture explicitly awaited the preconnection"
+    );
     assert!(timing.request_start <= timing.final_response_start);
     assert_eq!(timing.encoded_body_size, 4);
     let second = site.fetch(&site.request).await.unwrap();
@@ -471,14 +520,21 @@ async fn http3_invalid_certificate_falls_back_without_sending_request() {
     let site = Site::new(ok).await;
     // Discover but do NOT install the test trust root for QUIC.
     site.fetch(&site.request).await.unwrap();
+    let key = PoolKey::for_request(&site.request).unwrap();
+    let origin = POOL.lock().unwrap()[&key].origin.clone();
+    let connected = origin.connected.notified();
+    tokio::pin!(connected);
+    connected.as_mut().enable();
     let response = site.fetch(&site.request).await.unwrap();
     assert_eq!(response.timing.unwrap().next_hop_protocol, "h2");
     assert_eq!(site.requests.load(Ordering::SeqCst), 0);
-    let key = PoolKey::for_request(&site.request).unwrap();
-    assert!(matches!(
-        *POOL.lock().unwrap()[&key].origin.state.lock().unwrap(),
-        State::Failed(_)
-    ));
+    let connecting = matches!(*origin.state.lock().unwrap(), State::Connecting);
+    if connecting {
+        tokio::time::timeout(Duration::from_secs(10), connected)
+            .await
+            .unwrap();
+    }
+    assert!(matches!(*origin.state.lock().unwrap(), State::Failed(_)));
 }
 
 #[tokio::test]
@@ -686,7 +742,7 @@ async fn http3_download_streams_to_disk_and_enforces_its_own_limit() {
 #[tokio::test]
 async fn http3_udp_blackhole_uses_tcp_promptly_and_single_flights_handshake() {
     let site = Site::new(ok).await;
-    site.warm().await;
+    site.discover().await;
     // A bound UDP socket accepts packets but never answers: no ICMP shortcut.
     let blackhole = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let key = PoolKey::for_request(&site.request).unwrap();
@@ -853,7 +909,7 @@ async fn http3_live_transport_probe() {
 #[tokio::test]
 async fn http3_rejects_oversized_encoded_header_before_buffering_payload() {
     let mut site = Site::new(ok).await;
-    site.warm().await;
+    site.discover().await;
     site.quic.abort();
     let _ = (&mut site.quic).await;
     let endpoint = site.endpoint.clone();
@@ -867,6 +923,7 @@ async fn http3_rejects_oversized_encoded_header_before_buffering_payload() {
         let stopped = send.stopped().await.unwrap().unwrap();
         assert_eq!(stopped.into_inner(), Code::H3_EXCESSIVE_LOAD.value());
     });
+    let _lease = site.lease().await;
     assert!(
         site.fetch(&site.request)
             .await

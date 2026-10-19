@@ -275,6 +275,9 @@ webpki-roots = "1.0.9"
 wuff = "0.2.9"
 
 [target.'cfg(unix)'.dependencies]
+# Family-specific system resolver calls keep NSS, VPN DNS and /etc/hosts policy
+# while RFC 8305 starts connecting before the other family has finished.
+libc = "0.2.190"
 # Safe platform flags for nonblocking local-file opens (including FIFO races),
 # and CPU affinity for style worker threads on heterogeneous CPUs.
 # Already part of the native windowing stack; Linux uses Rust syscalls.
@@ -292,7 +295,7 @@ pulseaudio = "0.3.1"
 
 [target.'cfg(windows)'.dependencies]
 # GetCursorPos/ScreenToClient for native file drags (see x11rb above).
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_Networking_WinSock", "Win32_NetworkManagement_IpHelper"] }
 # Media: WASAPI output and the system's Media Foundation decoders (H.264,
 # HEVC, AAC, VP9), as Firefox and Chrome use them. The same release the
 # graphics and accessibility stacks already link.

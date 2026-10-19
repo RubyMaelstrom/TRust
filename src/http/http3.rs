@@ -39,6 +39,10 @@ struct Origin {
     alternative: alt_svc::Alternative,
     config: quinn::ClientConfig,
     state: Mutex<State>,
+    /// Loopback conformance fixtures observe readiness independently of the
+    /// production250ms speculative head start. Never changes transport policy.
+    #[cfg(test)]
+    connected: Notify,
 }
 struct Cached {
     origin: Arc<Origin>,
@@ -129,6 +133,8 @@ pub(crate) fn remember(request: &Request, status: u16, headers: &Headers, timing
                 alternative,
                 config,
                 state: Mutex::new(State::Idle),
+                #[cfg(test)]
+                connected: Notify::new(),
             }),
             expires: now + ttl,
             used: now,
@@ -274,6 +280,8 @@ pub(super) async fn acquire(key: &PoolKey, timing: &mut FetchTiming) -> Option<L
                 Ok(Ok(session)) => State::Ready(session),
                 _ => State::Failed(Instant::now() + RETRY_DELAY),
             };
+            #[cfg(test)]
+            origin.connected.notify_waiters();
             let _ = send.send(());
         });
         done
@@ -299,77 +307,57 @@ impl Drop for EndpointGuard {
 }
 
 async fn connect(key: &PoolKey, origin: &Origin) -> Result<Arc<Session>, String> {
-    use futures::{StreamExt, stream::FuturesUnordered};
     let mut timing = FetchTiming::new();
     timing.domain_lookup_start = crate::performance::now_ms();
-    let mut addresses: Vec<_> =
-        tokio::net::lookup_host((origin.alternative.dns_host(), origin.alternative.port))
-            .await
-            .map_err(|e| e.to_string())?
-            .take(8)
-            .collect();
-    timing.domain_lookup_end = crate::performance::now_ms();
-    if addresses.is_empty() {
-        return Err("HTTP/3 DNS returned no addresses".into());
-    }
-    // Alternate address families early when one route is unavailable.
-    if let Some(other) = addresses
-        .iter()
-        .position(|a| a.is_ipv6() != addresses[0].is_ipv6())
-    {
-        addresses.swap(1, other);
-    }
-    let mut attempts = FuturesUnordered::new();
-    for (index, address) in addresses.into_iter().enumerate() {
-        let config = origin.config.clone();
-        let host = key.host.trim_matches(['[', ']']).to_owned();
-        attempts.push(async move {
-            if index != 0 {
-                tokio::time::sleep(FIRST_WAIT * index as u32).await;
+    // RFC 8305 §§3–7 applies to the QUIC handshake too. Keep RFC 9114
+    // §3's origin certificate/SNI/ALPN checks and the existing 3s budget;
+    // only address discovery and staggered scheduling are shared with TCP.
+    let deadline = tokio::time::Instant::now() + CONNECT_BUDGET;
+    let (endpoint, connection, started) = crate::net::establish_with(
+        origin.alternative.dns_host(),
+        origin.alternative.port,
+        deadline,
+        || {
+            timing.domain_lookup_end = crate::performance::now_ms();
+        },
+        |address| {
+            let config = origin.config.clone();
+            let host = key.host.trim_matches(['[', ']']).to_owned();
+            async move {
+                let started = crate::performance::now_ms();
+                let bind = if address.is_ipv6() {
+                    "[::]:0"
+                } else {
+                    "0.0.0.0:0"
+                };
+                let endpoint = quinn::Endpoint::client(bind.parse().unwrap())?;
+                let mut guard = EndpointGuard(Some(endpoint));
+                let connection = guard
+                    .0
+                    .as_ref()
+                    .unwrap()
+                    .connect_with(config, address, &host)
+                    .map_err(std::io::Error::other)?
+                    .await
+                    .map_err(std::io::Error::other)?;
+                let alpn = connection
+                    .handshake_data()
+                    .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+                    .and_then(|data| data.protocol);
+                if alpn.as_deref() != Some(b"h3") {
+                    return Err(std::io::Error::other("HTTP/3 ALPN mismatch"));
+                }
+                Ok((guard.0.take().unwrap(), connection, started))
             }
-            let started = crate::performance::now_ms();
-            let bind = if address.is_ipv6() {
-                "[::]:0"
-            } else {
-                "0.0.0.0:0"
-            };
-            let endpoint =
-                quinn::Endpoint::client(bind.parse().unwrap()).map_err(|e| e.to_string())?;
-            let mut guard = EndpointGuard(Some(endpoint));
-            let connection = guard
-                .0
-                .as_ref()
-                .unwrap()
-                .connect_with(config, address, &host)
-                .map_err(|e| e.to_string())?
-                .await
-                .map_err(|e| e.to_string())?;
-            let alpn = connection
-                .handshake_data()
-                .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
-                .and_then(|data| data.protocol);
-            if alpn.as_deref() != Some(b"h3") {
-                return Err("HTTP/3 ALPN mismatch".into());
-            }
-            Ok((guard.0.take().unwrap(), connection, started))
-        });
-    }
-    let mut last = "HTTP/3 connection failed".to_string();
-    while let Some(result) = attempts.next().await {
-        let (endpoint, connection, started) = match result {
-            Ok(value) => value,
-            Err(error) => {
-                last = error;
-                continue;
-            }
-        };
-        timing.connect_start = started;
-        timing.secure_connection_start = started;
-        timing.connect_end = crate::performance::now_ms();
-        timing.next_hop_protocol = "h3";
-        return handshake(endpoint, connection, timing).await;
-    }
-    Err(last)
+        },
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    timing.connect_start = started;
+    timing.secure_connection_start = started;
+    timing.connect_end = crate::performance::now_ms();
+    timing.next_hop_protocol = "h3";
+    handshake(endpoint, connection, timing).await
 }
 
 struct DriverClosed(Arc<AtomicBool>);
