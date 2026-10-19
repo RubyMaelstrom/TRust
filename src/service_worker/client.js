@@ -27,7 +27,7 @@
     const usv = value => apply(toWellFormed, string(value), []);
     const object = value => value !== null && (typeof value === "object" || typeof value === "function");
     const rejected = error => apply(reject, PromiseCtor, [error]);
-    function record(kind) { const r = create(null); r.kind=kind; r.handlers=create(null); r.transport=request; r.adapter=adapter; return r; }
+    function record(kind) { const r = create(null); r.kind=kind; r.handlers=create(null); r.transport=request; r.native=native; r.adapter=adapter; return r; }
     function brand(value, kind) {
         const r = object(value) && own(value);
         if (!r || r.kind !== kind) throw new TypeErrorCtor("Illegal " + kind + " invocation");
@@ -136,7 +136,7 @@
         const packet = r.adapter.serializeMessage(message, options);
         const input = create(null);
         input.worker = r.id; input.packet = packet; input.incumbent = incumbent;
-        native("postWorker", input);
+        r.native("postWorker", input);
     }
     define(ServiceWorker.prototype, "postMessage", {writable:true, enumerable:true, configurable:true,
         value: adapter.callback ? adapter.callback(function (source, receiver, args, incumbent) {
@@ -173,7 +173,7 @@
             if(!arguments.length)throw new TypeErrorCtor("postMessage requires a message");
             const packet=r.adapter.serializeMessage(message,arguments[1]);
             const input=create(null);input.client=r.info.id;input.packet=packet;
-            native("postClient",input);
+            r.native("postClient",input);
         }
     }
     class WindowClient extends Client {
@@ -309,7 +309,7 @@
             try {const r=brand(this,"ServiceWorkerContainer");if(r.adapter.origin()==="null")throw new DOMExceptionCtor("Service-worker storage requires a non-opaque origin","SecurityError");return r.transport("getRegistrations",inputFor(r),r.convertMany);}
             catch(error) {return rejected(error);}
         }
-        startMessages() {brand(this,"ServiceWorkerContainer");enableMessages();}
+        startMessages() {brand(this,"ServiceWorkerContainer").enableMessages();}
     }
     function handlers(C, types) {
         for(let i=0;i<types.length;i++) {
@@ -318,7 +318,7 @@
                 get(){const r=brand(this,C.name);return r.handlers[type]?r.handlers[type].value:null;},
                 set(value){
                     const r=brand(this,C.name);
-                    if(C===ServiceWorkerContainer&&type==="message")enableMessages();
+                    if(C===ServiceWorkerContainer&&type==="message")r.enableMessages();
                     if(!object(value))value=null;
                     let handler=r.handlers[type];
                     if(value===null){if(handler)r.adapter.remove(this,type,handler.listener);delete r.handlers[type];return;}
@@ -346,6 +346,7 @@
     }
     const container=construct(EventTargetCtor,[],ServiceWorkerContainer), state=record("ServiceWorkerContainer");
     state.controller=null;state.ready=null;state.readyInfo=null;state.readyResolve=null;state.messagesEnabled=false;
+    state.enableMessages=enableMessages;
     state.transport=transport;state.convert=registration;
     state.convertMany=values=>{const result=[];for(let i=0;i<values.length;i++)result[i]=registration(values[i]);return freeze(result);};
     state.makeReady=()=>{
@@ -364,12 +365,18 @@
         if(!state.messagesEnabled)return;
         const taken=native("takeMessage",create(null));
         if(!taken)return;
-        const source=worker(taken.source);
-        let packet;
-        try {packet=adapter.deserializeMessage(taken.packet);}
-        catch(_){adapter.fireMessage(container,"messageerror",{origin:taken.origin,source});adapter.queue(drainMessage);return;}
-        adapter.fireMessage(container,"message",{data:packet.data,origin:taken.origin,source,ports:freeze(packet.ports)});
-        adapter.queue(drainMessage);
+        try {
+            const source=worker(taken.source);
+            let packet;
+            try {packet=adapter.deserializeMessage(taken.packet);}
+            catch(_){adapter.fireMessage(container,"messageerror",{origin:taken.origin,source});return;}
+            adapter.fireMessage(container,"message",{data:packet.data,origin:taken.origin,source,ports:freeze(packet.ports)});
+        } finally {
+            // Release any holders left unclaimed by a failed deserialize.
+            // The host keeps this ownership if the recipient ends mid-task.
+            native("finishMessage",create(null));
+            adapter.queue(drainMessage);
+        }
     }
     remember(container,state);adapter.navigatorAttribute("serviceWorker",container);
     const initial=create(null);initial.url=adapter.creationURL;initial.key=adapter.storageKey();initial.secure=adapter.secure;

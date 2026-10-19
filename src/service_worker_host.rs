@@ -106,6 +106,31 @@ fn profile_for(
     profile
 }
 
+/// HTML StructuredDeserializeWithTransfer may stop before claiming every
+/// holder. Keep native ownership through delivery, cancellation and teardown;
+/// cleanup only removes keys that were never claimed by the receiving realm.
+struct MessagePacket {
+    ports: Arc<Mutex<message_port_host::Registry>>,
+    text: String,
+}
+
+impl MessagePacket {
+    fn new(ports: Arc<Mutex<message_port_host::Registry>>, text: String) -> Self {
+        Self { ports, text }
+    }
+    fn into_text(mut self) -> String {
+        std::mem::take(&mut self.text)
+    }
+}
+
+impl Drop for MessagePacket {
+    fn drop(&mut self) {
+        if !self.text.is_empty() {
+            release_packet(&self.ports, &self.text);
+        }
+    }
+}
+
 /// Release a discarded packet's native transfers: MessagePort endpoints
 /// (including transferred streams' entangled ports) and OffscreenCanvas
 /// holders, recursively for packets queued on discarded ports. Bounded
@@ -120,8 +145,10 @@ fn release_packet(ports: &Arc<Mutex<message_port_host::Registry>>, packet: &str)
         }
     }
     let mut pending = vec![packet.to_string()];
-    for _ in 0..1024 {
-        let Some(text) = pending.pop() else { break };
+    // Removing an endpoint returns its queued packets only once. The native
+    // registry bounds endpoints and queued bytes; do not abandon a long chain
+    // partway through and leave its remaining holders permanently in flight.
+    while let Some(text) = pending.pop() {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
             continue;
         };
@@ -417,18 +444,18 @@ impl Profile {
         self: &Arc<Self>,
         worker: &Arc<Worker>,
         init: serde_json::Value,
-        packet: String,
+        packet: MessagePacket,
     ) {
         loop {
             let runtime = match self.start(worker).await {
                 Ok(runtime) => runtime,
-                Err(_) => {
-                    self.registry.release_packet(&packet);
-                    return;
-                }
+                Err(_) => return,
             };
             match runtime.event("message", init.clone()).await {
-                Ok(_) => return,
+                Ok(_) => {
+                    drop(packet);
+                    return;
+                }
                 Err(()) => continue,
             }
         }
@@ -896,6 +923,7 @@ struct Endpoint {
     workers: HashMap<u64, Arc<Worker>>,
     owns_client: bool,
     attachment: u64,
+    message: Option<MessagePacket>,
 }
 impl Drop for Endpoint {
     fn drop(&mut self) {
@@ -995,6 +1023,18 @@ fn operation_inner(
     input: serde_json::Value,
 ) -> Result<serde_json::Value, Error> {
     use serde_json::{Value as Json, json};
+    // Serialization already transferred these holders. Even a stale receiver
+    // or an early native error must release them when no queue takes ownership.
+    let mut message = if matches!(op, "postWorker" | "postClient") {
+        ctx.host::<HostState>().map(|state| {
+            MessagePacket::new(
+                state.message_ports.registry.clone(),
+                input["packet"].as_str().unwrap_or("").to_string(),
+            )
+        })
+    } else {
+        None
+    };
     if op == "complete" {
         if let Some(scope) = ctx
             .host::<HostState>()
@@ -1077,6 +1117,7 @@ fn operation_inner(
                     workers: HashMap::new(),
                     owns_client,
                     attachment,
+                    message: None,
                 },
             );
         }
@@ -1132,17 +1173,26 @@ fn operation_inner(
         }
         return Ok(Json::Null);
     }
+    if op == "finishMessage" {
+        if let Some(endpoint) = state.service_workers.endpoints.get_mut(&context) {
+            endpoint.message.take();
+        }
+        return Ok(Json::Null);
+    }
     if op == "takeMessage" {
         let Some(endpoint) = state.service_workers.endpoints.get_mut(&context) else {
             return Ok(Json::Null);
         };
+        endpoint.message.take();
         let Some(pending) = endpoint.client.take_message() else {
             return Ok(Json::Null);
         };
         endpoint.remember_worker(&pending.source);
-        return Ok(
-            json!({"packet":pending.packet, "origin":pending.origin, "source":pending.source}),
-        );
+        let packet = MessagePacket::new(endpoint.profile.ports.clone(), pending.packet);
+        let result =
+            json!({"packet":packet.text, "origin":pending.origin, "source":pending.source});
+        endpoint.message = Some(packet);
+        return Ok(result);
     }
     let endpoint = state
         .service_workers
@@ -1387,19 +1437,18 @@ fn operation_inner(
             }
         }
         "postWorker" => {
-            // ServiceWorker/postMessage (SW 92aba3be): JS serialized first;
-            // the source is the incumbent global's client, then Should Skip
-            // Event, then Run Service Worker in parallel.
-            let packet = input["packet"].as_str().unwrap_or("").to_string();
+            // SW ServiceWorker/postMessage: serialize first, use the incumbent
+            // sender, then Should Skip Event and Run Service Worker in parallel.
+            let packet = message.take().expect("message has a host");
             let destination = state
                 .service_workers
                 .endpoints
                 .get(&context)
                 .and_then(|endpoint| endpoint.workers.get(&input["worker"].as_u64().unwrap_or(0)))
                 .cloned();
-            if packet.len() > sw::MAX_QUEUED_MESSAGE_BYTES {
-                profile.registry.release_packet(&packet);
-            } else if let Some(worker) = destination {
+            if packet.text.len() <= sw::MAX_QUEUED_MESSAGE_BYTES
+                && let Some(worker) = destination
+            {
                 let (source, origin) = if let Some(scope) = state.service_scope.clone() {
                     (
                         json!({"worker": scope.worker.info()}),
@@ -1417,55 +1466,39 @@ fn operation_inner(
                     .event_types
                     .get()
                     .is_some_and(|types| !types.iter().any(|t| t == "message"));
-                let registration = worker.registration.upgrade();
-                if skip {
-                    profile.registry.release_packet(&packet);
-                } else if let Some(registration) = registration
+                if !skip
+                    && let Some(registration) = worker.registration.upgrade()
                     && let Some(lease) = registration.begin_event(&worker)
+                    && let Ok(permit) = profile.functional.clone().try_acquire_owned()
                 {
-                    if let Ok(permit) = profile.functional.clone().try_acquire_owned() {
-                        let owner = profile.clone();
-                        let init = json!({"packet": packet, "origin": origin, "source": source});
-                        let packet = input["packet"].as_str().unwrap_or("").to_string();
-                        profile.handle.spawn(async move {
-                            let _permit = permit;
-                            let _lease = lease;
-                            owner.message_event(&worker, init, packet).await;
-                        });
-                    } else {
-                        drop(lease);
-                        profile.registry.release_packet(&packet);
-                    }
-                } else {
-                    profile.registry.release_packet(&packet);
+                    let owner = profile.clone();
+                    let init = json!({"packet": packet.text, "origin": origin, "source": source});
+                    // Construct ownership before spawning: dropping an unpolled
+                    // task also discards its serialized transfers.
+                    profile.handle.spawn(async move {
+                        let _permit = permit;
+                        let _lease = lease;
+                        owner.message_event(&worker, init, packet).await;
+                    });
                 }
-            } else {
-                profile.registry.release_packet(&packet);
             }
         }
         "postClient" => {
-            // Client/postMessage: JS serialized first with the receiver's
-            // relevant settings; enqueue in parallel for its container.
-            let packet = input["packet"].as_str().unwrap_or("").to_string();
-            if packet.len() > sw::MAX_QUEUED_MESSAGE_BYTES {
-                profile.registry.release_packet(&packet);
-            } else if let Some(scope) = state.service_scope.clone()
+            // Client/postMessage uses the receiver's relevant settings. Its
+            // native client queue takes ownership only when enqueue succeeds.
+            let packet = message.take().expect("message has a host");
+            if packet.text.len() <= sw::MAX_QUEUED_MESSAGE_BYTES
+                && let Some(scope) = state.service_scope.clone()
                 && let Some(registration) = scope.worker.registration.upgrade()
-            {
-                if let Some(target) = profile
+                && let Some(target) = profile
                     .registry
                     .get_client(&registration.key, input["client"].as_str().unwrap_or(""))
-                {
-                    target.enqueue_message(sw::PendingMessage {
-                        packet,
-                        origin: scope.worker.script.origin().ascii_serialization(),
-                        source: scope.worker.info(),
-                    });
-                } else {
-                    profile.registry.release_packet(&packet);
-                }
-            } else {
-                profile.registry.release_packet(&packet);
+            {
+                target.enqueue_message(sw::PendingMessage {
+                    packet: packet.into_text(),
+                    origin: scope.worker.script.origin().ascii_serialization(),
+                    source: scope.worker.info(),
+                });
             }
         }
         "skipWaiting" | "claim" => {
@@ -1705,6 +1738,229 @@ pub(super) fn stop_idle_agents_for_test(ctx: &mut Ctx) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn port(
+        engine: &mut trust_js::Engine,
+        op: &str,
+        id: Value,
+        payload: &str,
+    ) -> serde_json::Value {
+        let value = message_port_host::call(
+            engine.ctx(),
+            Value::Undefined,
+            &[
+                Value::from_string(op.to_string()),
+                id,
+                Value::from_string(payload.to_string()),
+            ],
+        )
+        .unwrap_or_else(|_| panic!("MessagePort {op} failed"));
+        serde_json::from_str(&value.as_text().unwrap()).unwrap()
+    }
+
+    fn packet_engine() -> trust_js::Engine {
+        let mut engine = trust_js::Engine::new();
+        engine
+            .ctx()
+            .op_state()
+            .put_retained_memory_with_external_memory(HostState::new(
+                Rc::new(RefCell::new(Dom::new())),
+                Rc::new(RealmClock::new()),
+            ));
+        engine
+    }
+
+    fn transferred_port(engine: &mut trust_js::Engine) -> (u64, String) {
+        let pair = port(engine, "create", Value::Num(0.), "");
+        let peer = pair[0].as_u64().unwrap();
+        let token = port(
+            engine,
+            "transfer",
+            Value::Num(pair[1].as_u64().unwrap() as f64),
+            "",
+        );
+        (peer, token.as_str().unwrap().to_string())
+    }
+
+    #[test]
+    fn service_worker_message_packets_release_on_error_and_unpolled_task_drop() {
+        let mut engine = packet_engine();
+        let ports = engine
+            .ctx()
+            .host::<HostState>()
+            .unwrap()
+            .message_ports
+            .registry
+            .clone();
+        let (peer, key) = transferred_port(&mut engine);
+        let text = serde_json::json!({"ports":[key]}).to_string();
+        // A removed receiver fails before the postWorker match arm. Its
+        // already-detached transfer must still be discarded.
+        assert!(
+            operation_inner(
+                engine.ctx(),
+                "postWorker",
+                999,
+                serde_json::json!({"worker":1,"packet":text})
+            )
+            .is_err()
+        );
+        assert_eq!(
+            port(&mut engine, "peer", Value::Num(peer as f64), ""),
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            port(&mut engine, "receive", Value::from_string(key), ""),
+            false
+        );
+
+        let (_, key) = transferred_port(&mut engine);
+        let packet = MessagePacket::new(
+            ports.clone(),
+            serde_json::json!({"ports":[key]}).to_string(),
+        );
+        let unpolled = async move {
+            std::future::pending::<()>().await;
+            drop(packet);
+        };
+        drop(unpolled);
+        assert_eq!(
+            port(&mut engine, "receive", Value::from_string(key), ""),
+            false
+        );
+
+        let (peer, key) = transferred_port(&mut engine);
+        let packet = MessagePacket::new(ports, serde_json::json!({"ports":[key]}).to_string());
+        let received = port(&mut engine, "receive", Value::from_string(key), "");
+        drop(packet);
+        assert_eq!(
+            port(
+                &mut engine,
+                "peer",
+                Value::Num(received.as_u64().unwrap() as f64),
+                ""
+            ),
+            peer
+        );
+    }
+
+    #[test]
+    fn service_worker_message_cleanup_reaches_the_end_of_nested_queued_transfers() {
+        let mut engine = packet_engine();
+        let ports = engine
+            .ctx()
+            .host::<HostState>()
+            .unwrap()
+            .message_ports
+            .registry
+            .clone();
+        let canvas = crate::canvas_offscreen::send(crate::canvas_offscreen::DataHolder {
+            width: 1,
+            height: 1,
+            language: None,
+            rtl: false,
+            placeholder: None,
+        })
+        .unwrap();
+        let mut text = serde_json::json!({"canvases":[canvas]}).to_string();
+        let mut innermost = String::new();
+        for index in 0..1100 {
+            let pair = port(&mut engine, "create", Value::Num(0.), "");
+            let destination = pair[1].as_u64().unwrap();
+            port(&mut engine, "send", Value::Num(destination as f64), &text);
+            let key = port(&mut engine, "transfer", Value::Num(destination as f64), "");
+            if index == 0 {
+                innermost = key.as_str().unwrap().to_string();
+            }
+            text = serde_json::json!({"ports":[key]}).to_string();
+        }
+        drop(MessagePacket::new(ports, text));
+        assert!(crate::canvas_offscreen::receive(&canvas).is_none());
+        assert_eq!(
+            port(&mut engine, "receive", Value::from_string(innermost), ""),
+            false
+        );
+    }
+
+    #[tokio::test]
+    async fn service_worker_taken_message_keeps_transfers_until_finish_or_detach() {
+        let mut engine = packet_engine();
+        let url = url::Url::parse(DEFAULT_URL).unwrap();
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        engine
+            .ctx()
+            .host_mut::<HostState>()
+            .unwrap()
+            .enable_network(
+                url.clone(),
+                tokio::runtime::Handle::current(),
+                Arc::default(),
+                sender,
+            );
+        operation_inner(engine.ctx(), "init", 0, serde_json::json!({
+            "url":url.as_str(),"key":url.origin().ascii_serialization(),"secure":true,"kind":"window"
+        })).unwrap();
+        let (profile, client) = {
+            let endpoint = &engine
+                .ctx()
+                .host::<HostState>()
+                .unwrap()
+                .service_workers
+                .endpoints[&0];
+            (endpoint.profile.clone(), endpoint.client.clone())
+        };
+        let options = RegistrationOptions::parse(
+            &url,
+            &url.origin(),
+            "/sw.js",
+            None,
+            WorkerType::Classic,
+            sw::UpdateViaCache::Imports,
+        )
+        .unwrap();
+        let registration = profile.registry.set_registration(&client.key, &options);
+        let worker = profile.registry.new_worker(&registration, &options);
+        client.enable_messages();
+        for detach in [false, true] {
+            let (_, unclaimed) = transferred_port(&mut engine);
+            let (peer, claimed) = transferred_port(&mut engine);
+            client.enqueue_message(sw::PendingMessage {
+                packet: serde_json::json!({"ports":[claimed,unclaimed]}).to_string(),
+                origin: url.origin().ascii_serialization(),
+                source: worker.info(),
+            });
+            assert!(
+                operation_inner(engine.ctx(), "takeMessage", 0, serde_json::Value::Null)
+                    .unwrap()
+                    .is_object()
+            );
+            // A decode can claim its first holder and then throw. Finishing
+            // or destroying the recipient must release only the remainder.
+            let received = port(&mut engine, "receive", Value::from_string(claimed), "");
+            if detach {
+                engine
+                    .ctx()
+                    .host_mut::<HostState>()
+                    .unwrap()
+                    .service_workers
+                    .remove(0);
+            } else {
+                operation_inner(engine.ctx(), "finishMessage", 0, serde_json::Value::Null).unwrap();
+            }
+            assert_eq!(
+                port(&mut engine, "receive", Value::from_string(unclaimed), ""),
+                false
+            );
+            assert_eq!(
+                port(
+                    &mut engine,
+                    "peer",
+                    Value::Num(received.as_u64().unwrap() as f64),
+                    ""
+                ),
+                peer
+            );
+        }
+    }
 
     #[tokio::test]
     async fn closing_agents_keep_their_slots_and_restart_handshakes_until_exit() {
@@ -1796,24 +2052,6 @@ mod tests {
                 .put_retained_memory_with_external_memory(state);
             engine
         };
-        fn port(
-            engine: &mut trust_js::Engine,
-            op: &str,
-            id: Value,
-            payload: &str,
-        ) -> serde_json::Value {
-            let value = message_port_host::call(
-                engine.ctx(),
-                Value::Undefined,
-                &[
-                    Value::from_string(op.to_string()),
-                    id,
-                    Value::from_string(payload.to_string()),
-                ],
-            )
-            .unwrap_or_else(|_| panic!("MessagePort {op} failed"));
-            serde_json::from_str(&value.as_text().unwrap()).unwrap()
-        }
         let mut first = make(url);
         let pair = port(&mut first, "create", Value::Num(0.), "");
         let receiver = pair[1].as_u64().unwrap();

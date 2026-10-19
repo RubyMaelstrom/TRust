@@ -280,6 +280,82 @@ fn service_worker_messages_round_trip_through_clients_and_ports() {
 }
 
 #[test]
+fn service_worker_messages_keep_receiver_and_incumbent_realms() {
+    // SW 92aba3be: postMessage targets the represented worker but uses the
+    // incumbent sender; startMessages/onmessage enable the receiver's queue.
+    let runtime = runtime();
+    let (listener, base) = listen(&runtime);
+    let server = runtime.spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = read_head(&mut socket).await;
+            let source = r#"
+                self.addEventListener('message', event => event.waitUntil((async () => {
+                    event.source.postMessage({frameType:event.source.frameType});
+                    await (await caches.open('realm-messages')).put('/sent', new Response('yes'));
+                })()));
+            "#;
+            let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{source}", source.len());
+            socket.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+    for method in ["startMessages", "onmessage"] {
+        let (mut engine, mut tasks) = page(&runtime, &format!("{base}/page"));
+        eval(
+            &mut engine,
+            &format!("globalThis.enableMethod={method:?};"),
+            "queue method",
+        )
+        .unwrap();
+        eval(&mut engine, r#"
+            globalThis.realmMessagesDone=false;
+            (async()=>{
+                const check=(ok,what)=>{if(!ok)throw Error(what);};
+                const html=document.createElement('html');document.append(html);
+                html.append(document.createElement('head'),document.createElement('body'));
+                const frame=document.createElement('iframe');document.body.append(frame);
+                const childURL=location.origin+'/child/frame';
+                __dom_load_frame(frame.__id,'<body></body>',childURL);frame.__contentDoc=undefined;
+                const child=__dom_create_window_realm(__dom_allocate_job_context(),frame.__id,childURL,
+                    __trust_cfg,window,window,frame,0,'');
+                await child.eval(`(async()=>{
+                    globalThis.registration=await navigator.serviceWorker.register(${JSON.stringify(location.origin+'/child/sw.js')});
+                    globalThis.worker=registration.installing||registration.waiting||registration.active;
+                    if(worker.state!=='activated')await new Promise(resolve=>worker.addEventListener('statechange',()=>{
+                        if(worker.state==='activated')resolve();
+                    }));
+                })()`);
+                const received=[];
+                let ready;
+                const reply=new Promise(resolve=>{ready=resolve;});
+                navigator.serviceWorker.addEventListener('message',event=>{received.push(event);ready();});
+                // The parent has never obtained this registration. Borrowing
+                // its method must still address the child's worker object.
+                ServiceWorker.prototype.postMessage.call(child.worker,{value:1});
+                let sent=false;
+                for(let i=0;i<200&&!sent;i++)sent=!!(await caches.match('/sent'));
+                check(sent,'borrowed postMessage reached its receiver');
+                check(received.length===0,'parent message queue remains disabled');
+                let handlerThis=false;
+                if(enableMethod==='startMessages')child.ServiceWorkerContainer.prototype.startMessages.call(navigator.serviceWorker);
+                else Object.getOwnPropertyDescriptor(child.ServiceWorkerContainer.prototype,'onmessage').set.call(navigator.serviceWorker,function(){handlerThis=this===navigator.serviceWorker;});
+                await reply;
+                const event=received[0];
+                check(event.isTrusted&&event.data.frameType==='top-level','incumbent parent is the message source');
+                check(event.source instanceof ServiceWorker&&event.source.scriptURL===child.worker.scriptURL,'reply source belongs to the receiving Window');
+                check(event.origin===location.origin,'reply origin');
+                check(enableMethod==='startMessages'||handlerThis,'borrowed onmessage setter receiver');
+                log.push(enableMethod+':ok');
+                await child.registration.unregister();
+            })().catch(error=>log.push('ERROR:'+error.message)).finally(()=>realmMessagesDone=true);
+        "#, "borrowed service-worker messaging").unwrap();
+        run_until(&runtime, &mut engine, &mut tasks, "realmMessagesDone");
+        assert_eq!(log(&mut engine), format!("{method}:ok"));
+    }
+    server.abort();
+}
+
+#[test]
 fn service_worker_documents_keep_controllers_after_their_actors_retire() {
     let runtime = runtime();
     let (listener, base) = listen(&runtime);
