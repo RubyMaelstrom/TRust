@@ -179,7 +179,7 @@ impl VelloHybridRenderer {
     /// covers adapter/device negotiation; rendering remains synchronous with
     /// the winit redraw callback and does not create a polling loop.
     pub async fn new_window(window: Arc<Window>) -> Result<Self, String> {
-        let instance = wgpu::Instance::default();
+        let instance = crate::native_gpu::initialize(wgpu::Instance::default);
         let surface = instance
             .create_surface(Arc::clone(&window))
             .map_err(|error| format!("could not create Hybrid surface: {error}"))?;
@@ -263,7 +263,7 @@ impl VelloHybridRenderer {
     /// Initialize a window-free renderer. Used only by parity/regression tools;
     /// production Hybrid presentation never performs a GPU-to-CPU readback.
     pub async fn new_headless() -> Result<Self, String> {
-        let instance = wgpu::Instance::default();
+        let instance = crate::native_gpu::initialize(wgpu::Instance::default);
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
@@ -2130,6 +2130,118 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hybrid_concurrent_headless_construction_keeps_independent_readbacks() {
+        use crate::core::{CssSize, ScaleFactor, ViewportMetrics};
+
+        const WORKERS: usize = 2;
+        const ROUNDS: usize = 2;
+        // Independent instances may initialize together, but native loader
+        // initialization must finish before another caller enters it. Keep
+        // both renderers alive past construction, then read them back in
+        // parallel, so the gate cannot accidentally cover their lifetimes.
+        let barrier = Arc::new(std::sync::Barrier::new(WORKERS));
+        let workers: Vec<_> = (0..WORKERS)
+            .map(|worker| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let mut results = Vec::new();
+                    for round in 0..ROUNDS {
+                        barrier.wait();
+                        let renderer = catch_unwind(|| {
+                            futures::executor::block_on(VelloHybridRenderer::new_headless())
+                        });
+                        // Reach this barrier even after an unavailable
+                        // adapter or panic, so another worker cannot wait
+                        // forever merely because this attempt failed.
+                        barrier.wait();
+                        let renderer = match renderer {
+                            Ok(Ok(renderer)) => renderer,
+                            Ok(Err(error)) => {
+                                eprintln!("Concurrent Hybrid construction unavailable: {error}");
+                                results.push(Ok(false));
+                                continue;
+                            }
+                            Err(payload) => {
+                                results.push(Err(panic_message(payload)));
+                                continue;
+                            }
+                        };
+                        // Scene creation, rendering, and renderer destruction
+                        // must all finish before this worker's next barrier,
+                        // including when one of those operations panics.
+                        let result = catch_unwind(AssertUnwindSafe(move || {
+                        let mut renderer = renderer;
+                        let color = [[255, 0, 0, 255], [0, 0, 255, 255]][(worker + round) % 2];
+                        let handle = ImageHandle(1);
+                        let scene = Scene {
+                            viewport: ViewportMetrics::from_physical(
+                                PhysicalSize::new(8, 8),
+                                ScaleFactor::default(),
+                            ),
+                            primitives: vec![DisplayCommand::Image {
+                                rect: CssRect::new(0., 0., 8., 8.),
+                                handle,
+                                source_rect: None,
+                                fit: ImageFit::Fill,
+                                sampling: ImageSampling::Nearest,
+                                clip: None,
+                                node: 0,
+                                link: None,
+                            }],
+                            controls: Vec::new(),
+                            content_viewport: CssRect::new(0., 0., 8., 8.),
+                            image_store: Default::default(),
+                            canvas_images: Default::default(),
+                            page_scroll_containers: Vec::new(),
+                            page_size: CssSize::new(8., 8.),
+                        };
+                        scene.image_store.insert(
+                            handle,
+                            ImageResource {
+                                svg_source: None,
+                                width: 1,
+                                height: 1,
+                                rgba: Arc::from(color),
+                                has_alpha: false,
+                            },
+                        );
+                        renderer.render_rgba(&scene).and_then(|frame| {
+                            if frame.size == PhysicalSize::new(8, 8)
+                                && frame.pixels.len() == 8 * 8 * 4
+                                && frame.pixels.as_chunks::<4>().0.iter().all(|p| *p == color)
+                            {
+                                Ok(true)
+                            } else {
+                                Err(format!(
+                                    "worker {worker}, round {round}: independent readback lost its {color:?} pixels"
+                                ))
+                            }
+                        })
+                        }))
+                        .unwrap_or_else(|payload| Err(panic_message(payload)));
+                        results.push(result);
+                    }
+                    results
+                })
+            })
+            .collect();
+        // Join every worker before reporting any stored failure, so a failed
+        // round cannot leave another test's GPU work running in the background.
+        let rounds: Vec<_> = workers.into_iter().map(|worker| worker.join()).collect();
+        let mut completed = 0;
+        for worker in rounds {
+            for result in worker.unwrap() {
+                completed += usize::from(result.expect("concurrent Hybrid readback failed"));
+            }
+        }
+        if completed == 0 {
+            eprintln!("Concurrent Hybrid readback not exercised: no Hybrid adapter");
+            return;
+        }
+        assert_eq!(completed, WORKERS * ROUNDS);
+    }
 
     #[test]
     fn svg_cache_variants_obey_budget_and_frame_lifetime_hybrid() {

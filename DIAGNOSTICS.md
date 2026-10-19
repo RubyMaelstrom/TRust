@@ -119,6 +119,29 @@ and CacheStorage remain in RAM; `--site-data` is unnecessary for these fixtures.
 The implementation history and full validation results are recorded in
 `docs/servo-follow-ups-20261018.txt`.
 
+### Native Vulkan initialization
+
+`tools/vulkan_init_probe.c` exercises concurrent global extension enumeration
+and creation of independent Vulkan instances without browser or media code.
+It reproduced the native initialization crash captured on NVIDIA 610.57.04
+with Vulkan loader 1.4.365 on AArch64. It requires Vulkan headers and the loader:
+
+```sh
+cc -std=c11 -D_XOPEN_SOURCE=700 -O2 -g -Wall -Wextra -Werror -pthread tools/vulkan_init_probe.c -lvulkan -o target/vulkan-init-probe
+timeout 30 target/vulkan-init-probe serial 100
+timeout 30 target/vulkan-init-probe parallel 20
+```
+
+The parallel mode can reproduce a process crash on affected native runtimes.
+Serial mode coordinates only extension enumeration and instance creation;
+each thread still owns and destroys its independent instance. TRust applies
+the same initialization coordination across wgpu and FFmpeg's Vulkan backend.
+Rendering and decoding continue independently. Its browser regression is:
+
+```sh
+cargo test --release --lib hybrid_concurrent_headless_construction_keeps_independent_readbacks -- --nocapture
+```
+
 ### WebAssembly
 
 Compare native WebAssembly execution against the interpreter with the same

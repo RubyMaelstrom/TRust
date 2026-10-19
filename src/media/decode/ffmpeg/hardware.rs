@@ -132,7 +132,7 @@ impl Library {
             let mut buffer = null_mut();
             // SAFETY: creates a device of a known type on its default
             // adapter; `buffer` receives the only reference on success.
-            let ret = unsafe {
+            let mut create = || unsafe {
                 (self.api.av_hwdevice_ctx_create)(
                     &mut buffer,
                     kind,
@@ -140,6 +140,14 @@ impl Library {
                     null_mut(),
                     0,
                 )
+            };
+            // FFmpeg creates its own VkInstance for this backend. Coordinate
+            // that synchronous loader entry with wgpu's initialization only;
+            // later hardware decoding does not hold the gate.
+            let ret = if name.as_bytes() == b"vulkan" {
+                crate::native_gpu::initialize(create)
+            } else {
+                create()
             };
             if ret >= 0 && !buffer.is_null() {
                 return Some(Device {
