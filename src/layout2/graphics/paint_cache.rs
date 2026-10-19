@@ -1336,6 +1336,11 @@ fn chunk_nodes(fragment: &Frag) -> Box<[NodeId]> {
                     }
                 }
             }
+            // CSS 2 §10.8 / Appendix E #each-box: an empty inline's
+            // decorations read its own styles even without a text piece.
+            for empty in &line.empty_boxes {
+                add(empty.entry.key.0);
+            }
         }
         _ => {}
     }
@@ -2043,6 +2048,37 @@ mod tests {
         // The inherited color and decoration reach the lines below #a only.
         assert!(stats.dirty + stats.new >= 2, "{stats:?}");
         assert!(stats.hits >= 1, "{stats:?}");
+    }
+
+    #[test]
+    fn empty_inline_decorations_invalidate_for_style_and_geometry_changes() {
+        // An equal retained line can still paint a new color or visibility
+        // from an empty inline's Dom styles. Geometry changes must also
+        // invalidate it. Each frame is compared to a fresh full paint.
+        let _inputs = crate::layout2::stable_global_layout_inputs();
+        let mut fuzz = page(
+            "<div style='font:20px/40px serif'><span id=empty style='padding-left:10px;background:#dfa8fa'></span></div>\
+             <p>unchanged paragraph</p>",
+        );
+        fuzz.frame();
+        let warm = fuzz.frame();
+        assert!(warm.hits > 0, "{warm:?}");
+        let empty = by_id(&fuzz, "empty");
+        for style in [
+            "padding-left:10px;background:#2174c9",
+            "padding-left:10px;background:#2174c9;visibility:hidden",
+            "padding-left:10px;background:#dfa8fa;visibility:visible",
+            "padding:3px 8px;background:#dfa8fa;border:2px solid #2174c9",
+            "padding:3px 8px;background:#dfa8fa;border:2px solid #2174c9;position:relative;left:17px;top:6px",
+            "padding-left:10px;background:#dfa8fa",
+        ] {
+            fuzz.dom.set_attr(empty, "style", style);
+            let stats = fuzz.frame();
+            assert!(stats.dirty + stats.new >= 1, "{style}: {stats:?}");
+            assert!(stats.hits > 0, "{style}: {stats:?}");
+            let warm = fuzz.frame();
+            assert_eq!(warm.hits + warm.tainted, warm.leaves, "{style}: {warm:?}");
+        }
     }
 
     #[test]

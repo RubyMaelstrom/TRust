@@ -5208,22 +5208,25 @@ fn paint_inline_box_decorations(
     }
     // A relatively positioned box paints at its offset (CSS 2 §9.4.3), which
     // its fragments and content area include.
-    let runs = super::inline::line_box_fragments(&line.pieces, &[], |entry| entry.decorated)
-        .into_iter()
-        .map(|run| {
-            let (top, bottom) = run
-                .entry
-                .content_area(fragment.y, line.height, line.baseline);
-            Run {
-                node: run.entry.key,
-                left: fragment.x + run.x0,
-                right: fragment.x + run.x1,
-                top,
-                bottom,
-                left_edge: run.left_edge,
-                right_edge: run.right_edge,
-            }
-        });
+    // CSS 2 §10.8 / Appendix E #each-box: empty inline boxes retain their
+    // font-based content area and paint their background and borders too.
+    let runs =
+        super::inline::line_box_fragments(&line.pieces, &line.empty_boxes, |entry| entry.decorated)
+            .into_iter()
+            .map(|run| {
+                let (top, bottom) = run
+                    .entry
+                    .content_area(fragment.y, line.height, line.baseline);
+                Run {
+                    node: run.entry.key,
+                    left: fragment.x + run.x0,
+                    right: fragment.x + run.x1,
+                    top,
+                    bottom,
+                    left_edge: run.left_edge,
+                    right_edge: run.right_edge,
+                }
+            });
     for run in runs {
         let (node, pseudo) = run.node;
         let style = match pseudo {
@@ -10327,6 +10330,122 @@ mod tests {
             .count();
         assert_eq!(blue, 1, "start border on the first fragment only");
         assert!(layout.boxes.contains_key(&span));
+    }
+
+    #[test]
+    fn empty_inline_boxes_paint_their_measured_backgrounds_and_borders() {
+        // CSS 2 #inline-non-replaced / §10.8 / Appendix E #each-box:
+        // an empty inline's padding and borders paint around its own font
+        // content area, independently of the line height. CSS 2 §9.4.3 moves
+        // the decorations and CSSOM View geometry together.
+        let purple = PaintColor::Rgba(223, 168, 250, 255);
+        let mut content_top = None;
+        for (extra, border, dx, dy) in [
+            ("", 0.0, 0.0, 0.0),
+            ("border:2px solid #2174c9", 2.0, 0.0, 0.0),
+            (
+                "border:2px solid #2174c9;position:relative;left:17px;top:6px",
+                2.0,
+                17.0,
+                6.0,
+            ),
+        ] {
+            let (dom, layout) = render_fixture(&format!(
+                r#"<!doctype html><body style="margin:20px;background:white;font:20px/40px serif"><div id=parent><span id=empty style="padding-left:10px;background:#dfa8fa;{extra}"></span></div></body>"#,
+            ));
+            let measured = layout.boxes[&dom.get_by_id("empty").unwrap()];
+            assert_eq!(measured.left, 20.0 + dx, "{extra}: {measured:?}");
+            assert_eq!(measured.width, 10.0 + 2.0 * border);
+            assert!(measured.height > 2.0 * border, "{extra}: {measured:?}");
+            assert_eq!(layout.boxes[&dom.get_by_id("parent").unwrap()].height, 40.0);
+            let top = measured.top + border - dy;
+            let initial_top = *content_top.get_or_insert(top);
+            assert!((top - initial_top).abs() < 0.01, "{extra}: {measured:?}");
+            let fills: Vec<_> = layout
+                .paint
+                .primitives
+                .iter()
+                .filter_map(|command| match command {
+                    DisplayCommand::Fill {
+                        shape: PaintShape::Rect(rect),
+                        brush: PaintBrush::Solid(color),
+                    } if *color == purple => Some(*rect),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(fills.len(), 1, "{extra}: {fills:?}");
+            let fill = fills[0];
+            for (painted, expected) in [
+                (fill.x, measured.left),
+                (fill.y, measured.top),
+                (fill.width, measured.width),
+                (fill.height, measured.height),
+            ] {
+                assert!(
+                    (f64::from(painted) - expected).abs() < 0.01,
+                    "{extra}: {fill:?} {measured:?}"
+                );
+            }
+            let frame =
+                crate::render::headless::render_paint(&layout.paint, CssSize::new(800., 600.))
+                    .unwrap();
+            let pixel = |x: usize, y: usize| frame.pixels[(y * 800 + x) * 4..][..3].to_vec();
+            let middle_y = (measured.top + measured.height / 2.0).floor() as usize;
+            let inside_x = (measured.left + border + 3.0) as usize;
+            assert_eq!(pixel(inside_x, middle_y), [223, 168, 250], "{extra}");
+            assert_eq!(pixel(measured.left as usize - 1, middle_y), [255; 3]);
+            if border > 0.0 {
+                for (x, y) in [
+                    (measured.left as usize, middle_y),
+                    ((measured.left + measured.width - 1.0) as usize, middle_y),
+                    (inside_x, measured.top.ceil() as usize),
+                    (
+                        inside_x,
+                        (measured.top + measured.height).floor() as usize - 1,
+                    ),
+                ] {
+                    assert_eq!(pixel(x, y), [33, 116, 201], "{extra}: ({x}, {y})");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn empty_inline_boxes_with_hidden_visibility_keep_geometry_without_paint() {
+        // CSS 2 #visibility: a hidden box still affects layout but paints
+        // neither its background nor its borders, including at a relative
+        // positioning offset.
+        let (dom, layout) = render_fixture(
+            r#"<!doctype html><body style="margin:20px;background:white;font:20px/40px serif"><div id=parent><span id=empty style="padding-left:10px;border:2px solid #2174c9;background:#dfa8fa;position:relative;left:17px;top:6px;visibility:hidden"></span></div></body>"#,
+        );
+        let measured = layout.boxes[&dom.get_by_id("empty").unwrap()];
+        assert_eq!((measured.left, measured.width), (37.0, 14.0));
+        assert!(measured.height > 4.0);
+        assert_eq!(layout.boxes[&dom.get_by_id("parent").unwrap()].height, 40.0);
+        for command in &layout.paint.primitives {
+            if let DisplayCommand::Fill {
+                brush: PaintBrush::Solid(color),
+                ..
+            }
+            | DisplayCommand::Stroke {
+                brush: PaintBrush::Solid(color),
+                ..
+            } = command
+            {
+                assert!(
+                    !matches!(
+                        color,
+                        PaintColor::Rgba(223, 168, 250, 255) | PaintColor::Rgba(33, 116, 201, 255)
+                    ),
+                    "hidden inline decoration: {command:?}"
+                );
+            }
+        }
+        let frame =
+            crate::render::headless::render_paint(&layout.paint, CssSize::new(800., 600.)).unwrap();
+        let x = measured.left as usize;
+        let y = (measured.top + measured.height / 2.0) as usize;
+        assert_eq!(&frame.pixels[(y * 800 + x) * 4..][..3], &[255; 3]);
     }
 
     #[test]
