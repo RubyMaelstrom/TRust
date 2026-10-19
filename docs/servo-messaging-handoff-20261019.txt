@@ -1,214 +1,132 @@
-TRust service-worker messaging handoff — 2026-10-19
+TRust service-worker messaging review — 2026-10-19
 =================================================
 
-Purpose
--------
-Finish the shared structured-copy/message transport checks, then implement
-ServiceWorker.postMessage, Client.postMessage and the container message queue.
-This supports the already-authorized service-worker work. Fetch interception
-is still pending. This is ordinary browser implementation work against local
-official HTML, Service Workers, Web IDL, WebCrypto and IndexedDB specifications.
+Status and scope
+----------------
+The shared copying work and service-worker message transport are implemented
+and reviewed. ServiceWorker.postMessage and Client.postMessage exchange real
+messages and transferred ports with native worker agents. This completes the
+messaging handoff; it does not complete request interception or module workers.
 
-Constraints
------------
-- Do not edit /big/Code/trust-js (the user's active engine work checkout).
-- Use the isolated main engine at /tmp/trust-servo-build/trust-js, revision
-  e33109935c25e291da71c082cfd03d2f24c12a12. Its source is unchanged too.
-- README.md is user-owned. Preserve unrelated dirty files, including rendering
-  and vendor edits. The working tree includes three earlier implementation batches.
-- Service-worker registrations/scripts/caches stay in RAM. Cookie persistence
-  follows existing policy: same-site cookies only for bookmarked sites.
-- No installed executable replacement, commit, or push is authorized.
-- Accessibility and persistent HTTP caching remain deferred.
-- Read /home/ruby/.codex/skills/web-standards-skill/SKILL.md before changes and
-  consult its local authoritative library. AGENTS.md requires focused checks,
-  affected suites, final debug/release tests, Clippy and release acceptance.
+The user authorized commits for all outstanding TRust work on October 19.
+Installation and pushing remain separate actions and were not authorized.
+README.md is user-owned. The active /big/Code/trust-js checkout was not modified.
 
-Build command
--------------
-From /big/Code/TRust:
+Storage remains as requested: service-worker registrations, script versions and
+CacheStorage live in RAM. CookieStore uses the existing cookie jar and bookmark
+policy: same-site cookies persist only for bookmarked sites; third-party,
+partitioned, session and unbookmarked-site cookies remain session-only.
+
+Implementation reviewed
+-----------------------
+- Captured JSON and object/collection operations support copying in Windows,
+  workers and AudioWorklets. Native transfer lists and serialization records
+  remain separate from author data and property hooks.
+- ServiceWorker.postMessage serializes before deciding whether to skip an
+  event, records the incumbent sender and can start installing, waiting or
+  active workers. Delivery uses ExtendableMessageEvent/messageerror and the
+  normal event lifetime lease.
+- Client.postMessage uses the receiver's relevant settings and a native,
+  bounded container queue. startMessages, the first onmessage assignment,
+  DOMContentLoaded and dedicated/shared-worker startup enable delivery at
+  their specified points. Each MessageEvent runs as its own task.
+- Empty DOM-only hosts tolerate presentation clientState notifications.
+  The host-boundary inventory is 270. Frame-geometry expectations now allow
+  the implemented Pointer Events compatibility-mouse transition grouping.
+
+Corrections made during this review
+-----------------------------------
+1. Borrowed methods now operate on the receiver's worker and container.
+   Previously, a parent Window's postMessage method could silently address its
+   own empty worker map when called with a child's ServiceWorker object.
+   Borrowed startMessages/onmessage similarly enabled the wrong queue. Private
+   records now carry their native operation and queue-enabling function, while
+   ServiceWorker.postMessage still records the incumbent sender separately.
+2. Serialized transfers retain native ownership until delivery finishes or is
+   abandoned. A guard releases unclaimed holders after stale-receiver errors,
+   failed sends/startup, worker exit, cancellation before an async task starts,
+   partial deserialization, or recipient teardown. Already-claimed ports stay
+   valid. Client delivery explicitly finishes ownership in a finally block.
+3. Recursive discard drains the complete queued transfer graph. The previous
+   1,024-packet cut-off could leave the remainder allocated. The registry's
+   endpoint/byte bounds still apply; removing an endpoint returns its queue
+   only once. A regression follows 1,100 links to a final OffscreenCanvas.
+
+Standards consulted locally
+---------------------------
+W3C Service Workers 92aba3be92bca0703d21f81460905a24bd135cfa:
+ServiceWorker/postMessage, Client/postMessage, Should Skip Event, the client
+message queue, startMessages and onmessage.
+WHATWG HTML e5071a20c8569d8a3ec02ed27dd01b948773f850:
+StructuredSerializeWithTransfer and StructuredDeserializeWithTransfer,
+including partial failure and per-holder transfer-receiving steps.
+These are local official snapshots, not a fresh upstream verification.
+
+Remaining service-worker work
+-----------------------------
+- Reserved navigation clients and request interception, including response/body
+  lifetime and cancellation through Fetch.
+- Client focus/navigate/openWindow and navigation preload.
+- Module worker validation and module service-worker startup. The proposed
+  isolated-engine inspection patch in target/servo-fourth remains unapplied.
+
+Other later follow-ups (LCP, further grid/compositor combinations, incremental
+A/AAAA and NAT64, and the separate desktop startup crash investigation) remain
+in docs/servo-follow-ups-20261018.txt. Accessibility and persistent HTTP caching
+remain deferred. This review does not start those tasks.
+
+Build and verification
+----------------------
+Use the isolated main engine at /tmp/trust-servo-build/trust-js, revision
+  e33109935c25e291da71c082cfd03d2f24c12a12
+The TRust manifest path must retain the symlink so Cargo resolves that sibling:
 
   TMPDIR=/big/Code/TRust/target/servo-fourth/tmp cargo test --offline --locked \
-    --manifest-path /tmp/trust-servo-build/TRust/Cargo.toml \
-    --lib private_records -- --test-threads=1 --nocapture
+    --manifest-path /tmp/trust-servo-build/TRust/Cargo.toml service_worker_ \
+    -- --test-threads=4
 
-Use the same manifest and TMPDIR for other Cargo commands. Do not substitute
-the numbered-release profile. The touch handoff records the final release build status in
-docs/servo-follow-ups-20261018.txt. Installed binaries are unchanged.
+Use the same manifest and TMPDIR for Clippy, debug/release tests and ordinary
+cargo build --release. Do not substitute the numbered-release profile.
 
-Current copying changes
------------------------
-- src/js_platform.js, shared PORTS and SC_CODEC blocks: capture intrinsic
-  operations; copy internal JSON records to null-prototype data; use own data
-  properties for lists; preserve object __proto__ properties, holes and cycles;
-  snapshot Map/Set entries before visiting getters. Preserve invalid Date values
-  and accept older numeric Date records. Use intrinsic Date/RegExp/view accessors.
-- The CryptoKey and MessagePort interface checks require an own private brand.
-  CryptoKey internal property descriptors use a null prototype too.
-- IndexedDB's surrounding records use the same principle. Internal lists avoid
-  author collection methods, iterators, indexed setters and species constructors.
-  The database storage representation and persistence policy are unchanged.
-- Worker/SharedWorker/AudioWorklet outgoing packets use portAPI.stringify.
-  Platform-created transfer Lists use portAPI.serializeList; user arguments
-  still receive Web IDL conversion. RegExp.prototype is treated as an ordinary
-  object, as ECMA-262's special source getter requires.
-- New fixtures: src/fixtures/structured_clone_private_records.mjs and
-  src/fixtures/indexed_db_private_records.mjs. Tests are in trust_js_backend.rs.
-  The SharedWorker connection regression now also checks internal transfer Lists.
+Final verification (target/worker-review-20261019/):
+- The final focused debug and release runs each passed 17 worker checks,
+  including the three native ownership regressions. The borrowed-method case
+  fails against the original client bootstrap and passes with the correction.
+  Its final fixture uses a transferred-port acknowledgement instead of a fixed
+  number of cache polls; the full debug run exposed that polling race.
+- Full debug: 3,852 library checks passed, 11 failed, 43 were ignored. All 11
+  passed isolated rechecks. The first full release run had nine failures;
+  all nine also passed isolated rechecks (isolated-rechecks.json).
+- A further release run without concurrent builds or the debug suite passed
+  3,860 library checks, with three failures and 43 ignored. The two HTTP/3
+  cases and one regexp case all passed subsequent isolated rechecks
+  (quiet-release-rechecks.json). Full-suite runs are not consistently clean;
+  all original failure logs are retained. These full runs precede only the
+  final test-only acknowledgement correction, which passed both focused runs.
+- Full binary suites passed in both profiles: 64 desktop tests (five ignored),
+  15 headless tests and one replay-example test. The one doc test is ignored.
+- Clippy completed with nine existing warnings in pending worker/body/HostTask
+  plumbing and no new warnings from the review fixes. Rust formatting,
+  JavaScript syntax and git diff --check passed.
+- The ordinary release build succeeded and was confirmed after the test-only
+  correction. All three artifacts remain byte-identical to release-sha256.txt.
+- The actual release headless browser passed the parent/iframe messaging page:
+  reply 43, top-level incumbent sender, transferred-port response port:42,
+  no script errors. Its PNG was inspected. A separate srcdoc check confirmed
+  inherited secure-context status, worker API exposure and document base URL.
+  The temporary acceptance server was stopped. Its pages remain under
+  target/worker-review-20261019/acceptance for later reproduction.
 
-Verification completed
-----------------------
-- clone-and-storage-private-record-tests.log: two focused tests passed in both
-  Window and worker realms (15.99s).
-- clone-and-storage-private-record-tests-2.log: the same two tests, with the
-  internal descriptor edge case, passed (11.39s).
-- clone-boundary-affected-tests.log: 22 related tests passed (140.94s), covering
-  cloning, crypto, ports, streams, bitmaps, canvases, cross-realm Window messages,
-  BroadcastChannel and closing service-worker agent admission.
-- idb-boundary-affected-tests.log: all 13 IndexedDB checks passed (71.48s).
-- sw-message-event-tests-2.log: ExtendableMessageEvent/FetchEvent lifetimes passed.
-- Syntax and git diff --check passed at these checkpoints.
+All outstanding source and review corrections were committed locally. Neither
+installation nor pushing was performed; the active engine checkout is unchanged.
 
-Latest checkpoint / next verification
--------------------------------------
-The latest Cargo run is private_records, logged in:
-  target/servo-fourth/clone-and-storage-private-record-tests-3.log
-It includes the RegExp.prototype correction and serializeList implementation.
-It completed successfully: two focused tests passed in 11.34s after a 5m10s build.
-The SharedWorker test body was changed in this checkpoint but is excluded by
-the private_records filter: run shared_workers_connect_matching_constructors_
-through_message_ports afterward. Also run worker_message_ports_transfer_queues_
-buffers_and_return_endpoints and audio_worklet_processors_run_on_the_rendering_
-thread for the affected callers, followed by the broader affected checks.
+The other developer's pre-review release suite passed 3,859 library tests;
+its three debug HTTP/3 failures passed isolated reruns. Those checks supersede
+the earlier touch handoff's worker initialization/lifecycle/inventory failures.
+Historical logs and probes remain in target/servo-fourth/.
 
-Concrete remaining review items (not yet edited)
-------------------------------------------------
-1. Incoming worker/worklet packets still use a mutable JSON.parse lookup:
-   - src/js_worker.js: WK.message, portAPI.deserialize(JSON.parse(s)).
-   - src/js_audio_worklet.js: workletGlobalPort and workletCreate.
-   Capture JSON.parse during bootstrap and exercise incoming delivery after
-   author code replaces JSON.parse. The Window frame-trace diagnostic also
-   parses wire with a mutable lookup; capture that operation as well.
-2. src/js_worker.js internalsFor dynamically resolves Reflect.apply and
-   WeakMap.prototype get/set. Capture these and Object.create before author
-   execution. The Window's primary map already uses privateSlots() with own
-   immutable get/set methods, so do not mechanically rewrite that mechanism.
-   Extend the worker check to exercise actual platform-object operations while
-   those global/prototype methods are replaced, restoring them before reporting.
-3. Audit the affected call sites after these targeted corrections, format the
-   touched Rust code, then repeat the focused and affected checks. No final
-   release build or final full suite has been done for this fourth batch.
-
-Local release acceptance
--------------------------
-Synthetic pages (no real keys/profile data) are retained under target/servo-fourth:
-  clone-private-record-repro.html
-  clone-storage-boundary-repro.html
-Their existing-release results are in clone-private-record-before.log and
-clone-storage-boundary-before-http.log. After rebuilding release, the first
-should report hooks=0, private-handle-visible=false, extractable=false; the
-database page should report both observation flags false.
-Use localhost for IndexedDB; file: correctly has an opaque origin. The local
-acceptance server was stopped after touch verification. Restart it when needed:
-  python3 -m http.server 32941 --bind 127.0.0.1 --directory target/servo-fourth
-Omit --site-data from probes.
-
-Service-worker implementation still to do
-------------------------------------------
-- Messaging source uses the incumbent global for ServiceWorker.postMessage;
-  Client.postMessage uses the receiver's relevant settings. Serialize before
-  checking the destination. Reuse the existing native callback context boundary.
-- Keep native transfer ownership until delivery or discard; release unconsumed
-  port/stream/canvas transfers on skipped events, failed startup and teardown.
-  Bound message bytes and counts. Avoid a destructor taking a registry mutex
-  while that same mutex is already held.
-- Enable the initially-disabled container message queue at the specified
-  onmessage/startMessages/DOMContentLoaded/worker-start points.
-- Messages can run installing/waiting workers. Registration.begin_event currently
-  admits installing and active workers; waiting needs the corresponding lifetime.
-- Then reserved navigation clients, fetch interception, response/body lifetime,
-  client focus/navigate/openWindow and navigation preload remain.
-- Module workers still explicitly reject because parser inspection is unavailable.
-  target/servo-fourth/proposed-engine-module-inspection.patch remains unapplied.
-  A specific question about editing only the isolated engine clone is unanswered;
-  general "continue" messages have not been treated as that permission.
-
-Standards and broader scope
----------------------------
-Local snapshots: HTML e5071a20; Service Workers92aba3be; WebIDL8f182624;
-WebCrypto811c24c; IndexedDBf704918; ECMA-262e28783d5. Relevant clauses:
-HTML StructuredSerializeInternal/StructuredDeserialize/WithTransfer;
-WebCrypto cryptokey-interface-serializable; IndexedDB clone-value and
-object-store-storage-operation; ECMA-262 sec-get-regexp.prototype.source.
-
-The rest of the authorized batch remains: touch-action/axis locking, LCP,
-nested orthogonal/logical-axis subgrids, further compositor combinations,
-incremental A/AAAA and NAT64, remaining Servo regressions, and the intermittent
-desktop startup crash investigation. See docs/servo-follow-ups-20261018.txt.
-Detailed engineering history: target/servo-fourth/progress.txt. The user has now
-assigned this part to another developer; the current agent has moved to touch
-input. Keep changes to shared files confined to the relevant blocks and tests.
-
-Additional integration evidence from touch-input verification
------------------------------------------------------------
-The existing pointer_input_capture_modifiers_clicks_and_offsets test fails at
-iframe focus with "InvalidStateError: Service-worker host is unavailable".
-This reproduces with js_touch.js completely omitted from the bootstrap, so it
-is independent of the new touch input module. Logs:
-target/servo-fourth/pointer-without-touch-module.log and
-target/servo-fourth/touch-pointer-existing-source-check.log.
-The bare platform_engine() fixture has no HostState.network. Service-worker
-init returns an empty controller/ready snapshot without installing an endpoint;
-the later clientState notification requires that endpoint. Please reconcile
-that empty-host case as part of the existing service-worker integration review.
-The new touch iframe test uses a fully initialized resident-page host instead.
-
-The broader debug run (touch-full-debug-tests.log) finished with 3,841 passing,
-14 failing and 43 ignored tests. Nine failures explicitly report the unavailable
-service-worker host during iframe input/geometry/user-activation operations.
-Three additional iframe cases reproduce the same error with touch omitted;
-their logs are without-touch-iframe_*.log in target/servo-fourth/.
-Four traversable visibility/focus/title/timer cases also fail with touch omitted
-(without-touch-traversable-tests-2.log: 21 passing, the same four failing).
-That comparison supplies a neutral hasTouchInput() result for the actor's new
-residency query. Finally, the host-boundary inventory test expects 267 entries
-but now finds 270. Touch introduced no native host bindings. Please include
-these initialization/lifecycle and inventory checks in the worker completion.
-
-Additional final checks
------------------------
-The final touch Clippy run completed successfully (touch-final-clippy.log).
-Its remaining nine warnings are in the existing service-worker/body/response
-plumbing and HostTask enum sizes. The full formatting check still flags three
-handed-off blocks in trust_js_backend.rs (around lines 2474, 54042 and 54062);
-touch code is formatted. These sections were left for the worker developer.
-
-A separate HTTP/3 cookie-policy test currently receives the TCP fallback body
-"tcp" instead of "new-user" at src/http/http3/tests.rs:812. It repeated in a
-focused run (touch-http3-retry.log); no touch JavaScript runs in that test.
-The broad-suite TLS handshake-signature timeout passed in its separate retry
-(touch-tls-retry.log). Final suite results are in the follow-up notes.
-
-Final touch verification result
--------------------------------
-Touch input is complete; the user asked this agent to stop here while their
-other developer completes workers. The ordinary release build succeeded and
-the three artifact hashes are in target/servo-fourth/touch-release-sha256.txt.
-Installed binaries and the active trust-js checkout remain unchanged.
-
-The final release library run with eight threads completed with 3,832 passing,
-24 failing and 43 ignored checks. Fourteen failures are the worker/lifecycle/
-inventory cases listed above. The additional HTTP/2 and regexp failures passed
-in isolated reruns after the suite stopped. HTTP/3 then passed 16 checks, with
-one remaining failure: http3_header_length_and_bodyless_validation, "length",
-tests.rs:515. Its earlier cookie case passed. Logs: touch-final-quiet-rechecks.log
-and touch-full-release-final-bounded.log. No transport or regexp changes were
-made as part of touch.
-
-A separate unrestricted parallel library run crashed in a render::headles
-thread, with PC zero and a return address in libvulkan.so.1.4.365 at offset
-0x45c18. The truncated core, stack and mapped-file evidence are retained as
-target/servo-fourth/touch-unbounded-test*. This is not a root-cause conclusion
-or proof of the same cause as the existing desktop startup crash. The bounded
-run passed the renderer stage. Touch's focused checks passed in both profiles,
-including iframe boundaries, native Wayland panning and independent Window IDs.
+A prior unrestricted parallel touch-era test run crashed in a renderer thread,
+with PC zero and a return address in libvulkan.so.1.4.365 at offset 0x45c18.
+The truncated core and stack/map evidence remain in target/servo-fourth/
+touch-unbounded-test*. This is not a root-cause conclusion or proof that it is
+the same issue as the reported desktop startup crash.

@@ -290,10 +290,10 @@ fn service_worker_messages_keep_receiver_and_incumbent_realms() {
             let (mut socket, _) = listener.accept().await.unwrap();
             let _ = read_head(&mut socket).await;
             let source = r#"
-                self.addEventListener('message', event => event.waitUntil((async () => {
+                self.addEventListener('message', event => {
                     event.source.postMessage({frameType:event.source.frameType});
-                    await (await caches.open('realm-messages')).put('/sent', new Response('yes'));
-                })()));
+                    event.ports[0].postMessage('queued');
+                });
             "#;
             let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{source}", source.len());
             socket.write_all(response.as_bytes()).await.unwrap();
@@ -331,10 +331,12 @@ fn service_worker_messages_keep_receiver_and_incumbent_realms() {
                 navigator.serviceWorker.addEventListener('message',event=>{received.push(event);ready();});
                 // The parent has never obtained this registration. Borrowing
                 // its method must still address the child's worker object.
-                ServiceWorker.prototype.postMessage.call(child.worker,{value:1});
-                let sent=false;
-                for(let i=0;i<200&&!sent;i++)sent=!!(await caches.match('/sent'));
-                check(sent,'borrowed postMessage reached its receiver');
+                const channel=new MessageChannel();
+                const queued=new Promise(resolve=>channel.port1.onmessage=event=>resolve(event.data));
+                ServiceWorker.prototype.postMessage.call(child.worker,{value:1},[channel.port2]);
+                // The port acknowledgement follows the native client enqueue.
+                // It advances independently of the disabled container queue.
+                check(await queued==='queued','borrowed postMessage reached its receiver');
                 check(received.length===0,'parent message queue remains disabled');
                 let handlerThis=false;
                 if(enableMethod==='startMessages')child.ServiceWorkerContainer.prototype.startMessages.call(navigator.serviceWorker);
@@ -346,6 +348,7 @@ fn service_worker_messages_keep_receiver_and_incumbent_realms() {
                 check(event.origin===location.origin,'reply origin');
                 check(enableMethod==='startMessages'||handlerThis,'borrowed onmessage setter receiver');
                 log.push(enableMethod+':ok');
+                channel.port1.close();
                 await child.registration.unregister();
             })().catch(error=>log.push('ERROR:'+error.message)).finally(()=>realmMessagesDone=true);
         "#, "borrowed service-worker messaging").unwrap();

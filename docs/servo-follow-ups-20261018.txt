@@ -392,6 +392,21 @@ in begin_event. The worker/worklet incoming paths and the worker
 slot map now use bootstrap JSON.parse and Reflect/WeakMap/Object
 captures, and empty-host clientState traffic no longer fails.
 
+Worker messaging review — 2026-10-19
+-----------------------------------
+The additional worker implementation completes ServiceWorker.postMessage,
+Client.postMessage, native queue enable/delivery and transfer discard paths.
+Review corrected borrowed-method receiver ownership and native cleanup on
+abandoned or partially decoded messages, including long queued-transfer chains.
+The earlier worker integration failures are fixed. The original implementation
+passed its full release suite. The final review's 17 focused worker checks pass
+in both profiles, including a port acknowledgement replacing a racy test poll.
+The release browser passes parent/iframe messaging with a transferred port.
+Full-suite failures and successful isolated retries are retained and recorded
+in the messaging handoff; the full suites are not consistently clean. All
+outstanding source was committed locally. Installation and pushing were not
+performed, and the active engine checkout remains unchanged.
+
 Touch input implementation
 --------------------------
 Native desktop touch contacts now reach the page as trusted PointerEvents with
@@ -461,14 +476,13 @@ Touch verification (final source)
   retained; the repository-wide suite is not clean. No networking or regexp
   implementation was changed during this touch increment.
 
-No installation, source commit, push, or change to the active trust-js checkout
-was performed. Pinch zoom, workers and the later follow-ups remain outside this
-completed touch increment.
+At the touch handoff, no installation, source commit, push, or change to the
+active trust-js checkout had been performed. Source has since been committed
+as part of the worker review above. Pinch zoom remains outside this touch
+increment.
 
-Touch verification is complete. Work stops here at the user's request. The user
-will arrange for the other developer to finish workers before any further
-feature work begins.
-The later authorized areas are LCP,
+Touch input and the messaging review are complete. The remaining service-worker
+tasks above precede the later authorized areas: LCP,
 nested orthogonal/logical-axis subgrid work, further compositor combinations,
 incremental A/AAAA resolution and NAT64, the remaining Servo regression audit,
 and the separate intermittent desktop startup crash investigation. Accessibility
