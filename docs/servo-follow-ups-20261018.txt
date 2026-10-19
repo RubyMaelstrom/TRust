@@ -174,7 +174,7 @@ Follow-ups identified after the third batch (historical)
   the system's combined resolver with a bounded wait. It implements RFC 8305
   §§4–5 after resolution, not that RFC's complete asynchronous DNS algorithm.
 
-Other comparisons requiring dedicated regression work
+Other comparisons requiring dedicated regression work (historical)
 ----------------------------------------------------
 
 Navigation/history/initial about:blank, cross-origin Window/Location, font
@@ -329,10 +329,10 @@ Detailed third-batch logs, probes and crash evidence are retained under
 target/servo-third/. Failed intermediate runs are retained alongside their
 successful reruns. No installation, source commit or push has been performed.
 
-Fourth batch in progress — 2026-10-19
-------------------------------------
+Fourth batch checkpoint — 2026-10-19 (historical)
+------------------------------------------------
 
-The authorized batch is still in progress. The following component checks do
+At this checkpoint the authorized batch was still in progress. These checks do
 not replace the required final debug/release suites, Clippy, release build and
 release-browser acceptance. Installed binaries and the active trust-js checkout
 remain unchanged; builds use the isolated main-engine checkout described above.
@@ -622,8 +622,6 @@ test-lock fallout from the worker cookie-context assertion. The other failures
 are the integration and fixture corrections described above. This original
 failure log is retained; final rerun results are recorded below.
 
-Verification and startup investigation results follow after final validation.
-
 The final debug CPU group ran with eight test threads; graphics/media tests
 run separately with two. Its initial run passed 3,584 library tests with seven
 failures and 30 ignored. Desktop (64), headless (15) and replay (one) checks
@@ -636,3 +634,197 @@ is now bounded at 60 seconds with every resource/origin/error assertion kept.
 No production behavior changed in response to these seven failures. The raw
 run is retained in target/servo-debug-cpu-initial-failures.log; corrected
 checks and the remaining verification are recorded below.
+
+Native Vulkan initialization correction
+- Release GPU/media validation reproduced a null native dispatch call twice.
+  The two browser cores and an independent C-only reproduction show the same
+  state: the NVIDIA ICD initialization flag is published while its dispatch
+  pointer remains null and another thread is still initializing the driver.
+  The loader return address is loader_scanned_icd_add+0x98 (offset 0x45c18).
+  The installed runtime is NVIDIA 610.57.04/AArch64, Vulkan loader 1.4.365.
+- tools/vulkan_init_probe.c preserves the standalone reproduction. Concurrent
+  extension discovery and creation of independent VkInstances crashed in
+  0.30 seconds; coordinating those initialization calls completed 100 rounds
+  (200 instances) with no errors. Destruction remains outside the gate.
+- A shared synchronous gate now coordinates both wgpu instance constructors
+  and FFmpeg's Vulkan device initialization. It holds no native resources and
+  does not cover adapter/device requests, awaits, rendering, or decoding. A
+  regression constructs two independent headless renderers concurrently and
+  verifies their distinct image pixels across two rounds of readback.
+- Vulkan's Threading Behavior permits these independent calls; coordination
+  addresses the demonstrated native initialization defect, not a normative
+  requirement to serialize Vulkan instances. The relevant official clauses
+  and Loader Driver Interface v1.4.365 were read online because the local
+  standards library lacks this text. References are in src/native_gpu.rs and
+  target/servo-native-crash-20261019/analysis.txt; original cores, library
+  identities, register records, disassembly and comparison runs are retained
+  in that directory. DIAGNOSTICS.md provides standalone reproduction commands.
+- This matches the earlier touch test's null-call/loader-offset evidence. It
+  does not establish the cause of the older, separate desktop NVIDIA worker
+  thread stack. The previously fixed image-registry panic is also distinct.
+
+Deferred Document timing correction from final review
+- A saved creation timestamp was exposed only when FetchTiming existed. Local
+  srcdoc/data/initial-blank Documents could therefore acquire the later Realm
+  startup time when their native Document gained an actor. The timing bridge
+  now retains native Document moments independently of fetch metadata.
+- Initial blank Documents keep their context-creation time origin and zero
+  domLoading: they start complete rather than entering loading. Accepted
+  srcdoc/data Documents keep their navigation and loading moments. A response
+  that produces no new Document leaves the initial blank's clock intact.
+- A no-FetchTiming root retains its original native Document-creation moment
+  as a fallback origin. Such paths still lack a measurement of the earlier
+  browser navigation start; the fallback is not represented as that missing
+  measurement. Unavailable fetch fields and completed static lifecycle phases
+  stay zero. This does not add fabricated network entries or replay events.
+- Authority: HTML e5071a20, creating-a-new-browsing-context, Window settings
+  time origin, initialise-the-document-object and readiness; HR-Time 1f0b9faf,
+  sec-time-origin/coarsen-time; Navigation Timing 245fee24, domLoading.
+
+Final focused validation (source a6e0bca)
+- Three new document_clock regressions passed in debug (24.67 s). The broader
+  timing/frame/initial-window/auxiliary selection passed all 44 checks in
+  debug (99.43 s) and release (8.29 s).
+- Final debug graphics/media validation passed 388 checks with 13 existing
+  ignores (63.45 s). Release graphics/media passed the same 388 checks twice
+  in fresh processes (23.95 s and 24.33 s), with the concurrent renderer
+  regression also passing separately. Both complete optimized runs reached
+  the end without the previously reproduced native initialization crash.
+- The retained standalone tools/vulkan_init_probe.c compiled with strict
+  warning flags and completed its serialized 100-round control with zero
+  errors. Its cleanup only destroys successfully created native instances.
+
+Broad verification before final HTTP acceptance correction (a6e0bca)
+- The final release CPU group passed 3,594 library tests, with 30 existing
+  ignores (81.62 s). Combined with the graphics/media group, all 3,982 enabled
+  library tests passed; 43 remain ignored. Desktop added 64 passes/five
+  ignores, headless 15 passes, and the replay example one pass. The existing
+  ignored FFmpeg doctest stayed filtered from this partitioned run.
+- Debug verification includes the earlier full CPU run and its seven corrected
+  reruns, the final 44 timing/frame checks including the three added tests,
+  and the final 388 graphics/media checks. The original failure logs remain
+  available as documented above; no failure was removed from those logs.
+- Final all-target Clippy completed successfully. Its five browser advisories
+  are one eight-argument helper, two large event enums, a collapsible test
+  condition, and test-module placement. The pinned Parley dependency also
+  reports its existing ICU bidi-value deprecation. These are warnings, not
+  failed checks; no warning suppression or mechanical vendor rewrite was used.
+
+Release acceptance found a navigation-preload body omission
+- The ordinary release build completed, and the LCP, layout/shaping, compositor
+  and initial service-worker fixture checks passed. Their PNGs were inspected:
+  the text/poster/image sequence, matching shaping, logical subgrid geometry,
+  transformed/opacity boxes, sticky placement and controlled iframe rendered.
+- The navigation-preload fixture failed with status 200/basic and an empty
+  body. Its replacesClientId/resultingClientId were present, and the loopback
+  server received Service-Worker-Navigation-Preload: servo-acceptance. The
+  extensionless network resource contains exactly "network preload\n" but
+  is served as application/octet-stream by the fixture HTTP server.
+- Transport code treated destination=document as permission to skip download
+  bytes. That optimization runs too early for a script reading a preload
+  Response or fetch(event.request): the worker may use the bytes to produce
+  its final response. The correction distinguishes the response consumer
+  from Fetch mode/destination across HTTP/1, HTTP/2 and HTTP/3.
+- The first failure, condition diagnostics, and fetch trace are retained in
+  target/servo-release-acceptance-first/, -diagnostic-first/ and -empty-body/;
+  the fixture now reports failed body/client conditions explicitly.
+- Authority: Service Workers 92aba3be Handle Fetch (navigation preload clone
+  and exposed Response); Fetch 394d20d global fetch and consume-body; HTML
+  e5071a20 navigation-as-a-download, which processes the final response.
+
+Empty-inline paint correction from visual acceptance
+- The layout fixture's geometry checks passed, but its empty padded inline
+  had no purple background in the PNG. The graphical decoration collector
+  discarded line.empty_boxes even though CSSOM retained them. It now paints
+  their font-based background/border geometry, including relative offsets.
+- Retained-paint dependencies also include those empty inline owners. Color
+  and visibility edits invalidate their cached output; padding/border/relative
+  geometry changes remain covered by full line equality. CSSOM and containing
+  block collectors already retained these boxes. The terminal's separate
+  lossy cell adapter has no corresponding graphical decoration collector.
+- Authority: CSSWG 81c27f6, CSS2 inline-non-replaced, section 10.8 and Appendix E
+  each-box; Backgrounds3 background-clip. Tests check measured rectangles,
+  actual background/all-four-border pixels, hidden visibility, relative
+  positioning, and retained-cache/full-paint parity through style mutations.
+- Both acceptance corrections passed all ten focused debug checks (7.65 s).
+  The broader HTTP/service-worker selection passed 357 tests/11 ignores
+  (151.22 s), and the graphical paint module passed 96 tests/one ignore
+  (94.23 s). Commits: c6a3b09 (body consumer), 6c638eb (empty-inline paint).
+
+Final broad release run exposed an expander-test ordering assumption
+- All ten focused acceptance corrections passed in release (0.84 s). The
+  broad CPU run then passed 3,599 tests with one failure and 30 ignores:
+  execute_js_live_path_handles_the_expander_page received Title("Pure JS
+  Toggle") where it required its next channel message to be Updated.
+- The page's title and rendered contents are separate frontend notifications.
+  The test now validates that title if it arrives, then requires the click's
+  update within one ten-second deadline. It retains the initial-hidden and
+  post-click-visible assertions and also checks the updated JS outcome.
+  No production behavior changed. HTML e5071a20 document.title/title-element
+  clauses describe the title used in browser UI, not an internal channel
+  ordering relative to a later content update.
+- The original failure log remains in
+  target/servo-release-cpu-title-notification-failure.log.
+
+Final source verification (c3cc431)
+- The expander regression passed in debug (5.35 s) and release (0.50 s).
+  The clean broad release CPU rerun passed all 3,600 enabled checks with
+  30 ignores (102.91 s); the graphics/media partition passed all 388 enabled
+  checks with 13 ignores. Together: 3,988 passed, zero failed, 43 ignored.
+- Final debug coverage also includes the ten acceptance-fix checks, 357
+  HTTP/service-worker checks, 96 graphical-paint checks and 388 graphics/media
+  checks. All-target Clippy completed successfully after the test correction,
+  with the same five browser advisories and Parley deprecation listed above.
+  The earlier 80 executable/example checks passed in this batch; the last
+  corrections change library behavior and test synchronization only.
+
+Final release acceptance and completion
+- The ordinary release build for browser source c3cc431 succeeded in 8m 20s
+  using isolated engine ec4e4b742559222909101b14698a5d6f4b793fb7. The isolated
+  checkout is clean; the active /big/Code/trust-js checkout was not changed.
+  The engine patch and exact build instructions are retained in this repository.
+- All five final release acceptance cases passed: LCP, layout/shaping/subgrid,
+  compositor/sticky, service-worker interception and service-worker navigation
+  preload. All five PNGs were inspected, including the corrected empty-inline
+  background and the successful preload navigation. The server observed the
+  expected Service-Worker-Navigation-Preload header. Results and screenshots:
+  target/servo-release-acceptance/ (report.json records every case and hash).
+- A process-local delayed-DNS fixture held AAAA resolution for two seconds.
+  The release browser's IPv4 HTTP request arrived 53.095037 ms after AAAA
+  resolution started, while that lookup was still pending. The page reported
+  PASS and the browser exited normally. System DNS was not changed. Evidence:
+  target/network-followups-20261019/final-dns/results.json and adjacent logs.
+- Eight fresh desktop launches each initialized Hybrid on NVIDIA GB10, rendered
+  a completed frame and closed normally with exit 0. There were no CPU fallbacks
+  or forced terminations. Each probe used a separate empty profile and closed
+  only its own uniquely titled window. Evidence:
+  target/network-followups-20261019/final-desktop/desktop-startup-results.json
+  and startup-0.log through startup-7.log. These probes and the feature pages
+  used identical final artifacts; their recorded hashes match current files.
+- Final formatting, prelude and worker JavaScript syntax checks, and
+  git diff --check passed. Full release library results remain 3,988 passed,
+  zero failed and 43 ignored. Clippy succeeded with the advisories above.
+
+Final artifact SHA-256 (ordinary target/release)
+  trust:
+    8cdb9ff4979754dad18d84b1ed0e9d8358f88ac486a5f1d0d30fc8ab826959cf
+  trust-desktop:
+    9e03b446b2a8cb941c058eb9eb7a3007b3eb95496e53d4051922a06591eb66fc
+  trust-headless:
+    b3cf173cfea7473d3a5715cf946b8e99ff9c43bee7f3ef26a7be68be3f46d9df
+
+Scope and remaining limits
+- The authorized follow-up batch is implemented and locally committed. RAM-only
+  service-worker/cache storage and bookmark-restricted same-site cookie disk
+  persistence are preserved. Accessibility and persistent HTTP caching remain
+  explicitly deferred; pinch zoom and native legacy TouchEvents were outside
+  the touch increment. No installation, promotion or push was performed.
+- The reproduced Vulkan initialization crash is addressed. The older, separate
+  NVIDIA worker-thread trace has not been explained by that reproduction and
+  did not recur in these eight startup probes. No claim is made that all older
+  desktop crashes share the initialization cause.
+- The implementation limits recorded above still apply: nested-context LCP
+  opts out; unavailable presentation/static lifecycle timestamps stay absent
+  or zero as appropriate; genuinely projective/SVG-dependent animation uses
+  the actor path. The Windows networking path was source-reviewed, not
+  cross-compiled or exercised on Windows during this batch.
