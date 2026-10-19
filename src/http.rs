@@ -18668,12 +18668,26 @@ mod tests {
             .send(crate::js::PageCmd::Click(toggle))
             .await
             .unwrap();
-        match live.events.recv().await {
-            Some(crate::js::PageEvt::Updated { html, .. }) => {
-                assert!(html.contains("Additional Link 1"), "{html}");
+        // The document title and clicked content are independent frontend
+        // notifications. The initial title can still be queued after the
+        // first paint; it does not replace the click's eventual update.
+        let html = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match live.events.recv().await {
+                    Some(crate::js::PageEvt::Title(title)) => {
+                        assert_eq!(title, "Pure JS Toggle");
+                    }
+                    Some(crate::js::PageEvt::Updated { html, outcome }) => {
+                        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                        break html;
+                    }
+                    other => panic!("expected click update, got {other:?}"),
+                }
             }
-            other => panic!("expected Updated, got {other:?}"),
-        }
+        })
+        .await
+        .expect("click produced no render update within 10s");
+        assert!(html.contains("Additional Link 1"), "{html}");
         server.abort();
     }
 
