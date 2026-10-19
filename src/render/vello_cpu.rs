@@ -419,7 +419,8 @@ impl VelloCpuRenderer {
                     };
                     // A layer's own paint clip bounds even destructive
                     // operators: outside it the backdrop is untouched.
-                    let hidden = clips.bounds().width <= 0.
+                    let hidden = super::transparent_source_over(layer)
+                        || clips.bounds().width <= 0.
                         || clips.bounds().height <= 0.
                         || layer.clip.is_some_and(|clip| {
                             !rect_is_visible(
@@ -2549,6 +2550,55 @@ mod tests {
         );
         assert_ne!(scrolled.pixels, before.pixels);
         assert!(optimized.rasterized_clips < 4);
+    }
+
+    #[test]
+    fn transparent_groups_skip_backend_work_and_reveal_their_latest_contents() {
+        use super::super::{BlendMode, CompositeOperator, CompositingLayer};
+        let mut scene = clip_test_scene(1.5);
+        let layer = scene.primitives.len();
+        scene.primitives.extend([
+            DisplayCommand::PushLayer(CompositingLayer::new(
+                0.,
+                BlendMode::Multiply,
+                Arc::from([]),
+            )),
+            DisplayCommand::PushClip(PaintShape::Rect(CssRect::new(8., 8., 30., 20.))),
+            DisplayCommand::FillRect {
+                rect: CssRect::new(0., 0., 96., 64.),
+                color: PaintColor::Rgba(240, 0, 0, 255),
+            },
+            DisplayCommand::PopClip,
+            DisplayCommand::PopLayer,
+        ]);
+        let mut optimized = VelloCpuRenderer::new();
+        let mut reference = VelloCpuRenderer::new();
+        reference.eager_clips = true;
+        let hidden = optimized.render_rgba(&scene).unwrap();
+        assert_eq!(hidden.pixels, reference.render_rgba(&scene).unwrap().pixels);
+        assert_eq!(optimized.rasterized_clips, 0);
+        assert!(reference.rasterized_clips > 0);
+        scene.primitives[layer + 1] =
+            DisplayCommand::PushClip(PaintShape::Rect(CssRect::new(8., 8., 50., 20.)));
+        if let DisplayCommand::PushLayer(layer) = &mut scene.primitives[layer] {
+            layer.opacity = 1.;
+        }
+        let shown = optimized.render_rgba(&scene).unwrap();
+        assert_eq!(shown.pixels, reference.render_rgba(&scene).unwrap().pixels);
+        assert_ne!(hidden.pixels, shown.pixels);
+        assert!(optimized.rasterized_clips > 0);
+        if let DisplayCommand::PushLayer(layer) = &mut scene.primitives[layer] {
+            layer.opacity = 0.;
+            layer.compose = CompositeOperator::DestinationIn;
+        }
+        assert_eq!(
+            optimized.render_rgba(&scene).unwrap().pixels,
+            reference.render_rgba(&scene).unwrap().pixels
+        );
+        assert!(
+            optimized.rasterized_clips > 0,
+            "transparent masks still apply"
+        );
     }
 
     #[test]

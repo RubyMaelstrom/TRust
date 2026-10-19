@@ -951,7 +951,8 @@ impl VelloHybridRenderer {
                     }
                 }
                 DisplayCommand::PushLayer(layer) => {
-                    let hidden = clips.bounds().width <= 0.
+                    let hidden = super::transparent_source_over(layer)
+                        || clips.bounds().width <= 0.
                         || clips.bounds().height <= 0.
                         || layer.clip.is_some_and(|clip| {
                             !rect_is_visible(

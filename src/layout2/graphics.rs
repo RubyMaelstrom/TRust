@@ -507,13 +507,22 @@ impl<'a> Builder<'a> {
         // applying it again inside BeginScroll permanently hides content
         // beyond the initial iframe viewport. The scoped overflow chain below
         // retains each edge at its owner, including clips within the content.
-        let mut clip = hard
+        let clip = hard
             .filter(|_| !self.scroll_nodes.iter().any(|(_, scroll)| *scroll))
             .map(|clip| self.clip_rect(clip));
+        let legacy = self.legacy_clip(node);
+        if let Some(recording) = self.recording.borrow_mut().as_mut() {
+            recording.read(paint_cache::Read::LegacyClip(node, legacy));
+        }
+        legacy.map_or(clip, |legacy| intersect_css_rects(clip, legacy))
+    }
+
+    fn legacy_clip(&self, node: NodeId) -> Option<CssRect> {
         // Only `clip: rect()` regions need the flat-tree ancestor walk.
         if self.legacy_clips.is_empty() {
-            return clip;
+            return None;
         }
+        let mut clip = None;
         let mut current = (node != NO_NODE).then_some(node);
         while let Some(id) = current {
             if let Some(rect) = self.legacy_clips.get(&id) {

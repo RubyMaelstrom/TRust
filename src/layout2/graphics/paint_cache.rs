@@ -22,7 +22,8 @@
 //!    ([`EntryState`]).
 //! 3. Lookups into the builder's per-document tables, recorded while the
 //!    chunk was built and re-evaluated on reuse ([`Read`]): the scroll/clip
-//!    chain of each node it asked about, the replaced-element border boxes,
+//!    chain (including legacy `clip:rect()`) of each node it asked about,
+//!    the replaced-element border boxes,
 //!    the clip extent, and image sizes and SVG ratios.
 //! 4. The Dom state of the nodes the fragment names. The paint journal
 //!    (`dom::paint_journal`) lists the nodes whose state may have changed;
@@ -146,6 +147,10 @@ pub(super) enum Read {
         include_node: bool,
         links: Vec<(NodeId, PaintShape, bool)>,
     },
+    /// CSS 2 clipping applies to this node and its descendants. Revalidate
+    /// only leaves that read the changed clip, rather than dropping every
+    /// cached leaf when a clipped label moves with a progress indicator.
+    LegacyClip(NodeId, Option<CssRect>),
     ReplacedBorder(NodeId, Option<CssRect>),
     /// The finite extent used for an unbounded clip edge.
     ClipExtent(CssRect),
@@ -201,6 +206,7 @@ impl Recording {
                     ..
                 },
             ) => a == b && x == y,
+            (Read::LegacyClip(a, _), Read::LegacyClip(b, _)) => a == b,
             (Read::ReplacedBorder(a, _), Read::ReplacedBorder(b, _)) => a == b,
             (Read::ClipExtent(_), Read::ClipExtent(_)) => true,
             (Read::ImageSize(a, _), Read::ImageSize(b, _)) => a == b,
@@ -266,21 +272,13 @@ struct GlobalKey {
     selection_rules: bool,
     backdrop_filters: bool,
     inline_media: bool,
-    /// `clip: rect()` regions and marquees decide clips and scopes by
-    /// flat-tree ancestry; they are rare, so they key the cache whole.
-    legacy_clips: Vec<(NodeId, CssRect)>,
+    /// Marquees decide scopes by flat-tree ancestry.
     marquees: Vec<(NodeId, MarqueeScope)>,
     epochs: [u64; 5],
 }
 
 impl GlobalKey {
     fn of(builder: &Builder<'_>) -> Self {
-        let mut legacy_clips: Vec<_> = builder
-            .legacy_clips
-            .iter()
-            .map(|(&node, &rect)| (node, rect))
-            .collect();
-        legacy_clips.sort_unstable_by_key(|(node, _)| *node);
         let mut marquees: Vec<_> = builder
             .marquee_scopes
             .iter()
@@ -298,7 +296,6 @@ impl GlobalKey {
             selection_rules: builder.selection_rules,
             backdrop_filters: builder.backdrop_filters,
             inline_media: builder.dom.inline_media(),
-            legacy_clips,
             marquees,
             epochs: builder.dom.paint_epochs(),
         }
@@ -485,8 +482,6 @@ fn key_difference(old: &GlobalKey, new: &GlobalKey) -> &'static str {
         "ratio"
     } else if old.base != new.base {
         "base"
-    } else if old.legacy_clips != new.legacy_clips {
-        "clip-rect"
     } else if old.marquees != new.marquees {
         "marquee"
     } else if old.epochs != new.epochs {
@@ -1061,6 +1056,7 @@ fn reads_valid(reads: &[Read], builder: &Builder<'_>) -> bool {
             include_node,
             links,
         } => builder.scroll_chain_links(*node, *include_node) == *links,
+        Read::LegacyClip(node, value) => builder.legacy_clip(*node) == *value,
         Read::ReplacedBorder(node, rect) => {
             builder.replaced_border_boxes.get(node).copied() == *rect
         }
@@ -2047,6 +2043,49 @@ mod tests {
         // The inherited color and decoration reach the lines below #a only.
         assert!(stats.dirty + stats.new >= 2, "{stats:?}");
         assert!(stats.hits >= 1, "{stats:?}");
+    }
+
+    #[test]
+    fn moving_a_legacy_clip_preserves_unrelated_leaf_paint() {
+        // CSS 2 #clipping: only the clipped element and its descendants use
+        // this rectangle. Every frame also compares against a fresh paint.
+        let _inputs = crate::layout2::stable_global_layout_inputs();
+        let mut fuzz = page(&format!(
+            "{}<div id=moving style='position:absolute;left:10px;top:20px;width:100px;height:30px'>\
+             <div id=clipped style='position:absolute;clip:rect(0px,40px,20px,0px);width:80px;height:25px'>clipped label</div></div>",
+            "<p>unchanged paragraph</p>".repeat(30)
+        ));
+        fuzz.frame();
+        let moving = by_id(&fuzz, "moving");
+        for left in [20, 45, 10] {
+            fuzz.dom.set_attr(
+                moving,
+                "style",
+                &format!("position:absolute;left:{left}px;top:20px;width:100px;height:30px"),
+            );
+            let stats = fuzz.frame();
+            assert_eq!(
+                LAST_RESET.with(|reset| reset.borrow().clone()),
+                "None",
+                "{stats:?}"
+            );
+            assert!(stats.hits > 30, "{stats:?}");
+        }
+        let clipped = by_id(&fuzz, "clipped");
+        for clip in ["rect(0px,20px,15px,0px)", "auto", "rect(0px,60px,25px,0px)"] {
+            fuzz.dom.set_attr(
+                clipped,
+                "style",
+                &format!("position:absolute;clip:{clip};width:80px;height:25px"),
+            );
+            let stats = fuzz.frame();
+            assert_eq!(
+                LAST_RESET.with(|reset| reset.borrow().clone()),
+                "None",
+                "{stats:?}"
+            );
+            assert!(stats.hits > 30, "{stats:?}");
+        }
     }
 
     #[test]

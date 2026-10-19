@@ -2158,8 +2158,9 @@ pub enum SceneDamage {
 /// Compute damage for a retained scene without weakening CSS painting order.
 ///
 /// CSS 2.2 Appendix E, CSS Transforms, and CSS Overflow make transforms,
-/// clips, and compositing scopes stateful. Structural changes require a
-/// full-frame fallback. Aligned transform/opacity changes damage all paint
+/// clips, and compositing scopes stateful. Balanced local structural changes
+/// damage their complete scopes; unsupported effects retain a full-frame
+/// fallback. Aligned transform/clip/opacity changes damage all paint
 /// inside their scopes, using both the old and new coordinates. We
 /// replay both complete lists to recover their active transforms and clips,
 /// then union the old and new painted bounds. Removed paint is included so
@@ -2183,63 +2184,77 @@ pub fn scene_damage_with_image_changes(
     if old.viewport != new.viewport || old.canvas_images != new.canvas_images {
         return SceneDamage::Full;
     }
-    let prefix = old
-        .primitives
+    let old_commands = raster_commands(&old.primitives);
+    let new_commands = raster_commands(&new.primitives);
+    let prefix = old_commands
         .iter()
-        .zip(&new.primitives)
+        .zip(&new_commands)
         .take_while(|(old, new)| old == new)
         .count();
-    if prefix == old.primitives.len() && prefix == new.primitives.len() && changed_images.is_empty()
-    {
+    if prefix == old_commands.len() && prefix == new_commands.len() && changed_images.is_empty() {
         return SceneDamage::Unchanged;
     }
-    let suffix = old.primitives[prefix..]
+    let suffix = old_commands[prefix..]
         .iter()
         .rev()
-        .zip(new.primitives[prefix..].iter().rev())
+        .zip(new_commands[prefix..].iter().rev())
         .take_while(|(old, new)| old == new)
         .count();
-    let old_changed = prefix..old.primitives.len() - suffix;
-    let new_changed = prefix..new.primitives.len() - suffix;
-    let aligned = old.primitives.len() == new.primitives.len();
+    let mut old_changed = prefix..old_commands.len() - suffix;
+    let mut new_changed = prefix..new_commands.len() - suffix;
+    let mut aligned = old_commands.len() == new_commands.len();
     let state_changed = if aligned {
-        old.primitives[old_changed.clone()]
+        old_commands[old_changed.clone()]
             .iter()
-            .zip(&new.primitives[new_changed.clone()])
+            .zip(&new_commands[new_changed.clone()])
             .any(|(old, new)| {
                 (command_changes_paint_state(old) || command_changes_paint_state(new))
                     && old != new
                     && !bounded_scope_change(old, new)
             })
     } else {
-        old.primitives[old_changed.clone()]
+        old_commands[old_changed.clone()]
             .iter()
-            .chain(&new.primitives[new_changed.clone()])
-            .any(command_changes_paint_state)
+            .chain(&new_commands[new_changed.clone()])
+            .any(|command| command_changes_paint_state(command))
     };
     if state_changed {
-        return SceneDamage::Full;
+        let Some((a, b)) = balanced_damage_ranges(&old_commands, &new_commands, prefix, suffix)
+        else {
+            return SceneDamage::Full;
+        };
+        old_changed = a;
+        new_changed = b;
+        aligned = false;
     }
     // Filter Effects 2 #BackdropRoot: a backdrop filter reads content
     // painted anywhere behind it, and an SVG filter's output fills its
     // filter region; neither is bounded by the changed commands.
-    let reads_beyond = |scene: &Scene| {
-        scene.primitives.iter().any(|command| {
+    let reads_beyond = |commands: &[&DisplayCommand]| {
+        commands.iter().any(|command| {
             matches!(command, DisplayCommand::PushLayer(layer)
                 if layer.backdrop.is_some() || layer.needs_offscreen_filters())
         })
     };
-    if reads_beyond(old) || reads_beyond(new) {
+    if reads_beyond(&old_commands) || reads_beyond(&new_commands) {
         return SceneDamage::Full;
     }
-    let Some(old_bounds) =
-        changed_command_bounds(old, old_changed, aligned.then_some(new), changed_images)
-    else {
+    let Some(old_bounds) = changed_command_bounds(
+        old,
+        &old_commands,
+        old_changed,
+        aligned.then_some(new_commands.as_slice()),
+        changed_images,
+    ) else {
         return SceneDamage::Full;
     };
-    let Some(new_bounds) =
-        changed_command_bounds(new, new_changed, aligned.then_some(old), changed_images)
-    else {
+    let Some(new_bounds) = changed_command_bounds(
+        new,
+        &new_commands,
+        new_changed,
+        aligned.then_some(old_commands.as_slice()),
+        changed_images,
+    ) else {
         return SceneDamage::Full;
     };
     let bounds = match (old_bounds, new_bounds) {
@@ -2258,11 +2273,156 @@ pub fn scene_damage_with_image_changes(
     .map_or(SceneDamage::Unchanged, SceneDamage::Partial)
 }
 
+/// CSS Color 4 #transparency applies opacity to the complete group after
+/// filtering. A zero-opacity source-over group cannot change the backdrop;
+/// its descendants and hit regions must not turn a control update into damage.
+/// Keep the original list for hit testing (opacity does not affect it), and
+/// only omit balanced groups. Other Porter-Duff operators can erase pixels
+/// even with a transparent source and must retain their ordinary rendering.
+fn raster_commands(commands: &[DisplayCommand]) -> Vec<&DisplayCommand> {
+    let mut paint = Vec::with_capacity(commands.len());
+    let mut index = 0;
+    while let Some(command) = commands.get(index) {
+        if let DisplayCommand::PushLayer(layer) = command
+            && transparent_source_over(layer)
+            && let Some(end) = clipped_layer_end(commands, index)
+        {
+            index = end + 1;
+            continue;
+        }
+        if !matches!(command, DisplayCommand::HitRegion(_)) {
+            paint.push(command);
+        }
+        index += 1;
+    }
+    paint
+}
+
+fn transparent_source_over(layer: &CompositingLayer) -> bool {
+    layer.opacity <= 0.0 && layer.compose == CompositeOperator::SourceOver
+}
+
+/// CSS 2 Appendix E / CSS Masking 1 #clipping-paths: inserting or removing
+/// a balanced local clip/transform/group can only affect paint inside that
+/// scope. Close the edit over every scope it crosses, preserving the common
+/// prefix and suffix in both lists. This also covers a progress bar whose
+/// zero width removes its paint commands, or a transparent group appearing.
+/// Each command is visited at most once after matching the scope endpoints.
+fn balanced_damage_ranges(
+    old: &[&DisplayCommand],
+    new: &[&DisplayCommand],
+    prefix: usize,
+    suffix: usize,
+) -> Option<(std::ops::Range<usize>, std::ops::Range<usize>)> {
+    fn partners(commands: &[&DisplayCommand]) -> Option<Vec<Option<usize>>> {
+        let mut pairs = vec![None; commands.len()];
+        let mut stacks: [Vec<usize>; 3] = Default::default();
+        for (index, command) in commands.iter().enumerate() {
+            let (kind, open) = match command {
+                DisplayCommand::PushClip(_) => (0, true),
+                DisplayCommand::PopClip => (0, false),
+                DisplayCommand::PushTransform(_) => (1, true),
+                DisplayCommand::PopTransform => (1, false),
+                DisplayCommand::PushLayer(_) => (2, true),
+                DisplayCommand::PopLayer => (2, false),
+                _ => continue,
+            };
+            if open {
+                stacks[kind].push(index);
+            } else {
+                let start = stacks[kind].pop()?;
+                pairs[start] = Some(index);
+                pairs[index] = Some(start);
+            }
+        }
+        stacks.iter().all(Vec::is_empty).then_some(pairs)
+    }
+
+    struct Edit {
+        start: usize,
+        end: usize,
+        scanned_start: usize,
+        scanned_end: usize,
+    }
+    impl Edit {
+        fn new(start: usize, end: usize) -> Self {
+            Self {
+                start,
+                end,
+                scanned_start: start,
+                scanned_end: start,
+            }
+        }
+
+        fn close(&mut self, pairs: &[Option<usize>]) {
+            loop {
+                let range = if self.start < self.scanned_start {
+                    let range = self.start..self.scanned_start;
+                    self.scanned_start = self.start;
+                    range
+                } else if self.scanned_end < self.end {
+                    let range = self.scanned_end..self.end;
+                    self.scanned_end = self.end;
+                    range
+                } else {
+                    break;
+                };
+                for partner in pairs[range].iter().flatten() {
+                    self.start = self.start.min(*partner);
+                    self.end = self.end.max(*partner + 1);
+                }
+            }
+        }
+    }
+
+    let old_pairs = partners(old)?;
+    let new_pairs = partners(new)?;
+    let (old_suffix, new_suffix) = (old.len() - suffix, new.len() - suffix);
+    let mut a = Edit::new(prefix, old_suffix);
+    let mut b = Edit::new(prefix, new_suffix);
+    loop {
+        a.close(&old_pairs);
+        b.close(&new_pairs);
+        let start = a.start.min(b.start);
+        let consumed_suffix = (a.end - old_suffix).max(b.end - new_suffix);
+        let ends = (old_suffix + consumed_suffix, new_suffix + consumed_suffix);
+        if a.start == start && b.start == start && (a.end, b.end) == ends {
+            break;
+        }
+        (a.start, b.start) = (start, start);
+        (a.end, b.end) = ends;
+    }
+    // Filters and destructive compositing can affect pixels beyond ordinary
+    // leaf bounds. Non-raster scope markers have not been composed yet either.
+    for command in old[a.start..a.end].iter().chain(&new[b.start..b.end]) {
+        if command_changes_paint_state(command)
+            && !matches!(
+                command,
+                DisplayCommand::PopClip | DisplayCommand::PopTransform | DisplayCommand::PopLayer
+            )
+            && !bounded_scope_change(command, command)
+        {
+            return None;
+        }
+    }
+    Some((a.start..a.end, b.start..b.end))
+}
+
 fn bounded_scope_change(old: &DisplayCommand, new: &DisplayCommand) -> bool {
     // CSS Transforms 1 #transform-rendering and CSS Color 4 #transparency:
     // transforms and group opacity affect the group's descendant paint.
-    // Keep clip topology and blending/filter changes on the full fallback.
+    // CSS Overflow 3 #overflow-control: changing a clip affects the clipped
+    // descendants, bounded by the union of their old and new visible paint.
+    // Unbalanced scopes and unsupported blending/filter changes retain the
+    // full fallback.
     match (old, new) {
+        (DisplayCommand::PushClip(a), DisplayCommand::PushClip(b)) => [a, b].iter().all(|shape| {
+            shape_css_bounds(shape).is_some_and(|rect| {
+                [rect.x, rect.y, rect.width, rect.height]
+                    .iter()
+                    .all(|value| value.is_finite())
+            })
+        }),
         (DisplayCommand::PushTransform(a), DisplayCommand::PushTransform(b)) => {
             a.0.iter().chain(&b.0).all(|value| value.is_finite())
         }
@@ -2273,7 +2433,11 @@ fn bounded_scope_change(old: &DisplayCommand, new: &DisplayCommand) -> bool {
                 && b.filters.is_empty()
                 && a.compose == CompositeOperator::SourceOver
                 && b.compose == CompositeOperator::SourceOver
-                && a.clip == b.clip
+                && a.clip.iter().chain(&b.clip).all(|rect| {
+                    [rect.x, rect.y, rect.width, rect.height]
+                        .iter()
+                        .all(|value| value.is_finite())
+                })
         }
         _ => false,
     }
@@ -2350,8 +2514,9 @@ fn command_changes_paint_state(command: &DisplayCommand) -> bool {
 
 fn changed_command_bounds(
     scene: &Scene,
+    commands: &[&DisplayCommand],
     changed: std::ops::Range<usize>,
-    aligned_other: Option<&Scene>,
+    aligned_other: Option<&[&DisplayCommand]>,
     changed_images: &HashSet<ImageHandle>,
 ) -> Option<Option<CssRect>> {
     let mut transforms = vec![Affine2d::IDENTITY];
@@ -2363,24 +2528,30 @@ fn changed_command_bounds(
     )];
     let mut bounds = None;
     let mut changed_transforms = vec![false];
+    let mut changed_clips = vec![false];
     let mut changed_layers = vec![false];
+    let mut layer_clips = vec![clips[0]];
     // Filter Effects 1 #FilterProperty: a filter (blur, drop-shadow, an SVG
     // graph) spreads a change beyond its command's bounds.
     let mut filtered_layers = vec![false];
-    for (index, command) in scene.primitives.iter().enumerate() {
+    for (index, &command) in commands.iter().enumerate() {
         let transform = *transforms.last()?;
         let clip = *clips.last()?;
         let differs = (changed.contains(&index)
-            && aligned_other.is_none_or(|other| other.primitives[index] != *command))
+            && aligned_other.is_none_or(|other| other[index] != command))
             || matches!(command, DisplayCommand::Image { handle, .. } if changed_images.contains(handle));
-        if differs && *filtered_layers.last()? && leaf_command_bounds(command).is_some() {
+        let affected = differs
+            || *changed_transforms.last()?
+            || *changed_clips.last()?
+            || *changed_layers.last()?;
+        if affected && *filtered_layers.last()? && leaf_command_bounds(command).is_some() {
             return None;
         }
-        if (differs || *changed_transforms.last()? || *changed_layers.last()?)
-            && let Some(command_bounds) = leaf_command_bounds(command)
-        {
+        if affected && let Some(command_bounds) = leaf_command_bounds(command) {
             let command_bounds = transformed_css_bounds(command_bounds, transform);
-            if let Some(visible) = intersect_css_rect(command_bounds, clip) {
+            if let Some(visible) = intersect_css_rect(command_bounds, clip)
+                .and_then(|visible| intersect_css_rect(visible, *layer_clips.last()?))
+            {
                 bounds = Some(bounds.map_or(visible, |old| union_rect(old, visible)));
             }
         }
@@ -2400,16 +2571,25 @@ fn changed_command_bounds(
                 let shape = shape_css_bounds(shape)?;
                 let transformed = transformed_css_bounds(shape, transform);
                 clips.push(intersect_css_rect(clip, transformed).unwrap_or_default());
+                // The clip captures this transform. Keep its damage active
+                // even if PopTransform precedes the corresponding PopClip.
+                changed_clips.push(affected);
             }
             DisplayCommand::PopClip => {
                 if clips.len() == 1 {
                     return None;
                 }
                 clips.pop();
+                changed_clips.pop();
             }
             DisplayCommand::PushLayer(layer) => {
                 filtered_layers.push(!layer.filters.is_empty() || *filtered_layers.last()?);
-                changed_layers.push(differs || *changed_layers.last()?);
+                changed_layers.push(affected);
+                let parent = *layer_clips.last()?;
+                layer_clips.push(layer.clip.map_or(parent, |rect| {
+                    intersect_css_rect(parent, transformed_css_bounds(rect, transform))
+                        .unwrap_or_default()
+                }));
             }
             DisplayCommand::PopLayer => {
                 if changed_layers.len() == 1 {
@@ -2417,6 +2597,7 @@ fn changed_command_bounds(
                 }
                 changed_layers.pop();
                 filtered_layers.pop();
+                layer_clips.pop();
             }
             _ => {}
         }
@@ -5144,7 +5325,8 @@ mod tests {
     fn separated_leaf_changes_preserve_unchanged_scopes_and_limit_damage() {
         // CSS 2 Appendix E / CSS Masking #clipping-paths: replay the full
         // paint order and cumulative clips, but unchanged intervening drawing
-        // contributes no damage. Actual scope changes still require fallback.
+        // contributes no damage. Clip edits are bounded; unsupported blend
+        // changes and unbalanced edits retain the conservative fallback.
         let viewport =
             ViewportMetrics::from_physical(PhysicalSize::new(200, 120), ScaleFactor::default());
         let mut old = desktop_shell(viewport, &snapshot());
@@ -5192,7 +5374,10 @@ mod tests {
         let mut changed_clip = new.clone();
         changed_clip.primitives[6] =
             DisplayCommand::PushClip(PaintShape::Rect(CssRect::new(110.0, 80.0, 70.0, 40.0)));
-        assert_eq!(scene_damage(&old, &changed_clip), SceneDamage::Full);
+        assert!(matches!(
+            scene_damage(&old, &changed_clip),
+            SceneDamage::Partial(_)
+        ));
         let mut changed_layer = new.clone();
         if let DisplayCommand::PushLayer(layer) = &mut changed_layer.primitives[9] {
             layer.opacity = 0.4;
@@ -5224,6 +5409,345 @@ mod tests {
         );
         new.primitives.remove(1);
         assert_eq!(scene_damage(&old, &new), SceneDamage::Full);
+    }
+
+    #[test]
+    fn transparent_control_updates_have_no_raster_damage_or_lost_hit_regions() {
+        // CSS Color 4 #transparency: descendants cannot override group
+        // opacity, while transparent boxes remain hit-testable.
+        let viewport =
+            ViewportMetrics::from_physical(PhysicalSize::new(200, 120), ScaleFactor::default());
+        let mut old = desktop_shell(viewport, &snapshot());
+        old.primitives.extend([
+            DisplayCommand::PushLayer(CompositingLayer::new(
+                0.,
+                BlendMode::Normal,
+                Default::default(),
+            )),
+            DisplayCommand::PushClip(PaintShape::Rect(CssRect::new(20., 80., 100., 20.))),
+            DisplayCommand::FillRect {
+                rect: CssRect::new(20., 80., 30., 20.),
+                color: PaintColor::Accent,
+            },
+            DisplayCommand::HitRegion(HitRegion {
+                rect: CssRect::new(20., 80., 30., 20.),
+                node: 9,
+                actor: Some(9),
+                link: None,
+                cursor: None,
+            }),
+            DisplayCommand::PopClip,
+            DisplayCommand::PopLayer,
+        ]);
+        let mut new = old.clone();
+        new.primitives[2] =
+            DisplayCommand::PushClip(PaintShape::Rect(CssRect::new(20., 80., 140., 20.)));
+        if let DisplayCommand::HitRegion(hit) = &mut new.primitives[4] {
+            hit.rect.width = 70.;
+        }
+        new.primitives.insert(
+            4,
+            DisplayCommand::FillRect {
+                rect: CssRect::new(50., 80., 40., 20.),
+                color: PaintColor::Foreground,
+            },
+        );
+        assert_eq!(scene_damage(&old, &new), SceneDamage::Unchanged);
+        assert!(new.primitives.iter().any(
+            |command| matches!(command, DisplayCommand::HitRegion(hit) if hit.rect.width == 70.)
+        ));
+        let mut renderer = vello_cpu::VelloCpuRenderer::new();
+        let hidden = renderer.render_rgba(&new).unwrap();
+        assert_eq!(hidden.pixels, renderer.render_rgba(&old).unwrap().pixels);
+        if let DisplayCommand::PushLayer(layer) = &mut new.primitives[1] {
+            layer.opacity = 1.;
+        }
+        assert_ne!(scene_damage(&old, &new), SceneDamage::Unchanged);
+        assert_ne!(hidden.pixels, renderer.render_rgba(&new).unwrap().pixels);
+    }
+
+    #[test]
+    fn transparent_dom_controls_keep_geometry_and_reveal_current_text() {
+        // CSS Color 4 #transparency and CSS Display 3 #visibility separate
+        // paint from layout and interaction. Exercise actual layout output,
+        // including the progress control's changing clip and hit region.
+        let _inputs = crate::layout2::stable_global_layout_inputs();
+        let mut dom = crate::dom::Dom::parse_document(
+            "<style>body{margin:0}#controls{position:absolute;left:20px;top:70px;width:150px;height:30px;opacity:0}\
+             #bar{display:block;width:30px;height:10px;overflow:hidden;border-radius:4px;background:red}\
+             #time{position:absolute;left:0;top:12px}</style>\
+             <div style='width:200px;height:120px;background:navy'></div>\
+             <div id=controls><a id=bar href='/control'>progress</a><span id=time>0:00</span></div>",
+        );
+        let controls = dom.get_by_id("controls").unwrap();
+        let bar = dom.get_by_id("bar").unwrap();
+        let time = dom.get_by_id("time").unwrap();
+        let text = dom.child_iter(time).next().unwrap();
+        let render = |dom: &crate::dom::Dom| {
+            let layout = crate::layout2::lay_out_graphical(
+                dom,
+                &url::Url::parse("https://example.test/").unwrap(),
+                crate::layout2::Viewport::new(200., 120.),
+                &[],
+                &Default::default(),
+                &Default::default(),
+            );
+            let scene =
+                chromeless_scene(&layout.paint, CssSize::new(200., 120.), CssPoint::default());
+            (layout, scene)
+        };
+        let (before_layout, before) = render(&dom);
+        dom.set_attr(bar, "style", "width:75px");
+        dom.set_text(text, "0:15");
+        let (updated_layout, updated) = render(&dom);
+        assert_eq!(before_layout.boxes[&bar].width, 30.);
+        assert_eq!(updated_layout.boxes[&bar].width, 75.);
+        assert!(dom.point_hit_testable(bar));
+        assert!(updated.primitives.iter().any(|command| matches!(command, DisplayCommand::HitRegion(hit) if hit.node == bar && hit.rect.width >= 75.)));
+        assert_eq!(scene_damage(&before, &updated), SceneDamage::Unchanged);
+        let mut renderer = vello_cpu::VelloCpuRenderer::new();
+        let hidden = renderer.render_rgba(&updated).unwrap();
+        assert_eq!(hidden.pixels, renderer.render_rgba(&before).unwrap().pixels);
+        dom.set_attr(controls, "style", "opacity:1");
+        let (_, shown) = render(&dom);
+        assert!(matches!(
+            scene_damage(&updated, &shown),
+            SceneDamage::Partial(_)
+        ));
+        assert_ne!(hidden.pixels, renderer.render_rgba(&shown).unwrap().pixels);
+        assert!(shown.primitives.iter().any(|command| matches!(command, DisplayCommand::GlyphRun { shaped, .. } if shaped.text.contains("0:15"))));
+        let mut previous = shown;
+        for width in [95, 0, 1, 70] {
+            dom.set_attr(bar, "style", &format!("width:{width}px"));
+            let (_, current) = render(&dom);
+            let SceneDamage::Partial(rect) = scene_damage(&previous, &current) else {
+                panic!("a visible control update to {width}px must remain local")
+            };
+            assert!(rect.width < 110. && rect.height < 30., "{rect:?}");
+            previous = current;
+        }
+    }
+
+    #[test]
+    fn balanced_paint_insertions_and_removals_repaint_only_the_local_scope() {
+        let viewport =
+            ViewportMetrics::from_physical(PhysicalSize::new(200, 120), ScaleFactor::default());
+        let mut present = desktop_shell(viewport, &snapshot());
+        present.primitives.extend([
+            DisplayCommand::PushClip(PaintShape::Rect(CssRect::new(0., 0., 200., 120.))),
+            DisplayCommand::FillRect {
+                rect: CssRect::new(150., 80., 20., 20.),
+                color: PaintColor::Foreground,
+            },
+            DisplayCommand::PushTransform(Affine2d::translate(30., 40.)),
+            DisplayCommand::PushLayer(CompositingLayer::new(
+                1.,
+                BlendMode::Normal,
+                Default::default(),
+            )),
+            DisplayCommand::PushClip(PaintShape::Rect(CssRect::new(0., 0., 30., 20.))),
+            DisplayCommand::FillRect {
+                rect: CssRect::new(-50., -50., 200., 120.),
+                color: PaintColor::Accent,
+            },
+            DisplayCommand::PopClip,
+            DisplayCommand::PopLayer,
+            DisplayCommand::PopTransform,
+            DisplayCommand::PopClip,
+        ]);
+        let mut absent = present.clone();
+        absent.primitives.drain(3..10);
+        // The same number of commands can change scope topology too. This
+        // moves the clip outside the translation, relocating the visible
+        // portion of the oversized child into the untransformed clip.
+        let mut reordered = present.clone();
+        reordered.primitives.swap(3, 5);
+        reordered.primitives.swap(7, 9);
+        for (before, after, expected) in [
+            (&present, &absent, CssRect::new(28., 38., 34., 24.)),
+            (&absent, &present, CssRect::new(28., 38., 34., 24.)),
+            (&present, &reordered, CssRect::new(0., 0., 62., 62.)),
+            (&reordered, &present, CssRect::new(0., 0., 62., 62.)),
+        ] {
+            let SceneDamage::Partial(rect) = scene_damage(before, after) else {
+                panic!("a balanced local insertion/removal needs only local damage")
+            };
+            assert_eq!(rect, expected);
+            let crop = raster_damage(after, rect).unwrap();
+            let mut renderer = vello_cpu::VelloCpuRenderer::new();
+            let mut composed = renderer.render_rgba(before).unwrap();
+            let patch = renderer.render_rgba(&crop.scene).unwrap();
+            for y in 0..patch.size.height as usize {
+                let from = y * patch.size.width as usize * 4;
+                let to =
+                    ((y + crop.y as usize) * composed.size.width as usize + crop.x as usize) * 4;
+                let len = patch.size.width as usize * 4;
+                composed.pixels[to..to + len].copy_from_slice(&patch.pixels[from..from + len]);
+            }
+            assert!(composed.pixels == renderer.render_rgba(after).unwrap().pixels);
+        }
+    }
+
+    #[test]
+    fn local_clip_changes_repaint_old_and_new_pixels_without_touching_the_whole_window() {
+        // CSS Overflow 3 #overflow-control / CSS Color 4 #transparency:
+        // clip edits and group-opacity edits affect only their descendants.
+        for scale in [1.0, 1.5, 2.0] {
+            let viewport = ViewportMetrics::from_physical(
+                PhysicalSize::new(200, 120),
+                ScaleFactor::new(scale),
+            );
+            let mut old = desktop_shell(viewport, &snapshot());
+            old.primitives.extend([
+                DisplayCommand::PushTransform(Affine2d::translate(7., 5.)),
+                DisplayCommand::PushClip(PaintShape::RoundedRect {
+                    rect: CssRect::new(10., 10., 30., 20.),
+                    radii: CornerRadii {
+                        corners: [(4., 4.); 4],
+                    },
+                }),
+                DisplayCommand::PushLayer(CompositingLayer {
+                    clip: Some(CssRect::new(10., 10., 80., 20.)),
+                    ..CompositingLayer::new(0.6, BlendMode::Normal, Default::default())
+                }),
+                DisplayCommand::FillRect {
+                    rect: CssRect::new(0., 0., 150., 100.),
+                    color: PaintColor::Accent,
+                },
+                DisplayCommand::PopLayer,
+                DisplayCommand::PopClip,
+                DisplayCommand::PopTransform,
+            ]);
+            let mut new = old.clone();
+            new.primitives[2] = DisplayCommand::PushClip(PaintShape::RoundedRect {
+                rect: CssRect::new(20., 10., 50., 20.),
+                radii: CornerRadii {
+                    corners: [(7., 7.); 4],
+                },
+            });
+            if let DisplayCommand::PushLayer(layer) = &mut new.primitives[3] {
+                layer.clip = Some(CssRect::new(25., 10., 30., 20.));
+            }
+            for (before, after) in [(&old, &new), (&new, &old)] {
+                let SceneDamage::Partial(rect) = scene_damage(before, after) else {
+                    panic!("local clip edit must have bounded damage")
+                };
+                assert!(rect.width < 65. && rect.height < 30., "{rect:?}");
+                let crop = raster_damage(after, rect).unwrap();
+                let mut renderer = vello_cpu::VelloCpuRenderer::new();
+                let mut composed = renderer.render_rgba(before).unwrap();
+                let patch = renderer.render_rgba(&crop.scene).unwrap();
+                for y in 0..patch.size.height as usize {
+                    let from = y * patch.size.width as usize * 4;
+                    let to = ((y + crop.y as usize) * composed.size.width as usize
+                        + crop.x as usize)
+                        * 4;
+                    let len = patch.size.width as usize * 4;
+                    composed.pixels[to..to + len].copy_from_slice(&patch.pixels[from..from + len]);
+                }
+                let full = renderer.render_rgba(after).unwrap();
+                // The crop shifts Vello's tile boundaries. Fractional group
+                // opacity can round the same channel one 8-bit step either
+                // way; lost pixels or incorrectly bounded damage cannot.
+                let difference = composed
+                    .pixels
+                    .iter()
+                    .zip(&full.pixels)
+                    .enumerate()
+                    .find(|(_, (a, b))| a.abs_diff(**b) > 1)
+                    .map(|(index, (a, b))| {
+                        (
+                            index / 4 % full.size.width as usize,
+                            index / 4 / full.size.width as usize,
+                            *a,
+                            *b,
+                        )
+                    });
+                assert!(
+                    difference.is_none(),
+                    "scale {scale}, damage {rect:?}, pixel {difference:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_clip_keeps_damage_from_the_transform_at_its_definition() {
+        // CSS Masking 1 #clipping-paths: a clip retains its defining coordinate
+        // system after the transform stack returns to the parent's space.
+        let viewport =
+            ViewportMetrics::from_physical(PhysicalSize::new(200, 120), ScaleFactor::default());
+        for layer_clip in [false, true] {
+            let clip = CssRect::new(0., 0., 30., 20.);
+            let mut old = desktop_shell(viewport, &snapshot());
+            old.primitives.extend([
+                DisplayCommand::PushTransform(Affine2d::translate(30., 40.)),
+                if layer_clip {
+                    DisplayCommand::PushLayer(CompositingLayer {
+                        clip: Some(clip),
+                        ..CompositingLayer::new(1., BlendMode::Normal, Default::default())
+                    })
+                } else {
+                    DisplayCommand::PushClip(PaintShape::Rect(clip))
+                },
+                DisplayCommand::PopTransform,
+                DisplayCommand::FillRect {
+                    rect: CssRect::new(0., 0., 150., 100.),
+                    color: PaintColor::Accent,
+                },
+                if layer_clip {
+                    DisplayCommand::PopLayer
+                } else {
+                    DisplayCommand::PopClip
+                },
+            ]);
+            let mut new = old.clone();
+            new.primitives[1] = DisplayCommand::PushTransform(Affine2d::translate(50., 40.));
+            let SceneDamage::Partial(rect) = scene_damage(&old, &new) else {
+                panic!("moving a clip must damage paint in its saved coordinate system")
+            };
+            assert_eq!(rect, CssRect::new(28., 38., 54., 24.));
+            let crop = raster_damage(&new, rect).unwrap();
+            let mut renderer = vello_cpu::VelloCpuRenderer::new();
+            let mut composed = renderer.render_rgba(&old).unwrap();
+            let patch = renderer.render_rgba(&crop.scene).unwrap();
+            for y in 0..patch.size.height as usize {
+                let from = y * patch.size.width as usize * 4;
+                let to =
+                    ((y + crop.y as usize) * composed.size.width as usize + crop.x as usize) * 4;
+                let len = patch.size.width as usize * 4;
+                composed.pixels[to..to + len].copy_from_slice(&patch.pixels[from..from + len]);
+            }
+            assert!(composed.pixels == renderer.render_rgba(&new).unwrap().pixels);
+        }
+    }
+
+    #[test]
+    fn transparent_destructive_operators_and_unbalanced_groups_are_not_discarded() {
+        let clear = CompositingLayer {
+            compose: CompositeOperator::DestinationIn,
+            ..CompositingLayer::new(0., BlendMode::Normal, Default::default())
+        };
+        assert!(!transparent_source_over(&clear));
+        let mut commands = vec![
+            DisplayCommand::PushLayer(CompositingLayer::new(
+                0.,
+                BlendMode::Normal,
+                Default::default(),
+            )),
+            DisplayCommand::PushClip(PaintShape::Rect(CssRect::new(0., 0., 20., 20.))),
+            DisplayCommand::PopLayer,
+            DisplayCommand::PopClip,
+        ];
+        assert_eq!(
+            raster_commands(&commands).len(),
+            commands.len(),
+            "cross-scope clips must be replayed"
+        );
+        commands.swap(2, 3);
+        assert!(raster_commands(&commands).is_empty());
+        commands[0] = DisplayCommand::PushLayer(clear);
+        assert_eq!(raster_commands(&commands).len(), commands.len());
     }
 
     #[test]
