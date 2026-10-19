@@ -82,6 +82,8 @@ The project favors:
   `src/http/http3.rs` adds partitioned Alt-Svc discovery and QUIC sessions;
   `src/http/http3_io.rs` bounds encoded metadata and guards stream cancellation.
   Both multiplexed transports share field semantics in `src/http/wire.rs`.
+- `src/net.rs`: shared TCP resolution and staggered IPv4/IPv6 connection
+  attempts, preserving system address preference and bounded caller deadlines.
 - `src/dom.rs`: html5ever-backed arena DOM, mutations, selectors, CSS parsing,
   cascade, computed values, serialization, and live geometry state.
 - `src/js.rs`: JavaScript/browser contract and engine-neutral

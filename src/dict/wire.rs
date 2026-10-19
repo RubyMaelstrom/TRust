@@ -9,7 +9,6 @@ use super::{Operation, Target, atom, mime};
 use std::{future::Future, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
     time::{Instant, timeout_at},
 };
 
@@ -647,11 +646,7 @@ where
         parser.stop("Incomplete reply: stopped.");
         return Ok(parser.reply);
     }
-    let connected = timeout_at(
-        deadline,
-        TcpStream::connect((target.host.as_str(), target.port)),
-    )
-    .await;
+    let connected = timeout_at(deadline, crate::net::connect(&target.host, target.port)).await;
     let mut stream = match connected {
         Ok(Ok(stream)) => stream,
         Ok(Err(error)) => {

@@ -309,6 +309,8 @@ windows = { version = "0.62.2", features = [
 parley = { version = "0.11.1", default-features = false, features = ["system", "complex-scripts"] }
 
 [dev-dependencies]
+# Deterministic clocks for connection-racing regressions.
+tokio = { version = "1.53.2", features = ["test-util"] }
 # RAII cleanup and collision-safe directories for local-file conformance tests.
 tempfile = "3.27.0"
 # Compiles readable `.wat` text into wasm bytes for the WebAssembly test

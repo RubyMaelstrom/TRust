@@ -103,7 +103,7 @@ enum Opened {
 async fn open(url: &GeminiUrl) -> Result<Opened, String> {
     use super::{security, tofu};
     let request = url.request()?; // validate before DNS, TLS, or identity access
-    let sock = TcpStream::connect((url.host.as_str(), url.port))
+    let sock = crate::net::connect(&url.host, url.port)
         .await
         .map_err(|e| e.to_string())?;
     let _ = sock.set_nodelay(true);

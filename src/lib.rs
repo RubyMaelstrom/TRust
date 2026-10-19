@@ -75,6 +75,7 @@ mod js_host_boundary;
 pub mod layout2;
 mod locale;
 pub mod media;
+mod net;
 pub mod oneshot;
 mod pattern_regexp;
 mod performance;

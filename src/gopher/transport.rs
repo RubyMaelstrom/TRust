@@ -1,8 +1,8 @@
 //! Gopher/Gophers transport; RFC 8446 §§2, 4.4.3 and 6.1.
 //! Share the plain/TLS I/O adapter with HTTP and WebSockets, while keeping
-//! Gopher's certificate policy, connection racing and request lifetime here.
+//! Gopher's certificate policy and request lifetime here.
 
-use super::{CONNECT_TIMEOUT, GopherUrl, connect_addresses};
+use super::{CONNECT_TIMEOUT, GopherUrl};
 use crate::{http::Conn, tls};
 use std::{
     io,
@@ -83,7 +83,7 @@ pub(crate) async fn connect(url: &GopherUrl) -> Result<Connection, String> {
 
 async fn connect_before(url: &GopherUrl, deadline: Instant) -> Result<Connection, String> {
     let request = url.request()?;
-    let stream = timeout_at(deadline, connect_addresses(&url.host, url.port))
+    let stream = timeout_at(deadline, crate::net::connect(&url.host, url.port))
         .await
         .map_err(|_| "Gopher connection timed out".to_string())?
         .map_err(|e| format!("Gopher connection failed: {e}"))?;

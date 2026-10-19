@@ -10,7 +10,6 @@ use std::sync::{
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
 
 use super::protocol::{self, Frame, Nvt, Options, Parser, op_command::*, op_option::*};
@@ -138,11 +137,10 @@ pub fn connect(
     let task_events = events.clone();
     let task = tokio::spawn(async move {
         let work = async {
-            let stream =
-                tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect((host.as_str(), port)))
-                    .await
-                    .map_err(|_| "Telnet connection timed out".to_owned())?
-                    .map_err(|error| error.to_string())?;
+            let stream = tokio::time::timeout(CONNECT_TIMEOUT, crate::net::connect(&host, port))
+                .await
+                .map_err(|_| "Telnet connection timed out".to_owned())?
+                .map_err(|error| error.to_string())?;
             stream
                 .set_nodelay(true)
                 .map_err(|error| error.to_string())?;

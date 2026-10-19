@@ -8,7 +8,6 @@ use crate::oneshot::{OneShotUrl, Scheme};
 use std::future::Future;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::time::{Instant, sleep_until, timeout_at};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -166,7 +165,7 @@ where
 {
     let protocol = url.scheme.name();
     validate_query(&url.query, protocol)?;
-    let mut stream = timeout_at(deadline, TcpStream::connect((url.host.as_str(), url.port)))
+    let mut stream = timeout_at(deadline, crate::net::connect(&url.host, url.port))
         .await
         .map_err(|_| format!("{protocol} connection timed out"))?
         .map_err(|e| format!("{protocol} connection failed: {e}"))?;

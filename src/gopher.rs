@@ -19,7 +19,6 @@ use std::{fmt, future::Future, time::Duration};
 use tokio::io::AsyncReadExt;
 #[cfg(test)]
 use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
 use tokio::time::{Instant, sleep_until, timeout};
 
 pub const MAX_RESPONSE: usize = 2 * 1024 * 1024;
@@ -521,55 +520,6 @@ impl From<Vec<u8>> for Page {
             finished: true,
             notice: None,
         })
-    }
-}
-
-/// RFC 8305 §§4–5: alternate address families and stagger connection
-/// attempts; the winning socket cancels the rest. The system resolver still
-/// owns DNS ordering, so this is not a separate DNS implementation.
-async fn connect_addresses(host: &str, port: u16) -> std::io::Result<TcpStream> {
-    use futures::{StreamExt, stream::FuturesUnordered};
-    let resolved: Vec<_> = tokio::net::lookup_host((host, port))
-        .await?
-        .take(32)
-        .collect();
-    let first_v6 = resolved.first().is_some_and(|a| a.is_ipv6());
-    let mut v4 = std::collections::VecDeque::new();
-    let mut v6 = std::collections::VecDeque::new();
-    for address in resolved {
-        if address.is_ipv6() {
-            v6.push_back(address);
-        } else {
-            v4.push_back(address);
-        }
-    }
-    let mut candidates = std::collections::VecDeque::new();
-    let mut prefer_v6 = first_v6;
-    while !v4.is_empty() || !v6.is_empty() {
-        let address = if prefer_v6 {
-            v6.pop_front().or_else(|| v4.pop_front())
-        } else {
-            v4.pop_front().or_else(|| v6.pop_front())
-        };
-        candidates.push_back(address.unwrap());
-        prefer_v6 = !prefer_v6;
-    }
-    let mut attempts = FuturesUnordered::new();
-    let mut next = Instant::now();
-    let mut error = std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "No addresses found");
-    loop {
-        if candidates.is_empty() && attempts.is_empty() {
-            return Err(error);
-        }
-        tokio::select! {
-            _ = sleep_until(next), if !candidates.is_empty() => {
-                attempts.push(TcpStream::connect(candidates.pop_front().unwrap()));
-                next = Instant::now() + Duration::from_millis(250);
-            }
-            Some(result) = attempts.next(), if !attempts.is_empty() => {
-                match result { Ok(stream) => return Ok(stream), Err(e) => { error = e; next = Instant::now(); } }
-            }
-        }
     }
 }
 

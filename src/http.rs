@@ -4713,22 +4713,22 @@ async fn dial_with_connector(
     connector: &tokio_rustls::TlsConnector,
     mut timing: Option<&mut crate::performance::FetchTiming>,
 ) -> Result<BufReader<Conn>, String> {
-    // Same resolver and address-order fallback as TcpStream::connect(host),
-    // with the actual DNS and connection boundaries made explicit (Fetch
-    // #create-a-connection / #record-connection-timing-info).
+    // Fetch #create-a-connection / #record-connection-timing-info: DNS
+    // and the staggered TCP race retain separate timing boundaries. RFC 8305
+    // §§4–5 lets the other family proceed when the first route is silent.
+    let deadline = tokio::time::Instant::now() + crate::net::CONNECT_TIMEOUT;
     if let Some(timing) = timing.as_deref_mut() {
         timing.connection_reused = false;
         timing.domain_lookup_start = crate::performance::now_ms();
     }
-    let addresses: Vec<_> = tokio::net::lookup_host((host, port))
+    let addresses = crate::net::resolve(host, port, deadline)
         .await
-        .map_err(|e| e.to_string())?
-        .collect();
+        .map_err(|e| e.to_string())?;
     if let Some(timing) = timing.as_deref_mut() {
         timing.domain_lookup_end = crate::performance::now_ms();
         timing.connect_start = timing.domain_lookup_end;
     }
-    let stream = TcpStream::connect(addresses.as_slice())
+    let stream = crate::net::connect_addresses(addresses, deadline)
         .await
         .map_err(|e| e.to_string())?;
     let _ = stream.set_nodelay(true);
