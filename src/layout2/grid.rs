@@ -26,6 +26,9 @@ use super::style::{BOTTOM, LEFT, RIGHT, TOP};
 use super::tree::{BoxNode, Content, SharedBox};
 use super::value::{Len, Vp, split_args, substitute_var_fallbacks};
 
+#[path = "grid/logical.rs"]
+mod logical;
+
 /// One track sizing function pair per §11.2: `minmax()` splits, `<flex>`
 /// and `fit-content()` take an `auto` minimum, plain values serve as both.
 #[derive(Clone, Debug)]
@@ -1682,18 +1685,14 @@ impl Flow<'_> {
         }
     }
 
-    /// Placement and column sizing are shared by intrinsic queries and
-    /// final layout (CSS Grid 2 #intrinsic-sizes / #algo-track-sizing).
-    #[allow(clippy::too_many_arguments)]
-    fn grid_setup<'t>(
+    /// Placement is axis-neutral: its columns and rows are the container's
+    /// inline and block axes (Grid 2 #grid-model and #subgrid-indexing).
+    fn grid_placement<'t>(
         &self,
         b: &BoxNode,
         items: &'t [SharedBox],
         basis: Option<f32>,
         def_ch: Option<f32>,
-        inl: &InlineStyle,
-        mode: Option<IMode>,
-        row_bases: Option<&[f32]>,
     ) -> GridSetup<'t> {
         let node = b.node;
         let u = Units::of(self.dom, node);
@@ -2030,6 +2029,59 @@ impl Flow<'_> {
             }
         }
 
+        GridSetup {
+            col_contributions: Vec::new(),
+            ordered,
+            cols,
+            rows,
+            placed,
+            row_names,
+            col_names,
+            row_areas,
+            col_areas,
+            gap_col,
+            gap_row,
+            inherited,
+            inherited_columns,
+        }
+    }
+
+    /// Placement and column sizing are shared by intrinsic queries and
+    /// final layout (CSS Grid 2 #intrinsic-sizes / #algo-track-sizing).
+    #[allow(clippy::too_many_arguments)]
+    fn grid_setup<'t>(
+        &self,
+        b: &BoxNode,
+        items: &'t [SharedBox],
+        basis: Option<f32>,
+        def_ch: Option<f32>,
+        inl: &InlineStyle,
+        mode: Option<IMode>,
+        row_bases: Option<&[f32]>,
+    ) -> GridSetup<'t> {
+        if logical::needed(self.dom, b, items) {
+            return self
+                .logical_grid_sized(b, items, [basis, def_ch], [0., 0.], inl, mode)
+                .0;
+        }
+        let node = b.node;
+        let cv = |p: &str| self.dom.computed_value_resolved(node, p);
+        let GridSetup {
+            col_contributions: _,
+            ordered,
+            mut cols,
+            rows,
+            placed,
+            row_names,
+            col_names,
+            row_areas,
+            col_areas,
+            gap_col,
+            gap_row,
+            inherited,
+            inherited_columns,
+        } = self.grid_placement(b, items, basis, def_ch);
+
         // Grid 2 #algo-grid-sizing step 1: definite row maxima include
         // distributed gaps when both the container and every row are definite.
         let distributed_row_gap = def_ch
@@ -2110,7 +2162,7 @@ impl Flow<'_> {
                     let child_height = if row_subgrid {
                         None
                     } else {
-                        self.height_px(&s.height, s, bt, bb, block_basis)
+                        self.height_value(&s.height, it, bt, bb, block_basis, 0.)
                     }
                     .or_else(|| {
                         let align = cv("align-items");
@@ -2270,6 +2322,9 @@ impl Flow<'_> {
         mode: IMode,
         inl: &InlineStyle,
     ) -> f32 {
+        if logical::needed(self.dom, b, items) {
+            return self.logical_grid_intrinsic_width(b, items, mode, inl);
+        }
         let setup = self.grid_setup(b, items, None, None, inl, Some(mode), None);
         let live = setup.cols.iter().filter(|t| !t.collapsed).count();
         setup.cols.iter().map(|t| t.base).sum::<f32>()
@@ -2293,6 +2348,19 @@ impl Flow<'_> {
         inl: &InlineStyle,
         anchors: &mut Vec<(NodeId, f32)>,
     ) -> (Vec<Frag>, f32) {
+        if logical::needed(self.dom, b, items) {
+            return self.logical_grid_content(
+                b,
+                items,
+                content_x,
+                content_top,
+                content_w,
+                def_ch,
+                min_ch,
+                inl,
+                anchors,
+            );
+        }
         let setup = self.grid_setup(b, items, Some(content_w), def_ch, inl, None, None);
         self.grid_content_pass(
             b,
@@ -2844,6 +2912,19 @@ impl Flow<'_> {
             let area_y = row_y[p.rows.start];
             let last = p.rows.end - 1;
             let area_h = (row_y[last] + rows[last].base - area_y).max(0.0);
+            if g.subgrid.is_none() {
+                let style = &g.it.style;
+                let bt = style.border[TOP] + self.pad(style, TOP, g.area_w);
+                let bb = style.border[BOTTOM] + self.pad(style, BOTTOM, g.area_w);
+                let min = self
+                    .height_value(&style.min_height, g.it, bt, bb, Some(area_h), g.area_w)
+                    .unwrap_or(0.);
+                let max = self
+                    .height_value(&style.max_height, g.it, bt, bb, Some(area_h), g.area_w)
+                    .unwrap_or(f32::INFINITY)
+                    .max(min);
+                g.clamp_h = (min, max);
+            }
             // Row stretching can lay this child out again. Keep its parent
             // column constraints for every such pass, including both-axis
             // and nested subgrids.
@@ -2897,7 +2978,9 @@ impl Flow<'_> {
                 let s = &g.it.style;
                 let bt = s.border[TOP] + self.pad(s, TOP, g.area_w);
                 let bb = s.border[BOTTOM] + self.pad(s, BOTTOM, g.area_w);
-                if let Some(height) = self.height_px(&s.height, s, bt, bb, Some(area_h)) {
+                if let Some(height) =
+                    self.height_value(&s.height, g.it, bt, bb, Some(area_h), g.area_w)
+                {
                     let height = height.clamp(g.clamp_h.0, g.clamp_h.1);
                     let (frag, anchors) =
                         self.item_frag(g.it, g.content_w, g.area_w, Some(height), inl);
@@ -3002,6 +3085,133 @@ mod tests {
             &Default::default(),
         );
         (dom, layout)
+    }
+
+    #[test]
+    fn logical_grid_tracks_follow_writing_mode_and_inline_direction() {
+        for (mode, rtl, x_first, x_second, y_first, y_second) in [
+            ("vertical-rl", false, 100., 0., 0., 100.),
+            ("vertical-lr", false, 0., 60., 0., 100.),
+            ("vertical-rl", true, 100., 0., 200., 0.),
+            ("vertical-lr", true, 0., 60., 200., 0.),
+            ("sideways-rl", false, 100., 0., 0., 100.),
+        ] {
+            let (dom, layout) = measured_grid(&format!(
+                "<style>body{{margin:0}}#grid{{display:grid;width:160px;height:300px;writing-mode:{mode};direction:{};grid-template-columns:100px 200px;grid-template-rows:60px 100px}}</style><div id=grid><i id=a></i><i id=b></i><i id=c></i><i id=d></i></div>",
+                if rtl { "rtl" } else { "ltr" }
+            ));
+            let a = layout.boxes[&dom.get_by_id("a").unwrap()];
+            let b = layout.boxes[&dom.get_by_id("b").unwrap()];
+            let c = layout.boxes[&dom.get_by_id("c").unwrap()];
+            assert_eq!(
+                (a.left, a.top, a.width, a.height),
+                (x_first, y_first, 60., 100.),
+                "{mode} rtl={rtl}"
+            );
+            assert_eq!(
+                (b.left, b.top, b.width, b.height),
+                (x_first, y_second, 60., 200.),
+                "{mode} rtl={rtl}"
+            );
+            assert_eq!(
+                (c.left, c.top, c.width, c.height),
+                (x_second, y_first, 100., 100.),
+                "{mode} rtl={rtl}"
+            );
+            let tracks = &layout.grid_tracks[&dom.get_by_id("grid").unwrap()];
+            assert_eq!(tracks, &(vec![100., 200.], vec![60., 100.]));
+        }
+    }
+
+    #[test]
+    fn logical_grid_orthogonal_subgrid_maps_parent_columns_to_child_rows_and_names() {
+        let (dom, layout) = measured_grid(
+            "<style>body{margin:0}#grid{display:grid;width:300px;height:100px;grid-template-columns:[a] 100px [b] 200px [c];grid-template-rows:100px}#sub{display:grid;writing-mode:vertical-rl;grid-column:span 2;grid-template-rows:subgrid;grid-template-columns:100px}#first{grid-row:1}#named{grid-row:b/a}</style><div id=grid><div id=sub><i id=first></i><i id=named></i></div></div>",
+        );
+        let first = layout.boxes[&dom.get_by_id("first").unwrap()];
+        let named = layout.boxes[&dom.get_by_id("named").unwrap()];
+        assert_eq!(
+            (first.left, first.top, first.width, first.height),
+            (100., 0., 200., 100.)
+        );
+        assert_eq!(
+            (named.left, named.top, named.width, named.height),
+            (0., 0., 100., 100.)
+        );
+        assert_eq!(
+            layout.grid_tracks[&dom.get_by_id("sub").unwrap()],
+            (vec![100.], vec![200., 100.])
+        );
+    }
+
+    #[test]
+    fn logical_grid_nested_orthogonal_subgrids_preserve_both_axes() {
+        let (dom, layout) = measured_grid(
+            "<style>body{margin:0}#grid{display:grid;width:300px;height:150px;grid-template-columns:100px 200px;grid-template-rows:50px 100px}#middle,#inner{display:grid;grid-column:span 2;grid-row:span 2;grid-template-columns:subgrid;grid-template-rows:subgrid;min-width:999px;max-width:1px;min-height:999px;max-height:1px}#middle{writing-mode:vertical-rl}#inner{writing-mode:horizontal-tb}#target{grid-column:2;grid-row:2}</style><div id=grid><div id=middle><div id=inner><i id=target></i></div></div></div>",
+        );
+        let target = layout.boxes[&dom.get_by_id("target").unwrap()];
+        assert_eq!(
+            (target.left, target.top, target.width, target.height),
+            (100., 50., 200., 100.)
+        );
+        assert_eq!(
+            layout.grid_tracks[&dom.get_by_id("middle").unwrap()],
+            (vec![50., 100.], vec![200., 100.])
+        );
+        assert_eq!(
+            layout.grid_tracks[&dom.get_by_id("inner").unwrap()],
+            (vec![100., 200.], vec![50., 100.])
+        );
+    }
+
+    #[test]
+    fn logical_grid_orthogonal_subgrid_edges_and_gutters_follow_physical_sides() {
+        for (gap, first_x, first_w, second_w) in
+            [("normal", 120., 180., 90.), ("0", 110., 190., 100.)]
+        {
+            let (dom, layout) = measured_grid(&format!(
+                "<style>body{{margin:0}}#grid{{display:grid;width:320px;height:100px;grid-template-columns:100px 200px;column-gap:20px;grid-template-rows:100px}}#sub{{display:grid;writing-mode:vertical-rl;grid-column:span 2;grid-template-rows:subgrid;grid-template-columns:100px;padding-left:10px;padding-right:20px;row-gap:{gap}}}</style><div id=grid><div id=sub><i id=first></i><i id=second></i></div></div>"
+            ));
+            let first = layout.boxes[&dom.get_by_id("first").unwrap()];
+            let second = layout.boxes[&dom.get_by_id("second").unwrap()];
+            assert_eq!((first.left, first.width), (first_x, first_w), "{gap}");
+            assert_eq!((second.left, second.width), (10., second_w), "{gap}");
+        }
+    }
+
+    #[test]
+    fn logical_grid_intrinsic_inline_tracks_contribute_to_physical_height() {
+        let (dom, layout) = measured_grid(
+            "<style>body{margin:0}#grid{display:grid;writing-mode:vertical-rl;width:100px;grid-template-columns:auto auto;grid-template-rows:100px}#a{height:80px}#b{height:120px}</style><div id=grid><i id=a></i><i id=b></i></div>",
+        );
+        let grid = dom.get_by_id("grid").unwrap();
+        assert_eq!(layout.boxes[&grid].height, 200.);
+        assert_eq!(layout.grid_tracks[&grid].0, [80., 120.]);
+    }
+
+    #[test]
+    fn logical_grid_orthogonal_subgrid_exports_grandchild_intrinsic_widths() {
+        let (dom, layout) = measured_grid(
+            "<style>body{margin:0}#grid{display:grid;width:300px;grid-template-columns:max-content max-content;grid-template-rows:100px;justify-content:start}#sub{display:grid;writing-mode:vertical-rl;grid-column:span 2;grid-template-rows:subgrid;grid-template-columns:100px}#a{width:110px;grid-row:1}#b{width:70px;grid-row:2}</style><div id=grid><div id=sub><i id=a></i><i id=b></i></div></div>",
+        );
+        assert_eq!(
+            layout.grid_tracks[&dom.get_by_id("grid").unwrap()].0,
+            [70., 110.]
+        );
+        let a = layout.boxes[&dom.get_by_id("a").unwrap()];
+        let b = layout.boxes[&dom.get_by_id("b").unwrap()];
+        assert_eq!((a.left, a.width), (70., 110.));
+        assert_eq!((b.left, b.width), (0., 70.));
+    }
+
+    #[test]
+    fn logical_grid_cyclic_percentage_track_overflows_the_intrinsic_container() {
+        let (dom, layout) = measured_grid(
+            "<style>body{margin:0}#grid{display:grid;writing-mode:vertical-lr;width:50px;grid-template-columns:200%;grid-template-rows:50px}#item{height:100px}</style><div id=grid><i id=item></i></div>",
+        );
+        let grid = dom.get_by_id("grid").unwrap();
+        assert_eq!(layout.boxes[&grid].height, 100.);
+        assert_eq!(layout.grid_tracks[&grid].0, [200.]);
     }
 
     #[test]

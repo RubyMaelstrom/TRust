@@ -265,13 +265,14 @@ pub(super) fn load(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
     // HTML #set-up-a-worker-environment-settings-object separates the API
     // base URL from the inherited origin (notably for blob: workers).
     // Fetch #concept-request-origin uses that origin for CORS/credentials.
-    let client = ctx
-        .host::<HostState>()
-        .and_then(|state| state.worker_self.as_ref())
-        .map_or(client_url, |worker| worker.origin.clone());
+    let client = request_origin_for_context(
+        ctx.host_mut::<HostState>().expect("font host"),
+        context,
+        &client_url,
+    );
     let cookies = request_cookie_context(ctx);
     let environment = ModuleFetchEnvironment::of(ctx, context);
-    let base = url::Url::parse(base).unwrap_or_else(|_| client.clone());
+    let base = url::Url::parse(base).unwrap_or_else(|_| client_url.clone());
     let Some((handle, cache, events, traversable, referrer)) =
         ctx.host_mut::<HostState>().and_then(|state| {
             let policy = environment_referrer_policy(state, context);
@@ -287,7 +288,9 @@ pub(super) fn load(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
                     source: environment_referrer_source(state, context),
                     policy,
                     document_policy: policy,
-                });
+                    service_worker: None,
+                })
+                .with_service_worker(service_worker_host::fetch::for_context(state, context));
             let network = state.network.as_ref()?;
             let events = state.task_events.clone()?;
             let result = (

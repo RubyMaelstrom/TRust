@@ -31,6 +31,10 @@ mod alt_svc;
 mod body_stream;
 mod content_coding;
 pub(crate) mod cookie_store;
+pub(crate) mod frames;
+#[cfg(test)]
+use frames::install_page_frames;
+use frames::{FrameDocuments, install_page_frames_with_clients, prefetch_frame_documents};
 pub(crate) mod http2;
 pub(crate) mod http3;
 mod http3_io;
@@ -354,6 +358,33 @@ pub struct Request {
     /// Fetch #concept-request-redirect-mode. Service-worker script requests
     /// use Error; author Fetch requests can also choose Manual.
     pub(crate) redirect: RedirectMode,
+    /// Fetch's client/reserved-client identity and session-only coordinator.
+    pub(crate) service_worker: Option<crate::trust_js_backend::service_worker_fetch::Context>,
+    pub(crate) web: WebRequestOptions,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct WebRequestOptions {
+    pub cache: &'static str,
+    pub integrity: String,
+    pub keepalive: bool,
+    pub priority: &'static str,
+    pub reload_navigation: bool,
+    pub history_navigation: bool,
+    pub replaces_client_id: String,
+}
+impl Default for WebRequestOptions {
+    fn default() -> Self {
+        Self {
+            cache: "default",
+            integrity: String::new(),
+            keepalive: false,
+            priority: "auto",
+            reload_navigation: false,
+            history_navigation: false,
+            replaces_client_id: String::new(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -614,6 +645,8 @@ impl Request {
             referrer_policy: None,
             fetch_policy: None,
             redirect: RedirectMode::Follow,
+            service_worker: None,
+            web: Default::default(),
         }
     }
 
@@ -720,6 +753,29 @@ pub struct Response {
     pub referrer_policy: Option<crate::referrer_policy::ReferrerPolicy>,
 }
 
+/// HTML #populating-a-session-history-entry / #navigation-as-a-download:
+/// discard an unused reserved environment when navigation keeps the active
+/// Document. SW #client-navigate resolves from that surviving Window.
+pub(crate) fn settle_aborted_navigation(
+    response: &mut Response,
+    current: Option<&std::sync::Arc<crate::service_worker::Client>>,
+) {
+    if let Some(document) = response.service_client.take() {
+        document.abort_navigation(current);
+    }
+}
+
+pub(crate) fn settle_no_content_navigation(
+    response: &mut Response,
+    current: Option<&std::sync::Arc<crate::service_worker::Client>>,
+) -> bool {
+    if !matches!(response.status, 204 | 205) {
+        return false;
+    }
+    settle_aborted_navigation(response, current);
+    true
+}
+
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct InternalResponse {
@@ -731,6 +787,7 @@ pub struct InternalResponse {
     // CORS shares the visible body; opaque and opaqueredirect hide it.
     pub body: Option<Vec<u8>>,
     pub url_list: Vec<Url>,
+    pub range_requested: bool,
 }
 
 impl Response {
@@ -758,6 +815,7 @@ impl Response {
             headers: self.headers.clone(),
             body: opaque.then(|| std::mem::take(&mut self.body)),
             url_list: vec![self.url.clone()],
+            range_requested: false,
         }));
         if opaque {
             self.status = 0;
@@ -1101,8 +1159,7 @@ pub fn plays_as_media_document(response: &Response, computed_type: &str) -> bool
         .trim()
         .to_ascii_lowercase();
     (essence.starts_with("video/") || essence.starts_with("audio/"))
-        && !crate::download::content_disposition(response)
-            .is_some_and(|disposition| !disposition.eq_ignore_ascii_case("inline"))
+        && !crate::download::response_is_attachment(response)
         && crate::media::container::can_play_type(&essence, crate::media::decode::Registry::get())
             != crate::media::container::CanPlay::No
 }
@@ -1668,6 +1725,7 @@ struct CachedFetch {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ResourceCacheContext {
     Unscoped,
+    ServiceWorker(String, Box<ResourceCacheContext>),
     CookieRestricted(Box<ResourceCacheContext>),
     Element {
         origin: url::Origin,
@@ -1818,21 +1876,6 @@ impl PageCache {
         self.fetch_request(handle, Request::get(url), ResourceCacheContext::Unscoped)
     }
 
-    pub(crate) fn fetch_resource(
-        &self,
-        handle: &tokio::runtime::Handle,
-        url: Url,
-        client: &Url,
-        destination: &'static str,
-        cors_credentials: Option<CredentialsMode>,
-    ) -> SharedFetch {
-        self.fetch_request(
-            handle,
-            Request::subresource(url, client, destination, cors_credentials),
-            ResourceCacheContext::new(client, destination, cors_credentials),
-        )
-    }
-
     /// A subresource request the caller prepared (its cookie context and
     /// referrer determined), shared by URL, destination, client and
     /// credentials; a cookie-restricted request gets its own cache context.
@@ -1844,7 +1887,15 @@ impl PageCache {
         destination: &'static str,
         credentials: Option<CredentialsMode>,
     ) -> SharedFetch {
-        let mut context = ResourceCacheContext::new(client, destination, credentials);
+        let effective = request
+            .service_worker
+            .as_ref()
+            .and_then(|context| context.client_url(client));
+        let mut context = ResourceCacheContext::new(
+            effective.as_ref().unwrap_or(client),
+            destination,
+            credentials,
+        );
         if request
             .cookie_context
             .as_ref()
@@ -1878,12 +1929,24 @@ impl PageCache {
         destination: &'static str,
         cors_credentials: Option<CredentialsMode>,
     ) -> (SharedFetch, bool) {
-        if let Some(shared) =
-            self.peek_resource(&request.url, client, destination, cors_credentials)
-        {
+        if let Some(shared) = self.peek_resource_for_client(
+            &request.url,
+            client,
+            destination,
+            cors_credentials,
+            request.service_worker.as_ref(),
+        ) {
             return (shared, false);
         }
-        let context = ResourceCacheContext::new(client, destination, cors_credentials);
+        let effective = request
+            .service_worker
+            .as_ref()
+            .and_then(|context| context.client_url(client));
+        let context = ResourceCacheContext::new(
+            effective.as_ref().unwrap_or(client),
+            destination,
+            cors_credentials,
+        );
         (
             self.fetch_request_inner(handle, request, context, None, true),
             true,
@@ -1910,10 +1973,20 @@ impl PageCache {
         preload: bool,
     ) -> SharedFetch {
         use futures::future::FutureExt as _;
+        let uncontrolled = !request
+            .service_worker
+            .as_ref()
+            .is_some_and(|c| c.controlled());
+        let context = if let Some(client) = request.service_worker.as_ref() {
+            ResourceCacheContext::ServiceWorker(client.cache_key(), Box::new(context))
+        } else {
+            context
+        };
         let key = request.url.to_string();
         let mut map = self.map.lock().unwrap();
         if let Some(f) = map.get(&key)
-            && (f.resource_context.as_ref() == Some(&context) || f.resource_context.is_none())
+            && (f.resource_context.as_ref() == Some(&context)
+                || f.resource_context.is_none() && uncontrolled)
         {
             return f.future.clone();
         }
@@ -1923,7 +1996,8 @@ impl PageCache {
             async move {
                 match fetch_with_timing(&request, Default::default()).await {
                     Ok(details) => {
-                        let r = details.response;
+                        let mut r = details.response;
+                        r.unfilter();
                         // Fetch #fetch-finale: enqueue the real fetch's timing
                         // before a consumer can execute the completed script.
                         if let Some(report) = report {
@@ -2021,6 +2095,7 @@ impl PageCache {
     /// A no-CORS preload must not satisfy an element's CORS load, nor may an
     /// authorization for one document origin or credentials mode authorize a
     /// different one. Retain in-flight sharing only within the same context.
+    #[cfg(test)]
     pub(crate) fn peek_resource(
         &self,
         url: &Url,
@@ -2028,35 +2103,69 @@ impl PageCache {
         destination: &'static str,
         cors_credentials: Option<CredentialsMode>,
     ) -> Option<SharedFetch> {
-        let context = ResourceCacheContext::new(client, destination, cors_credentials);
+        self.peek_resource_for_client(url, client, destination, cors_credentials, None)
+    }
+
+    pub(crate) fn peek_resource_for_client(
+        &self,
+        url: &Url,
+        client: &Url,
+        destination: &'static str,
+        cors_credentials: Option<CredentialsMode>,
+        service_worker: Option<&crate::trust_js_backend::service_worker_fetch::Context>,
+    ) -> Option<SharedFetch> {
+        let effective = service_worker.and_then(|context| context.client_url(client));
+        let context = ResourceCacheContext::new(
+            effective.as_ref().unwrap_or(client),
+            destination,
+            cors_credentials,
+        );
+        let uncontrolled = !service_worker.is_some_and(|c| c.controlled());
+        let context = if let Some(client) = service_worker {
+            ResourceCacheContext::ServiceWorker(client.cache_key(), Box::new(context))
+        } else {
+            context
+        };
         self.map
             .lock()
             .unwrap()
             .get(url.as_str())
             .filter(|entry| {
                 entry.resource_context.as_ref() == Some(&context)
-                    || entry.resource_context.is_none()
+                    || entry.resource_context.is_none() && uncontrolled
             })
             .map(|entry| entry.future.clone())
     }
 
     /// The first matching consumer uses the preload's fetch and timing entry;
     /// later consumers perform a new memory-cache load with their own timing.
-    pub(crate) fn consume_resource(
+    pub(crate) fn consume_resource_for_client(
         &self,
         url: &Url,
         client: &Url,
         destination: &'static str,
         cors_credentials: Option<CredentialsMode>,
+        service_worker: Option<&crate::trust_js_backend::service_worker_fetch::Context>,
     ) -> Option<(SharedFetch, bool)> {
-        let context = ResourceCacheContext::new(client, destination, cors_credentials);
+        let effective = service_worker.and_then(|context| context.client_url(client));
+        let context = ResourceCacheContext::new(
+            effective.as_ref().unwrap_or(client),
+            destination,
+            cors_credentials,
+        );
+        let uncontrolled = !service_worker.is_some_and(|c| c.controlled());
+        let context = if let Some(client) = service_worker {
+            ResourceCacheContext::ServiceWorker(client.cache_key(), Box::new(context))
+        } else {
+            context
+        };
         self.map
             .lock()
             .unwrap()
             .get_mut(url.as_str())
             .filter(|entry| {
                 entry.resource_context.as_ref() == Some(&context)
-                    || entry.resource_context.is_none()
+                    || entry.resource_context.is_none() && uncontrolled
             })
             .map(|entry| {
                 (
@@ -2198,6 +2307,66 @@ pub async fn fetch_web_default_with_referrer(
         Ok(response) => Ok(response),
         Err(_) => first,
     }
+}
+
+/// A frontend navigation reserves its service-worker client before Fetch,
+/// then transfers that exact environment to the resulting Document.
+pub(crate) async fn fetch_navigation(
+    url: &Url,
+    body: Option<(String, Vec<u8>)>,
+    initiator: Option<&NavigationInitiator>,
+    storage: &crate::js::WebStorage,
+    fallback_http: bool,
+) -> Result<Response, String> {
+    fetch_navigation_with_type(
+        url,
+        body,
+        initiator,
+        storage,
+        fallback_http,
+        NavigationType::Navigate,
+        "",
+    )
+    .await
+}
+
+pub(crate) async fn fetch_navigation_with_type(
+    url: &Url,
+    body: Option<(String, Vec<u8>)>,
+    initiator: Option<&NavigationInitiator>,
+    storage: &crate::js::WebStorage,
+    fallback_http: bool,
+    navigation_type: NavigationType,
+    replaces_client_id: &str,
+) -> Result<Response, String> {
+    let mut request = navigation_request(url.clone(), body, initiator);
+    request.web.reload_navigation = navigation_type == NavigationType::Reload;
+    request.web.history_navigation = navigation_type == NavigationType::BackForward;
+    request.web.replaces_client_id = replaces_client_id.to_owned();
+    request.service_worker = crate::trust_js_backend::service_worker_fetch::navigation(
+        storage,
+        tokio::runtime::Handle::current(),
+        url,
+        initiator.and_then(|i| i.service_worker_context.clone()),
+    );
+    if let Some(document) = request.service_worker.as_ref().and_then(|c| c.document()) {
+        document.navigation_reply(initiator.and_then(|i| i.service_worker_reply.clone()));
+    }
+    let first = fetch(&request).await;
+    if first.is_ok() || !fallback_http || url.scheme() != "https" {
+        return first;
+    }
+    let Some(url) = parse_url(&format!("http://{}", &url.as_str()["https://".len()..])) else {
+        return first;
+    };
+    request.url = url.clone();
+    request.service_worker = crate::trust_js_backend::service_worker_fetch::navigation(
+        storage,
+        tokio::runtime::Handle::current(),
+        &url,
+        None,
+    );
+    fetch(&request).await.or(first)
 }
 
 /// A process-global monotonic origin shared by every trace line (network
@@ -2391,7 +2560,11 @@ async fn fetch_script_timing_inner(
     let Some(policy) = &request.fetch_policy else {
         return fetch_timed(request, sink).await;
     };
-    let cross_origin = !same_origin(&policy.origin, &request.url);
+    let client = request
+        .service_worker
+        .as_ref()
+        .and_then(|context| context.client_url(&policy.origin));
+    let cross_origin = !same_origin(client.as_ref().unwrap_or(&policy.origin), &request.url);
     if !cross_origin {
         return fetch_timed(request, sink).await;
     }
@@ -2412,14 +2585,19 @@ async fn fetch_script_timing_inner(
     // request's use-CORS-preflight flag is set, or when its method or header
     // list is not CORS-safelisted. A network error from that branch clears
     // the request's CORS-preflight cache entries (#concept-cache-clear).
-    if needs_preflight || request.use_cors_preflight {
-        let result = fetch_cors_with_preflight(request, policy, sink).await;
-        if result.is_err() {
+    // HTTP fetch dispatches the service worker before network preflight.
+    // The network fallback below performs this check for each actual hop.
+    let result = fetch_timed(request, sink).await;
+    if result.is_err() && (needs_preflight || request.use_cors_preflight) {
+        if let Some(context) = request.service_worker.as_ref() {
+            let mut effective = request.clone();
+            context.apply_client_origin(&mut effective);
+            PREFLIGHT_CACHE.lock().unwrap().clear_for(&effective);
+        } else {
             PREFLIGHT_CACHE.lock().unwrap().clear_for(request);
         }
-        return result;
     }
-    fetch_timed(request, sink).await
+    result
 }
 
 /// Fetch #http-fetch step 5.1 for a request taking the CORS-with-preflight
@@ -2429,8 +2607,7 @@ async fn fetch_script_timing_inner(
 async fn fetch_cors_with_preflight(
     request: &Request,
     policy: &FetchPolicy,
-    sink: BodySink<'_>,
-) -> Result<Response, TimedFetchError> {
+) -> Result<(), TimedFetchError> {
     let names = cors_non_safelisted_header_names(request);
     let method_safelisted = matches!(request.method.as_str(), "GET" | "HEAD" | "POST");
     let needed = {
@@ -2468,6 +2645,8 @@ async fn fetch_cors_with_preflight(
             use_cors_preflight: false,
             referrer_policy: request.referrer_policy,
             redirect: RedirectMode::Error,
+            service_worker: None,
+            web: Default::default(),
             fetch_policy: Some(FetchPolicy {
                 origin: policy.origin.clone(),
                 mode: RequestMode::Cors,
@@ -2485,7 +2664,7 @@ async fn fetch_cors_with_preflight(
             .unwrap()
             .store(request, &response, Instant::now());
     }
-    fetch_timed(request, sink).await
+    Ok(())
 }
 
 /// Fetch #cors-preflight-cache (local whatwg/fetch@394d20d): what successful
@@ -2954,6 +3133,11 @@ async fn fetch_redirecting_inner(
     mut sink: BodySink<'_>,
 ) -> Result<FetchResponseDetails, TimedFetchError> {
     let mut policy = request.referrer_policy.unwrap_or(policy);
+    let mut navigation_context = request
+        .service_worker
+        .as_ref()
+        .filter(|c| c.document().is_some())
+        .cloned();
     let navigation_start = crate::performance::now_ms();
     let mut redirect_end = 0.0;
     // Fetch's navigation TAO list contains only the timing allow values, not
@@ -2967,6 +3151,9 @@ async fn fetch_redirecting_inner(
             .iter()
             .any(|(name, _)| name.eq_ignore_ascii_case("referer"));
     let mut request = request.clone();
+    if let Some(context) = request.service_worker.clone() {
+        context.apply_client_origin(&mut request);
+    }
     let mut url_list = vec![request.url.clone()];
     let client = request.timing_client.clone().or_else(|| {
         request
@@ -2993,13 +3180,61 @@ async fn fetch_redirecting_inner(
             return Err(String::from("same-origin fetch crossed origins").into());
         }
         let origin = request_origin_header(&request, policy, &url_list);
-        let response = tokio::time::timeout(
-            FETCH_TIMEOUT,
-            fetch_once_into(&request, origin.as_deref(), sink.as_deref_mut()),
-        )
-        .await
-        .map_err(|_| TimedFetchError::network(String::from("timed out"), navigation_start))?
-        .map_err(|error| TimedFetchError::network(error, navigation_start))?;
+        let service_response = crate::trust_js_backend::service_worker_fetch::intercept(&request)
+            .await
+            .map_err(|error| TimedFetchError::network(error, navigation_start))?;
+        let from_service_worker = service_response.is_some();
+        let response = if let Some((mut response, mut body)) = service_response {
+            if let Some(slot) = sink.as_deref_mut() {
+                *slot = body;
+            } else if let Some(body) = body.as_mut() {
+                while let Some(piece) = body
+                    .next()
+                    .await
+                    .map_err(|error| TimedFetchError::network(error, navigation_start))?
+                {
+                    let target = if let Some(inner) = response.internal.as_mut()
+                        && matches!(inner.kind, "opaque" | "opaqueredirect")
+                    {
+                        inner.body.get_or_insert_with(Vec::new)
+                    } else {
+                        &mut response.body
+                    };
+                    target.extend_from_slice(&piece);
+                }
+                if let Some(timing) = response.timing.as_mut() {
+                    timing.response_end = crate::performance::now_ms();
+                    timing.encoded_body_size = body.encoded_size();
+                    timing.decoded_body_size = body.decoded_size();
+                }
+            }
+            if mode == "navigate" {
+                response.unfilter();
+            }
+            response
+        } else {
+            if let Some(fetch_policy) = &request.fetch_policy
+                && fetch_policy.mode == RequestMode::Cors
+                && !same_origin(&fetch_policy.origin, &request.url)
+                && (cors_preflight_required(&request) || request.use_cors_preflight)
+                && let Err(error) = fetch_cors_with_preflight(&request, fetch_policy).await
+            {
+                PREFLIGHT_CACHE.lock().unwrap().clear_for(&request);
+                return Err(error);
+            }
+            // A network fallback switches service-workers mode to none, including
+            // subsequent redirect hops (Fetch #concept-http-fetch).
+            if mode != "navigate" {
+                request.service_worker = None;
+            }
+            tokio::time::timeout(
+                FETCH_TIMEOUT,
+                fetch_once_into(&request, origin.as_deref(), sink.as_deref_mut()),
+            )
+            .await
+            .map_err(|_| TimedFetchError::network(String::from("timed out"), navigation_start))?
+            .map_err(|error| TimedFetchError::network(error, navigation_start))?
+        };
         if let Some(client) = &client {
             cross_origin_response |= !same_origin(client, &request.url);
             let opaque_origin = url_list
@@ -3087,12 +3322,19 @@ async fn fetch_redirecting_inner(
             // Recorded off the FINAL hop: 301-303 rewrite the method to
             // GET below, so a Post/Redirect/Get flow lands here as a GET.
             response.from_post = request.method.eq_ignore_ascii_case("POST");
-            response = enforce_fetch_policy_for_redirect_chain(
+            response = filter_fetch_response(
                 &request,
                 response,
                 origin.as_deref(),
                 cross_origin_response,
+                !from_service_worker,
             )?;
+            if !from_service_worker && let Some(internal) = response.internal.as_mut() {
+                internal.range_requested = request
+                    .headers
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case("range"));
+            }
             if redirect && request.redirect == RedirectMode::Manual {
                 // Fetch #http-fetch: CORS is checked before redirect mode.
                 // The manual view retains this hop's URL but hides its
@@ -3104,7 +3346,9 @@ async fn fetch_redirecting_inner(
                     timing.resource_response_status = 0;
                 }
             }
-            if let Some(internal) = response.internal.as_mut() {
+            if let Some(internal) = response.internal.as_mut()
+                && (!from_service_worker || internal.url_list.is_empty())
+            {
                 internal.url_list.clone_from(&url_list);
             }
             let referrer = request
@@ -3113,6 +3357,27 @@ async fn fetch_redirecting_inner(
                 .find(|(name, _)| name.eq_ignore_ascii_case("referer"))
                 .map_or_else(String::new, |(_, value)| value.clone());
             response.referrer.clone_from(&referrer);
+            response.service_client = navigation_context.as_ref().and_then(|c| c.document());
+            if let Some(client) = &response.service_client {
+                if mode == "navigate" {
+                    client.client().set_document_origin(response.url.origin());
+                    client.client().set_secure_context(
+                        client.client().secure_context() && potentially_trustworthy(&response.url),
+                    );
+                }
+                // HTML #initialise-the-document-object uses the navigation
+                // request's current URL for the Window's creation URL, even
+                // if respondWith forwarded bytes from a different resource.
+                // Worker scripts instead use their response URL.
+                client.client().set_document_url(if mode == "navigate" {
+                    request.url.clone()
+                } else {
+                    response.url.clone()
+                });
+            }
+            if mode == "navigate" {
+                response.url = request.url.clone();
+            }
             return Ok(FetchResponseDetails {
                 response,
                 url_list,
@@ -3127,12 +3392,14 @@ async fn fetch_redirecting_inner(
         }
         // CORS checks apply to every network response, including a followed
         // redirect (Fetch #http-fetch), before another origin is contacted.
-        validate_cors_response(
-            &request,
-            &response,
-            origin.as_deref(),
-            cross_origin_response,
-        )?;
+        if !from_service_worker {
+            validate_cors_response(
+                &request,
+                &response,
+                origin.as_deref(),
+                cross_origin_response,
+            )?;
+        }
         // The previous hop's body is no longer needed. Do not wait for a
         // slow or never-ending redirect body before fetching Location.
         if let Some(slot) = sink.as_deref_mut() {
@@ -3243,6 +3510,12 @@ async fn fetch_redirecting_inner(
         redirect_end = crate::performance::now_ms();
         url_list.push(target.clone());
         request.url = target;
+        if mode == "navigate"
+            && let Some(context) = &navigation_context
+        {
+            navigation_context = context.redirected(&request);
+            request.service_worker = navigation_context.clone();
+        }
     }
     Err(TimedFetchError::network(
         format!("too many redirects (>{MAX_REDIRECTS})"),
@@ -3263,16 +3536,38 @@ fn enforce_fetch_policy(request: &Request, response: Response) -> Result<Respons
     enforce_fetch_policy_for_redirect_chain(request, response, origin.as_deref(), false)
 }
 
+#[cfg(test)]
 fn enforce_fetch_policy_for_redirect_chain(
+    request: &Request,
+    response: Response,
+    serialized_origin: Option<&str>,
+    crossed_origin: bool,
+) -> Result<Response, String> {
+    filter_fetch_response(request, response, serialized_origin, crossed_origin, true)
+}
+
+fn filter_fetch_response(
     request: &Request,
     mut response: Response,
     serialized_origin: Option<&str>,
     crossed_origin: bool,
+    network_response: bool,
 ) -> Result<Response, String> {
+    if !network_response && response.internal.is_some() {
+        return Ok(response);
+    }
     let Some(policy) = &request.fetch_policy else {
         return Ok(response);
     };
-    let cross_origin = crossed_origin || !same_origin(&policy.origin, &response.url);
+    let cross_origin = crossed_origin
+        || !same_origin(
+            &policy.origin,
+            if network_response {
+                &response.url
+            } else {
+                &request.url
+            },
+        );
     match policy.mode {
         RequestMode::SameOrigin if cross_origin => {
             Err(String::from("same-origin fetch crossed origins"))
@@ -3287,7 +3582,9 @@ fn enforce_fetch_policy_for_redirect_chain(
             // Fetch #concept-cors-check reads each field with "get" (Fetch
             // #concept-header-list-get), which combines repeated fields: two
             // `Access-Control-Allow-Origin` fields never match one origin.
-            validate_cors_response(request, &response, serialized_origin, crossed_origin)?;
+            if network_response {
+                validate_cors_response(request, &response, serialized_origin, crossed_origin)?;
+            }
             // HTML's script/link consumers inspect the unsafe (internal)
             // response after CORS succeeds. Filtering `nosniff` here would
             // incorrectly turn a blocked script MIME type into an allowed
@@ -4105,11 +4402,11 @@ mod cookie_policy_tests {
         let mut dom = crate::dom::Dom::parse_document(
             "<img src='/root.png'><iframe id='outer' src='/redirect'></iframe><iframe src='/same'></iframe>",
         );
-        let frames = HashMap::from([
-            (page.join("/redirect").unwrap().to_string(), (url("https://third.example.net/"),
+        let frames = FrameDocuments::from_metadata([
+            (vec![0], (url("https://third.example.net/"),
                 "<img src='https://picture.example.com/private.png'><div style=\"background-image:url(https://picture.example.com/background.png)\">x</div><iframe src='https://picture.example.com/inner'></iframe>".into(), encoding_rs::UTF_8, Default::default())),
-            (page.join("/inner").unwrap().to_string(), (page.join("/inner").unwrap(), "<img src='https://picture.example.com/nested.png'>".into(), encoding_rs::UTF_8, Default::default())),
-            (page.join("/same").unwrap().to_string(), (page.join("/same").unwrap(), "<img src='https://picture.example.com/allowed.png'>".into(), encoding_rs::UTF_8, Default::default())),
+            (vec![0,0], (page.join("/inner").unwrap(), "<img src='https://picture.example.com/nested.png'>".into(), encoding_rs::UTF_8, Default::default())),
+            (vec![1], (page.join("/same").unwrap(), "<img src='https://picture.example.com/allowed.png'>".into(), encoding_rs::UTF_8, Default::default())),
         ]);
         install_page_frames(&mut dom, &page, &frames);
         let outer = dom
@@ -4161,15 +4458,26 @@ mod cookie_policy_tests {
             <iframe></iframe>
             <iframe sandbox="allow-scripts" srcdoc="<iframe src='https://service-worker.test/inner' sandbox='allow-scripts allow-same-origin'></iframe>"></iframe>"#;
         let inner = page.join("/inner").unwrap();
-        let frames = FrameDocuments::from([(
-            inner.to_string(),
+        let frames = FrameDocuments::from_metadata([
             (
-                inner.clone(),
-                "<p>nested</p>".into(),
-                encoding_rs::UTF_8,
-                Default::default(),
+                vec![0, 0],
+                (
+                    inner.clone(),
+                    "<p>nested</p>".into(),
+                    encoding_rs::UTF_8,
+                    Default::default(),
+                ),
             ),
-        )]);
+            (
+                vec![2, 0],
+                (
+                    inner.clone(),
+                    "<p>nested</p>".into(),
+                    encoding_rs::UTF_8,
+                    Default::default(),
+                ),
+            ),
+        ]);
         let mut dom = crate::dom::Dom::parse_document(html);
         install_page_frames_with_clients(&mut dom, &page, &frames, Some(&owner));
         let clients = registry.matching_clients(&key, 0, true, None);
@@ -4180,16 +4488,14 @@ mod cookie_policy_tests {
         );
         let nested = clients.iter().find(|client| client.url == inner).unwrap();
         assert_eq!(nested.window_state().ancestor_origins, ["null", "null"]);
+        assert!(clients.iter().any(
+            |client| client.url.as_str() == "about:srcdoc" && client.origin() == page.origin()
+        ));
         assert!(
             clients
                 .iter()
-                .any(|client| client.url.as_str() == "about:srcdoc"
-                    && client.origin == page.origin())
-        );
-        assert!(
-            clients.iter().any(
-                |client| client.url.as_str() == "about:blank" && client.origin == page.origin()
-            )
+                .any(|client| client.url.as_str() == "about:blank"
+                    && client.origin() == page.origin())
         );
         let mut ids: Vec<_> = clients.iter().map(|client| client.id.clone()).collect();
         ids.sort();
@@ -5079,24 +5385,22 @@ async fn dial_with_connector(
     connector: &tokio_rustls::TlsConnector,
     mut timing: Option<&mut crate::performance::FetchTiming>,
 ) -> Result<BufReader<Conn>, String> {
-    // Fetch #create-a-connection / #record-connection-timing-info: DNS
-    // and the staggered TCP race retain separate timing boundaries. RFC 8305
-    // §§4–5 lets the other family proceed when the first route is silent.
+    // Fetch #create-a-connection / #record-connection-timing-info: the first
+    // ready DNS family starts the RFC 8305 §§3–7 TCP race while a slower
+    // lookup can still supply candidates. Preserve both timing boundaries.
     let deadline = tokio::time::Instant::now() + crate::net::CONNECT_TIMEOUT;
     if let Some(timing) = timing.as_deref_mut() {
         timing.connection_reused = false;
         timing.domain_lookup_start = crate::performance::now_ms();
     }
-    let addresses = crate::net::resolve(host, port, deadline)
-        .await
-        .map_err(|e| e.to_string())?;
-    if let Some(timing) = timing.as_deref_mut() {
-        timing.domain_lookup_end = crate::performance::now_ms();
-        timing.connect_start = timing.domain_lookup_end;
-    }
-    let stream = crate::net::connect_addresses(addresses, deadline)
-        .await
-        .map_err(|e| e.to_string())?;
+    let stream = crate::net::connect_with_dns_callback(host, port, deadline, || {
+        if let Some(timing) = timing.as_deref_mut() {
+            timing.domain_lookup_end = crate::performance::now_ms();
+            timing.connect_start = timing.domain_lookup_end;
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?;
     let _ = stream.set_nodelay(true);
     let conn = if scheme == "https" {
         let name = tls::server_name(host)?;
@@ -6828,6 +7132,7 @@ pub async fn execute_js_for_device(
 pub(crate) fn prefetch_page_scripts(
     html: &str,
     env: &crate::js::PageEnv,
+    service_worker: Option<crate::trust_js_backend::service_worker_fetch::Context>,
     report: std::sync::Arc<dyn Fn(crate::performance::ResourceTiming) + Send + Sync>,
 ) {
     let Some(handle) = env.net.as_ref() else {
@@ -6849,6 +7154,7 @@ pub(crate) fn prefetch_page_scripts(
         document_referrer_policy(html, env.referrer_policy),
         &env.cache,
         handle,
+        service_worker,
         report,
     );
 }
@@ -6877,9 +7183,14 @@ pub(crate) fn prefetch_parser_scripts(
     referrer_policy: crate::referrer_policy::ReferrerPolicy,
     cache: &std::sync::Arc<PageCache>,
     handle: &tokio::runtime::Handle,
+    service_worker: Option<crate::trust_js_backend::service_worker_fetch::Context>,
     report: std::sync::Arc<dyn Fn(crate::performance::ResourceTiming) + Send + Sync>,
 ) {
     let base = base_with_doc_base(html, client);
+    let effective = service_worker
+        .as_ref()
+        .and_then(|context| context.client_url(client));
+    let origin = effective.as_ref().unwrap_or(client);
     let mut scripts = 0;
     let mut preloads = 0;
     for job in
@@ -6905,12 +7216,13 @@ pub(crate) fn prefetch_parser_scripts(
                 document_encoding,
             )
             && matches!(url.scheme(), "http" | "https" | "file")
-            && subresource_allowed(client, &url)
+            && subresource_allowed(origin, &url)
         {
             let credentials = job.cors_credentials();
             let name = url.to_string();
             let report = report.clone();
-            let mut request = Request::subresource(url.clone(), client, "script", credentials);
+            let mut request = Request::subresource(url.clone(), origin, "script", credentials);
+            request.service_worker = service_worker.clone();
             // The element's request computes its Referer from its
             // `referrerpolicy` attribute (HTML #referrer-policy-attributes),
             // else the Document's policy (Fetch #main-fetch step 7); the
@@ -6924,7 +7236,7 @@ pub(crate) fn prefetch_parser_scripts(
             let shared = cache.fetch_request_reporting(
                 handle,
                 request,
-                ResourceCacheContext::new(client, "script", credentials),
+                ResourceCacheContext::new(origin, "script", credentials),
                 Some(Box::new(move |timing| {
                     if let Some(mut timing) = timing {
                         timing.render_blocking = job.render_blocking;
@@ -6941,6 +7253,7 @@ pub(crate) fn prefetch_parser_scripts(
                 // HTML #fetch-a-module-script-tree: its descendants are
                 // fetched as soon as the module script's own fetch completes.
                 let (cache, runtime, page) = (cache.clone(), handle.clone(), client.clone());
+                let service_worker = service_worker.clone();
                 cache.clone().spawn(handle, async move {
                     let Ok(response) = shared.await else {
                         return;
@@ -6956,6 +7269,7 @@ pub(crate) fn prefetch_parser_scripts(
                             fetched,
                             url,
                             &response.body,
+                            service_worker,
                         );
                     }
                 });
@@ -7009,6 +7323,12 @@ async fn execute_js_with_presentation(
     traversable: crate::js::TraversableState,
     group: Option<crate::js::TraversableLink>,
 ) -> Response {
+    // HTML #populating-a-session-history-entry: these responses never create
+    // a Document, even when they advertise an HTML media type. The frontend
+    // settles their navigation reservation against its still-active Window.
+    if matches!(response.status, 204 | 205) {
+        return response;
+    }
     let device_pixel_ratio = if device_pixel_ratio.is_finite() && device_pixel_ratio > 0.0 {
         device_pixel_ratio
     } else {
@@ -7041,6 +7361,10 @@ async fn execute_js_with_presentation(
             traversable,
         );
     }
+    let service_worker = response
+        .service_client
+        .as_ref()
+        .and_then(crate::trust_js_backend::service_worker_fetch::for_document);
     let decoded = decode_document_body(&response.url, &response.content_type, &response.body);
     let (html, document_encoding) = (decoded.text, decoded.encoding);
     if response.declarative_refresh.is_none() {
@@ -7053,12 +7377,31 @@ async fn execute_js_with_presentation(
     // (#the-summary-element, form controls) and Selectors 4 §9.1 hover state
     // need the canonical live DOM even when there are no author scripts.
     let mut prefetched_sheets = None;
-    let mut scripted_frames = false;
+    let mut prefetched_frames = FrameDocuments::default();
+    let mut document_creation_time = None;
+    // A frame's own scripts determine whether it needs a resident realm.
+    // The inert prefetch retains distinct navigation records, which can be
+    // handed to the actor if a fetched child turns out to contain scripts.
+    let lower_html = html.to_ascii_lowercase();
+    let mut scripted_frames = lower_html.contains("<iframe") || lower_html.contains("<frame");
     // A group's traversables keep their Windows for each other: none of its
     // Documents is presented without a page actor.
-    if group.is_none() && !html.to_ascii_lowercase().contains("<script") {
-        let sheets =
-            fetch_page_sheets(&html, &response.url, document_encoding, referrer_policy).await;
+    if group.is_none()
+        && !lower_html.contains("<script")
+        && !service_worker.as_ref().is_some_and(|c| c.controlled())
+    {
+        let sheets = fetch_page_sheets_for_client(
+            &html,
+            &response.url,
+            document_encoding,
+            referrer_policy,
+            service_worker.clone(),
+        )
+        .await;
+        // This probe is the original root's first parse. Re-layout and a
+        // deferred actor keep this Document's loading transition instead
+        // of dating it after its already-created child Documents.
+        document_creation_time = Some(crate::performance::now_ms());
         let needs_live_dom = {
             let mut probe = crate::js::css_prepare(&html, viewport, cell_px);
             probe.attach_external_sheets(&sheets);
@@ -7081,18 +7424,18 @@ async fn execute_js_with_presentation(
                     &response.url,
                     document_encoding,
                     referrer_policy,
+                    response.service_client.as_ref(),
                 )
                 .await,
             )
         } else {
             None
         };
-        scripted_frames = frames.as_ref().is_some_and(|frames| {
-            frames
-                .values()
-                .any(|(_, markup, _, _)| markup.to_ascii_lowercase().contains("<script"))
-        });
+        scripted_frames = frames.as_ref().is_some_and(FrameDocuments::scripted);
         if !needs_live_dom && !scripted_frames {
+            if let Some(client) = &response.service_client {
+                client.client().set_execution_ready();
+            }
             return css_only_with_sheets(
                 response,
                 viewport,
@@ -7101,6 +7444,13 @@ async fn execute_js_with_presentation(
                 sheets,
                 frames,
                 terminal_presentation,
+                Some(frames::DeferredOptions {
+                    storage: storage.clone(),
+                    screen_position,
+                    fullscreen_supported,
+                    traversable,
+                    document_creation_time,
+                }),
             )
             .await;
         }
@@ -7110,6 +7460,7 @@ async fn execute_js_with_presentation(
         // source of truth); script-less iframe loading retains its established
         // CSS-only behavior when no live interaction is present.
         prefetched_sheets = Some(sheets);
+        prefetched_frames = frames.unwrap_or_default();
     }
     // Stylesheets still establish the initial cascade before layout. Scripts
     // are fetched by the page's parser scheduler: waiting for every script
@@ -7166,6 +7517,7 @@ async fn execute_js_with_presentation(
         referrer_policy,
         &cache,
         &tokio::runtime::Handle::current(),
+        service_worker.clone(),
         std::sync::Arc::new(move |timing| {
             if let Some(cache) = held.upgrade() {
                 cache.report_speculative_timing(timing);
@@ -7175,6 +7527,7 @@ async fn execute_js_with_presentation(
     let results = futures::stream::iter(jobs.into_iter().map(|job| {
         let doc_base = doc_base.clone();
         let page_url = response.url.clone();
+        let service_worker = service_worker.clone();
         async move {
             // HTML #encoding-parsing-a-url relative to the document.
             let resolved = crate::form_encoding::encoding_parse_url(
@@ -7199,6 +7552,7 @@ async fn execute_js_with_presentation(
                         job.destination(),
                         job.cors_credentials(),
                     );
+                    request.service_worker = service_worker.clone();
                     set_request_referrer(
                         &mut request,
                         Some(&page_url),
@@ -7284,6 +7638,7 @@ async fn execute_js_with_presentation(
                         cors_mode,
                         encoding,
                         SheetReferrer::document(&response.url, referrer_policy)
+                            .with_service_worker(service_worker.clone())
                             .sheet(&url, &r.headers),
                         sheet_policy,
                     )
@@ -7311,9 +7666,14 @@ async fn execute_js_with_presentation(
         }
     }
     if !prefetched {
-        let inline =
-            fetch_inline_style_imports(&html, &response.url, document_encoding, referrer_policy)
-                .await;
+        let inline = fetch_inline_style_imports_for_client(
+            &html,
+            &response.url,
+            document_encoding,
+            referrer_policy,
+            service_worker.clone(),
+        )
+        .await;
         push_imported_sheets(&mut sheets, inline);
     }
     // CSS Fonts 4 #font-style-matching: the actor requests faces when text
@@ -7328,6 +7688,7 @@ async fn execute_js_with_presentation(
         referrer: response.referrer.clone(),
         url: response.url.to_string(),
         navigation_timing: response.timing.clone(),
+        document_creation_time,
         resource_timings,
         viewport,
         cell_px,
@@ -7341,6 +7702,8 @@ async fn execute_js_with_presentation(
         storage: Some(storage),
         blobs,
         service_client: response.service_client.clone(),
+        prefetched_frames,
+        resume_static: false,
         scripted_frames,
         last_modified: document_last_modified(&response.url, &response.headers),
         document_encoding,
@@ -7576,6 +7939,8 @@ pub(crate) struct SheetReferrer {
     /// The document's policy container referrer policy, for imported sheets
     /// whose responses name no policy.
     pub(crate) document_policy: crate::referrer_policy::ReferrerPolicy,
+    /// The owning environment is independent of the sheet's URL/referrer.
+    pub(crate) service_worker: Option<crate::trust_js_backend::service_worker_fetch::Context>,
 }
 
 impl SheetReferrer {
@@ -7585,12 +7950,15 @@ impl SheetReferrer {
             source: url.origin().is_tuple().then(|| url.clone()),
             policy,
             document_policy: policy,
+            service_worker: None,
         }
     }
 
     /// The sheet located at `location` whose response's headers are `headers`.
     pub(crate) fn sheet(&self, location: &Url, headers: &[(String, String)]) -> Self {
-        Self::located(location, headers, self.document_policy)
+        let mut result = Self::located(location, headers, self.document_policy);
+        result.service_worker = self.service_worker.clone();
+        result
     }
 
     /// The sheet located at `location` whose response's headers are
@@ -7606,11 +7974,21 @@ impl SheetReferrer {
             policy: crate::referrer_policy::ReferrerPolicy::from_headers(headers)
                 .unwrap_or(document_policy),
             document_policy,
+            service_worker: None,
         }
     }
 
     fn apply(&self, request: &mut Request) {
         set_request_referrer(request, self.source.as_ref(), self.policy);
+        request.service_worker = self.service_worker.clone();
+    }
+
+    pub(crate) fn with_service_worker(
+        mut self,
+        context: Option<crate::trust_js_backend::service_worker_fetch::Context>,
+    ) -> Self {
+        self.service_worker = context;
+        self
     }
 }
 
@@ -7690,31 +8068,49 @@ pub(crate) fn splice_imports<'a>(
 /// simultaneous I/O; no arbitrary declaration-count cutoff is applied to the
 /// cascade. `encoding` is the document's character encoding, the style
 /// sheets' environment encoding unless a link names its own `charset`.
+#[cfg(test)]
 async fn fetch_page_sheets(
     html: &str,
     page_url: &Url,
     encoding: &'static encoding_rs::Encoding,
     referrer_policy: crate::referrer_policy::ReferrerPolicy,
 ) -> Vec<PageSheet> {
+    fetch_page_sheets_for_client(html, page_url, encoding, referrer_policy, None).await
+}
+
+async fn fetch_page_sheets_for_client(
+    html: &str,
+    page_url: &Url,
+    encoding: &'static encoding_rs::Encoding,
+    referrer_policy: crate::referrer_policy::ReferrerPolicy,
+    service_worker: Option<crate::trust_js_backend::service_worker_fetch::Context>,
+) -> Vec<PageSheet> {
     let base = base_with_doc_base(html, page_url);
+    let origin = service_worker
+        .as_ref()
+        .and_then(|context| context.client_url(page_url))
+        .unwrap_or_else(|| page_url.clone());
     let jobs = crate::js::external_resources(html)
         .into_iter()
         .filter(|job| job.kind == crate::js::ExternalResourceKind::Sheet);
     let fetched = futures::stream::iter(jobs.map(|job| {
         let base = base.clone();
         let page_url = page_url.clone();
+        let origin = origin.clone();
+        let service_worker = service_worker.clone();
         async move {
             // HTML #link-type-stylesheet fetches the encoding-parsed href.
             let resolved =
                 crate::form_encoding::encoding_parse_url(&job.source, Some(&base), encoding)
                     .ok()
                     .filter(|u| matches!(u.scheme(), "http" | "https" | "file"))
-                    .filter(|u| subresource_allowed(&page_url, u));
+                    .filter(|u| subresource_allowed(&origin, u));
             let cors_mode = job.cors_credentials().is_some();
             let resp = match &resolved {
                 Some(u) => {
                     let mut request =
-                        Request::subresource(u.clone(), &page_url, "style", job.cors_credentials());
+                        Request::subresource(u.clone(), &origin, "style", job.cors_credentials());
+                    request.service_worker = service_worker;
                     // HTML #referrer-policy-attributes: the link's policy, else
                     // the Document's (Fetch #main-fetch step 7).
                     set_request_referrer(
@@ -7722,7 +8118,10 @@ async fn fetch_page_sheets(
                         Some(&page_url),
                         job.referrer_policy.unwrap_or(referrer_policy),
                     );
-                    fetch(&request).await.ok()
+                    fetch(&request).await.ok().map(|mut response| {
+                        response.unfilter();
+                        response
+                    })
                 }
                 None => None,
             };
@@ -7747,7 +8146,7 @@ async fn fetch_page_sheets(
         );
         let sheet = PageSheet {
             link_href: Some(raw),
-            cors_same_origin: sheet_cors_same_origin(page_url, &url, &response.url, cors_mode),
+            cors_same_origin: sheet_cors_same_origin(&origin, &url, &response.url, cors_mode),
             text: absolutize_css_urls(&css, &response.url),
             url: url.to_string(),
             base: response.url.to_string(),
@@ -7761,10 +8160,12 @@ async fn fetch_page_sheets(
         let imports = fetch_sheet_imports(
             sheet.text.clone(),
             response.url,
-            page_url.clone(),
+            origin.clone(),
             vec![sheet.url.clone()],
             encoding,
-            SheetReferrer::document(page_url, referrer_policy).sheet(&url, &response.headers),
+            SheetReferrer::document(page_url, referrer_policy)
+                .with_service_worker(service_worker.clone())
+                .sheet(&url, &response.headers),
         );
         Some((sheet, imports))
     })
@@ -7777,7 +8178,14 @@ async fn fetch_page_sheets(
     for imported in imported {
         push_imported_sheets(&mut sheets, imported);
     }
-    let inline = fetch_inline_style_imports(html, page_url, encoding, referrer_policy).await;
+    let inline = fetch_inline_style_imports_for_client(
+        html,
+        page_url,
+        encoding,
+        referrer_policy,
+        service_worker,
+    )
+    .await;
     push_imported_sheets(&mut sheets, inline);
     sheets
 }
@@ -7798,11 +8206,12 @@ fn push_imported_sheets(sheets: &mut Vec<PageSheet>, imported: Vec<PageSheet>) {
 /// and the sheets those import. An inline sheet's text is part of the
 /// document, so the document's `encoding` is the imported sheets'
 /// environment encoding.
-async fn fetch_inline_style_imports(
+async fn fetch_inline_style_imports_for_client(
     html: &str,
     page_url: &Url,
     encoding: &'static encoding_rs::Encoding,
     referrer_policy: crate::referrer_policy::ReferrerPolicy,
+    service_worker: Option<crate::trust_js_backend::service_worker_fetch::Context>,
 ) -> Vec<PageSheet> {
     if !html.to_ascii_lowercase().contains("@import") {
         return Vec::new();
@@ -7816,7 +8225,8 @@ async fn fetch_inline_style_imports(
             page_url.clone(),
             Vec::new(),
             encoding,
-            SheetReferrer::document(page_url, referrer_policy),
+            SheetReferrer::document(page_url, referrer_policy)
+                .with_service_worker(service_worker.clone()),
         )
     }))
     .buffered(PREFETCH_CONCURRENCY)
@@ -7868,6 +8278,11 @@ pub(crate) async fn fetched_stylesheet(
     referrer: SheetReferrer,
     referrer_policy: Option<crate::referrer_policy::ReferrerPolicy>,
 ) -> FetchedStyleSheet {
+    let client = referrer
+        .service_worker
+        .as_ref()
+        .and_then(|context| context.client_url(&client))
+        .unwrap_or(client);
     let text = absolutize_css_urls(&css, &sheet_url);
     let imports = fetch_sheet_imports(
         text.clone(),
@@ -7905,6 +8320,11 @@ fn fetch_sheet_imports(
 ) -> futures::future::BoxFuture<'static, Vec<PageSheet>> {
     use futures::FutureExt as _;
     async move {
+        let client = referrer
+            .service_worker
+            .as_ref()
+            .and_then(|context| context.client_url(&client))
+            .unwrap_or(client);
         let mut sheets: Vec<PageSheet> = Vec::new();
         for import in stylesheet_imports(&css) {
             let Some(url) = sheet_base
@@ -8839,6 +9259,7 @@ fn document_font_faces(
                     source: Some(location),
                     policy: sheet.referrer_policy.unwrap_or(referrer_policy),
                     document_policy: referrer_policy,
+                    service_worker: None,
                 },
                 Err(_) => document.clone(),
             };
@@ -9063,6 +9484,9 @@ async fn css_only_for_device(
     device_pixel_ratio: f32,
     terminal_presentation: bool,
 ) -> Response {
+    if matches!(response.status, 204 | 205) {
+        return response;
+    }
     let media = response
         .content_type
         .split(';')
@@ -9079,7 +9503,18 @@ async fn css_only_for_device(
         response.declarative_refresh = detect_declarative_refresh(&response, &html);
     }
     let referrer_policy = document_referrer_policy(&html, response_referrer_policy(&response));
-    let sheets = fetch_page_sheets(&html, &response.url, decoded.encoding, referrer_policy).await;
+    let service_worker = response
+        .service_client
+        .as_ref()
+        .and_then(crate::trust_js_backend::service_worker_fetch::for_document);
+    let sheets = fetch_page_sheets_for_client(
+        &html,
+        &response.url,
+        decoded.encoding,
+        referrer_policy,
+        service_worker,
+    )
+    .await;
     css_only_with_sheets(
         response,
         viewport,
@@ -9088,6 +9523,7 @@ async fn css_only_for_device(
         sheets,
         None,
         terminal_presentation,
+        None,
     )
     .await
 }
@@ -9104,6 +9540,7 @@ async fn css_only_with_sheets(
     sheets: Vec<PageSheet>,
     frames: Option<FrameDocuments>,
     terminal_presentation: bool,
+    deferred: Option<frames::DeferredOptions>,
 ) -> Response {
     let decoded = decode_document_body(&response.url, &response.content_type, &response.body);
     let (html, document_encoding) = (decoded.text, decoded.encoding);
@@ -9115,9 +9552,8 @@ async fn css_only_with_sheets(
     crate::font_system::install_page_fonts(Vec::new());
     let base = base_with_doc_base(&html, &response.url);
     fetch_svg_sprite_sheets(&html, &base, &response.url, referrer_policy).await;
-    // The frame documents are fetched up front into a url→content map (Dom is
-    // not `Send`, so it must never cross an `.await`), then installed into the
-    // real arena synchronously.
+    // Each child navigable retains its own response and reserved environment.
+    // DOM parsing stays synchronous; only owned records cross an await.
     let frames = match frames {
         Some(frames) => frames,
         None => {
@@ -9127,6 +9563,7 @@ async fn css_only_with_sheets(
                 &response.url,
                 document_encoding,
                 referrer_policy,
+                response.service_client.as_ref(),
             )
             .await
         }
@@ -9134,18 +9571,23 @@ async fn css_only_with_sheets(
     // A nested document owns its stylesheets (HTML #the-iframe-element): fetch
     // each frame's `<link rel=stylesheet>` against that frame's own URL. The
     // installed frame tree carries absolutized hrefs, so key them absolutely.
-    let mut frame_sheets = Vec::new();
+    let frame_sheets = Vec::new();
     let mut font_faces = HashMap::from([(
         response.url.to_string(),
         document_font_faces(&html, &sheets, &response.url, referrer_policy),
     )]);
-    for (frame_url, markup, encoding, frame_policy) in frames.values() {
+    for (frame_url, markup, encoding, frame_policy, owner, path) in frames.documents() {
         let frame_base = base_with_doc_base(markup, frame_url);
-        let fetched = fetch_page_sheets(markup, frame_url, encoding, *frame_policy).await;
+        let context = owner
+            .as_ref()
+            .and_then(crate::trust_js_backend::service_worker_fetch::for_document);
+        let fetched =
+            fetch_page_sheets_for_client(markup, frame_url, encoding, frame_policy, context).await;
         font_faces.insert(
             frame_url.to_string(),
-            document_font_faces(markup, &fetched, frame_url, *frame_policy),
+            document_font_faces(markup, &fetched, frame_url, frame_policy),
         );
+        let mut scoped = Vec::new();
         for mut sheet in fetched {
             if let Some(source) = sheet.link_href.take() {
                 match frame_base.join(&source) {
@@ -9153,8 +9595,9 @@ async fn css_only_with_sheets(
                     Err(_) => continue,
                 }
             }
-            frame_sheets.push(sheet);
+            scoped.push(sheet);
         }
+        frames.set_sheets(path, scoped);
     }
     let mut font_data = StaticFontData::default();
     let font_demands = std::sync::Arc::new(crate::font_system::FontDemands::default());
@@ -9209,6 +9652,29 @@ async fn css_only_with_sheets(
         font_data.extend(outcomes);
     };
     response.rendered = Some(Box::new(rendered));
+    if let (Some(options), Some(owner)) = (deferred, response.service_client.as_ref()) {
+        let mut env = crate::js::PageEnv::bare(response.url.as_str());
+        env.navigation_timing = response.timing.clone();
+        env.document_creation_time = options.document_creation_time;
+        env.viewport = viewport;
+        env.cell_px = cell_px;
+        env.device_pixel_ratio = device_pixel_ratio;
+        env.terminal_presentation = terminal_presentation;
+        env.screen_position = options.screen_position;
+        env.sheets = sheets;
+        env.net = Some(tokio::runtime::Handle::current());
+        env.storage = Some(options.storage);
+        env.blobs = response.blobs.clone().unwrap_or_default();
+        env.prefetched_frames = frames;
+        env.document_encoding = document_encoding;
+        env.content_type = response.content_type.clone();
+        env.referrer_policy = referrer_policy;
+        env.referrer = response.referrer.clone();
+        env.last_modified = document_last_modified(&response.url, &response.headers);
+        env.fullscreen_supported = options.fullscreen_supported;
+        env.traversable = options.traversable;
+        owner.defer_page(frames::DeferredPage { html, env });
+    }
     // Retain a baked source snapshot for history/diagnostics only. Frontends
     // consume `response.rendered` and never parse this presentation copy.
     response.body = body;
@@ -9575,401 +10041,6 @@ fn data_frame_document(url: &Url) -> Option<String> {
     Some(decode_nested_document_body(url, content_type, &bytes, None).text)
 }
 
-/// Scan one document's markup for its frames' `src` URLs to fetch and inline
-/// `srcdoc` contents to recurse into. Synchronous (a throwaway parse, dropped
-/// before the caller's next `.await`), the same parse-don't-pattern-match
-/// approach as `external_stylesheets`. Returns `(src URLs, srcdoc bodies)`.
-fn scan_frame_sources(
-    html: &str,
-    base: &Url,
-    page_url: &Url,
-    ancestors: &[String],
-    encoding: &'static encoding_rs::Encoding,
-) -> (Vec<Url>, Vec<String>) {
-    let dom = crate::dom::Dom::parse_document(html);
-    let mut srcs = Vec::new();
-    let mut srcdocs = Vec::new();
-    for id in dom.flat_descendants(dom.document()) {
-        match dom.tag_name(id) {
-            Some("iframe") | Some("frame") => {}
-            _ => continue,
-        }
-        // srcdoc wins over src (HTML "process the iframe attributes").
-        if let Some(srcdoc) = dom.attr(id, "srcdoc") {
-            srcdocs.push(srcdoc.to_string());
-            continue;
-        }
-        if let Some(src) = dom.attr(id, "src").map(str::trim).filter(|s| !s.is_empty())
-            && let Some(url) = resolve_frame_src(src, base, page_url, ancestors, encoding)
-        {
-            srcs.push(url);
-        }
-    }
-    (srcs, srcdocs)
-}
-
-/// Prefetched frame documents by requested URL: the final URL, the decoded
-/// markup and its character encoding.
-/// Each frame `src`'s document: its URL, markup, encoding, and policy
-/// container referrer policy (HTML #meta-referrer applied).
-type FrameDocuments = HashMap<
-    String,
-    (
-        Url,
-        String,
-        &'static encoding_rs::Encoding,
-        crate::referrer_policy::ReferrerPolicy,
-    ),
->;
-
-/// Fetch every frame document a script-less page (and its nested frames) needs,
-/// into a `url → content` map, breadth-first so each level's `src` fetches
-/// overlap. `srcdoc` frames hold no URL but their markup is still scanned for
-/// nested `src` frames. Only successful HTML responses are kept; local
-/// `data:` documents use their scheme fetch algorithm without touching the
-/// network.
-async fn prefetch_frame_documents(
-    html: &str,
-    base: &Url,
-    page_url: &Url,
-    encoding: &'static encoding_rs::Encoding,
-    referrer_policy: crate::referrer_policy::ReferrerPolicy,
-) -> FrameDocuments {
-    use std::collections::VecDeque;
-    let mut map = FrameDocuments::new();
-    // (document markup, its base, fragment-stripped ancestor URLs, the URL
-    // that determines its origin, its character encoding, its policy
-    // container's referrer policy)
-    type Pending = (
-        String,
-        Url,
-        Vec<String>,
-        Url,
-        &'static encoding_rs::Encoding,
-        crate::referrer_policy::ReferrerPolicy,
-    );
-    let mut queue: VecDeque<Pending> = VecDeque::new();
-    queue.push_back((
-        html.to_string(),
-        base.clone(),
-        vec![strip_fragment(page_url.as_str()).to_string()],
-        page_url.clone(),
-        encoding,
-        referrer_policy,
-    ));
-
-    while let Some((markup, base, ancestors, origin_url, encoding, referrer_policy)) =
-        queue.pop_front()
-    {
-        let (srcs, srcdocs) = scan_frame_sources(&markup, &base, page_url, &ancestors, encoding);
-
-        let cookie_ancestor = ancestors.iter().any(|ancestor| {
-            Url::parse(ancestor)
-                .ok()
-                .is_none_or(|url| !crate::site_storage::same_site(page_url, &url))
-        });
-        // Fetch this level's `src` documents concurrently.
-        let origin_url = &origin_url;
-        type Fetched = (
-            Url,
-            Url,
-            String,
-            &'static encoding_rs::Encoding,
-            crate::referrer_policy::ReferrerPolicy,
-        );
-        let fetched: Vec<Option<Fetched>> =
-            futures::stream::iter(srcs.into_iter().map(|url| async move {
-                if url.scheme() == "data" {
-                    // The CSS-only presentation never reads a data: frame's
-                    // encoding; its nested documents are cross-origin. A local
-                    // URL's Document inherits its initiator's policy container
-                    // (HTML #determine-navigation-params-policy-container).
-                    return data_frame_document(&url).map(|body| {
-                        let policy = document_referrer_policy(&body, referrer_policy);
-                        (url.clone(), url, body, encoding_rs::UTF_8, policy)
-                    });
-                }
-                let mut request = Request::subresource(url.clone(), page_url, "iframe", None);
-                request.cookie_context.as_mut().unwrap().cross_site_ancestor = cookie_ancestor;
-                // Fetch #determine-requests-referrer: the containing Document's
-                // URL under its policy container's referrer policy.
-                set_request_referrer(&mut request, Some(origin_url), referrer_policy);
-                let resp = fetch(&request).await.ok()?;
-                let media = resp
-                    .content_type
-                    .split(';')
-                    .next()
-                    .unwrap_or("")
-                    .trim()
-                    .to_ascii_lowercase();
-                let is_html = media == "text/html" || media == "application/xhtml+xml";
-                if !(resp.status >= 200 && resp.status < 300 && is_html) {
-                    return None;
-                }
-                // HTML #encoding-sniffing-algorithm step 6: a same-origin
-                // container document lends its encoding.
-                let container = (resp.url.origin() == origin_url.origin()).then_some(encoding);
-                let decoded = decode_nested_document_body(
-                    &resp.url,
-                    &resp.content_type,
-                    &resp.body,
-                    container,
-                );
-                let policy =
-                    document_referrer_policy(&decoded.text, response_referrer_policy(&resp));
-                Some((url, resp.url, decoded.text, decoded.encoding, policy))
-            }))
-            .buffered(PREFETCH_CONCURRENCY)
-            .collect()
-            .await;
-
-        for (requested, url, body, child_encoding, policy) in fetched.into_iter().flatten() {
-            let mut child_ancestors = ancestors.clone();
-            child_ancestors.push(strip_fragment(url.as_str()).to_string());
-            // Nested frames in the fetched content resolve against ITS url.
-            queue.push_back((
-                body.clone(),
-                url.clone(),
-                child_ancestors,
-                url.clone(),
-                child_encoding,
-                policy,
-            ));
-            map.insert(requested.to_string(), (url, body, child_encoding, policy));
-        }
-        // srcdoc bodies hold no URL of their own; recurse to load THEIR frames
-        // (base/origin inherit the parent document, per about:srcdoc). Their
-        // source is already decoded text (HTML #charset), hence UTF-8.
-        for srcdoc in srcdocs {
-            // HTML #determine-navigation-params-policy-container: an
-            // about:srcdoc Document's container is its parent's.
-            let policy = document_referrer_policy(&srcdoc, referrer_policy);
-            queue.push_back((
-                srcdoc,
-                base.clone(),
-                ancestors.clone(),
-                origin_url.clone(),
-                encoding_rs::UTF_8,
-                policy,
-            ));
-        }
-    }
-    map
-}
-
-/// Install the prefetched frame documents into the real arena, reusing the
-/// same `Dom::install_frame_document` the JS pipeline drives. Walks the live
-/// frames breadth-first; a `src` frame takes its content from `fetched`, a
-/// `srcdoc` frame from its attribute (base = the parent document). Synchronous
-/// — `Dom` never crosses an `.await`. Bounded identically to the prefetch.
-#[cfg(test)]
-fn install_page_frames(dom: &mut crate::dom::Dom, page_url: &Url, fetched: &FrameDocuments) {
-    install_page_frames_with_clients(dom, page_url, fetched, None);
-}
-
-fn install_page_frames_with_clients(
-    dom: &mut crate::dom::Dom,
-    page_url: &Url,
-    fetched: &FrameDocuments,
-    service_client: Option<&crate::js::DocumentClient>,
-) {
-    use crate::dom::NodeId;
-    use std::collections::VecDeque;
-
-    let base = {
-        let mut b = page_url.clone();
-        for id in dom.descendants(dom.document()) {
-            if dom.tag_name(id) == Some("base")
-                && let Some(href) = dom.attr(id, "href")
-                && let Ok(u) = page_url.join(href.trim())
-            {
-                b = u;
-                break;
-            }
-        }
-        b
-    };
-    // (subtree root, base for that subtree, fragment-stripped ancestor URLs,
-    // that document's character encoding, as `prefetch_frame_documents`
-    // tracks it)
-    type PendingFrame = (
-        NodeId,
-        Url,
-        Vec<String>,
-        &'static encoding_rs::Encoding,
-        Option<crate::js::DocumentClient>,
-        url::Origin,
-        bool,
-    );
-    let mut queue: VecDeque<PendingFrame> = VecDeque::new();
-    queue.push_back((
-        dom.document(),
-        base,
-        vec![strip_fragment(page_url.as_str()).to_string()],
-        dom.document_encoding(dom.document()),
-        service_client.cloned(),
-        service_client.map_or_else(|| page_url.origin(), |owner| owner.client().origin.clone()),
-        false,
-    ));
-
-    while let Some((root, base, ancestors, encoding, parent, parent_origin, parent_sandboxed)) =
-        queue.pop_front()
-    {
-        // Collect each frame's content first (immutable borrow), then install
-        // (mutable borrow) — can't hold the descendants borrow across install.
-        type Plan = (
-            NodeId,
-            String,
-            Url,
-            Option<Url>,
-            &'static encoding_rs::Encoding,
-        );
-        let mut plans: Vec<Plan> = Vec::new();
-        for id in dom.descendants(root) {
-            match dom.tag_name(id) {
-                Some("iframe") | Some("frame") => {}
-                _ => continue,
-            }
-            if let Some(srcdoc) = dom.attr(id, "srcdoc") {
-                plans.push((
-                    id,
-                    srcdoc.to_string(),
-                    base.clone(),
-                    None,
-                    encoding_rs::UTF_8,
-                ));
-                continue;
-            }
-            if let Some(src) = dom.attr(id, "src").map(str::trim).filter(|s| !s.is_empty())
-                && let Some(url) = resolve_frame_src(src, &base, page_url, &ancestors, encoding)
-                && let Some((final_url, content, child_encoding, _)) = fetched.get(url.as_str())
-            {
-                plans.push((
-                    id,
-                    content.clone(),
-                    final_url.clone(),
-                    Some(final_url.clone()),
-                    *child_encoding,
-                ));
-            } else {
-                // Every iframe begins with an initial about:blank Document;
-                // an absent/unusable navigation leaves it in place.
-                plans.push((
-                    id,
-                    "<!doctype html><html><head></head><body></body></html>".into(),
-                    base.clone(),
-                    None,
-                    encoding_rs::UTF_8,
-                ));
-            }
-        }
-
-        for (frame, content, frame_base, frame_url, child_encoding) in plans {
-            if let Some(body) = dom.install_frame_document(frame, &content, frame_base.as_str()) {
-                let sandboxed = parent_sandboxed
-                    || dom.tag_name(frame) == Some("iframe")
-                        && dom.attr(frame, "sandbox").is_some_and(|flags| {
-                            !flags
-                                .split_ascii_whitespace()
-                                .any(|flag| flag.eq_ignore_ascii_case("allow-same-origin"))
-                        });
-                let restricted = sandboxed
-                    || ancestors.iter().any(|ancestor| {
-                        Url::parse(ancestor)
-                            .ok()
-                            .is_none_or(|url| !crate::site_storage::same_site(page_url, &url))
-                    })
-                    || frame_url
-                        .as_ref()
-                        .is_some_and(|url| !crate::site_storage::same_site(page_url, url));
-                dom.set_frame_cookie_restriction(frame, restricted);
-                let creation_url = frame_url.clone().unwrap_or_else(|| {
-                    Url::parse(if dom.attr(frame, "srcdoc").is_some() {
-                        "about:srcdoc"
-                    } else {
-                        "about:blank"
-                    })
-                    .unwrap()
-                });
-                let mut origin = if sandboxed {
-                    url::Origin::new_opaque()
-                } else if frame_url.is_none() {
-                    parent_origin.clone()
-                } else {
-                    creation_url.origin()
-                };
-                let child = parent.as_ref().and_then(|parent| {
-                    let mut cookies = CookieContext::subresource(page_url);
-                    cookies.cross_site_ancestor = restricted;
-                    let partition = cookies.storage_partition();
-                    let key = if !origin.is_tuple() || partition == "null" {
-                        "null".into()
-                    } else if partition.is_empty() {
-                        origin.ascii_serialization()
-                    } else {
-                        format!("{}^{partition}", origin.ascii_serialization())
-                    };
-                    let parent_info = parent.client().window_state();
-                    let referrer = (dom.tag_name(frame) == Some("iframe"))
-                        .then(|| dom.attr(frame, "referrerpolicy"))
-                        .flatten()
-                        .and_then(crate::referrer_policy::ReferrerPolicy::parse);
-                    let mut masked = referrer
-                        == Some(crate::referrer_policy::ReferrerPolicy::NoReferrer)
-                        || referrer == Some(crate::referrer_policy::ReferrerPolicy::SameOrigin)
-                            && origin != parent_origin;
-                    let parent_serialized = parent_origin.ascii_serialization();
-                    let mut ancestor_origins = vec![if masked {
-                        "null".into()
-                    } else {
-                        parent_serialized.clone()
-                    }];
-                    // HTML internal ancestor origin objects list creation steps:
-                    // mask the same-origin run, preserving already-masked entries.
-                    for ancestor in parent_info.ancestor_origins {
-                        if masked && ancestor == parent_serialized {
-                            ancestor_origins.push("null".into());
-                        } else {
-                            ancestor_origins.push(ancestor);
-                            masked = false;
-                        }
-                    }
-                    parent
-                        .static_child(
-                            frame,
-                            creation_url,
-                            origin.clone(),
-                            key,
-                            crate::service_worker::WindowState {
-                                frame_type: "nested".into(),
-                                visibility_state: parent_info.visibility_state,
-                                ancestor_origins,
-                                ..Default::default()
-                            },
-                        )
-                        .ok()
-                });
-                if let Some(child) = &child {
-                    origin = child.client().origin.clone();
-                }
-                let mut child_ancestors = ancestors.clone();
-                if let Some(u) = &frame_url {
-                    child_ancestors.push(strip_fragment(u.as_str()).to_string());
-                }
-                queue.push_back((
-                    body,
-                    frame_base,
-                    child_ancestors,
-                    child_encoding,
-                    child,
-                    origin,
-                    sandboxed,
-                ));
-            }
-        }
-    }
-}
-
 /// Known ad / tracker network domains we neither fetch nor run. A terminal
 /// browser can't render ads and shouldn't pretend they loaded: running an ad
 /// SDK wastes the wire, leaks privacy, and triggers behaviours a single-view
@@ -10232,6 +10303,12 @@ pub(crate) fn document_referrer_policy(
 /// request's client), with the hyperlink's or form's referrer policy.
 #[derive(Clone, Debug)]
 pub struct NavigationInitiator {
+    pub(crate) service_worker_context:
+        Option<crate::trust_js_backend::service_worker_fetch::Context>,
+    pub(crate) service_worker_reply: Option<std::sync::Arc<crate::service_worker::WindowReply>>,
+    /// The target's page actor already ran HTML #abort-a-document-and-its-
+    /// descendants before handing this navigation to its frontend.
+    pub(crate) document_aborted: bool,
     /// The source Document's URL: Fetch Metadata's and SameSite's client.
     pub client: Url,
     /// Fetch #concept-request-referrer once "client" is resolved
@@ -10255,6 +10332,9 @@ impl NavigationInitiator {
     /// referrer `policy`, with no element-specific referrer policy.
     pub fn document(url: &Url, policy: crate::referrer_policy::ReferrerPolicy) -> Self {
         Self {
+            service_worker_context: None,
+            service_worker_reply: None,
+            document_aborted: false,
             client: url.clone(),
             referrer: url.origin().is_tuple().then(|| url.clone()),
             referrer_policy: policy,
@@ -10275,6 +10355,9 @@ impl NavigationInitiator {
         Self {
             client: url.clone(),
             referrer: None,
+            service_worker_context: None,
+            service_worker_reply: None,
+            document_aborted: false,
             referrer_policy: crate::referrer_policy::ReferrerPolicy::NoReferrer,
             policy_container: entry.referrer_policy,
             blob: Some(entry),
@@ -12744,6 +12827,8 @@ mod tests {
             timing_client: None,
             use_cors_preflight: false,
             redirect: RedirectMode::Follow,
+            service_worker: None,
+            web: Default::default(),
             referrer_policy: None,
             fetch_policy: Some(FetchPolicy {
                 origin: Url::parse("https://app.example").unwrap(),
@@ -13592,6 +13677,7 @@ mod tests {
             Default::default(),
             &cache,
             runtime.handle(),
+            None,
             std::sync::Arc::new(move |timing| {
                 if let Some(cache) = held.upgrade() {
                     cache.report_speculative_timing(timing);
@@ -21442,6 +21528,8 @@ customElements.define('lit-counter', LitCounter);
             timing_client: None,
             use_cors_preflight: false,
             redirect: RedirectMode::Follow,
+            service_worker: None,
+            web: Default::default(),
             referrer_policy: None,
             fetch_policy: None,
         };
@@ -21468,6 +21556,8 @@ customElements.define('lit-counter', LitCounter);
                 timing_client: None,
                 use_cors_preflight: false,
                 redirect: RedirectMode::Follow,
+                service_worker: None,
+                web: Default::default(),
                 referrer_policy: None,
                 fetch_policy: None,
             };
@@ -21492,6 +21582,8 @@ customElements.define('lit-counter', LitCounter);
             timing_client: None,
             use_cors_preflight: false,
             redirect: RedirectMode::Follow,
+            service_worker: None,
+            web: Default::default(),
             referrer_policy: None,
             fetch_policy: None,
         };
@@ -21560,6 +21652,8 @@ customElements.define('lit-counter', LitCounter);
             timing_client: None,
             use_cors_preflight: false,
             redirect: RedirectMode::Follow,
+            service_worker: None,
+            web: Default::default(),
             referrer_policy: None,
             fetch_policy: None,
         };
@@ -22432,6 +22526,8 @@ customElements.define('lit-counter', LitCounter);
             timing_client: None,
             use_cors_preflight: false,
             redirect: RedirectMode::Follow,
+            service_worker: None,
+            web: Default::default(),
             referrer_policy: None,
             fetch_policy: None,
         };
@@ -22493,6 +22589,8 @@ customElements.define('lit-counter', LitCounter);
             timing_client: None,
             use_cors_preflight: false,
             redirect: RedirectMode::Follow,
+            service_worker: None,
+            web: Default::default(),
             referrer_policy: None,
             fetch_policy: None,
         };
@@ -24779,6 +24877,7 @@ pub(crate) mod referer_server {
     pub(crate) struct Server {
         pub(crate) base: String,
         pub(crate) log: Log,
+        pub(crate) heads: Arc<Mutex<Vec<String>>>,
         task: tokio::task::JoinHandle<()>,
     }
 
@@ -24790,6 +24889,8 @@ pub(crate) mod referer_server {
             let base = format!("http://{}", listener.local_addr().unwrap());
             let log: Log = Arc::default();
             let record = log.clone();
+            let heads: Arc<Mutex<Vec<String>>> = Arc::default();
+            let requests = heads.clone();
             let route = Arc::new(route);
             let task = tokio::spawn(async move {
                 loop {
@@ -24797,6 +24898,7 @@ pub(crate) mod referer_server {
                         return;
                     };
                     let record = record.clone();
+                    let requests = requests.clone();
                     let route = route.clone();
                     tokio::spawn(async move {
                         let mut request = Vec::new();
@@ -24808,6 +24910,7 @@ pub(crate) mod referer_server {
                             }
                         }
                         let head = String::from_utf8_lossy(&request).into_owned();
+                        requests.lock().unwrap().push(head.clone());
                         let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
                         let referer = head.lines().find_map(|line| {
                             line.split_once(':')
@@ -24826,7 +24929,12 @@ pub(crate) mod referer_server {
                     });
                 }
             });
-            Self { base, log, task }
+            Self {
+                base,
+                log,
+                heads,
+                task,
+            }
         }
 
         /// The `Referer` of the first request for `path`: `None` while it was

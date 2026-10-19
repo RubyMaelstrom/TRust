@@ -28,6 +28,7 @@ use unicode_segmentation::UnicodeSegmentation as _;
 use crate::core::{ImeAction, Key, KeyInput, KeyState};
 
 mod cells;
+pub(crate) mod context;
 pub(crate) mod dom_context;
 mod layout_cache;
 mod outline;
@@ -1695,64 +1696,15 @@ impl TextSystem {
         if text.is_empty() || style.size <= 0.0 {
             return Vec::new();
         }
-        // Parley keeps a cluster's byte offset within its run in 16 bits, so
-        // in a run over 64 KiB the offsets wrap and a line's text range goes
-        // invalid. Break such a paragraph through windows well below that:
-        // lay a window, keep its complete lines, and lay again from the
-        // start of its last line, which may continue past the window. The
-        // greedy breaker settles each kept line within the window, so these
-        // are the paragraph's own lines. A window without a break opportunity
-        // (an unbreakable run of that length) becomes one line.
-        // Synthesized small capitals can triple a cluster's bytes.
-        let expands = style
-            .typography
-            .as_ref()
-            .is_some_and(|t| t.caps != typography::Caps::Normal);
-        let (limit, window) = if expands {
-            (usize::from(u16::MAX) / 3, 1 << 13)
-        } else {
-            (usize::from(u16::MAX), 1 << 15)
-        };
-        if text.len() <= limit {
-            return self
-                .wrapped_window(text, style, first_width, width, breaks)
-                .0;
-        }
-        let mut lines = Vec::new();
-        let mut start = 0;
-        while start < text.len() {
-            let mut end = (start + window).min(text.len());
-            while !text.is_char_boundary(end) {
-                end -= 1;
-            }
-            if end < text.len()
-                && let Some(space) = text[start..end].rfind(char::is_whitespace)
-                && space > 0
-            {
-                end = start
-                    + space
-                    + text[start + space..]
-                        .chars()
-                        .next()
-                        .map_or(1, char::len_utf8);
-            }
-            let line_width = if lines.is_empty() { first_width } else { width };
-            let (mut window, last_start) =
-                self.wrapped_window(&text[start..end], style, line_width, width, breaks);
-            if end == text.len() || window.len() < 2 {
-                lines.append(&mut window);
-                start = end;
-                continue;
-            }
-            window.pop();
-            lines.append(&mut window);
-            start += last_start;
-        }
-        lines
+        // CSS Text 3 #word-break-shaping keeps one context through soft
+        // wraps. The owned Parley offset correction also makes this safe for
+        // long paragraphs; an arbitrary byte window must not sever a word.
+        self.wrapped_window(text, style, first_width, width, breaks)
+            .0
     }
 
-    /// Break one paragraph (at most 64 KiB once prepared) into lines; also
-    /// returns the byte offset at which its last line starts.
+    /// Break one complete paragraph, retaining its original shaping context.
+    /// Also returns the source byte offset at which its last line starts.
     fn wrapped_window(
         &mut self,
         text: &str,
@@ -2344,6 +2296,90 @@ pub fn shape(text: &str, style: &TextStyle) -> ShapedText {
     })
 }
 
+/// Prepared source bytes, independent of retained glyph copies and wall time.
+#[cfg(test)]
+pub(crate) fn shaping_work_bytes() -> usize {
+    TEXT.with_borrow(|system| system.shaped_input_bytes)
+}
+
+/// Shape a retained inline context with each glyph's actual source cluster,
+/// including all components of a ligature. Ink bounds alone cannot identify
+/// ownership: an independent italic glyph may overhang its neighbor.
+pub(crate) fn shape_context(
+    text: &str,
+    style: &TextStyle,
+    direction: Option<bool>,
+) -> (ShapedText, Vec<Vec<Range<usize>>>) {
+    if let Some(cells) = cell_metrics() {
+        let shaped = cells::shape(text, style, cells);
+        return (
+            if direction == Some(true) {
+                shaped.mirrored_cells()
+            } else {
+                shaped
+            },
+            Vec::new(),
+        );
+    }
+    let mut forced = String::new();
+    if let Some(rtl) = direction {
+        forced.push(if rtl { '\u{202e}' } else { '\u{202d}' });
+        forced.push_str(text);
+    }
+    let prefix = if direction.is_some() { 3 } else { 0 };
+    let source = if prefix == 0 { text } else { &forced };
+    TEXT.with_borrow_mut(|system| {
+        system.select_fonts(style.font_set.as_ref());
+        if source.is_empty() || style.size <= 0. {
+            return (zero_size_shape(text, style), Vec::new());
+        }
+        let prepared = system.prepare(source, style, None);
+        let mut layout = system.prepared_layout::<()>(&prepared, style, true, None, &[]);
+        layout.break_all_lines(None);
+        let mut sources = Vec::new();
+        let mut shaped = layout
+            .lines()
+            .next()
+            .map_or_else(ShapedText::default, |line| {
+                retain_line_with_sources(
+                    &prepared.text,
+                    &line,
+                    &prepared.synthesis,
+                    &prepared.blocked,
+                    prepared.map.as_ref(),
+                    Some(&mut sources),
+                )
+            });
+        system.finish_line(
+            &mut shaped,
+            &prepared,
+            source,
+            0..prepared.text.len(),
+            style,
+        );
+        shaped.text = source.to_owned();
+        shaped.underline = style.underline;
+        shaped.strikethrough = style.strikethrough;
+        if prefix > 0 {
+            let mut run_index = 0;
+            sources.retain(|_| {
+                let keep = shaped.runs[run_index].text_range.end > prefix;
+                run_index += 1;
+                keep
+            });
+            shaped = shaped.without_leading_control(prefix, text);
+            for run in &mut sources {
+                run.retain(|range| range.end > prefix);
+                for range in run {
+                    range.start = range.start.saturating_sub(prefix);
+                    range.end = range.end.saturating_sub(prefix);
+                }
+            }
+        }
+        (shaped, sources)
+    })
+}
+
 /// Shape `text`, all of whose characters the paragraph's Unicode
 /// Bidirectional Algorithm resolved to one embedding level, in that level's
 /// direction (`rtl` for an odd level): UAX #9 L2 reverses an odd-level run,
@@ -2652,6 +2688,17 @@ fn retain_line<B: parley::Brush>(
     blocked: &[Range<usize>],
     map: Option<&typography::OffsetMap>,
 ) -> ShapedText {
+    retain_line_with_sources(text, line, synthesis, blocked, map, None)
+}
+
+fn retain_line_with_sources<B: parley::Brush>(
+    text: &str,
+    line: &parley::Line<'_, B>,
+    synthesis: &SynthesisPolicy,
+    blocked: &[Range<usize>],
+    map: Option<&typography::OffsetMap>,
+    mut sources: Option<&mut Vec<Vec<Range<usize>>>>,
+) -> ShapedText {
     let range = line.text_range();
     let line_text = &text[range.clone()];
     let metrics = line.metrics();
@@ -2704,11 +2751,49 @@ fn retain_line<B: parley::Brush>(
     let mut masked_run = None;
     let mut mask = Vec::new();
     let mut glyph_index = 0;
+    let mut source_run = None;
+    let mut source_ranges = Vec::new();
+    let mut source_index = 0;
     for item in line.items() {
         let PositionedLayoutItem::GlyphRun(glyph_run) = item else {
             continue;
         };
         let run = glyph_run.run();
+        if sources.is_some() {
+            let key = (run.index(), run.cluster_range());
+            if source_run.as_ref() != Some(&key) {
+                source_run = Some(key);
+                source_ranges.clear();
+                source_index = 0;
+                // The ligature start is visually first, including in an
+                // RTL run whose logical first cluster is a continuation.
+                let clusters: Vec<_> = run.visual_clusters().collect();
+                let mut at = 0;
+                while at < clusters.len() {
+                    let mut end = at + 1;
+                    while end < clusters.len() && clusters[end].is_ligature_continuation() {
+                        end += 1;
+                    }
+                    let start_byte = clusters[at..end]
+                        .iter()
+                        .map(|c| c.text_range().start)
+                        .min()
+                        .unwrap();
+                    let end_byte = clusters[at..end]
+                        .iter()
+                        .map(|c| c.text_range().end)
+                        .max()
+                        .unwrap();
+                    let range = start_byte..end_byte;
+                    let range = map.map_or(range.clone(), |map| map.range_to_source(range));
+                    for cluster in &clusters[at..end] {
+                        source_ranges
+                            .extend(std::iter::repeat_n(range.clone(), cluster.glyphs().count()));
+                    }
+                    at = end;
+                }
+            }
+        }
         if !blocked.is_empty() {
             let key = (run.index(), run.cluster_range());
             if masked_run.as_ref() != Some(&key) {
@@ -2729,6 +2814,7 @@ fn retain_line<B: parley::Brush>(
             }
         }
         let (synthesis, policy) = (run.synthesis(), synthesis);
+        let mut retained_sources = Vec::new();
         runs.push(ShapedRun {
             font: FontFace(run.font().clone()),
             font_size: run.font_size(),
@@ -2739,6 +2825,13 @@ fn retain_line<B: parley::Brush>(
                 .filter_map(|glyph| {
                     let hidden = mask.get(glyph_index).copied().unwrap_or(false);
                     glyph_index += 1;
+                    if sources.is_some() {
+                        if !hidden {
+                            retained_sources
+                                .push(source_ranges.get(source_index).cloned().unwrap_or_default());
+                        }
+                        source_index += 1;
+                    }
                     (!hidden).then_some(ShapedGlyph {
                         id: glyph.id,
                         x: glyph.x,
@@ -2753,6 +2846,9 @@ fn retain_line<B: parley::Brush>(
             synth_bold: synthesis.embolden() && policy.weight,
             synth_skew_degrees: synthesis.skew().filter(|_| policy.style),
         });
+        if let Some(sources) = sources.as_mut() {
+            sources.push(retained_sources);
+        }
     }
     ShapedText {
         text: line_text.to_string(),
@@ -3004,7 +3100,7 @@ mod tests {
 
     #[test]
     fn wrapped_lines_break_paragraphs_longer_than_a_parley_run() {
-        // Parley keeps a cluster's offset in its run in 16 bits. A preserved
+        // Regression for Parley's former 16-bit cluster offsets: a preserved
         // paragraph over 64 KiB (a pasted log line in a textarea) must still
         // break into the lines the greedy breaker gives a shorter prefix,
         // partitioning the text, instead of panicking on wrapped offsets.

@@ -224,9 +224,20 @@ impl Dom {
     /// The imported sheet fetched for an absolute request URL, as
     /// `[text, base, CORS-same-origin]` for the CSSOM (CSSImportRule's
     /// associated style sheet), or `None` when no import fetched it.
-    pub(crate) fn imported_sheet_source(&self, url: &str) -> Option<String> {
-        let sheet = self.imported_sheets.get(url)?;
+    pub(crate) fn imported_sheet_source(&self, url: &str, document: NodeId) -> Option<String> {
+        let sheet = self.imported_sheet_for_document(document, url)?;
         Some(json!([sheet.text, sheet.base, sheet.cors_same_origin]).to_string())
+    }
+
+    pub(super) fn imported_sheet_for_document(
+        &self,
+        document: NodeId,
+        url: &str,
+    ) -> Option<&ImportedSheet> {
+        self.document_imported_sheets
+            .get(&document)
+            .and_then(|sheets| sheets.get(url))
+            .or_else(|| self.imported_sheets.get(url))
     }
 
     /// CSS Cascade 5 #at-import for the cascade: `css` with each valid
@@ -248,9 +259,11 @@ impl Dom {
             return None;
         }
         crate::http::splice_imports(css, base, own_url, &|url| {
+            let document = owner
+                .and_then(|owner| self.owner_document(owner))
+                .unwrap_or(self.document());
             let found = self
-                .imported_sheets
-                .get(url)
+                .imported_sheet_for_document(document, url)
                 .map(|sheet| (sheet.text.as_str(), sheet.base.as_str()));
             if found.is_none()
                 && let Some(owner) = owner
@@ -264,7 +277,10 @@ impl Dom {
     /// Request the sheet an applicable `@import` of `owner`'s sheet names,
     /// unless it was requested (or obtained) before.
     pub(crate) fn request_import(&self, owner: NodeId, url: &str) {
-        if self.imported_sheets.contains_key(url) {
+        if self
+            .imported_sheet_for_document(self.owner_document(owner).unwrap_or(self.document()), url)
+            .is_some()
+        {
             return;
         }
         let mut requests = self.import_requests.borrow_mut();
@@ -296,7 +312,11 @@ impl Dom {
         for sheet in self.external_sheets.values() {
             sources.push((sheet.text.clone(), url::Url::parse(&sheet.base).ok()));
         }
-        for sheet in self.imported_sheets.values() {
+        for sheet in self.imported_sheets.values().chain(
+            self.document_imported_sheets
+                .values()
+                .flat_map(|sheets| sheets.values()),
+        ) {
             sources.push((sheet.text.clone(), url::Url::parse(&sheet.base).ok()));
         }
         let mut requests = self.import_requests.borrow_mut();
@@ -339,7 +359,7 @@ impl Dom {
                 &linked.text,
                 base.as_ref(),
                 Some(&linked.location),
-                None,
+                Some(id),
             ) && let Some(linked) = self.external_sheets.get_mut(&id)
             {
                 linked.cascade = cascade;
@@ -1053,10 +1073,12 @@ pub(super) fn accepts_longhand(property: &str, value: &str) -> bool {
         {
             let allowed_keyword = match p {
                 "width" | "height" | "min-width" | "min-height" | "flex-basis" => {
-                    one_of("auto min-content max-content fit-content")
+                    one_of("auto min-content max-content fit-content stretch")
                         || p == "flex-basis" && value == "content"
                 }
-                "max-width" | "max-height" => one_of("none min-content max-content fit-content"),
+                "max-width" | "max-height" => {
+                    one_of("none min-content max-content fit-content stretch")
+                }
                 "top" | "right" | "bottom" | "left" | "margin-top" | "margin-right"
                 | "margin-bottom" | "margin-left" | "column-width" => value == "auto",
                 "font-size" => one_of(

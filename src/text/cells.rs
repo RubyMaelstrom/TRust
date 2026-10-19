@@ -132,7 +132,10 @@ fn segmenter(word_break: TextWordBreak) -> icu_segmenter::LineSegmenterBorrowed<
 
 /// UAX #14 soft wrap opportunities after the start of `text`, in order. The
 /// end of the text is always the last.
-fn opportunities(text: &str, word_break: TextWordBreak) -> impl Iterator<Item = usize> + '_ {
+pub(super) fn opportunities(
+    text: &str,
+    word_break: TextWordBreak,
+) -> impl Iterator<Item = usize> + '_ {
     segmenter(word_break)
         .segment_str(text)
         .filter(|&index| index > 0 && index <= text.len())
@@ -162,10 +165,45 @@ pub(super) fn first_line_end(
     if !breaks.wrap {
         return text.len();
     }
-    let fits = |end: usize| hanging_advance(&text[..end], cells) <= width + 0.01;
+    first_line_end_measured(text, width, breaks, |end| {
+        hanging_advance(&text[..end], cells)
+    })
+}
+
+/// The same UAX #14 / CSS emergency-break algorithm over an already shaped
+/// context: measuring a prefix must not discard the surrounding glyphs.
+pub(super) fn first_line_end_measured(
+    text: &str,
+    width: f32,
+    breaks: TextBreakStyle,
+    advance: impl Fn(usize) -> f32,
+) -> usize {
+    first_line_end_at(
+        text,
+        width,
+        breaks,
+        advance,
+        opportunities(text, breaks.word_break),
+    )
+}
+
+pub(super) fn first_line_end_at(
+    text: &str,
+    width: f32,
+    breaks: TextBreakStyle,
+    advance: impl Fn(usize) -> f32,
+    opportunities: impl Iterator<Item = usize>,
+) -> usize {
+    if text.is_empty() || width <= 0. {
+        return 0;
+    }
+    if !breaks.wrap {
+        return text.len();
+    }
+    let fits = |end: usize| advance(end) <= width + 0.01;
     let mut first = None;
     let mut last_fitting = None;
-    for index in opportunities(text, breaks.word_break) {
+    for index in opportunities {
         first.get_or_insert(index);
         if !fits(index) {
             break;

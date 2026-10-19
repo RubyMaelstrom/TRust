@@ -7,6 +7,9 @@ use crate::service_worker::{
     scripts,
 };
 use futures::FutureExt;
+use std::collections::BTreeMap;
+#[path = "service_worker_host/fetch.rs"]
+pub(crate) mod fetch;
 use std::sync::{
     Mutex, Weak,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -176,13 +179,28 @@ fn release_packet(ports: &Arc<Mutex<message_port_host::Registry>>, packet: &str)
     }
 }
 
-fn client_for_context(state: &HostState, context: u64) -> Option<Arc<sw::Client>> {
+pub(super) fn client_for_context(state: &HostState, context: u64) -> Option<Arc<sw::Client>> {
     state
         .service_workers
         .endpoints
         .get(&context)
         .map(|endpoint| endpoint.client.clone())
         .or_else(|| state.service_workers.documents.get(&context).cloned())
+}
+
+fn local_file_access_for_context(state: &HostState, context: u64) -> bool {
+    if let Some(worker) = &state.worker_self {
+        // WorkerLaunch.owner_page is the creator's native effective client;
+        // sandboxed/other opaque creators already carry about:blank there.
+        return crate::file::is_local_url(&worker.origin);
+    }
+    !state.sandboxed_origins.contains(&context)
+        && crate::file::is_local_url(
+            state
+                .window_request_urls
+                .get(&context)
+                .unwrap_or(&state.base),
+        )
 }
 
 /// Create an environment before author scripts, including for a static page.
@@ -206,6 +224,7 @@ pub(crate) fn document(
             matches!(url.scheme(), "http" | "https"),
         )
         .ok()?;
+    client.set_local_file_access(crate::file::is_local_url(url));
     client.set_execution_ready();
     let document = sw::DocumentClient::new(client);
     document.presentation(traversable.hidden, traversable.focused);
@@ -215,13 +234,45 @@ pub(crate) fn document(
 /// Native Window setup prepares an owned environment even if the child is
 /// insecure and has no ServiceWorkerContainer. Its parent Document retains
 /// it when the idle shared actor retires (HTML #creating-a-new-browsing-context).
-pub(super) fn child_document(state: &mut HostState, context: u64, parent: u64, url: url::Url) {
+pub(super) fn child_document(
+    state: &mut HostState,
+    context: u64,
+    parent: u64,
+    node: usize,
+    url: url::Url,
+) {
+    let navigation_reply = state.service_workers.navigation_replies.remove(&node);
     let Some(owner) = state.service_workers.document_owners.get(&parent).cloned() else {
         return;
     };
     let Some(profile) = profile(state) else {
         return;
     };
+    if let Some(document) = state.service_workers.navigation_documents.remove(&node) {
+        let origin = realm_origin(state, context);
+        let partition = state
+            .window_cookie_contexts
+            .get(&context)
+            .map(|(_, _, cookies)| cookies.storage_partition())
+            .unwrap_or("");
+        let key = if !origin.is_tuple() || partition == "null" {
+            "null".into()
+        } else if partition.is_empty() {
+            origin.ascii_serialization()
+        } else {
+            format!("{}^{partition}", origin.ascii_serialization())
+        };
+        document.client().set_document_origin(origin);
+        document.client().set_storage_key(key);
+        document
+            .client()
+            .set_local_file_access(local_file_access_for_context(state, context));
+        owner.adopt_child(context, &document);
+        state
+            .service_workers
+            .document(context, &document, state.blobs.clone(), state.blob_agent);
+        return;
+    }
     let origin = realm_origin(state, context);
     let partition = state
         .window_cookie_contexts
@@ -247,6 +298,12 @@ pub(super) fn child_document(state: &mut HostState, context: u64, parent: u64, u
         return;
     };
     client.set_secure_context(secure);
+    client.set_local_file_access(local_file_access_for_context(state, context));
+    if !navigation && client.origin().is_tuple() && client.origin() == owner.client().origin() {
+        // SW #control-and-use-window-client: an initial local blank/srcdoc
+        // (or same-origin blob Document) inherits its creator's controller.
+        client.inherit_controller(&owner.client());
+    }
     let mut window = owner.client().window_state();
     window.frame_type = "nested".into();
     window.focused = false;
@@ -254,6 +311,7 @@ pub(super) fn child_document(state: &mut HostState, context: u64, parent: u64, u
     window.ancestor_origins.clear(); // The Window bootstrap supplies its privacy-filtered list.
     client.configure(sw::ClientKind::Window, window);
     let child = sw::DocumentClient::new(client);
+    child.navigation_reply(navigation_reply);
     owner.adopt_child(context, &child);
     state
         .service_workers
@@ -271,6 +329,7 @@ pub(super) struct Runtime {
     ended: tokio::sync::Notify,
     next_event: AtomicU64,
     events: Mutex<HashMap<u64, tokio::sync::oneshot::Sender<bool>>>,
+    fetches: Mutex<HashMap<u64, Weak<fetch::Exchange>>>,
     last_event: Mutex<Instant>,
 }
 
@@ -327,6 +386,16 @@ impl Runtime {
             "Service-worker agent failed to start",
         )));
         self.events.lock().unwrap().clear();
+        let exchanges: Vec<_> = self
+            .fetches
+            .lock()
+            .unwrap()
+            .drain()
+            .filter_map(|(_, e)| e.upgrade())
+            .collect();
+        for exchange in exchanges {
+            exchange.failed();
+        }
         self.finished.store(true, Ordering::Release);
         self.ended.notify_waiters();
     }
@@ -349,7 +418,14 @@ impl Runtime {
     }
     pub(super) fn idle_remaining(&self) -> Option<Duration> {
         let events = self.events.lock().unwrap();
-        if !events.is_empty() {
+        if !events.is_empty()
+            || self
+                .fetches
+                .lock()
+                .unwrap()
+                .values()
+                .any(|e| e.strong_count() != 0)
+        {
             return None;
         }
         let remaining = IDLE_TIMEOUT.saturating_sub(self.last_event.lock().unwrap().elapsed());
@@ -666,6 +742,7 @@ impl Profile {
             ended: tokio::sync::Notify::new(),
             next_event: AtomicU64::new(1),
             events: Mutex::default(),
+            fetches: Mutex::default(),
             last_event: Mutex::new(Instant::now()),
         });
         let scope = Arc::new(Scope {
@@ -693,6 +770,7 @@ impl Profile {
             secure_context: true,
             shared: false,
             service: Some(scope),
+            client: None,
             // Service workers have a distinct agent cluster. SAB must not be
             // serialized across this boundary (HTML structured serialization).
             agent_cluster: next_agent_cluster_id(),
@@ -756,6 +834,69 @@ impl Profile {
         Ok(())
     }
 
+    // Service Workers #soft-update-algorithm: use the same per-scope FIFO as
+    // explicit updates, but no realm or author-visible promise is retained.
+    fn soft_update(self: &Arc<Self>, registration: &Arc<sw::Registration>) {
+        let Some(worker) = registration.newest() else {
+            return;
+        };
+        let Some(version) = worker.version.lock().unwrap().clone() else {
+            return;
+        };
+        if registration
+            .soft_update_pending
+            .swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        struct Pending(Arc<sw::Registration>);
+        impl Drop for Pending {
+            fn drop(&mut self) {
+                self.0.soft_update_pending.store(false, Ordering::Release);
+            }
+        }
+        let pending = Pending(registration.clone());
+        let options = RegistrationOptions {
+            script: worker.script.clone(),
+            scope: registration.scope.clone(),
+            kind: worker.kind,
+            update_via_cache: registration.info().update_via_cache,
+        };
+        let key = registration.key.clone();
+        let spec = jobs::Spec {
+            kind: jobs::Kind::Update,
+            key: key.clone(),
+            scope: options.scope.to_string(),
+            script: options.script.to_string(),
+            worker_type: options.kind,
+            update_via_cache: options.update_via_cache,
+        };
+        let owner = self.clone();
+        let (completion, primary) = self.queues.schedule(
+            &self.handle,
+            spec,
+            Box::new(|_| {}),
+            Box::new(move |completion| {
+                async move {
+                    let _pending = pending;
+                    owner
+                        .update(
+                            key,
+                            options,
+                            version.environment.clone(),
+                            jobs::Kind::Update,
+                            completion,
+                        )
+                        .await
+                }
+                .boxed()
+            }),
+        );
+        if primary {
+            completion.settled();
+        }
+    }
+
     async fn update(
         self: &Arc<Self>,
         key: String,
@@ -796,7 +937,7 @@ impl Profile {
             }
         }
         let prepared = self
-            .prepare_version(&options, &environment, newest.as_ref())
+            .prepare_version(&options, &environment, newest.as_ref(), &registration)
             .await;
         let (version, changed) = match prepared {
             Ok(prepared) => prepared,
@@ -873,6 +1014,7 @@ impl Profile {
         options: &RegistrationOptions,
         environment: &scripts::Environment,
         newest: Option<&Arc<Worker>>,
+        registration: &Arc<sw::Registration>,
     ) -> Result<(Arc<scripts::Version>, bool), Error> {
         let root = scripts::fetch(
             options.script.clone(),
@@ -881,13 +1023,32 @@ impl Profile {
             &self.budget,
         )
         .await?;
+        // This loader always checks the network, never a local HTTP cache.
+        *registration.last_update_check.lock().unwrap() = Some(Instant::now());
         let resources = scripts::Resources::new(options.script.clone(), root.clone());
+        let modules = if options.kind == WorkerType::Module {
+            self.prepare_modules(options, environment, root.clone())
+                .await?
+        } else {
+            BTreeMap::new()
+        };
         let old = newest.and_then(|worker| worker.version.lock().unwrap().clone());
         let mut changed = newest
             .is_none_or(|worker| worker.script != options.script || worker.kind != options.kind)
             || old
                 .as_ref()
                 .is_none_or(|version| version.root.bytes != root.bytes);
+        if options.kind == WorkerType::Module {
+            changed |= old.as_ref().is_none_or(|version| {
+                version.modules.len() != modules.len()
+                    || modules.iter().any(|(key, script)| {
+                        version
+                            .modules
+                            .get(key)
+                            .is_none_or(|old| old.bytes != script.bytes)
+                    })
+            });
+        }
         if !changed
             && let Some(old) = old
             && old.resources.classic_imported()
@@ -908,9 +1069,119 @@ impl Profile {
                 root,
                 resources,
                 environment: environment.clone(),
+                modules,
             }),
             changed,
         ))
+    }
+
+    async fn prepare_modules(
+        &self,
+        options: &RegistrationOptions,
+        environment: &scripts::Environment,
+        root: Arc<scripts::Script>,
+    ) -> Result<BTreeMap<(String, Option<String>), Arc<scripts::Script>>, Error> {
+        // SW #is-async-module-algorithm inspects every requested module before
+        // Run Service Worker evaluates anything, including unreachable await.
+        let mut modules = BTreeMap::new();
+        let mut queued = std::collections::HashSet::from([(options.script.to_string(), None)]);
+        let mut pending =
+            std::collections::VecDeque::from([(options.script.clone(), None, Some(root))]);
+        while let Some((url, kind, provided)) = pending.pop_front() {
+            let key = (url.to_string(), kind.clone());
+            if modules.contains_key(&key) {
+                continue;
+            }
+            if modules.len() >= 512 {
+                return Err(Error::new(
+                    "QuotaExceededError",
+                    "Service-worker module graph is too large",
+                ));
+            }
+            let script = match provided {
+                Some(script) => script,
+                None if matches!(url.scheme(), "data" | "blob") => {
+                    // HTML #fetch-a-single-module-script uses Fetch's scheme
+                    // fetch for descendants too; only the registration URL is
+                    // restricted to HTTP(S). Retain these bytes in the version
+                    // so a revoked Blob URL does not change a restarted worker.
+                    let (mime, bytes) = if url.scheme() == "data" {
+                        if url.as_str().len() > 24 * 1024 * 1024 {
+                            return Err(Error::new(
+                                "QuotaExceededError",
+                                "Module data URL is too large",
+                            ));
+                        }
+                        (
+                            data_url_content_type(url.as_str()),
+                            crate::img::decode_data_url(url.as_str())
+                                .ok_or_else(|| Error::type_error("Invalid module data URL"))?,
+                        )
+                    } else {
+                        let entry = self
+                            .blobs
+                            .obtain(
+                                url.as_str(),
+                                Some(&blob_storage_key(&environment.origin.origin())),
+                            )
+                            .ok_or_else(|| Error::type_error("Module Blob URL is unavailable"))?;
+                        if entry.size() > 16 * 1024 * 1024 {
+                            return Err(Error::new(
+                                "QuotaExceededError",
+                                "Module Blob is too large",
+                            ));
+                        }
+                        (
+                            entry.content_type.clone(),
+                            entry
+                                .read()
+                                .map_err(|_| Error::type_error("Cannot read module Blob"))?,
+                        )
+                    };
+                    if !crate::http::module_response_allowed(200, &mime, kind.as_deref()) {
+                        return Err(Error::type_error(
+                            "Module MIME type does not match its import",
+                        ));
+                    }
+                    scripts::Script::new(
+                        url,
+                        bytes,
+                        vec![("content-type".into(), mime)],
+                        &self.budget,
+                    )?
+                }
+                None => {
+                    scripts::fetch_module(url, environment, &self.budget, kind.as_deref()).await?
+                }
+            };
+            if kind.is_none() {
+                let inspection = trust_js::inspect_module(&script.source)
+                    .map_err(|e| Error::type_error(format!("Module parse error: {}", e.message)))?;
+                if inspection.has_top_level_await {
+                    return Err(Error::type_error(
+                        "Service-worker modules cannot use top-level await",
+                    ));
+                }
+                for (specifier, kind) in inspection.requests {
+                    let url =
+                        resolve_module_specifier(&options.script, &specifier, script.url.as_str())
+                            .ok_or_else(|| {
+                                Error::type_error("Invalid service-worker module specifier")
+                            })?;
+                    if queued.insert((url.to_string(), kind.clone())) {
+                        if queued.len() > 512 {
+                            return Err(Error::new(
+                                "QuotaExceededError",
+                                "Service-worker module graph is too large",
+                            ));
+                        }
+                        pending.push_back((url, kind, None));
+                    }
+                }
+            }
+            modules.insert(key, script);
+        }
+        Ok(modules)
     }
 }
 
@@ -953,6 +1224,11 @@ impl Endpoint {
 pub(super) struct Agent {
     endpoints: HashMap<u64, Endpoint>,
     documents: HashMap<u64, Arc<sw::Client>>,
+    pub(super) navigation_documents: HashMap<usize, sw::DocumentClient>,
+    pub(super) prefetched_frames: crate::http::frames::ActorFrames,
+    pub(super) keep_native_windows: bool,
+    pub(super) navigation_replies: HashMap<usize, Arc<sw::WindowReply>>,
+    pub(super) top_navigation_reply: Option<Arc<sw::WindowReply>>,
     // A running Document may still execute unloading cleanup after its
     // frontend has moved on. Idle actor drop releases these handles; the
     // frontend then owns static Documents and their descendants alone.
@@ -997,6 +1273,9 @@ impl Agent {
         } else if let Some(endpoint) = self.endpoints.get(&context) {
             endpoint.client.set_execution_ready();
         }
+        if let Some(document) = self.document_owners.get(&context) {
+            document.committed();
+        }
     }
 }
 
@@ -1009,11 +1288,207 @@ fn packet(result: Result<serde_json::Value, Error>) -> serde_json::Value {
 
 pub(super) fn operation(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let op = host_arg_string(ctx, args, 0);
+    if op == "fetchChunk" {
+        return fetch::chunk(ctx, args);
+    }
+    if op == "fetchPreload" {
+        return fetch::preload(ctx, args);
+    }
     let context = args.get(1).and_then(Value::as_num_opt).unwrap_or(0.) as u64;
     let input = host_arg_string(ctx, args, 2);
     let input: serde_json::Value = serde_json::from_str(&input).unwrap_or_default();
     let result = operation_inner(ctx, &op, context, input);
     Ok(Value::from_string(packet(result).to_string()))
+}
+
+/// HTML #initialise-the-document-object's initial-about:blank exception:
+/// replace the Document while retaining its Window, ESO and client id.
+fn initial_navigation(
+    ctx: &mut Ctx,
+    context: u64,
+    input: &serde_json::Value,
+) -> Result<serde_json::Value, Error> {
+    use serde_json::json;
+    let node = input["frame"]
+        .as_u64()
+        .ok_or_else(|| Error::type_error("Missing initial navigable"))? as usize;
+    let url = url::Url::parse(input["url"].as_str().unwrap_or(""))
+        .map_err(|_| Error::type_error("Invalid initial navigation URL"))?;
+    let state = ctx
+        .host_mut::<HostState>()
+        .ok_or_else(|| Error::type_error("Missing Window settings"))?;
+    if state.frame_contexts.get(&node) != Some(&context) {
+        return Err(Error::type_error(
+            "Initial navigable does not own these settings",
+        ));
+    }
+    let parent = state
+        .window_parents
+        .get(&context)
+        .copied()
+        .unwrap_or(state.top_context);
+    let origin = realm_origin(state, context);
+    let reserved = state
+        .service_workers
+        .navigation_documents
+        .get(&node)
+        .cloned();
+    let inherited = url.scheme() == "about" && matches!(url.path(), "blank" | "srcdoc");
+    let sandboxed = state.sandboxed_origins.contains(&parent) || {
+        let dom = state.dom.borrow();
+        dom.tag_name(node) == Some("iframe")
+            && dom.attr(node, "sandbox").is_some_and(|flags| {
+                !flags
+                    .split_ascii_whitespace()
+                    .any(|flag| flag.eq_ignore_ascii_case("allow-same-origin"))
+            })
+    };
+    let inherited_origin = inherited.then(|| realm_origin(state, parent));
+    let next_origin = reserved
+        .as_ref()
+        .map(|document| document.client().origin())
+        .unwrap_or_else(|| inherited_origin.unwrap_or_else(|| url.origin()));
+    let allowed = !sandboxed && origin == next_origin;
+    if input["check"].as_bool().unwrap_or(false) {
+        return Ok(json!({"allowed":allowed}));
+    }
+    if !allowed {
+        return Err(Error::security(
+            "Initial Window reuse requires the same origin",
+        ));
+    }
+    let creation = if inherited {
+        state
+            .window_request_urls
+            .get(&parent)
+            .unwrap_or(&state.base)
+            .clone()
+    } else {
+        url.clone()
+    };
+    let origin_client = request_origin_url(
+        &origin,
+        &creation,
+        !state.sandboxed_origins.contains(&context),
+    );
+    let parent_cookies = cookie_context_for_state(state, parent);
+    let mut cookies = crate::http::CookieContext::subresource(&origin_client);
+    cookies
+        .top_level_site
+        .clone_from(&parent_cookies.top_level_site);
+    cookies.cross_site_ancestor = parent_cookies.cross_site_ancestor
+        || parent_cookies
+            .client
+            .as_ref()
+            .is_none_or(|parent| !crate::site_storage::same_site(parent, &origin_client));
+    state.window_request_urls.insert(context, creation.clone());
+    state
+        .window_cookie_contexts
+        .insert(context, (node, url.clone(), cookies.clone()));
+    state
+        .dom
+        .borrow_mut()
+        .set_frame_cookie_restriction(node, cookies.cross_site_ancestor);
+    let policy = if matches!(url.scheme(), "about" | "blob" | "data") {
+        environment_referrer_policy(state, parent)
+    } else {
+        input["policy"]
+            .as_str()
+            .and_then(crate::referrer_policy::ReferrerPolicy::parse_attribute)
+            .unwrap_or_default()
+    };
+    let policy = {
+        let dom = state.dom.borrow();
+        dom.frame_document(node)
+            .and_then(|document| dom.parsed_referrer_meta_policy(document))
+            .unwrap_or(policy)
+    };
+    state.referrer_policies.insert(context, policy);
+    let owner = state.service_workers.document_owners.get(&context).cloned();
+    let client = client_for_context(state, context)
+        .or_else(|| owner.as_ref().map(sw::DocumentClient::client));
+    if let Some(client) = &client {
+        let previous = client.controller().map(|worker| worker.id);
+        let mut reply = state.service_workers.navigation_replies.remove(&node);
+        if let Some(reserved) = state.service_workers.navigation_documents.remove(&node) {
+            let replacement = reserved.client();
+            if !Arc::ptr_eq(client, &replacement) {
+                client.adopt_initial_navigation(&replacement);
+                reply = reserved.take_navigation_reply().or(reply);
+                reserved.discard();
+            }
+        } else if matches!(url.scheme(), "http" | "https") {
+            if let Some(registry) = client.registry() {
+                registry.select_navigation(client, &url);
+            }
+        } else if let Some(creator) = client_for_context(state, parent)
+            && creator.origin() == origin
+        {
+            client.inherit_controller(&creator);
+        }
+        client.set_document_url(url.clone());
+        client.set_local_file_access(local_file_access_for_context(state, context));
+        let partition = cookies.storage_partition();
+        client.set_storage_key(if !origin.is_tuple() || partition == "null" {
+            "null".into()
+        } else if partition.is_empty() {
+            origin.ascii_serialization()
+        } else {
+            format!("{}^{partition}", origin.ascii_serialization())
+        });
+        if let Some(owner) = &owner
+            && reply.is_some()
+        {
+            owner.navigation_reply(reply);
+        }
+        if previous != client.controller().map(|worker| worker.id) {
+            client.notify_controller_change();
+        }
+    } else {
+        // A DOM-only/insecure Window still commits native URL and policy
+        // state. No service-worker endpoint is required by this operation.
+        if let Some(reserved) = state.service_workers.navigation_documents.remove(&node) {
+            reserved.discard();
+        }
+        state.service_workers.navigation_replies.remove(&node);
+    }
+    let import_map = crate::import_maps::Handle::default();
+    state.import_maps.insert(context, import_map.clone());
+    let environment = ModuleFetchEnvironment {
+        blobs: state.blobs.clone(),
+        storage_key: blob_storage_key(&origin),
+        referrer_policy: policy,
+        service_worker: fetch::for_context(state, context),
+        origin: Some(origin_client),
+    };
+    if let Some(loader) = state.early_imports.borrow_mut().get_mut(&context) {
+        loader.page = creation;
+        loader.cookie_context = cookies.clone();
+        loader.import_map = import_map;
+        loader.environment = environment;
+    }
+    let (controller, ready) =
+        if let Some(endpoint) = state.service_workers.endpoints.get_mut(&context) {
+            endpoint.cookies = cookies;
+            let controller = endpoint.client.controller().map(|worker| worker.info());
+            let ready = endpoint
+                .profile
+                .registry
+                .matching(&endpoint.client.storage_key(), &endpoint.client.url())
+                .filter(|registration| registration.active().is_some())
+                .map(|registration| registration.info());
+            if let Some(info) = &controller {
+                endpoint.remember_worker(info);
+            }
+            if let Some(info) = &ready {
+                endpoint.remember(info);
+            }
+            (controller, ready)
+        } else {
+            (None, None)
+        };
+    state.service_workers.execution_ready(context);
+    Ok(json!({"updated":true,"controller":controller,"ready":ready}))
 }
 
 fn operation_inner(
@@ -1023,6 +1498,9 @@ fn operation_inner(
     input: serde_json::Value,
 ) -> Result<serde_json::Value, Error> {
     use serde_json::{Value as Json, json};
+    if op == "initialNavigation" {
+        return initial_navigation(ctx, context, &input);
+    }
     // Serialization already transferred these holders. Even a stale receiver
     // or an early native error must release them when no queue takes ownership.
     let mut message = if matches!(op, "postWorker" | "postClient") {
@@ -1047,6 +1525,9 @@ fn operation_inner(
             );
         }
         return Ok(Json::Null);
+    }
+    if matches!(op, "fetchResponse" | "fetchFallback") {
+        return fetch::response(ctx, op, input);
     }
     if op == "import" {
         return import(ctx, input["url"].as_str().unwrap_or(""));
@@ -1082,6 +1563,7 @@ fn operation_inner(
                     .reserve_client_with_origin(key, url, origin, false)?,
             };
             client.set_secure_context(input["secure"].as_bool().unwrap_or(false));
+            client.set_local_file_access(local_file_access_for_context(state, context));
             let kind = serde_json::from_value(input["kind"].clone()).unwrap_or_default();
             let window = serde_json::from_value(input["window"].clone()).unwrap_or_else(|_| {
                 sw::WindowState {
@@ -1100,7 +1582,7 @@ fn operation_inner(
                     Arc::new(move |notice| {
                         let _ = events.send(TrustJsHostTask::ServiceNotice { context, notice });
                     }),
-                    state.service_scope.is_none(),
+                    state.service_scope.is_none() && state.worker_self.is_none(),
                 );
             }
             // Transferred ports must use the same registry across tabs and
@@ -1125,7 +1607,7 @@ fn operation_inner(
         let ready = endpoint
             .profile
             .registry
-            .matching(&endpoint.client.key, &endpoint.client.url)
+            .matching(&endpoint.client.storage_key(), &endpoint.client.url())
             .filter(|r| r.active().is_some())
             .map(|r| r.info());
         let controller = endpoint.client.controller().map(|w| w.info());
@@ -1201,7 +1683,7 @@ fn operation_inner(
         .ok_or_else(|| Error::new("InvalidStateError", "Service-worker host is unavailable"))?;
     let profile = endpoint.profile.clone();
     let client = endpoint.client.clone();
-    if !client.origin.is_tuple() {
+    if !client.origin().is_tuple() {
         return Err(Error::security(
             "Service-worker storage requires a non-opaque origin",
         ));
@@ -1220,9 +1702,122 @@ fn operation_inner(
             result,
         });
     });
-    let base = url::Url::parse(input["base"].as_str().unwrap_or(client.url.as_str()))
+    let base = url::Url::parse(input["base"].as_str().unwrap_or(client.url().as_str()))
         .map_err(|_| Error::type_error("Invalid service-worker API base URL"))?;
     match op {
+        "focusClient" | "navigateClient" | "openWindow" => {
+            let permit = profile
+                .functional
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| {
+                    Error::new("QuotaExceededError", "Too many pending window operations")
+                })?;
+            let scope = state
+                .service_scope
+                .as_ref()
+                .ok_or_else(|| Error::type_error("Not a service worker"))?;
+            let worker = scope.worker.clone();
+            let registration = worker
+                .registration
+                .upgrade()
+                .ok_or_else(|| Error::type_error("Missing registration"))?;
+            let key = registration.key.clone();
+            let url = if op == "focusClient" {
+                None
+            } else {
+                let url = base
+                    .join(input["url"].as_str().unwrap_or(""))
+                    .map_err(|_| Error::type_error("Invalid window URL"))?;
+                if url.scheme() == "about" && url.path() == "blank" {
+                    return Err(Error::type_error("Cannot navigate to about:blank"));
+                }
+                Some(url)
+            };
+            let target = if op == "openWindow" {
+                None
+            } else {
+                let client = profile
+                    .registry
+                    .get_client(&key, input["client"].as_str().unwrap_or(""))
+                    .ok_or_else(|| Error::type_error("The window is no longer available"))?;
+                if op == "navigateClient" && client.controller().is_none_or(|w| w.id != worker.id) {
+                    return Err(Error::type_error(
+                        "The window is not controlled by this worker",
+                    ));
+                }
+                Some(client)
+            };
+            let needs_activation = op != "navigateClient";
+            let focus = op == "focusClient";
+            let windows = profile.registry.matching_clients(
+                &key,
+                worker.id,
+                true,
+                Some(sw::ClientKind::Window),
+            );
+            profile.handle.spawn(async move {
+                let _permit = permit;
+                let mut activated = None;
+                if needs_activation {
+                    for window in windows {
+                        if window
+                            .inspect()
+                            .await
+                            .ok()
+                            .flatten()
+                            .is_some_and(|i| i.window.transient_activation)
+                        {
+                            activated = Some(window);
+                            break;
+                        }
+                    }
+                    if activated.is_none() {
+                        reply(Err(Error::new(
+                            "InvalidAccessError",
+                            "No same-origin window has transient activation",
+                        )));
+                        return;
+                    }
+                }
+                let (target, operation) = if focus {
+                    (target.unwrap(), sw::WindowOperation::Focus)
+                } else if let Some(target) = target {
+                    (target, sw::WindowOperation::Navigate(url.unwrap()))
+                } else {
+                    (activated.unwrap(), sw::WindowOperation::Open(url.unwrap()))
+                };
+                reply(
+                    target
+                        .window_action(operation, key)
+                        .await
+                        .map(|info| json!(info).into()),
+                );
+            });
+        }
+        "preloadEnable" | "preloadDisable" | "preloadHeader" | "preloadState" => {
+            let registration = endpoint
+                .registrations
+                .get(&input["registration"].as_u64().unwrap_or(0))
+                .ok_or_else(|| Error::new("InvalidStateError", "Unknown registration"))?;
+            if op != "preloadState" && registration.active().is_none() {
+                reply(Err(Error::new(
+                    "InvalidStateError",
+                    "Registration has no active worker",
+                )));
+            } else {
+                let mut preload = registration.navigation_preload.lock().unwrap();
+                match op {
+                    "preloadEnable" => preload.enabled = true,
+                    "preloadDisable" => preload.enabled = false,
+                    "preloadHeader" => {
+                        preload.header_value = input["value"].as_str().unwrap_or("").to_string()
+                    }
+                    _ => (),
+                }
+                reply(Ok(serde_json::to_value(&*preload).unwrap().into()));
+            }
+        }
         "getClient" | "matchClients" => {
             let permit = profile
                 .functional
@@ -1288,7 +1883,7 @@ fn operation_inner(
             });
         }
         "getRegistrations" => reply(Ok(jobs::Output::registrations(
-            profile.registry.registrations(&client.key),
+            profile.registry.registrations(&client.storage_key()),
             true,
         ))),
         "getRegistration" => {
@@ -1296,13 +1891,13 @@ fn operation_inner(
                 .join(input["url"].as_str().unwrap_or(""))
                 .map_err(|_| Error::type_error("Invalid client URL"))?;
             url.set_fragment(None);
-            if url.origin() != client.origin {
+            if url.origin() != client.origin() {
                 return Err(Error::security("Client URL is not same origin"));
             }
             reply(Ok(jobs::Output::registrations(
                 profile
                     .registry
-                    .matching(&client.key, &url)
+                    .matching(&client.storage_key(), &url)
                     .into_iter()
                     .collect(),
                 false,
@@ -1348,7 +1943,7 @@ fn operation_inner(
             let options: RegistrationOptions = if kind == jobs::Kind::Register {
                 RegistrationOptions::parse(
                     &base,
-                    &client.origin,
+                    &client.origin(),
                     input["script"].as_str().unwrap_or(""),
                     input["scope"].as_str(),
                     serde_json::from_value(input["kind"].clone()).unwrap_or(WorkerType::Classic),
@@ -1358,12 +1953,12 @@ fn operation_inner(
             } else {
                 let scope = url::Url::parse(input["scope"].as_str().unwrap_or(""))
                     .map_err(|_| Error::type_error("Invalid registration scope"))?;
-                if scope.origin() != client.origin {
+                if scope.origin() != client.origin() {
                     return Err(Error::security("Registration is not same origin"));
                 }
                 let registration = profile
                     .registry
-                    .get(&client.key, &scope)
+                    .get(&client.storage_key(), &scope)
                     .filter(|r| Some(r.id) == input["registration"].as_u64());
                 if kind == jobs::Kind::Unregister && registration.is_none() {
                     reply(Ok(json!(false).into()));
@@ -1383,23 +1978,22 @@ fn operation_inner(
                 }
             };
             let environment = scripts::Environment {
-                client: environment_referrer_source(state, context)
-                    .unwrap_or_else(|| client.url.clone()),
-                origin: url::Url::parse(&client.origin.ascii_serialization())
+                client: environment_referrer_source(state, context).unwrap_or_else(|| client.url()),
+                origin: url::Url::parse(&client.origin().ascii_serialization())
                     .map_err(|_| Error::security("Invalid client origin"))?,
                 cookies,
                 referrer_policy: environment_referrer_policy(state, context),
             };
             let spec = jobs::Spec {
                 kind,
-                key: client.key.clone(),
+                key: client.storage_key(),
                 scope: options.scope.to_string(),
                 script: options.script.to_string(),
                 worker_type: options.kind,
                 update_via_cache: options.update_via_cache,
             };
             let owner = profile.clone();
-            let key = client.key.clone();
+            let key = client.storage_key();
             let (completion, primary) = profile.queues.schedule(
                 &profile.handle,
                 spec,
@@ -1459,7 +2053,7 @@ fn operation_inner(
                         .as_u64()
                         .and_then(|incumbent| client_for_context(state, incumbent))
                         .unwrap_or_else(|| client.clone());
-                    let origin = sender.origin.ascii_serialization();
+                    let origin = sender.origin().ascii_serialization();
                     (json!({"client": sender.source_info()}), origin)
                 };
                 let skip = worker
@@ -1623,6 +2217,63 @@ pub(super) fn dispatch_notice(
     context: u64,
     notice: Notice,
 ) -> Result<(), String> {
+    if matches!(&notice, Notice::FocusWindow) {
+        return run_in_context_realm(engine, context, "service-worker window focus", |engine| {
+            host_call_trust_interruptible(
+                engine.ctx(),
+                "serviceWindowAction",
+                &[Value::from_string("focus".into())],
+            )
+            .map(|_| ())
+            .map_err(|_| "Window focus failed".into())
+        });
+    }
+    if let Notice::WindowAction { action } = &notice {
+        let sw::WindowOperation::Navigate(url) = &action.operation else {
+            action.reply.complete(Err(Error::type_error(
+                "The window has no native controller",
+            )));
+            return Ok(());
+        };
+        let node = engine
+            .ctx()
+            .host::<HostState>()
+            .and_then(|s| s.window_cookie_contexts.get(&context))
+            .map(|(node, _, _)| *node);
+        let agent = &mut engine
+            .ctx()
+            .host_mut::<HostState>()
+            .unwrap()
+            .service_workers;
+        if let Some(node) = node {
+            agent.navigation_replies.insert(node, action.reply.clone());
+        } else {
+            agent.top_navigation_reply = Some(action.reply.clone());
+        }
+        let result = run_in_context_realm(
+            engine,
+            context,
+            "service-worker client navigation",
+            |engine| {
+                host_call_trust_interruptible(
+                    engine.ctx(),
+                    "serviceWindowAction",
+                    &[
+                        Value::from_string("navigate".into()),
+                        Value::from_string(url.to_string()),
+                    ],
+                )
+                .map(|_| ())
+                .map_err(|_| "Window navigation failed".into())
+            },
+        );
+        if result.is_err() {
+            action
+                .reply
+                .complete(Err(Error::type_error("Window navigation failed")));
+        }
+        return result;
+    }
     if let Notice::Inspect { inspection } = notice {
         let mut window = None;
         let result = run_in_context_realm(
@@ -1917,7 +2568,9 @@ mod tests {
             sw::UpdateViaCache::Imports,
         )
         .unwrap();
-        let registration = profile.registry.set_registration(&client.key, &options);
+        let registration = profile
+            .registry
+            .set_registration(&client.storage_key(), &options);
         let worker = profile.registry.new_worker(&registration, &options);
         client.enable_messages();
         for detach in [false, true] {
@@ -1980,6 +2633,7 @@ mod tests {
                 ended: tokio::sync::Notify::new(),
                 next_event: AtomicU64::new(1),
                 events: Mutex::default(),
+                fetches: Mutex::default(),
                 last_event: Mutex::new(Instant::now()),
             })
         }

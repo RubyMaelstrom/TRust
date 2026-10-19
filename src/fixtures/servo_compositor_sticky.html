@@ -1,0 +1,125 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Servo compositor and sticky follow-ups</title>
+<!--
+  Release acceptance reduction. CSSWG local snapshot 81c27f686901 (2026-09-06):
+  CSS Animations 1 #animations; Web Animations 1 #effect-composition;
+  CSS Transforms 1 #transform-function-lists and Transforms 2 #mathematical-description;
+  CSS Color 4 #transparency; CSS Position 3 #stickypos-insets / #stickypos-scroll;
+  CSS Flexbox 1 #flex-direction-property / #flex-wrap-property.
+  Run in target/release/trust-desktop. The automatic report settles after 1.7 s.
+-->
+<style>
+  body { margin: 20px; background: #142332; color: #f3f7fa; font: 16px sans-serif; }
+  h1 { font-size: 24px; margin: 0 0 10px; }
+  h2 { font-size: 17px; margin: 0 0 12px; }
+  p { max-width: 900px; line-height: 1.4; }
+  #status { font-weight: bold; padding: 10px; background: #354556; }
+  #status.pass { background: #15532e; }
+  #status.fail { background: #762c31; }
+  #results { columns: 2; max-width: 950px; padding-left: 25px; line-height: 1.5; }
+  .pass { color: #a6edb7; }
+  .fail { color: #ffaaa7; }
+  .card { display: inline-block; vertical-align: top; width: 300px; height: 190px; margin: 0 12px 16px 0; padding: 14px; background: #20364c; }
+  .stage { position: relative; height: 110px; outline: 1px solid #57748b; }
+  .swatch { width: 80px; height: 40px; color: #142332; background: #ffc36f; transform-origin: 0 0; }
+  #singular { transform: scale(0); }
+  .running #singular { animation: singular 1s linear both; }
+  @keyframes singular { from { transform: scale(0); } to { transform: scale(1); } }
+  #affine { translate: 10px 20px; transform: translateY(4px); transform-origin: 0 0 30px; }
+  .running #affine { animation: affine 1s linear both; animation-composition: add; }
+  @keyframes affine { from { transform: rotateX(0deg); } to { transform: rotateX(60deg); } }
+  #mixed { position: relative; top: 4px; width: 40px; height: 24px; transform: translateX(5px); }
+  .running #mixed { animation: mixed 1s linear both; animation-composition: add; }
+  @keyframes mixed {
+    from { width: 0; top: 0; transform: translateX(0); }
+    to { width: 60px; top: 10px; transform: translateX(25px); }
+  }
+  #transition { opacity: .2; transform: translateX(0); transition: transform 1s linear; }
+  .running #transition { transform: translateX(40px); animation: fade 1s linear both; }
+  @keyframes fade { from { opacity: 0; } to { opacity: 1; } }
+  #reference { position: absolute; left: 40px; top: 55px; }
+  #scroller { position: relative; width: 260px; height: 100px; overflow: auto; outline: 1px solid #57748b; }
+  #sticky { position: sticky; top: 0; width: 160px; height: 24px; background: #a6edb7; color: #142332; }
+  #filler { height: 340px; background: linear-gradient(#3b5570, #172b40); }
+  #rtl { position: relative; display: flex; direction: rtl; width: 100px; height: 100px; overflow: auto; outline: 1px solid #57748b; }
+  #rtl > div { flex: none; width: 200px; height: 100px; background: #3b5570; }
+  #rtl > #rtl-sticky { position: sticky; left: 0; right: 20px; background: #a6edb7; color: #142332; }
+  #column { display: flex; direction: rtl; flex-direction: column; align-items: flex-start; width: 80px; height: 50px; outline: 1px solid #57748b; }
+  #column > div { flex: none; width: 20px; height: 20px; background: #ffc36f; }
+  #column > div + div { background: #a6edb7; }
+</style>
+<h1>Compositor and sticky release checks</h1>
+<p>The boxes animate once, then the checks below report their final geometry. The two orange opacity boxes should finish with the same color. Scrollable content must keep its green header visible.</p>
+<div id="status">Waiting for the animation samples…</div>
+<ul id="results"></ul>
+<div class="card"><h2>Singular start → visible</h2><div class="stage" id="singular-stage"><div class="swatch" id="singular">Scale 0 → 1</div></div></div>
+<div class="card"><h2>Affine 3D and origin depth</h2><div class="stage" id="affine-stage"><div class="swatch" id="affine">Rotate X</div></div></div>
+<div class="card"><h2>Mixed layout and transform</h2><div class="stage" id="mixed-stage"><div class="swatch" id="mixed">Additive</div></div></div>
+<div class="card"><h2>Underlying transition and opacity</h2><div class="stage" id="transition-stage"><div class="swatch" id="transition">Animated</div><div class="swatch" id="reference">Reference</div></div></div>
+<div class="card"><h2>Sticky beyond one scrollport</h2><div id="scroller"><div id="sticky">Still at the top</div><div id="filler">Long content</div></div></div>
+<div class="card"><h2>RTL scroll and column edges</h2><div style="display:inline-block;vertical-align:top"><div id="rtl"><div></div><div id="rtl-sticky">RTL sticky</div><div></div></div></div><div style="display:inline-block;vertical-align:top;margin-left:16px"><div id="column"><div id="column-a"></div><div id="column-b"></div></div></div></div>
+<p><button id="repeat">Run again</button></p>
+<script>
+(() => {
+  const report = window.servoFollowupResults = { done: false, passed: 0, failed: 0, results: [] };
+  const element = id => document.getElementById(id);
+  const rect = id => element(id).getBoundingClientRect();
+  const near = (actual, expected, label, tolerance = 1) => {
+    if (!Number.isFinite(actual) || Math.abs(actual - expected) > tolerance) throw Error(label + ': ' + actual + ', expected ' + expected);
+  };
+  const check = (name, run) => {
+    const result = { name, passed: true };
+    try { run(); report.passed++; }
+    catch (error) { result.passed = false; result.error = String(error); report.failed++; }
+    report.results.push(result);
+    const row = document.createElement('li');
+    row.className = result.passed ? 'pass' : 'fail';
+    row.textContent = (result.passed ? 'PASS ' : 'FAIL ') + name + (result.error ? ' — ' + result.error : '');
+    element('results').append(row);
+  };
+  check('Singular initial geometry', () => near(rect('singular').width, 0, 'initial width'));
+  element('repeat').addEventListener('click', () => location.reload());
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    document.body.classList.add('running');
+    setTimeout(() => {
+      check('Singular animation becomes visible', () => near(rect('singular').width, 80, 'final width'));
+      check('3D origin depth and individual translate', () => {
+        const box = rect('affine'), stage = rect('affine-stage');
+        near(box.left - stage.left, 10, 'left');
+        near(box.top - stage.top, 24 + 30 * Math.sqrt(3) / 2, 'top');
+        near(box.width, 80, 'width'); near(box.height, 20, 'height');
+      });
+      check('Mixed additive layout is applied once', () => {
+        const box = rect('mixed'), stage = rect('mixed-stage');
+        near(box.left - stage.left, 30, 'left'); near(box.top - stage.top, 14, 'top');
+        near(box.width, 100, 'width'); near(box.height, 24, 'height');
+      });
+      check('Transition clock and absolute opacity', () => {
+        near(rect('transition').left - rect('transition-stage').left, 40, 'translation');
+        near(Number(getComputedStyle(element('transition')).opacity), 1, 'opacity', .001);
+      });
+      check('Sticky keeps the scrollable content bounds', () => {
+        element('scroller').scrollTop = 140;
+        near(rect('sticky').top - rect('scroller').top, 0, 'sticky top');
+      });
+      check('RTL sticky overconstraints and scroll fallback', () => {
+        for (const pair of [[0, -120], [-160, -280], [-220, -340], [-500, -500]]) {
+          element('rtl').scrollLeft = pair[0];
+          near(element('rtl-sticky').offsetLeft, pair[1], 'scroll ' + pair[0]);
+        }
+      });
+      check('RTL column cross-start follows direction', () => {
+        near(rect('column-a').left - rect('column').left, 60, 'first column child');
+        near(rect('column-b').left - rect('column').left, 60, 'second column child');
+      });
+      report.done = true;
+      const status = element('status');
+      status.className = report.failed ? 'fail' : 'pass';
+      status.textContent = (report.failed ? 'FAIL' : 'PASS') + ': ' + report.passed + ' checks passed, ' + report.failed + ' failed.';
+      document.title = (report.failed ? 'FAIL' : 'PASS') + ' — Servo compositor and sticky follow-ups';
+      console.log('SERVO_FOLLOWUPS ' + JSON.stringify(report));
+    }, 1700);
+  }));
+})();
+</script>

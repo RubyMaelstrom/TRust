@@ -310,6 +310,21 @@ fn interpolate_matrices(a: &Matrix3d, b: &Matrix3d, t: f32) -> Option<Matrix3d> 
 }
 
 impl Transform {
+    /// CSS Transforms 2 #3d-transform-rendering: affine 3D transforms on a
+    /// flat box can be composed in 3D and projected once into its parent.
+    /// Projective matrices need a renderer that represents a homography.
+    pub(in crate::dom) fn affine(&self) -> bool {
+        fn affine(primitives: &[Primitive]) -> bool {
+            primitives.iter().all(|primitive| match primitive {
+                Primitive::Perspective(depth) => depth.is_infinite(),
+                Primitive::Matrix(m) => m[3] == 0. && m[7] == 0. && m[11] == 0. && m[15] == 1.,
+                Primitive::Deferred(value) => affine(&value.from) && affine(&value.to),
+                _ => true,
+            })
+        }
+        affine(&self.0)
+    }
+
     /// Parse a computed `transform` with the target's font-relative
     /// `units`.
     pub(in crate::dom) fn parse(value: &str, units: crate::layout2::Units, vp: Vp) -> Option<Self> {

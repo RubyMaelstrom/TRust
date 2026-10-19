@@ -125,8 +125,8 @@ Third implementation batch (user-approved scope)
     Filter Effects 2 #backdrop-filter-operation / #BackdropRoot and HTML
     #the-video-element. Reproduction and validation logs: target/servo-third/.
 
-Remaining features to consider
------------------------------
+Follow-ups identified after the third batch (historical)
+--------------------------------------------------------
 
 - Touch-action and axis-locked panning (implementation complete; final
   verification in progress). Native touch PointerEvents now have independent
@@ -481,9 +481,158 @@ active trust-js checkout had been performed. Source has since been committed
 as part of the worker review above. Pinch zoom remains outside this touch
 increment.
 
-Touch input and the messaging review are complete. The remaining service-worker
-tasks above precede the later authorized areas: LCP,
-nested orthogonal/logical-axis subgrid work, further compositor combinations,
-incremental A/AAAA resolution and NAT64, the remaining Servo regression audit,
-and the separate intermittent desktop startup crash investigation. Accessibility
-and persistent HTTP caching remain deferred.
+At the messaging handoff, the remaining service-worker and later authorized
+tasks were still pending. Their subsequent implementation is recorded below.
+Accessibility and persistent HTTP caching remain deferred.
+
+
+Fifth batch: remaining authorized follow-ups (2026-10-19)
+-------------------------------------------------------
+
+The following supersedes the historical remaining-work lists above. Accessibility
+and persistent HTTP caching remain explicitly deferred. Registrations, script
+versions and CacheStorage remain RAM-only. Bookmark and same-site cookie
+persistence policy is unchanged.
+
+- Service-worker interception now covers document, iframe, worker and ordinary
+  subresource requests. Reserved environments follow navigation redirects and
+  are committed into real Window/worker clients. Response filters and native
+  provenance survive forwarding and CacheStorage; streaming bodies have
+  demand-driven 64 KiB crossings, cancellation and separate event/body lifetimes.
+  Null-body responses discard their reader without aborting the request signal.
+- WindowClient focus/navigate and clients.openWindow use actual frontend
+  actions and navigation completion; transient activation is checked. Navigation
+  preload and automatic soft updates are connected to the native fetch path.
+  Module service workers validate the complete graph before executing any
+  author code, reject top-level await, and retain fetched dependencies in RAM
+  for updates and restarts. A forwarded response's Document origin remains
+  distinct from its request-derived creation URL in storage, frame access,
+  messaging, resource requests and workers.
+- LargestContentfulPaint is backed by completed rendering updates, with
+  observer delivery, readonly entries, image/poster/text candidates, clipping,
+  transforms, entropy/natural-size constraints and input/scroll termination.
+  presentationTime is null where the backend cannot provide a presentation
+  timestamp, as Paint Timing permits. Nested contexts opt out rather than
+  attributing their content to the parent.
+- Grid layout uses logical axes, including vertical writing modes, direction
+  reversal and nested/orthogonal subgrids. Shared tracks, names, gaps and
+  intrinsic-size contributions have dedicated conformance regressions.
+- Eligible retained transform/opacity stacks now handle singular starts,
+  underlying transitions, mixed-property animations and flattenable affine
+  3D transforms. Layout-dependent tracks stay with the page actor; genuinely
+  projective and SVG resource-dependent cases retain the correct actor path.
+  Sticky positioning shares containing-block/scrollport constraints across
+  painting and geometry, including nested, RTL and fixed-descendant cases.
+- DNS families resolve independently through the operating system's resolver,
+  preserving hosts/NSS/VPN policy. A 50 ms AAAA grace period and late-family
+  insertion feed the shared connection race. Resolver jobs remain bounded
+  even when canceled. Destination ordering follows RFC 6724/platform policy;
+  RFC 7050 discovery and RFC 6052 synthesis support IPv6-only NAT64 paths.
+  HTTP/3 uses the incremental scheduler with its existing deadline.
+- The Servo audit covers history ordering, initial about:blank replacement,
+  Window/Location exotic descriptors, pointer transitions, stylesheet font
+  matching ties, cross-inline shaping, zero-width inline edges, stretch sizes,
+  flex direction and sticky overflow. Shaping retains DOM-source ownership,
+  joining context, partial ligatures, combining marks and glyph overhang.
+  The pinned Parley fork widens its private cluster offsets for contexts
+  exceeding 64 KiB; provenance and license are retained.
+- Form-pattern evaluation no longer caches a temporary timeout as an invalid
+  regular expression. Only completed matches and actual SyntaxErrors are
+  cached; other failures can retry. Its request queue is bounded and waiting
+  shares the existing 250 ms evaluation budget. The semantic tests exercise
+  the matcher independently of scheduling, with separate deadline/cache tests.
+
+Reproducible engine dependency
+- The active /big/Code/trust-js checkout was not changed. The isolated clone
+  contains engine commit ec4e4b742559222909101b14698a5d6f4b793fb7, based on
+  e33109935c25e291da71c082cfd03d2f24c12a12. Its parse-only module inspector,
+  complete top-level-await detection and host object invariants are preserved
+  in docs/patches/trust-js-servo-host-api.patch. AGENTS.md gives reproduction
+  commands. The companion engine also preserves the registration realm with
+  pending Promise settings: a frame test exposed callbacks running under the
+  wrong settings after cross-realm settlement. Its new regressions reproduced
+  the failure before the fix and pass in all three execution tiers. The full
+  isolated engine library suite passed 2,151 tests with three ignored; the
+  combined patch recreates every changed engine file byte-for-byte.
+
+Standards are the local snapshots listed above, additionally:
+- Largest Contentful Paint f79fc4c8 and Paint Timing 053f575b.
+- ECMA-262 e28783d5 (module records, HasProduction and top-level await).
+- RFC Editor 2026-09-06: RFC 8305, RFC 6724, RFC 7050 and RFC 6052.
+- HTTPWG rfc6265bis editor's draft 1057fe0f, document/worker site-for-cookies
+  algorithms; HTML worker settings and policy-container initialization.
+- Initial Window/client reuse follows HTML's shared Window/ESO rule; its
+  service-worker controller integration is also checked against the official
+  about-blank-replacement WPT. The SW snapshot explicitly marks that model
+  non-normative; no reserved-client-ID transfer is claimed for reused ESOs.
+
+Integration corrections found during full validation
+- Native local-file access is retained separately from an opaque origin; it
+  is not inferred from a file base URL or granted to sandboxed documents.
+- Worker request and module settings preserve their owner's cookie-site
+  context. Data workers retain that top-level site and set their cross-site
+  ancestor flag. Blob creation URLs normalize to the creator's tuple origin
+  for request policy. Early dynamic imports receive the committed worker
+  script URL and policy container before author code runs.
+- Fetch callback/byte regressions now use a loopback HTTP server instead of
+  injecting responses into the generic resource cache. They exercise actual
+  response-head/body tasks while retaining realm and checkpoint assertions.
+- The worker termination fixture initializes its Window with the real test
+  origin instead of changing its URL after origin initialization. The parser
+  Atomics check permits an intermediate paint while waiting for its blocked
+  script; it still requires the timeout reaction to release that script within
+  the same deadline. The observer fixture now includes LCP in the Window's
+  supported-entry-type inventory.
+- Speculative parser requests use the initialized Window's native client,
+  including when an actor starts without a frontend-provided client. The
+  Atomics regression exposed a second script fetch caused by mismatched
+  client cache keys; its loopback server now exercises one shared request.
+- Static frame trees retain separate response occurrences, stylesheet scopes,
+  native clients and original timing. A worker action can attach an actor to
+  that retained tree without fetching it again, replacing opaque origins or
+  replaying completed load events. Native ownership moves without aliases or
+  reference cycles; pending actions wait for attachment in bounded queues.
+- WindowClient actions reach both graphical/headless and terminal controllers.
+  The terminal reports actual focus, retries a busy actor's focus notification,
+  and rejects unsupported new-window creation. Top-level worker navigation uses
+  ordinary unload checks and navigation completion. Canceled navigation,
+  downloads and 204/205 responses preserve the current Document, timers,
+  children and history while retiring the unused reserved environment.
+  Explicit attachment disposition is handled before the no-content status
+  gate, following HTML's navigation ordering and RFC 6266 section 4.2.
+- Queued Location navigation retains the initiating Window's native settings,
+  including context zero, through the asynchronous frame handoff. FetchEvent
+  clientId identifies that source even for navigations; resultingClientId and
+  replacesClientId continue to identify the destination reservation and old
+  target. WindowClient.navigate uses its target Document as the source, as
+  Service Workers' client-navigate algorithm specifies.
+- Deferred materialization preserves the original root loading timestamp and
+  each accepted child Document's creation timestamp. Original stylesheet
+  success/error state is restored silently; later inserted links still fetch.
+  Later lifecycle timestamps for entirely static pages remain uncaptured at
+  their existing default values. Actor startup does not fabricate DCL/load/
+  complete timestamps. Navigation Timing 2 snapshot 245fee24, domLoading,
+  and HTML's current-document-readiness algorithm govern these transitions.
+
+The initial full debug run (target/servo-final-debug.log) completed with 3,937
+library tests passing, 16 failing and 43 ignored; desktop/headless tests added
+79 passes and the replay example added one pass (one doctest was ignored).
+Three failures were poisoned-cookie
+test-lock fallout from the worker cookie-context assertion. The other failures
+are the integration and fixture corrections described above. This original
+failure log is retained; final rerun results are recorded below.
+
+Verification and startup investigation results follow after final validation.
+
+The final debug CPU group ran with eight test threads; graphics/media tests
+run separately with two. Its initial run passed 3,584 library tests with seven
+failures and 30 ignored. Desktop (64), headless (15) and replay (one) checks
+passed. The seven failures were six obsolete test expectations (native focus
+notifications, unloading only on commit, controlled actor retention, and the
+two added host bindings) and a 15-second asynchronous file-fixture deadline.
+The file fixture passed alone in 17.76 seconds total; under the broad run it
+was still constructing child Windows after its first presentation. Its wait
+is now bounded at 60 seconds with every resource/origin/error assertion kept.
+No production behavior changed in response to these seven failures. The raw
+run is retained in target/servo-debug-cpu-initial-failures.log; corrected
+checks and the remaining verification are recorded below.

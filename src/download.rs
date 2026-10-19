@@ -205,11 +205,19 @@ pub fn human_bytes(bytes: u64) -> String {
     }
 }
 
-/// Whether a top-level response must bypass document parsing. RFC 6266 §4.2
-/// gives attachment precedence even when TRust could otherwise render it.
-pub fn response_needs_download(response: &http::Response, supports_images: bool) -> bool {
+/// HTML #navigation-as-a-download precedes the 204/205 Document gate. RFC
+/// 6266 §4.2 treats unknown disposition types like attachment; inline uses
+/// the ordinary status and media-type processing instead.
+pub(crate) fn response_is_attachment(response: &http::Response) -> bool {
     content_disposition(response)
         .is_some_and(|disposition| !disposition.eq_ignore_ascii_case("inline"))
+}
+
+/// Whether loading a Document instead requires a download/external handler.
+/// Navigation first handles attachments, then excludes 204/205, before
+/// reaching this MIME fallback (HTML #loading-a-document).
+pub fn response_needs_download(response: &http::Response, supports_images: bool) -> bool {
+    response_is_attachment(response)
         || !mime_is_renderable(&computed_mime_type(response), supports_images)
 }
 

@@ -37,6 +37,8 @@ pub(crate) enum Len {
     MinContent,
     MaxContent,
     FitContent,
+    /// CSS Sizing 3 #stretch-fit-sizing: fill the containing margin box.
+    Stretch,
     /// CSS Sizing 4 #sizing-values: clamp the argument between the
     /// min-content and max-content sizes, preserving percentages.
     FitContentLimit(Node),
@@ -483,6 +485,7 @@ impl Len {
         match v.to_ascii_lowercase().as_str() {
             "auto" => return Some(Len::Auto),
             "none" => return Some(Len::None),
+            "stretch" => return Some(Len::Stretch),
             "min-content" => return Some(Len::MinContent),
             "max-content" => return Some(Len::MaxContent),
             _ => {}

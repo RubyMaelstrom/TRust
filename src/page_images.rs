@@ -518,6 +518,19 @@ impl PageImages {
         }
     }
 
+    /// A completed document response, without polling I/O or retaining a new
+    /// request. Paint timing must not turn a missing image into loaded content.
+    pub(crate) fn ready_for_paint_timing(&self, url: &str) -> Option<Arc<FetchedImage>> {
+        let inner = self.inner.lock().unwrap();
+        inner.entries.get(url)?.iter().find_map(|entry| {
+            entry
+                .fetch
+                .peek()
+                .and_then(|outcome| outcome.as_ref().ok())
+                .cloned()
+        })
+    }
+
     /// The document no longer makes requests. Waiting consumers fetch for
     /// themselves; completed responses remain available to the frozen
     /// presentation until the store itself is dropped with its page.

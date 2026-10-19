@@ -22,11 +22,15 @@ pub(crate) struct FlexStyle {
     /// Main-axis direction is reversed (`row-reverse`/`column-reverse`).
     pub reverse: bool,
     pub wrap: bool,
-    /// `wrap-reverse`: the cross axis is inverted (line stacking order and
-    /// cross alignment).
+    /// Cross-start is the physical bottom/right edge, including both the
+    /// writing direction and `wrap-reverse`.
     pub wrap_reverse: bool,
+    /// The writing mode's cross-start edge, before `wrap-reverse`. Auto
+    /// margins use this edge when the item overflows (Flexbox §9.6).
+    pub cross_normal_reverse: bool,
     pub justify: Justify,
     pub align_items: AlignItem,
+    align_items_value: String,
     pub align_content: AlignContent,
     /// Main-axis gap (`column-gap` in a row container, `row-gap` in a
     /// column one) and cross-axis gap.
@@ -57,6 +61,7 @@ pub(crate) enum AlignItem {
     Baseline,
     /// `safe center` / `safe end` (CSS Box Alignment 3 #overflow-values).
     SafeCenter,
+    SafeStart,
     SafeEnd,
 }
 
@@ -71,6 +76,7 @@ pub(crate) enum AlignContent {
     Evenly,
     /// `safe center` / `safe end` (CSS Box Alignment 3 #overflow-values).
     SafeCenter,
+    SafeStart,
     SafeEnd,
 }
 
@@ -103,10 +109,57 @@ impl AlignItem {
     pub(crate) fn safe(self, safe: Option<bool>) -> Self {
         match (safe, self) {
             (Some(true), Self::Center) => Self::SafeCenter,
+            (Some(true), Self::Start) => Self::SafeStart,
             (Some(true), Self::End) => Self::SafeEnd,
             _ => self,
         }
     }
+}
+
+impl FlexStyle {
+    /// Keep writing-mode-relative `start` distinct from flex cross-start.
+    /// CSS Align 3 #positional-values also resolves self-start against the
+    /// item's writing direction, rather than the container's direction.
+    pub(super) fn item_alignment(&self, dom: &Dom, id: NodeId) -> AlignItem {
+        let own = (id != super::NO_NODE)
+            .then(|| dom.computed_value_resolved(id, "align-self"))
+            .flatten();
+        let value = own
+            .as_deref()
+            .filter(|value| !matches!(value.trim(), "" | "auto"))
+            .unwrap_or(&self.align_items_value);
+        let (safe, keyword) = overflow_position(value);
+        let normal_reverse = if matches!(keyword.as_str(), "self-start" | "self-end") {
+            if id == super::NO_NODE {
+                self.cross_normal_reverse
+            } else {
+                !self.row && horizontal_rtl(dom, id)
+            }
+        } else {
+            self.cross_normal_reverse
+        };
+        let align = align_item_from(value, self.align_items);
+        if matches!(
+            keyword.as_str(),
+            "start" | "end" | "self-start" | "self-end"
+        ) && self.wrap_reverse != normal_reverse
+        {
+            match align {
+                AlignItem::Start | AlignItem::SafeStart => AlignItem::End.safe(safe),
+                AlignItem::End | AlignItem::SafeEnd => AlignItem::Start.safe(safe),
+                _ => align,
+            }
+        } else {
+            align
+        }
+    }
+}
+
+fn horizontal_rtl(dom: &Dom, id: NodeId) -> bool {
+    dom.computed_value_resolved(id, "direction").as_deref() == Some("rtl")
+        && !dom
+            .computed_value_resolved(id, "writing-mode")
+            .is_some_and(|mode| mode.starts_with("vertical-") || mode.starts_with("sideways-"))
 }
 
 /// Read a container's flex style.
@@ -147,6 +200,13 @@ pub(crate) fn container_style(dom: &Dom, id: NodeId, u: Units, vp: Vp) -> FlexSt
     } else {
         (wrap_v.contains("wrap"), false)
     };
+    // CSS Flexbox 1 #flex-direction-property / #flex-wrap-property:
+    // horizontal writing's inline-start follows direction. A row's main
+    // axis and a column's cross axis therefore reverse in RTL, independently
+    // of the explicit row/column-reverse and wrap-reverse keywords.
+    let horizontal_rtl = horizontal_rtl(dom, id);
+    let physical_reverse = reverse ^ (row && horizontal_rtl);
+    let physical_cross_reverse = wrap_reverse ^ (!row && horizontal_rtl);
     // CSS Box Alignment 3 #positional-values: `flex-start`/`flex-end` name
     // the main-start/main-end sides, `start`/`end` the container's own
     // writing-mode edges, so they swap in a reversed container. `left` and
@@ -160,9 +220,23 @@ pub(crate) fn container_style(dom: &Dom, id: NodeId, u: Units, vp: Vp) -> FlexSt
         overflow_position(&cv("justify-content").unwrap_or_default());
     let justify = match justify_value.as_str() {
         "flex-end" => Justify::End,
-        "start" | "left" => start,
+        "start" => start,
         "end" => end,
-        "right" if row => end,
+        "left" if row => {
+            if physical_reverse {
+                Justify::End
+            } else {
+                Justify::Start
+            }
+        }
+        "left" => start,
+        "right" if row => {
+            if physical_reverse {
+                Justify::Start
+            } else {
+                Justify::End
+            }
+        }
         "right" => start,
         "center" => Justify::Center,
         "space-between" => Justify::Between,
@@ -171,12 +245,15 @@ pub(crate) fn container_style(dom: &Dom, id: NodeId, u: Units, vp: Vp) -> FlexSt
         _ => Justify::Start,
     }
     .safe(justify_safe);
-    let align_items = align_item_from(
-        cv("align-items").as_deref().unwrap_or(""),
-        AlignItem::Stretch,
-    );
+    let align_items_value = cv("align-items").unwrap_or_default();
+    let align_items = align_item_from(&align_items_value, AlignItem::Stretch);
     let (content_safe, content_value) = overflow_position(&cv("align-content").unwrap_or_default());
     let align_content = match (content_safe, content_value.as_str()) {
+        (Some(true), "start") if wrap_reverse => AlignContent::SafeEnd,
+        (_, "start") if wrap_reverse => AlignContent::End,
+        (Some(true), "end") if wrap_reverse => AlignContent::SafeStart,
+        (_, "end") if wrap_reverse => AlignContent::Start,
+        (Some(true), "flex-start" | "start") => AlignContent::SafeStart,
         (_, "flex-start" | "start") => AlignContent::Start,
         (Some(true), "flex-end" | "end") => AlignContent::SafeEnd,
         (_, "flex-end" | "end") => AlignContent::End,
@@ -209,11 +286,13 @@ pub(crate) fn container_style(dom: &Dom, id: NodeId, u: Units, vp: Vp) -> FlexSt
     };
     FlexStyle {
         row,
-        reverse,
+        reverse: physical_reverse,
         wrap,
-        wrap_reverse,
+        wrap_reverse: physical_cross_reverse,
+        cross_normal_reverse: !row && horizontal_rtl,
         justify,
         align_items,
+        align_items_value,
         align_content,
         gap_main,
         gap_cross,
@@ -483,7 +562,7 @@ pub(crate) fn justify_offsets(justify: Justify, free: f32, n: usize) -> (f32, f3
 /// `justify_offsets` (css-align models them identically).
 pub(crate) fn align_content_offsets(align: AlignContent, free: f32, n: usize) -> (f32, f32) {
     let j = match align {
-        AlignContent::Start | AlignContent::Stretch => Justify::Start,
+        AlignContent::Start | AlignContent::SafeStart | AlignContent::Stretch => Justify::Start,
         AlignContent::End => Justify::End,
         AlignContent::Center => Justify::Center,
         AlignContent::SafeCenter => Justify::SafeCenter,
@@ -498,6 +577,146 @@ pub(crate) fn align_content_offsets(align: AlignContent, free: f32, n: usize) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn servo_sticky_rtl_flex_axes_and_physical_justification_follow_direction() {
+        for (direction, justify, expected) in [
+            ("row", "flex-start", [(80., 0.), (60., 0.)]),
+            ("row-reverse", "flex-start", [(0., 0.), (20., 0.)]),
+            ("column", "flex-start", [(80., 0.), (80., 20.)]),
+            ("column-reverse", "flex-start", [(80., 80.), (80., 60.)]),
+            ("row", "left", [(20., 0.), (0., 0.)]),
+            ("row", "right", [(80., 0.), (60., 0.)]),
+            ("row", "start", [(80., 0.), (60., 0.)]),
+            ("row", "end", [(20., 0.), (0., 0.)]),
+        ] {
+            let mut dom = Dom::parse_document(&format!(
+                r#"<style>body{{margin:0}}
+                #box{{display:flex;direction:rtl;flex-direction:{direction};justify-content:{justify};align-items:flex-start;width:100px;height:100px}}
+                #box>div{{flex:none;width:20px;height:20px}}</style><div id=box><div id=a></div><div id=b></div></div>"#
+            ));
+            dom.set_viewport_px(200., 200.);
+            let measured = crate::layout2::measure_retained_layout(
+                &dom,
+                &url::Url::parse("https://flex.test/").unwrap(),
+                crate::layout2::Viewport::new(200., 200.),
+                &[],
+                &Default::default(),
+                &Default::default(),
+            );
+            for (id, expected) in ["a", "b"].into_iter().zip(expected) {
+                let rect = measured.boxes[&dom.get_by_id(id).unwrap()];
+                assert_eq!(
+                    (rect.left, rect.top),
+                    expected,
+                    "{direction} {justify} {id}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn servo_sticky_flex_cross_edges_wrap_lines_and_physical_margins() {
+        for (style, expected) in [
+            (
+                "direction:rtl;flex-direction:column;flex-wrap:wrap",
+                [(80., 0.), (60., 0.)],
+            ),
+            (
+                "direction:rtl;flex-direction:column;flex-wrap:wrap-reverse",
+                [(0., 0.), (20., 0.)],
+            ),
+            (
+                "direction:rtl;flex-direction:column;flex-wrap:wrap-reverse;align-content:start",
+                [(60., 0.), (80., 0.)],
+            ),
+            (
+                "flex-wrap:wrap-reverse;align-content:stretch",
+                [(0., 40.), (20., 40.)],
+            ),
+            (
+                "flex-wrap:wrap-reverse;align-content:stretch;align-items:start",
+                [(0., 0.), (20., 0.)],
+            ),
+            (
+                "direction:rtl;flex-direction:column;align-items:flex-start",
+                [(80., 0.), (80., 60.)],
+            ),
+        ] {
+            let mut dom = Dom::parse_document(&format!(
+                r#"<style>body{{margin:0}}
+                #box{{display:flex;align-items:flex-start;align-content:flex-start;width:100px;height:100px;{style}}}
+                #box>div{{flex:none;width:20px;height:60px}}</style><div id=box><div id=a></div><div id=b></div></div>"#
+            ));
+            dom.set_viewport_px(200., 200.);
+            let measured = crate::layout2::measure_retained_layout(
+                &dom,
+                &url::Url::parse("https://flex.test/").unwrap(),
+                crate::layout2::Viewport::new(200., 200.),
+                &[],
+                &Default::default(),
+                &Default::default(),
+            );
+            for (id, expected) in ["a", "b"].into_iter().zip(expected) {
+                let rect = measured.boxes[&dom.get_by_id(id).unwrap()];
+                assert_eq!((rect.left, rect.top), expected, "{style} {id}");
+            }
+        }
+        for (margin, expected) in [
+            ("margin-left:10px;margin-right:5px", 75.),
+            ("margin-left:auto", 80.),
+            ("margin-right:auto", 0.),
+        ] {
+            let mut dom = Dom::parse_document(&format!(
+                r#"<style>body{{margin:0}}
+                #box{{display:flex;direction:rtl;flex-direction:column;align-items:flex-start;width:100px;height:100px}}
+                #a{{flex:none;width:20px;height:20px;{margin}}}</style><div id=box><div id=a></div></div>"#
+            ));
+            dom.set_viewport_px(200., 200.);
+            let measured = crate::layout2::measure_retained_layout(
+                &dom,
+                &url::Url::parse("https://flex.test/").unwrap(),
+                crate::layout2::Viewport::new(200., 200.),
+                &[],
+                &Default::default(),
+                &Default::default(),
+            );
+            assert_eq!(
+                measured.boxes[&dom.get_by_id("a").unwrap()].left,
+                expected,
+                "{margin}"
+            );
+        }
+        for (direction, wrap, align, margin, expected) in [
+            ("rtl", "nowrap", "safe flex-end", "", -50.),
+            ("rtl", "wrap-reverse", "safe flex-start", "", -50.),
+            ("ltr", "wrap-reverse", "safe flex-start", "", 0.),
+            ("ltr", "wrap-reverse", "safe end", "", 0.),
+            ("ltr", "wrap-reverse", "end", "", -50.),
+            ("rtl", "wrap-reverse", "center", "margin-left:auto", -50.),
+            ("ltr", "wrap-reverse", "center", "margin-right:auto", 0.),
+        ] {
+            let mut dom = Dom::parse_document(&format!(
+                r#"<style>body{{margin:0}}
+                #box{{display:flex;direction:{direction};flex-direction:column;flex-wrap:{wrap};align-items:{align};width:100px;height:100px}}
+                #a{{flex:none;width:150px;height:20px;{margin}}}</style><div id=box><div id=a></div></div>"#
+            ));
+            dom.set_viewport_px(200., 200.);
+            let measured = crate::layout2::measure_retained_layout(
+                &dom,
+                &url::Url::parse("https://flex.test/").unwrap(),
+                crate::layout2::Viewport::new(200., 200.),
+                &[],
+                &Default::default(),
+                &Default::default(),
+            );
+            assert_eq!(
+                measured.boxes[&dom.get_by_id("a").unwrap()].left,
+                expected,
+                "{direction} {wrap} {align} {margin}"
+            );
+        }
+    }
 
     #[test]
     fn distributed_justification_falls_back_to_safe_alignment() {

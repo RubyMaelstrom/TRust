@@ -903,7 +903,7 @@ impl Flow<'_> {
                 .computed_value_resolved(parent_inl.node, "direction")
                 .as_deref()
                 == Some("rtl");
-        let mut h = self.horizontal(b, cb_w, cb_h, &inl, cb_rtl);
+        let mut h = self.horizontal(b, cb_w, cb_h, &inl, cb_rtl, cb_w);
         // CSS 2.1 §10.3.4 says a block-level replaced element's auto width is
         // resolved by the inline-replaced algorithm (§10.3.2), then its
         // margins are solved with the ordinary block equation. The generic
@@ -973,29 +973,50 @@ impl Flow<'_> {
         if avoids_floats && !fc.is_empty() {
             let top = cur.preview();
             let (float_l, float_r, float_bottom) = fc.exclusion_band(top);
-            let mr = s.margin[RIGHT].resolve(Some(cb_w)).unwrap_or(0.0);
-            // CSS 2 §8.3/§9.5: exclude the actual float boxes, retaining
-            // negative margins outside the CB on an unconstrained side.
-            // An ended float leaves both limits unbounded.
-            let left = (cb_x + h.ml).max(float_l);
-            let right = (cb_x + cb_w - mr).min(float_r);
-            let available_border = (right - left).max(0.0);
-            let used_border = h.bp_l + h.content_w + h.bp_r;
-            let min_border = h.bp_l + h.min_w + h.bp_r;
-            if h.auto_w && available_border >= min_border {
-                x_border = left;
-                h.content_w = (available_border - h.bp_l - h.bp_r)
-                    .max(h.min_w)
-                    .min(h.content_w);
-            } else if available_border >= used_border {
-                x_border = left.min(right - used_border).max(float_l);
-            } else if float_bottom > top {
-                // CSS 2.2 §9.5 explicitly permits clearing the formatting-
-                // context root when there is insufficient adjacent space.
-                cur.y = float_bottom;
-                cur.pos = 0.0;
-                cur.neg = 0.0;
-                x_border = cb_x + h.ml;
+            let stretch = [&s.width, &s.min_width, &s.max_width]
+                .into_iter()
+                .any(|value| matches!(value, Len::Stretch));
+            if stretch {
+                // CSS Sizing 3 #stretch-fit-sizing substitutes the space
+                // available to line boxes for an independent block's inline
+                // containing size. Keep percentages against the real CB.
+                let left = cb_x.max(float_l);
+                let right = (cb_x + cb_w).min(float_r);
+                let available = (right - left).max(0.);
+                let fitted = self.horizontal(b, cb_w, cb_h, &inl, cb_rtl, available);
+                if fitted.bp_l + fitted.content_w + fitted.bp_r <= available + 0.01 {
+                    h = fitted;
+                    x_border = (left + h.ml).max(left);
+                } else if float_bottom > top {
+                    cur.y = float_bottom;
+                    cur.pos = 0.;
+                    cur.neg = 0.;
+                }
+            } else {
+                let mr = s.margin[RIGHT].resolve(Some(cb_w)).unwrap_or(0.0);
+                // CSS 2 §8.3/§9.5: exclude the actual float boxes, retaining
+                // negative margins outside the CB on an unconstrained side.
+                // An ended float leaves both limits unbounded.
+                let left = (cb_x + h.ml).max(float_l);
+                let right = (cb_x + cb_w - mr).min(float_r);
+                let available_border = (right - left).max(0.0);
+                let used_border = h.bp_l + h.content_w + h.bp_r;
+                let min_border = h.bp_l + h.min_w + h.bp_r;
+                if h.auto_w && available_border >= min_border {
+                    x_border = left;
+                    h.content_w = (available_border - h.bp_l - h.bp_r)
+                        .max(h.min_w)
+                        .min(h.content_w);
+                } else if available_border >= used_border {
+                    x_border = left.min(right - used_border).max(float_l);
+                } else if float_bottom > top {
+                    // CSS 2.2 §9.5 explicitly permits clearing the formatting-
+                    // context root when there is insufficient adjacent space.
+                    cur.y = float_bottom;
+                    cur.pos = 0.0;
+                    cur.neg = 0.0;
+                    x_border = cb_x + h.ml;
+                }
             }
         }
         let content_x = x_border + h.bp_l;
@@ -1004,7 +1025,7 @@ impl Flow<'_> {
         // Definite heights (content-box px). A percentage against an
         // indefinite CB height is auto (§10.5).
         let authored_h = self
-            .height_px(&s.height, s, bt, bb, cb_h)
+            .height_value(&s.height, b, bt, bb, cb_h, cb_w)
             .or_else(|| self.iframe_auto_height(b, s, bt, bb));
         // CSS Sizing 4 §§4.1–4.2: with an automatic block size and a
         // preferred aspect ratio, transfer the definite used inline size
@@ -1029,10 +1050,10 @@ impl Flow<'_> {
             .or(ratio_h)
             .or_else(|| (s.size_container == 2).then_some(0.0));
         let min_h = self
-            .height_px(&s.min_height, s, bt, bb, cb_h)
+            .height_value(&s.min_height, b, bt, bb, cb_h, cb_w)
             .unwrap_or(0.0);
         let max_h = self
-            .height_px(&s.max_height, s, bt, bb, cb_h)
+            .height_value(&s.max_height, b, bt, bb, cb_h, cb_w)
             .unwrap_or(f32::INFINITY);
 
         // The definite content height children/replaced content resolve
@@ -1040,12 +1061,14 @@ impl Flow<'_> {
         let ifc_cb_h = spec_h.map(|v| v.clamp(min_h, max_h.max(min_h)));
         // Quirks Mode: an auto-height block container hands its children a
         // percentage-height basis.
-        let child_cb_h = ifc_cb_h.or_else(|| {
-            spec_h
-                .is_none()
-                .then(|| self.quirks_percentage_basis(b, style_node, cb_h, mt + mb, bt + bb))
-                .flatten()
-        });
+        let child_cb_h = ifc_cb_h
+            .or_else(|| (b.node == NO_NODE).then_some(cb_h).flatten())
+            .or_else(|| {
+                spec_h
+                    .is_none()
+                    .then(|| self.quirks_percentage_basis(b, style_node, cb_h, mt + mb, bt + bb))
+                    .flatten()
+            });
 
         let mut column_rules = None;
         let mut y_border: Option<f32> = None;
@@ -1900,12 +1923,15 @@ impl Flow<'_> {
                 } else {
                     fs.justify
                 };
-                let cross = match self.item_align(ob.node, fs.align_items) {
+                let cross = match fs.item_alignment(self.dom, ob.node) {
                     AlignItem::Center => Justify::Center,
                     AlignItem::End => Justify::End,
                     AlignItem::SafeCenter => Justify::SafeCenter,
                     AlignItem::SafeEnd => Justify::SafeEnd,
-                    AlignItem::Start | AlignItem::Stretch | AlignItem::Baseline => Justify::Start,
+                    AlignItem::Start
+                    | AlignItem::SafeStart
+                    | AlignItem::Stretch
+                    | AlignItem::Baseline => Justify::Start,
                 };
                 let cross = if fs.wrap_reverse { flip(cross) } else { cross };
                 if fs.row {
@@ -2302,13 +2328,26 @@ impl Flow<'_> {
         cb_h: Option<f32>,
         inl: &InlineStyle,
         cb_rtl: bool,
+        available_w: f32,
     ) -> H {
         let s = &b.style;
         let bp_l = s.border[LEFT] + self.pad(s, LEFT, cb_w);
         let bp_r = s.border[RIGHT] + self.pad(s, RIGHT, cb_w);
         let bp = bp_l + bp_r;
         // A declared width, content-box px (box-sizing adjusts).
-        let intrinsic = |l: &Len| self.intrinsic_width_value(l, b, Some(cb_w), inl);
+        let intrinsic = |l: &Len| {
+            super::stretch::content_size(
+                self.dom,
+                b.node,
+                s,
+                l,
+                0,
+                Some(available_w),
+                Some(cb_w),
+                bp,
+            )
+            .or_else(|| self.intrinsic_width_value(l, b, Some(cb_w), inl))
+        };
         let spec = |l: &Len| {
             intrinsic(l).or_else(|| {
                 l.resolve(Some(cb_w)).map(|w| {
@@ -2342,10 +2381,10 @@ impl Flow<'_> {
                     // width:auto — auto margins become 0 and the width fills.
                     let ml = ml.unwrap_or(0.0);
                     let mr = mr.unwrap_or(0.0);
-                    (ml, (cb_w - ml - mr - bp).max(0.0))
+                    (ml, (available_w - ml - mr - bp).max(0.0))
                 }
                 Some(w) => {
-                    let free = cb_w - w - bp;
+                    let free = available_w - w - bp;
                     // CSS 2.2 #blockwidth: negative free space first makes
                     // auto margins zero, then the containing block's (not
                     // the child's) direction selects the discarded margin.
@@ -2403,7 +2442,7 @@ impl Flow<'_> {
             .then(|| {
                 let bt = s.border[TOP] + self.pad(s, TOP, cb_w);
                 let bb = s.border[BOTTOM] + self.pad(s, BOTTOM, cb_w);
-                self.ratio_auto_width(b, bp, bt, bb, cb_h)
+                self.ratio_auto_width(b, bp, bt, bb, cb_w, cb_h)
             })
             .flatten();
         let ratio_width = ratio.and_then(|ratio| {
@@ -2461,6 +2500,30 @@ impl Flow<'_> {
         } else {
             v.max(0.0)
         })
+    }
+
+    /// CSS Sizing 3 #stretch-fit-sizing uses the margin box even when
+    /// box-sizing is content-box; ordinary heights retain their box-sizing.
+    pub(super) fn height_value(
+        &self,
+        value: &Len,
+        b: &BoxNode,
+        bt: f32,
+        bb: f32,
+        cb_h: Option<f32>,
+        cb_w: f32,
+    ) -> Option<f32> {
+        super::stretch::content_size(
+            self.dom,
+            b.node,
+            &b.style,
+            value,
+            1,
+            cb_h,
+            Some(cb_w),
+            bt + bb,
+        )
+        .or_else(|| self.height_px(value, &b.style, bt, bb, cb_h))
     }
 
     /// CSS Sizing 4 #aspect-ratio-automatic: a box with a preferred aspect
@@ -2521,6 +2584,7 @@ impl Flow<'_> {
         bp_h: f32,
         bt: f32,
         bb: f32,
+        cb_w: f32,
         cb_h: Option<f32>,
     ) -> Option<RatioWidth> {
         let s = &b.style;
@@ -2537,9 +2601,9 @@ impl Flow<'_> {
                 height * ratio
             }
         };
-        let min_h = self.height_px(&s.min_height, s, bt, bb, cb_h);
+        let min_h = self.height_value(&s.min_height, b, bt, bb, cb_h, cb_w);
         let max_h = self
-            .height_px(&s.max_height, s, bt, bb, cb_h)
+            .height_value(&s.max_height, b, bt, bb, cb_h, cb_w)
             .map(|max| max.max(min_h.unwrap_or(0.0)));
         let min = min_h.filter(|_| s.min_width.is_auto()).map_or(0.0, width);
         let max = max_h
@@ -2547,9 +2611,11 @@ impl Flow<'_> {
             .map_or(f32::INFINITY, width)
             .max(min);
         Some(RatioWidth {
-            preferred: self.height_px(&s.height, s, bt, bb, cb_h).map(|height| {
-                width(height.clamp(min_h.unwrap_or(0.0), max_h.unwrap_or(f32::INFINITY)))
-            }),
+            preferred: self
+                .height_value(&s.height, b, bt, bb, cb_h, cb_w)
+                .map(|height| {
+                    width(height.clamp(min_h.unwrap_or(0.0), max_h.unwrap_or(f32::INFINITY)))
+                }),
             min,
             max,
         })
@@ -2560,17 +2626,19 @@ impl Flow<'_> {
     /// at least its automatic minimum (#aspect-ratio-minimum) capped by the
     /// maximum, else `fallback` (its shrink-to-fit width), within the
     /// transferred limits. `fallback` alone without a ratio.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn ratio_or_auto_width(
         &self,
         b: &BoxNode,
         edges: [f32; 3],
+        cb_w: f32,
         cb_h: Option<f32>,
         max_w: f32,
         inl: &InlineStyle,
         fallback: impl FnOnce() -> f32,
     ) -> f32 {
         let [bp_h, bt, bb] = edges;
-        let Some(ratio) = self.ratio_auto_width(b, bp_h, bt, bb, cb_h) else {
+        let Some(ratio) = self.ratio_auto_width(b, bp_h, bt, bb, cb_w, cb_h) else {
             return fallback();
         };
         ratio.constrain(match ratio.preferred {
@@ -2828,13 +2896,77 @@ pub(super) fn cross_shift(extra: f32, auto_start: bool, auto_end: bool, align: A
         // flex item's self-alignment is unsafe. Preserve negative free space
         // for center/end instead of silently changing them to flex-start.
         (false, false) => match align {
-            AlignItem::Start | AlignItem::Stretch | AlignItem::Baseline => 0.0,
+            AlignItem::Start | AlignItem::SafeStart | AlignItem::Stretch | AlignItem::Baseline => {
+                0.0
+            }
             AlignItem::Center => extra / 2.0,
             AlignItem::End => extra,
             // `safe`: an overflowing item aligns as `start`.
             AlignItem::SafeCenter => extra.max(0.0) / 2.0,
             AlignItem::SafeEnd => extra.max(0.0),
         },
+    }
+}
+
+fn flex_cross_shift(
+    extra: f32,
+    auto_start: bool,
+    auto_end: bool,
+    align: AlignItem,
+    style: &super::flex::FlexStyle,
+) -> f32 {
+    // Flexbox §9.6: physical auto margins absorb available space before
+    // alignment. Overflowing auto margins preserve the writing-mode start
+    // edge, independent of the wrap direction.
+    if auto_start || auto_end {
+        if extra < 0.0 {
+            if style.cross_normal_reverse {
+                extra
+            } else {
+                0.0
+            }
+        } else {
+            cross_shift(extra, auto_start, auto_end, align)
+        }
+    } else {
+        if extra < 0.0
+            && matches!(
+                align,
+                AlignItem::SafeStart | AlignItem::SafeCenter | AlignItem::SafeEnd
+            )
+        {
+            return if style.cross_normal_reverse {
+                extra
+            } else {
+                0.0
+            };
+        }
+        let logical = cross_shift(extra, false, false, align);
+        if style.wrap_reverse {
+            extra - logical
+        } else {
+            logical
+        }
+    }
+}
+
+fn flex_line_offsets(style: &super::flex::FlexStyle, free: f32, count: usize) -> (f32, f32) {
+    if free < 0.0
+        && matches!(
+            style.align_content,
+            AlignContent::SafeStart | AlignContent::SafeCenter | AlignContent::SafeEnd
+        )
+    {
+        (
+            if style.cross_normal_reverse == style.wrap_reverse {
+                0.0
+            } else {
+                free
+            },
+            0.0,
+        )
+    } else {
+        align_content_offsets(style.align_content, free, count)
     }
 }
 
@@ -3057,7 +3189,7 @@ impl Flow<'_> {
             let base = match &basis {
                 Len::Auto => width_def,
                 Len::MinContent => Some(self.intrinsic_w(it, IMode::Min, inl)),
-                Len::MaxContent | Len::FitContent | Len::FitContentLimit(_) => {
+                Len::MaxContent | Len::FitContent | Len::FitContentLimit(_) | Len::Stretch => {
                     intrinsic_main(&basis)
                 }
                 l => l.resolve(Some(content_w)).map(to_content),
@@ -3092,29 +3224,17 @@ impl Flow<'_> {
             };
             // Cross-axis (height) resolution for stretch/def-h bookkeeping.
             let bp_v = bp_t + bp_b;
-            let to_content_v = |v: f32| {
-                if s.border_box {
-                    (v - bp_v).max(0.0)
-                } else {
-                    v.max(0.0)
-                }
-            };
-            let hmin = s
-                .min_height
-                .resolve(def_ch)
-                .map(to_content_v)
-                .unwrap_or(0.0);
-            let hmax = match &s.max_height {
-                Len::None => f32::INFINITY,
-                l => l.resolve(def_ch).map(to_content_v).unwrap_or(f32::INFINITY),
-            }
-            .max(hmin);
-            let def_h = s
-                .height
-                .resolve(def_ch)
-                .map(to_content_v)
+            let hmin = self
+                .height_value(&s.min_height, it, bp_t, bp_b, def_ch, content_w)
+                .unwrap_or(0.);
+            let hmax = self
+                .height_value(&s.max_height, it, bp_t, bp_b, def_ch, content_w)
+                .unwrap_or(f32::INFINITY)
+                .max(hmin);
+            let def_h = self
+                .height_value(&s.height, it, bp_t, bp_b, def_ch, content_w)
                 .map(|v| v.clamp(hmin, hmax));
-            let align = self.item_align(it.node, fs.align_items);
+            let align = fs.item_alignment(self.dom, it.node);
             // #algo-visibility: a collapsed item has a zero main size.
             calcs.push(if collapsed {
                 FlexCalc::new(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
@@ -3223,7 +3343,7 @@ impl Flow<'_> {
             }
             if has_baseline {
                 cross = cross.max(above + below);
-                line_baseline.push(Some(above));
+                line_baseline.push(Some(if fs.wrap_reverse { below } else { above }));
             } else {
                 line_baseline.push(None);
             }
@@ -3308,18 +3428,18 @@ impl Flow<'_> {
         let total_cross: f32 =
             line_cross.iter().sum::<f32>() + gap_cross * line_cross.len().saturating_sub(1) as f32;
         let (lead_c, between_c) = match def_ch {
-            Some(d) => align_content_offsets(fs.align_content, d - total_cross, lines.len()),
+            Some(d) => flex_line_offsets(fs, d - total_cross, lines.len()),
             None => (0.0, 0.0),
         };
-        let order: Vec<usize> = if fs.wrap_reverse {
-            (0..lines.len()).rev().collect()
-        } else {
-            (0..lines.len()).collect()
-        };
-        let mut top = lead_c;
+        let mut cross_cursor = lead_c;
         let mut frags: Vec<Frag> = Vec::with_capacity(fi.len());
-        for &li in &order {
+        for li in 0..lines.len() {
             let cross = line_cross[li];
+            let top = if fs.wrap_reverse {
+                def_ch.unwrap_or(total_cross) - cross_cursor - cross
+            } else {
+                cross_cursor
+            };
             for i in lines[li].clone() {
                 if fi[i].collapsed {
                     fi[i].border_y = top;
@@ -3376,13 +3496,19 @@ impl Flow<'_> {
                     && let Some(line_baseline) = line_baseline[li]
                 {
                     let baseline = first_baseline(frag).unwrap_or(frag.h);
-                    it.border_y = top + line_baseline - baseline;
+                    it.border_y =
+                        top + if fs.wrap_reverse {
+                            cross - line_baseline
+                        } else {
+                            line_baseline
+                        } - baseline;
                 } else {
-                    let shift = cross_shift(extra, it.auto[TOP], it.auto[BOTTOM], it.align);
+                    let shift =
+                        flex_cross_shift(extra, it.auto[TOP], it.auto[BOTTOM], it.align, fs);
                     it.border_y = top + shift + it.m[TOP];
                 }
             }
-            top += cross + between_c + gap_cross;
+            cross_cursor += cross + between_c + gap_cross;
         }
         for it in &mut fi {
             let mut frag = it.frag.take().expect("laid above");
@@ -3448,7 +3574,7 @@ impl Flow<'_> {
                     self.vp,
                 )
             };
-            let align = self.item_align(it.node, fs.align_items);
+            let align = fs.item_alignment(self.dom, it.node);
             // Cross size (width): definite → that; stretch-eligible → fill;
             // else fit-content (§9.4.1 "treating auto as fit-content").
             let to_content_h = |v: f32| {
@@ -3486,10 +3612,9 @@ impl Flow<'_> {
             .clamp(wmin, wmax)
             .max(0.0);
             // The specified-size suggestion / % basis for children.
-            let to_content_v = |v: f32| {
-                if s.border_box { v - bp_main } else { v }
-            };
-            let def_h = s.height.resolve(def_ch).map(to_content_v);
+            let height_value =
+                |value: &Len| self.height_value(value, it, bp_t, bp_b, def_ch, content_w);
+            let def_h = height_value(&s.height);
             let (frag, anc) = self.item_frag(it, w, content_w, def_h.map(|v| v.max(0.0)), inl);
             let natural_main = (frag.h - bp_main).max(0.0);
             let base = match &basis {
@@ -3497,7 +3622,7 @@ impl Flow<'_> {
                 Len::MinContent | Len::MaxContent | Len::FitContent | Len::FitContentLimit(_) => {
                     None
                 }
-                l => l.resolve(def_ch).map(to_content_v),
+                l => height_value(l),
             }
             .unwrap_or(natural_main);
             // Flexbox §9.8: a post-flexing main size is definite when either
@@ -3510,15 +3635,12 @@ impl Flow<'_> {
                 Len::MinContent | Len::MaxContent | Len::FitContent | Len::FitContentLimit(_) => {
                     false
                 }
-                value => value.resolve(def_ch).is_some(),
+                value => height_value(value).is_some(),
             };
             post_flex_main_definite.push(def_ch.is_some() || basis_definite);
             let max_main = match &s.max_height {
                 Len::None => f32::INFINITY,
-                l => l
-                    .resolve(def_ch)
-                    .map(|v| to_content_v(v).max(0.0))
-                    .unwrap_or(f32::INFINITY),
+                l => height_value(l).unwrap_or(f32::INFINITY),
             };
             // §4.5 in the block axis: the content-based minimum is the laid
             // content height; shaped line boxes do not compress after layout.
@@ -3550,10 +3672,7 @@ impl Flow<'_> {
                         v.min(max_main)
                     }
                 }
-                l => l
-                    .resolve(def_ch)
-                    .map(|v| to_content_v(v).max(0.0))
-                    .unwrap_or(0.0),
+                l => height_value(l).unwrap_or(0.0),
             };
             // #algo-visibility: a collapsed item has a zero main size.
             calcs.push(if collapsed {
@@ -3776,16 +3895,15 @@ impl Flow<'_> {
         // ---- columns across (cross axis is the definite content width) ----
         let total_cross: f32 =
             line_cross.iter().sum::<f32>() + gap_cross * line_cross.len().saturating_sub(1) as f32;
-        let (lead_c, between_c) =
-            align_content_offsets(fs.align_content, content_w - total_cross, lines.len());
-        let order: Vec<usize> = if fs.wrap_reverse {
-            (0..lines.len()).rev().collect()
-        } else {
-            (0..lines.len()).collect()
-        };
-        let mut left = lead_c;
-        for &li in &order {
+        let (lead_c, between_c) = flex_line_offsets(fs, content_w - total_cross, lines.len());
+        let mut cross_cursor = lead_c;
+        for li in 0..lines.len() {
             let cross = line_cross[li];
+            let left = if fs.wrap_reverse {
+                content_w - cross_cursor - cross
+            } else {
+                cross_cursor
+            };
             for i in lines[li].clone() {
                 let it = &mut fi[i];
                 if it.collapsed {
@@ -3794,10 +3912,10 @@ impl Flow<'_> {
                 }
                 let frag = it.frag.as_mut().expect("laid above");
                 let extra = cross - (frag.w + it.m[LEFT] + it.m[RIGHT]);
-                let shift = cross_shift(extra, it.auto[LEFT], it.auto[RIGHT], it.align);
+                let shift = flex_cross_shift(extra, it.auto[LEFT], it.auto[RIGHT], it.align, fs);
                 it.border_x = left + shift + it.m[LEFT];
             }
-            left += cross + between_c + gap_cross;
+            cross_cursor += cross + between_c + gap_cross;
         }
         let mut frags: Vec<Frag> = Vec::with_capacity(fi.len());
         for it in &mut fi {
@@ -4991,8 +5109,27 @@ impl Flow<'_> {
             },
             _ => None,
         };
+        let stretch_available = [
+            (cb.w - left.unwrap_or(0.) - right.unwrap_or(0.)).max(0.),
+            (cb.h - top.unwrap_or(0.) - bottom.unwrap_or(0.)).max(0.),
+        ];
+        let positioned_size = |l: &Len, axis: usize| {
+            // CSS Position 3 #abspos-layout: intrinsic/stretch sizes use
+            // inset-modified available space; percentages keep the full CB.
+            super::stretch::content_size(
+                self.dom,
+                b.node,
+                s,
+                l,
+                axis,
+                Some(stretch_available[axis]),
+                Some(cb.w),
+                if axis == 0 { bp_h } else { bp_v },
+            )
+        };
         let spec_w = |l: &Len| {
-            self.intrinsic_width_value(l, b, Some(cb.w), ctx)
+            positioned_size(l, 0)
+                .or_else(|| self.intrinsic_width_value(l, b, Some(cb.w), ctx))
                 .or_else(|| {
                     l.resolve(Some(cb.w))
                         .map(|v| (v - if s.border_box { bp_h } else { 0. }).max(0.))
@@ -5057,7 +5194,7 @@ impl Flow<'_> {
         let vertical_inl = InlineStyle::for_box(self.dom, b.node, s, ctx, self.base);
         let vertical = self.vertical_lines(
             b,
-            self.height_px(&s.height, s, bp_t, bp_b, Some(cb.h)),
+            self.height_value(&s.height, b, bp_t, bp_b, Some(cb.h), cb.w),
             Some(
                 (cb.h - top.unwrap_or(0.) - bottom.unwrap_or(0.) - bp_v - m[TOP] - m[BOTTOM])
                     .max(0.),
@@ -5074,14 +5211,14 @@ impl Flow<'_> {
             }
             // The used height: clamped by the min/max heights first.
             let min_h = self
-                .height_px(&s.min_height, s, bp_t, bp_b, Some(cb.h))
+                .height_value(&s.min_height, b, bp_t, bp_b, Some(cb.h), cb.w)
                 .unwrap_or(0.0);
             let max_h = self
-                .height_px(&s.max_height, s, bp_t, bp_b, Some(cb.h))
+                .height_value(&s.max_height, b, bp_t, bp_b, Some(cb.h), cb.w)
                 .unwrap_or(f32::INFINITY)
                 .max(min_h);
             let height = self
-                .height_px(&s.height, s, bp_t, bp_b, Some(cb.h))?
+                .height_value(&s.height, b, bp_t, bp_b, Some(cb.h), cb.w)?
                 .clamp(min_h, max_h);
             Some(if s.border_box {
                 ((height + bp_v) * ratio - bp_h).max(0.0)
@@ -5119,13 +5256,7 @@ impl Flow<'_> {
         // both insets given (rule 5) — becomes the definite content height
         // children resolve against; otherwise the content decides (§10.6.7).
         let spec_v = |l: &Len| {
-            l.resolve(Some(cb.h)).map(|v| {
-                if s.border_box {
-                    (v - bp_v).max(0.0)
-                } else {
-                    v.max(0.0)
-                }
-            })
+            positioned_size(l, 1).or_else(|| self.height_px(l, s, bp_t, bp_b, Some(cb.h)))
         };
         let min_h = spec_v(&s.min_height).unwrap_or(0.0);
         let max_h = match &s.max_height {
@@ -5327,7 +5458,7 @@ impl Flow<'_> {
         let content_w = match spec_w(&s.width) {
             Some(w) => w.clamp(min_w, max_w),
             None => self
-                .ratio_or_auto_width(fb, [bp_h, bt, bb], cb_h, max_w, parent_inl, || {
+                .ratio_or_auto_width(fb, [bp_h, bt, bb], cb_w, cb_h, max_w, parent_inl, || {
                     let avail = (cb_w - m[LEFT] - m[RIGHT] - bp_h).max(0.0);
                     self.shrink_to_fit(fb, avail, parent_inl)
                 })
@@ -5338,14 +5469,14 @@ impl Flow<'_> {
         // inlines: clamp a definite height, else re-lay an automatic one
         // whose laid height falls outside them.
         let min_h = self
-            .height_px(&s.min_height, s, bt, bb, cb_h)
+            .height_value(&s.min_height, fb, bt, bb, cb_h, cb_w)
             .unwrap_or(0.0);
         let max_h = self
-            .height_px(&s.max_height, s, bt, bb, cb_h)
+            .height_value(&s.max_height, fb, bt, bb, cb_h, cb_w)
             .unwrap_or(f32::INFINITY)
             .max(min_h);
         let def_h = self
-            .height_px(&s.height, s, bt, bb, cb_h)
+            .height_value(&s.height, fb, bt, bb, cb_h, cb_w)
             .map(|height| height.clamp(min_h, max_h));
         let (mut frag, mut anchors) = self.item_frag(fb, content_w, cb_w, def_h, parent_inl);
         if def_h.is_none() {
@@ -5438,9 +5569,15 @@ impl Flow<'_> {
                     // widths already apply.
                     replaced.box_w.max(0.0)
                 } else {
-                    self.ratio_or_auto_width(ab, [bp_h, bt, bb], cb_h, max_w, parent_inl, || {
-                        self.shrink_to_fit(ab, avail, parent_inl)
-                    })
+                    self.ratio_or_auto_width(
+                        ab,
+                        [bp_h, bt, bb],
+                        cb_w,
+                        cb_h,
+                        max_w,
+                        parent_inl,
+                        || self.shrink_to_fit(ab, avail, parent_inl),
+                    )
                     .clamp(min_w, max_w)
                 }
             }
@@ -5450,14 +5587,14 @@ impl Flow<'_> {
         // its callers must enforce the box's own constraints. In particular,
         // an auto-height inline-flex button must not ignore min-height.
         let min_h = self
-            .height_px(&s.min_height, s, bt, bb, cb_h)
+            .height_value(&s.min_height, ab, bt, bb, cb_h, cb_w)
             .unwrap_or(0.0);
         let max_h = self
-            .height_px(&s.max_height, s, bt, bb, cb_h)
+            .height_value(&s.max_height, ab, bt, bb, cb_h, cb_w)
             .unwrap_or(f32::INFINITY)
             .max(min_h);
         let def_h = self
-            .height_px(&s.height, s, bt, bb, cb_h)
+            .height_value(&s.height, ab, bt, bb, cb_h, cb_w)
             .map(|height| height.clamp(min_h, max_h));
         let (mut frag, mut anchors) = self.item_frag(ab, content_w, cb_w, def_h, parent_inl);
         if def_h.is_none() {

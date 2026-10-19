@@ -97,6 +97,28 @@ and [DOM event dispatch](https://dom.spec.whatwg.org/#concept-event-dispatch).
 Successful local checks do not establish why a remote challenge accepts or
 rejects a browser.
 
+### Servo follow-up acceptance
+
+The retained rendering and navigation fixtures accompany the October 2026
+Servo comparison. Build the ordinary release binaries with the isolated engine
+instructions in `AGENTS.md`, then render these local pages:
+
+```sh
+target/release/trust-headless --timeout 20 --settle 2 --js-diagnostics src/fixtures/largest_contentful_paint.html
+target/release/trust-headless --timeout 20 --settle 2 --js-diagnostics src/fixtures/servo_layout_followups.html
+target/release/trust-headless --timeout 20 --settle 2 --js-diagnostics src/fixtures/servo_compositor_sticky.html
+```
+
+Set `TRUST_HEADLESS_PNG` to a distinct output path for each page to inspect its
+final painting. The pages display their own PASS/FAIL results. The service-worker
+fixture needs HTTP: serve `src/fixtures` on a loopback address and open
+`/service_worker/index.html`. After its checks pass, follow its navigation link
+to exercise navigation preload and client replacement. The headless equivalent
+is `--click 30,30 --click-settle 3` after settling the initial page. Registrations
+and CacheStorage remain in RAM; `--site-data` is unnecessary for these fixtures.
+The implementation history and full validation results are recorded in
+`docs/servo-follow-ups-20261018.txt`.
+
 ### WebAssembly
 
 Compare native WebAssembly execution against the interpreter with the same

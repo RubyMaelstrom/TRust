@@ -37,6 +37,7 @@ enum Motion {
     Sticky {
         constraint: Box<StickyConstraint>,
         container: Option<usize>,
+        horizontal_container: Option<usize>,
         document: bool,
     },
     Animation(CssAnimationScope),
@@ -158,6 +159,7 @@ pub(crate) struct PageHitIndex {
     entries: Vec<Entry>,
     groups: Vec<Group>,
     world: Vec<Affine2d>,
+    sticky_movements: Vec<CssPoint>,
     clip_marks: Vec<(u64, bool)>,
     serial: u64,
     stack: Vec<usize>,
@@ -187,6 +189,7 @@ impl PageHitIndex {
             entries: Vec::new(),
             groups: vec![Group::default(), Group::default()],
             world: Vec::new(),
+            sticky_movements: Vec::new(),
             clip_marks: Vec::new(),
             serial: 0,
             stack: Vec::new(),
@@ -216,6 +219,9 @@ impl PageHitIndex {
             group.build(&index.entries);
         }
         index.world.resize(index.spaces.len(), Affine2d::IDENTITY);
+        index
+            .sticky_movements
+            .resize(index.spaces.len(), CssPoint::default());
         index.clip_marks.resize(index.clips.len(), (0, false));
         index
     }
@@ -230,6 +236,7 @@ impl PageHitIndex {
         let mut space = SpaceRef::root(usize::from(document));
         let mut transforms = Vec::new();
         let mut clip = None;
+        let mut fixed_depth = 0usize;
         for command in commands {
             match command {
                 Primitive::PushTransform(matrix) => {
@@ -242,6 +249,9 @@ impl PageHitIndex {
                 | Primitive::EndSticky
                 | Primitive::EndCssAnimation
                 | Primitive::EndMarquee => {
+                    if matches!(command, Primitive::EndFixed) {
+                        fixed_depth = fixed_depth.saturating_sub(1);
+                    }
                     space = transforms
                         .pop()
                         .unwrap_or(SpaceRef::root(usize::from(document)));
@@ -263,6 +273,9 @@ impl PageHitIndex {
                 | Primitive::BeginSticky(_)
                 | Primitive::BeginCssAnimation(_)
                 | Primitive::BeginMarquee(_) => {
+                    if matches!(command, Primitive::BeginFixed) {
+                        fixed_depth += 1;
+                    }
                     transforms.push(space);
                     let motion = match command {
                         Primitive::BeginScroll(node) => Motion::Scroll(scrolls.get(node).copied()),
@@ -271,7 +284,10 @@ impl PageHitIndex {
                         Primitive::BeginSticky(constraint) => Motion::Sticky {
                             constraint: Box::new(constraint.clone()),
                             container: constraint.container.and_then(|n| scrolls.get(&n).copied()),
-                            document,
+                            horizontal_container: constraint
+                                .horizontal_container
+                                .and_then(|n| scrolls.get(&n).copied()),
+                            document: document && fixed_depth == 0,
                         },
                         Primitive::BeginCssAnimation(scope) => Motion::Animation(scope.clone()),
                         Primitive::BeginMarquee(scope) => Motion::Marquee(scope.clone()),
@@ -350,9 +366,12 @@ impl PageHitIndex {
             self.visited_entries = 0;
         }
         for (id, space) in self.spaces.iter().enumerate() {
+            let parent_sticky = self.sticky_movements[space.parent.dynamic];
+            self.sticky_movements[id] = parent_sticky;
             let offset = match &space.motion {
                 Motion::Identity => {
                     self.world[id] = Affine2d::IDENTITY;
+                    self.sticky_movements[id] = CssPoint::default();
                     continue;
                 }
                 Motion::Document => CssPoint::new(-scroll.x, -scroll.y),
@@ -367,20 +386,32 @@ impl PageHitIndex {
                 Motion::Sticky {
                     constraint,
                     container,
+                    horizontal_container,
                     document,
                 } => {
-                    let (offset, viewport) = container
-                        .and_then(|i| page.scroll_containers.get(i))
-                        .map(|c| (c.offset, c.viewport))
-                        .unwrap_or((
-                            if *document {
-                                scroll
-                            } else {
-                                CssPoint::default()
-                            },
-                            CssRect::new(0., 0., viewport.width, viewport.height),
-                        ));
-                    constraint.offset(offset, viewport)
+                    let resolve = |container: Option<usize>| {
+                        container
+                            .and_then(|i| page.scroll_containers.get(i))
+                            .map(|c| (c.offset, c.viewport))
+                            .unwrap_or((
+                                if *document {
+                                    scroll
+                                } else {
+                                    CssPoint::default()
+                                },
+                                CssRect::new(0., 0., viewport.width, viewport.height),
+                            ))
+                    };
+                    let (x_offset, x_view) = resolve(*horizontal_container);
+                    let (y_offset, y_view) = resolve(*container);
+                    let offset = constraint.offset_with_parent(
+                        CssPoint::new(x_offset.x, y_offset.y),
+                        CssRect::new(x_view.x, y_view.y, x_view.width, y_view.height),
+                        parent_sticky,
+                    );
+                    self.sticky_movements[id] =
+                        CssPoint::new(parent_sticky.x + offset.x, parent_sticky.y + offset.y);
+                    offset
                 }
                 Motion::Animation(scope) => {
                     self.world[id] = self.world[space.parent.dynamic]
@@ -490,6 +521,7 @@ impl PageHitIndex {
             + self.entries.capacity() * std::mem::size_of::<Entry>()
             + self.groups.capacity() * std::mem::size_of::<Group>()
             + self.world.capacity() * std::mem::size_of::<Affine2d>()
+            + self.sticky_movements.capacity() * std::mem::size_of::<CssPoint>()
             + self.clip_marks.capacity() * std::mem::size_of::<(u64, bool)>()
             + (self.stack.capacity() + self.candidates.capacity()) * std::mem::size_of::<usize>();
         let mut opaque = false;
@@ -628,6 +660,7 @@ mod tests {
                     node: 4,
                     rect: CssRect::new(10., 80., 70., 20.),
                     container: Some(10),
+                    horizontal_container: Some(10),
                     insets: [Some(0.), None, None, None],
                     movement: [-80., 0., 250., 0.],
                     reverse: [false; 2],
@@ -794,7 +827,10 @@ mod tests {
                     },
                 ],
                 transform_origin: CssPoint::default(),
+                transform_origin_z: 0.,
+                individual_transform: super::super::matrix3d::IDENTITY,
                 static_transform: Affine2d::IDENTITY,
+                static_opacity: 1.,
             }],
         };
         let marquee = MarqueeScope {

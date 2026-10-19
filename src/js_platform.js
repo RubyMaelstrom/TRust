@@ -3,6 +3,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
 (function () {
     "use strict";
     const g = globalThis;
+    const initialNavigationNative = g.__service_worker;
+    const initialNavigationStringify = JSON.stringify, initialNavigationParse = JSON.parse;
+    const initialNavigationCreate = Object.create, initialNavigationHasOwn = Object.prototype.hasOwnProperty;
+    const initialNavigationApply = Reflect.apply, initialNavigationString = String;
     const rememberMediaFailure = g.__media_failed;
     delete g.__media_failed;
     // These capabilities are bootstrap-only. Author code cannot supply an
@@ -120,12 +124,17 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     const documentURLs = new WeakMap();
     const frameNavigationURLs = new WeakMap();
     const frameBlobOrigins = new WeakMap();
+    const frameResponseOrigins = new WeakMap();
     const frameResourceTimings = new WeakMap();
     const configuredReferrer = typeof cfg.referrer === "string" ? cfg.referrer : "";
     const navigateDocument = g.__http_navigate;
     delete g.__http_navigate;
     const navigateDocumentAsync = g.__http_navigate_async;
     delete g.__http_navigate_async;
+    const resumeFrameNative = g.__dom_resume_frame;
+    delete g.__dom_resume_frame;
+    const parsedStyleResourcesNative = g.__dom_parsed_style_resources;
+    delete g.__dom_parsed_style_resources;
     delete g.__dom_fetch_classic_script;
     const makeWindowMessageBinding = g.__window_message_binding;
     delete g.__window_message_binding;
@@ -251,7 +260,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     // HTML #explicitly-set-attr-element for Element? reflections.
     const explicitAttrElements = new WeakMap();
-    const trust = { errors: [], logs: [], readyState: "loading" };
+    const trust = { errors: [], logs: [], readyState: cfg.resumedDocument ? "complete" : "loading" };
     // The control object is private to the platform. The native host and the
     // bootstraps of same-Agent Window Realms reach it through one host-rooted
     // WeakMap keyed by each Realm's global object, never an author-visible
@@ -1995,7 +2004,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // which makes navigation (#navigate), document.open() and
     // document.write() ignore requests from beforeunload, pagehide and
     // unload handlers.
-    let pageShowing = false;
+    let pageShowing = !!cfg.resumedDocument;
     let unloadCounter = 0;
     trust.unloading = function () { return unloadCounter > 0; };
     // The event loop's termination nesting level, which the top-level
@@ -2541,6 +2550,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const parent = cfg.parentWindow && trustOf(cfg.parentWindow);
         if (!parent) return systemFocused;
         return parent.documentFocused() && parent.focusedChildWindow() === g;
+    };
+    trust.documentFocusWithin = function () {
+        const parent = cfg.parentWindow && trustOf(cfg.parentWindow);
+        return !parent || parent.documentFocusWithin() && parent.focusedChildWindow() === g;
     };
     trust.focusedChildWindow = function () {
         activeElementFor(g.document);
@@ -4856,6 +4869,16 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             eventSlots.windowTargetSet = true;
             eventSlots.frameTarget = targetFrame;
         }
+        // LCP #sec-modifications-DOM and Event Timing's first interaction:
+        // use the platform's trusted-event slot, before author listeners run.
+        // pointerdown can still become a scrolling gesture; pointerup/click
+        // confirm the interaction. Child Documents have their own metric.
+        if (!targetFrame && messageApply(trustedEventHas, trustedEvents, [ev]) &&
+            typeof trust.stopLargestContentfulPaint === "function") {
+            const type = eventSlots.eventType;
+            if (type === "scroll" || type === "keydown" || type === "keyup" ||
+                type === "pointerup" || type === "click") trust.stopLargestContentfulPaint();
+        }
         eventSlots.eventTarget = targetOverride;
         const origRelated = eventSlots.eventRelatedTarget;
         const hasRelated = origRelated !== null && origRelated !== undefined;
@@ -5075,6 +5098,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (previous === value) return;
         if (realmRootFrame) internalsFor(realmRootFrame).trustReadyState = value;
         trust.readyState = value;
+        internalsFor(g.document).documentReadiness = value;
         if (trust.performanceLifecycle && (value === 'interactive' || value === 'complete'))
             trust.performanceLifecycle(value === 'interactive' ? 'domInteractive' : 'domComplete');
         trust.fire(g.document,'readystatechange',false);
@@ -5095,6 +5119,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     function frameSameOrigin(url, frame) {
         if (!url || url === "about:srcdoc" || url === "about:blank") return true;
         const own = windowMessageState(g);
+        const responseOrigin = frame && frameResponseOrigins.get(frame);
+        if(responseOrigin && responseOrigin.url===url)
+            return !!(own && responseOrigin.origin!=="null" && responseOrigin.origin===own.origin);
         const blobOrigin = frame && frameBlobOrigins.get(frame);
         // URL #concept-url-origin / File API #url-model: a resolved Blob
         // retains its creator's actual origin, including opaque identity.
@@ -5196,7 +5223,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             // that old Document must not fire the new Document's load event.
             if (internalsFor(frame).trustLoadGeneration !== generation) return;
             if (frame === realmRootFrame) trust.setDocumentReadiness('complete');
-            else internalsFor(frame).trustReadyState = "complete";
+            else {
+                internalsFor(frame).trustReadyState = "complete";
+                internalsFor(frameDocument(frame)).documentReadiness = "complete";
+            }
             try { runInFrame(frame, function () { trust.fire(g, "load", false); }); } catch (e) {}
             // HTML #the-end: this Realm's Document is showing. (A scoped
             // frame sharing this Realm has no page lifecycle of its own.)
@@ -5278,6 +5308,31 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (!frame || internalsOf(frame).contentRealmWindow || internalsFor(frame).trustInitialAboutBlank)
             return frame && internalsOf(frame).contentRealmWindow || null;
 
+        // An inert native Document can acquire its Realm when a worker asks
+        // its WindowClient to navigate/focus. It is already loaded: retain its
+        // URL, encoding and native settings identity instead of navigating it.
+        const restored = typeof resumeFrameNative === "function" ? resumeFrameNative(nodeIds.get(frame)) : null;
+        if (restored) {
+            navigableName(frame);
+            const srcdoc = frame.getAttribute("srcdoc");
+            internalsFor(frame).loadedSrcdoc = srcdoc === null ? undefined : srcdoc;
+            const src = frame.getAttribute("src");
+            if (srcdoc === null && src) {
+                const parsed = encodingParseForNode(src, frame);
+                if (parsed) internalsFor(frame).loadedSrc = parsed[0];
+            }
+            frameResponseOrigins.set(frame, {url:restored[0], origin:restored[6]});
+            frameResponsePolicies.set(frame, restored[5]);
+            const generation = beginFrameLoad(frame);
+            loadFrameMarkup(frame, restored[1], restored[2], restored[0], generation,
+                restored[4], "text/html", restored[7], restored[3], true);
+            if (/^about:blank(?:[?#]|$)/.test(restored[0])) {
+                internalsFor(frame).trustInitialAboutBlank = true;
+                internalsFor(frame).trustInitialLoadFired = true;
+            } else framesWithNonInitialDocuments.add(frame);
+            return internalsOf(frame).contentRealmWindow || null;
+        }
+
         // HTML §7.3.2.1 creates and completely loads a populated initial
         // about:blank Document, with its own Window Realm, as part of creating
         // the iframe's child navigable. It exists before attribute navigation.
@@ -5307,15 +5362,26 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         }
         return childWindow;
     }
-    function loadFrameMarkup(frame, markup, base, frameUrl, generation, referrer = "", contentType = "text/html", navigationTiming = null, encoding = "UTF-8") {
-        if (navigationTiming) navigationTiming['legacy:domLoading'] = navigationFloorTime(__clockNow());
+    function loadFrameMarkup(frame, markup, base, frameUrl, generation, referrer = "", contentType = "text/html", navigationTiming = null, encoding = "UTF-8", resuming = false) {
+        if (navigationTiming && !resuming) navigationTiming['legacy:domLoading'] = navigationFloorTime(__clockNow());
         if (frameBlobOrigins.get(frame)?.url !== frameUrl) frameBlobOrigins.delete(frame);
+        if (frameResponseOrigins.get(frame)?.url !== frameUrl) frameResponseOrigins.delete(frame);
         frameReferrers.set(frame, referrer);
         ftrace("loadFrameMarkup url=" + frameUrl + " markup=" + String(markup == null ? "" : markup).length);
         const initialWindow = internalsFor(frame).trustInitialAboutBlank
             ? internalsOf(frame).contentRealmWindow : null;
-        const reuseInitialWindow = !!(initialWindow && trustOf(initialWindow) &&
-            frameSameOrigin(frameUrl, frame));
+        let reuseInitialWindow = false;
+        if (initialWindow && trustOf(initialWindow)) {
+            // HTML compares the initial Document's actual origin with the
+            // response's origin. A new sandboxed Document has a fresh opaque
+            // origin even when its URL matches its parent's URL.
+            const initial = windowMessageState(initialWindow);
+            const input = initialNavigationCreate(null);
+            input.frame = nodeIds.get(frame); input.url = initialNavigationString(frameUrl); input.check = true;
+            const checked = initialNavigationParse(initialNavigationNative("initialNavigation", initial.settingsContext, initialNavigationStringify(input)));
+            reuseInitialWindow = !initialNavigationApply(initialNavigationHasOwn, checked, ["error"]) &&
+                !!(checked.value && checked.value.allowed);
+        }
         if (initialWindow) framesWithNonInitialDocuments.add(frame);
         if (!reuseInitialWindow) resetFrameWindowState(frame);
         internalsFor(frame).trustInitialAboutBlank = false;
@@ -5324,7 +5390,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         else frameAboutBaseURLs.delete(frame);
         internalsFor(frame).trustParentWindow = undefined;
         internalsFor(frame).trustTopWindow = undefined;
-        internalsFor(frame).trustReadyState = "loading";
+        internalsFor(frame).trustReadyState = resuming ? "complete" : "loading";
         const replacedRoots = internalsOf(frame).contentDoc ? [internalsOf(frame).contentDoc] : [];
         if (reuseInitialWindow) {
             for (const root of replacedRoots) destroyFrameNavigablesIn(root);
@@ -5339,7 +5405,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // cross-document navigations create a fresh Window and Realm.
         if (reuseInitialWindow) {
             try {
-                if (trustOf(initialWindow).replaceInitialDocument(nodeIds.get(frame), frameUrl, referrer, contentType, navigationTiming, frameAboutBaseURLs.get(frame) || null)) {
+                if (trustOf(initialWindow).replaceInitialDocument(nodeIds.get(frame), frameUrl, referrer, contentType, navigationTiming, frameAboutBaseURLs.get(frame) || null, frameResponsePolicies.get(frame) || "")) {
+                    frameResponsePolicies.delete(frame);
                     internalsFor(frame).contentRealmWindow = initialWindow;
                     internalsFor(frame).contentDoc = initialWindow.document;
                     trustOf(initialWindow).finishParsedFrameLoad(nodeIds.get(frame), generation);
@@ -5405,6 +5472,14 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // access paths within this navigation must subsequently return that
         // same object (Web IDL interface identity / Window.document).
         internalsFor(frame).contentDoc = frameDocument(frame);
+        if (cfg.resumedDocument && frame === realmRootFrame) {
+            queueFrameNavigationsIn(frameDocument(frame));
+            // HTML #current-document-readiness: this Document completed
+            // before it acquired an actor. Do not replay readiness events
+            // or replace its original navigation lifecycle timestamps.
+            internalsFor(frameDocument(frame)).documentReadiness = "complete";
+            return;
+        }
         // The native parse is atomic, but its parser-blocking scripts still
         // need to execute with readiness "loading". runFrameScripts marks
         // EOF only after those scripts and before deferred/module execution.
@@ -5597,12 +5672,14 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (!locationNavigation) internalsFor(frame).loadedSrc = url; // set before fetching so a re-sweep won't double-load
         const timingStart = navigationFloorTime(__clockNow()*10)/10;
         const sourceURL = locationNavigation ? navigationURL.sourceURL : frame.ownerDocument.URL;
+        const sourceContext = locationNavigation ? navigationURL.sourceContext : undefined;
+        const sourcePolicy = locationNavigation ? navigationURL.sourcePolicy : frame.referrerPolicy || "";
         if (parallel && navigateDocumentAsync) {
             // A later navigation of this frame supersedes the response.
             const token = {};
             internalsFor(frame).trustNavigationToken = token;
             let pending;
-            try { pending = navigateDocumentAsync(url, sourceURL, frame.referrerPolicy || "", nodeIds.get(frame)); }
+            try { pending = navigateDocumentAsync(url, sourceURL, sourcePolicy, nodeIds.get(frame), sourceContext); }
             catch (e) { pending = Promise.resolve(null); }
             return pending.then(function (r) {
                 if (internalsFor(frame).trustNavigationToken !== token || !frame.isConnected) return;
@@ -5611,7 +5688,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             });
         }
         let r;
-        try { r = navigateDocument(url, sourceURL, frame.referrerPolicy || "", nodeIds.get(frame)); } catch (e) { r = null; }
+        try { r = navigateDocument(url, sourceURL, sourcePolicy, nodeIds.get(frame), sourceContext); } catch (e) { r = null; }
         internalsFor(frame).trustNavigationToken = null;
         processFrameNavigationResponse(frame, url, r, timingStart);
     }
@@ -5633,6 +5710,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             trust.recordResourceTiming(r[8]);
         }
         const finalURL = r[5] || url;
+        if(typeof r[10]==="string")frameResponseOrigins.set(frame,{url:finalURL,origin:r[10]});
+        else frameResponseOrigins.delete(frame);
         // The response bytes (r[3]) are decoded per the document's rules; a
         // record without them carries text already decoded as UTF-8 (r[2]).
         const body = r[3] instanceof ArrayBuffer || ArrayBuffer.isView(r[3]) ? r[3] : (r[2] || "");
@@ -5687,6 +5766,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 frameNavigationURLs.set(frame, { source, parsed, location:!!locationRequest,
                     base:locationRequest ? locationRequest[3] : null,
                     sourceURL:locationRequest ? locationRequest[4] : null,
+                    sourcePolicy:locationRequest ? locationRequest[5] : "",
+                    sourceContext:locationRequest ? locationRequest[6] : null,
                     blob: parsed[1] === "blob:" ? blobURLEntry(key) : null });
             } else frameNavigationURLs.delete(frame);
         }
@@ -5761,15 +5842,18 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // HTML #the-end: the native page actor runs each of these steps as one
     // task through the private control object (never an author script).
     trust.parserFinished = function () {
+        if (cfg.resumedDocument) return;
         trust.setDocumentReadiness("interactive");
     };
     trust.fireDOMContentLoaded = function () {
         trust.queueInitialFrameNavigations();
+        if (cfg.resumedDocument) return;
         trust.fire(g.document, "DOMContentLoaded", true);
     };
     trust.completeDocumentLoad = function () {
         // An aborted parser never reaches HTML #the-end, whose steps fire load.
         if (trust.activeParserWasAborted) return;
+        if (cfg.resumedDocument) return;
         trust.setDocumentReadiness("complete");
         trust.fire(g.window, "load", false);
         showPage();
@@ -10130,14 +10214,15 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         return parent && parent.nodeType === 1 ? parent : null;
     }
     function offsetBoxRect(element) {
-        try { return __dom_rect(nodeIds.get(element), 2); }
+        const view = element.ownerDocument && element.ownerDocument.defaultView || g;
+        try { return __dom_rect(nodeIds.get(element), 2, view.scrollX || 0, view.scrollY || 0); }
         catch (_) { return null; }
     }
     function clientBoxRect(element) {
         let rect;
-        try { rect = __dom_rect(nodeIds.get(element)); } catch (_) { return null; }
-        if (!rect) return null;
         const view = element.ownerDocument && element.ownerDocument.defaultView || g;
+        try { rect = __dom_rect(nodeIds.get(element), false, view.scrollX || 0, view.scrollY || 0); } catch (_) { return null; }
+        if (!rect) return null;
         const sx = rect[4] ? 0 : (view.scrollX || 0), sy = rect[4] ? 0 : (view.scrollY || 0);
         return createDOMRect(rect[0] - sx, rect[1] - sy,
             rect[2], rect[3]);
@@ -10269,7 +10354,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     function elementDocumentRect() {
         let r = null;
-        try { r = __dom_rect(nodeIds.get(this)); } catch (e) { r = null; }
+        const view = this.ownerDocument && this.ownerDocument.defaultView || g;
+        try { r = __dom_rect(nodeIds.get(this), false, view.scrollX || 0, view.scrollY || 0); } catch (e) { r = null; }
         if (r) {
             const left = r[0], top = r[1], width = r[2], height = r[3];
             return createDOMRect(left, top, width, height);
@@ -16140,7 +16226,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // 2D context, OffscreenCanvas and ImageBitmapRenderingContext are the
     // shared CANVAS block below, which the worker prelude reuses.
     const canvasNative = g.__canvas_2d;
-    const canvasRealmOrigin = (__url_parse(cfg.url, null) || [])[8] || "null";
+    const canvasRealmOrigin = cfg.environmentOrigin === undefined ? ((__url_parse(cfg.url, null) || [])[8] || "null") : cfg.environmentOrigin;
     delete g.__canvas_2d;
     const bitmapNativeForCanvas = g.__image_bitmap_binding;
     let canvasAPI;
@@ -20181,6 +20267,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             super(__dom_frame_document(nodeIds.get(frameEl)));
             cookieDocuments.set(this, [nodeIds.get(frameEl), Number(cfg.hostSettingsContext) || 0, !!cfg.cookieOpaque, String(cfg.url)]);
             internalsFor(this).frame = frameEl;
+            // HTML #current-document-readiness belongs to this Document,
+            // including after its navigable replaces it with another one.
+            internalsFor(this).documentReadiness = internalsFor(frameEl).trustReadyState || "complete";
             const url = frameEl === realmRootFrame ? String(cfg.url) : frameURLFor(frameEl);
             documentURLs.set(this, url);
             const inheritedBase = frameEl === realmRootFrame ? cfg.aboutBaseURL : frameAboutBaseURLs.get(frameEl);
@@ -20215,7 +20304,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (internalsFor(this).destroyed) return null;
             return trust.__activeFrame === internalsOf(this).frame ? g : internalsOf(this).frame.contentWindow;
         }
-        get readyState() { return internalsFor(internalsOf(this).frame).trustReadyState || "complete"; }
+        get readyState() { return internalsFor(this).documentReadiness || "complete"; }
         // HTML #document.title.
         get title() { return __dom_document_title(nodeIds.get(this)); }
         set title(value) { setDocumentTitle(this, String(value)); }
@@ -21262,7 +21351,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 // list. DOMContentLoaded waits for that list; load also waits
                 // for every asynchronous classic or module script.
                 if (frame === realmRootFrame) trust.setDocumentReadiness('interactive');
-                else internalsFor(frame).trustReadyState = "interactive";
+                else {
+                    internalsFor(frame).trustReadyState = "interactive";
+                    internalsFor(frameDocument(frame)).documentReadiness = "interactive";
+                }
                 startOrdered(0);
             }
             // Empty/text documents and inline-only fragments never suspend
@@ -21290,7 +21382,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 }
                 parserImages(Infinity);
                 if (frame === realmRootFrame) trust.setDocumentReadiness('interactive');
-                else internalsFor(frame).trustReadyState = 'interactive';
+                else {
+                    internalsFor(frame).trustReadyState = "interactive";
+                    internalsFor(frameDocument(frame)).documentReadiness = "interactive";
+                }
                 parserDone();
                 allDone();
                 return;
@@ -28940,13 +29035,18 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (old.slice(withoutHash(old).length) !== url.slice(withoutHash(url).length))
             __queue_dom_task(() => fireHashChange(old, url));
     };
-    trust.replaceInitialDocument = function (frameId, url, referrer = "", contentType = "text/html", navigationTiming = null, aboutBaseURL = null) {
+    trust.replaceInitialDocument = function (frameId, url, referrer = "", contentType = "text/html", navigationTiming = null, aboutBaseURL = null, responsePolicy = "") {
         if (!realmRootFrame || Number(frameId) !== nodeIds.get(realmRootFrame))
             return false;
         // HTML §7.5.1's one Window-to-two-Documents exception: a first
         // same-origin navigation reuses the initial about:blank Window and
         // Realm, while installing a distinct active Document and updating the
         // existing Location object's URL state.
+        const input = initialNavigationCreate(null);
+        input.frame = frameId; input.url = initialNavigationString(url); input.policy = responsePolicy;
+        const committed = initialNavigationParse(initialNavigationNative("initialNavigation", storageContextId, initialNavigationStringify(input)));
+        if (initialNavigationApply(initialNavigationHasOwn, committed, ["error"]) || !committed.value || !committed.value.updated)
+            return false;
         if (internalsOf(realmRootFrame).contentDoc)
             detachListenerTarget(internalsOf(realmRootFrame).contentDoc);
         internalsFor(realmRootFrame).contentDoc = new FrameDocument(realmRootFrame);
@@ -28957,6 +29057,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         cfg.url = String(url);
         cfg.aboutBaseURL = aboutBaseURL;
         updateLoc(url);
+        if (trust.serviceInitialNavigation) trust.serviceInitialNavigation(committed.value);
         if (trust.replaceNavigationTiming) trust.replaceNavigationTiming(navigationTiming);
         baseHrefCache = null;
         forgetWindowNames();
@@ -28972,9 +29073,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const r = __url_set(locState.href, which, String(v));
         if (r) navigateLoc(r[0], false);
     };
-    // HTML #the-location-interface: every member is [LegacyUnforgeable], so
-    // each Location object carries them as non-configurable own properties
-    // (Web IDL #es-unforgeable); Location.prototype holds no members.
+    // HTML #the-location-interface: every member is [LegacyUnforgeable].
+    // Location's exotic descriptor algorithm reports default own properties
+    // as configurable while its define/delete algorithms protect them;
+    // Location.prototype holds no members.
     class Location {
         constructor() { throw new TypeError("Illegal constructor"); }
     }
@@ -29066,17 +29168,36 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     locationOperations.replace = locationNavigationAPI(true, false);
     // HTML "create a Location object": the unforgeable attributes and
     // operations, then own valueOf and @@toPrimitive data properties.
-    const loc = Object.create(Location.prototype);
-    internalsFor(loc).locationObject = true;
+    const locationTarget = Object.create(Location.prototype);
     for (const name of ["href", "origin", "protocol", "host", "hostname", "port", "pathname", "search", "hash", "ancestorOrigins"]) {
         const descriptor = Object.getOwnPropertyDescriptor(locationAccessors, name);
-        Object.defineProperty(loc, name, {get: descriptor.get, set: name === "href" ? setLocationHref : descriptor.set,
-            enumerable: true, configurable: false});
+        Object.defineProperty(locationTarget, name, {get: descriptor.get, set: name === "href" ? setLocationHref : descriptor.set,
+            enumerable: true, configurable: true});
     }
     for (const name of ["assign", "replace", "reload", "toString"])
-        Object.defineProperty(loc, name, {value: locationOperations[name], writable: false, enumerable: true, configurable: false});
-    Object.defineProperty(loc, "valueOf", {value: Object.prototype.valueOf, writable: false, enumerable: false, configurable: false});
-    Object.defineProperty(loc, Symbol.toPrimitive, {value: undefined, writable: false, enumerable: false, configurable: false});
+        Object.defineProperty(locationTarget, name, {value: locationOperations[name], writable: false, enumerable: true, configurable: true});
+    Object.defineProperty(locationTarget, "valueOf", {value: Object.prototype.valueOf, writable: false, enumerable: false, configurable: true});
+    Object.defineProperty(locationTarget, Symbol.toPrimitive, {value: undefined, writable: false, enumerable: false, configurable: true});
+    // HTML #location-getownproperty deliberately exposes default members
+    // as configurable, while #location-defineownproperty / #location-delete
+    // reject replacing them. A private configurable backing object lets the
+    // platform Proxy implement that exotic rule without Proxy-invariant gaps.
+    const locationDefaultKeys = new Set(Reflect.ownKeys(locationTarget));
+    const locationReflect = {defineProperty:Reflect.defineProperty, deleteProperty:Reflect.deleteProperty,
+        getPrototypeOf:Reflect.getPrototypeOf};
+    const locationDefaultHas = Set.prototype.has.bind(locationDefaultKeys);
+    const loc = new ProxyConstructor(locationTarget, {
+        defineProperty(target,key,descriptor) {
+            return !locationDefaultHas(key) && locationReflect.defineProperty(target,key,descriptor);
+        },
+        deleteProperty(target,key) {
+            return !locationDefaultHas(key) && locationReflect.deleteProperty(target,key);
+        },
+        setPrototypeOf(target,prototype) { return locationReflect.getPrototypeOf(target) === prototype; },
+        isExtensible() { return true; },
+        preventExtensions() { return false; },
+    });
+    internalsFor(loc).locationObject = true;
     Object.defineProperty(g, "location", {
         configurable: true, enumerable: true,
         get() { return loc; },
@@ -29137,7 +29258,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const result = [trust.navigation, trust.navigationReload ? 'reload' :
             trust.navigationReplace ? 'replace' : 'navigate', realmRootFrame ? nodeIds.get(realmRootFrame) : 0,
             trust.navigationSourceBase || baseHref(), trust.navigationSourceURL || g.document.URL,
-            trust.navigationReferrerPolicy || "", trust.navigationSourceContext || topWindowState.hostSettingsContext];
+            trust.navigationReferrerPolicy || "", trust.navigationSourceContext ?? topWindowState.hostSettingsContext];
         trust.navigation = null; trust.navigationReplace = false; trust.navigationReload = false;
         trust.navigationReferrerPolicy = ""; trust.navigationSourceContext = null;
         return result;
@@ -29632,14 +29753,15 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         kind: "window",
         creationURL: String(cfg.url),
         native(op, input) { return __service_worker(op, storageContextId, input); },
-        bind(control) { trust.serviceResult = control.result; trust.serviceNotice = control.notice; trust.serviceWorkerWork = control.resident; trust.serviceClientInfo = control.clientInfo; trust.serviceClientChanged = control.clientChanged; },
+        bind(control) { trust.serviceResult = control.result; trust.serviceNotice = control.notice; trust.serviceWorkerWork = control.resident; trust.serviceClientInfo = control.clientInfo; trust.serviceClientChanged = control.clientChanged; trust.serviceInitialNavigation = control.initialNavigation; },
         clientInfo() {
             const value=featureCreate(null), origins=[];
             featureSetPrototype(origins,null);
             const ancestors=ancestorOriginObjects();
             for(let i=0;i<ancestors.length;i++)origins[i]=ancestors[i].serialized;
             value.frameType=cfg.parentWindow?"nested":traversableRecord&&traversableRecord.opener?"auxiliary":"top-level";
-            value.visibilityState=documentVisibility;value.focused=trust.documentFocused();value.focusWithin=inFocusChain;value.ancestorOrigins=origins;
+            value.visibilityState=documentVisibility;value.focused=trust.documentFocused();value.focusWithin=trust.documentFocusWithin();value.ancestorOrigins=origins;
+            value.transientActivation=hasTransientActivation(activeWindowState());
             return value;
         },
         listens(target,type) { return lsFor(target,type).length !== 0; },
@@ -31070,6 +31192,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             const state = incumbent === undefined || incumbent === null ? null : windowMessageState(incumbent);
             if (state && state.transientActivation()) focusRequested = true;
         }
+    };
+    // SW WindowClient operations already passed the origin/activation gates
+    // in the coordinator. Use the target Document's own navigation/focus steps.
+    trust.serviceWindowAction=function(op,url){
+        if(op==="focus"){joinParentChain();focusRequested=true;return;}
+        if(op==="navigate")Reflect.apply(locationOperations.assign,loc,[url]);
     };
     // HTML #dom-window-blur: "The blur() method steps are to do nothing."
     g.blur = { blur() {} }.blur;
@@ -35391,7 +35519,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     });
     windowMessageSlots = messaging[0];
     g.postMessage = messaging[1];
-    const messageOrigin = (__url_parse(cfg.url, null) || [])[8] || "null";
+    const messageOrigin = cfg.environmentOrigin === undefined ? ((__url_parse(cfg.url, null) || [])[8] || "null") : cfg.environmentOrigin;
     // HTML #determining-the-origin: an initial about:blank Document has its
     // creator's origin, a child navigable's parent's or an auxiliary
     // browsing context's opener's.
@@ -35466,6 +35594,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             const frame = namedFrames.get(name);
             return frame ? frame.contentWindow : undefined;
         },
+        indexedChild(index) {
+            refreshWindowNames();
+            const frame = windowFrames[index];
+            return frame ? frame.contentWindow : undefined;
+        },
+        childCount() { refreshWindowNames(); return windowFrames.length; },
         documentURL() { return g.document.URL; },
         // HTML #concept-document-internal-ancestor-origin-objects-list.
         ancestorOriginObjects() { return ancestorOriginObjects(); },
@@ -35597,10 +35731,22 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             key === Symbol.isConcatSpreadable) return undefined;
         throw crossOriginSecurityError();
     }
+    const crossOriginFallbackKeys = ["then", Symbol.toStringTag, Symbol.hasInstance, Symbol.isConcatSpreadable];
+    function crossOriginFallbackDescriptor(key) {
+        crossOriginFallback(key);
+        // HTML #CrossOriginPropertyFallback returns a present own property,
+        // including when its value is undefined.
+        return {value:undefined, writable:false, enumerable:false, configurable:true};
+    }
     function crossOriginLocationView(target) {
         const methods = {
             replace(url) { windowMessageState(target).window.location.replace(`${url}`); },
         };
+        // HTML #CrossOriginGetOwnPropertyHelper memoizes operation functions
+        // and accessors for this (current settings, object settings) pair.
+        const hrefDescriptor = {get:undefined,
+            set(value) { windowMessageState(target).window.location.href = `${value}`; },
+            enumerable:false, configurable:true};
         return new ProxyConstructor(createObject(null), {
             get(_, key) {
                 if (key === "replace") return methods.replace;
@@ -35608,22 +35754,22 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             },
             set(_, key, value) {
                 if (key !== "href") throw crossOriginSecurityError();
-                windowMessageState(target).window.location.href = `${value}`;
+                hrefDescriptor.set(value);
                 return true;
             },
             has(_, key) {
                 if (key === "href" || key === "replace") return true;
-                throw crossOriginSecurityError();
+                crossOriginFallback(key);
+                return true;
             },
             getOwnPropertyDescriptor(_, key) {
-                if (key === "replace") return { value: methods.replace, writable: false, enumerable: false, configurable: true };
-                if (key === "href") return { get: undefined, set(value) { windowMessageState(target).window.location.href = `${value}`; }, enumerable: false, configurable: true };
-                crossOriginFallback(key);
-                return undefined;
+                if (key === "replace") return {value:methods.replace, writable:false, enumerable:false, configurable:true};
+                if (key === "href") return hrefDescriptor;
+                return crossOriginFallbackDescriptor(key);
             },
             defineProperty() { throw crossOriginSecurityError(); },
             deleteProperty() { throw crossOriginSecurityError(); },
-            ownKeys() { return ["href", "replace"]; },
+            ownKeys() { return ["href", "replace", ...crossOriginFallbackKeys]; },
             getPrototypeOf() { return null; },
             setPrototypeOf(_, prototype) { return prototype === null; },
             isExtensible() { return true; },
@@ -35648,7 +35794,22 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             },
         };
         let location;
+        const descriptors = new Map();
+        function childIndex(key) {
+            if (typeof key !== "string" || !/^(?:0|[1-9][0-9]*)$/.test(key)) return null;
+            const index = Number(key);
+            return index < 4294967295 ? index : null;
+        }
+        function indexedValue(key) {
+            const index = childIndex(key);
+            return index === null ? undefined : windowForRealm(state().indexedChild(index));
+        }
         function value(key) {
+            if (childIndex(key) !== null) {
+                const child = indexedValue(key);
+                if (child === undefined) throw crossOriginSecurityError();
+                return child;
+            }
             if (typeof key === "string" && !isCrossOriginWindowName(key)) {
                 // HTML #windowproxy-getownproperty: a cross-origin Window still
                 // exposes its document-tree child navigable target names.
@@ -35663,7 +35824,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                     return !!(control && typeof control.navigableClosed === "function" && control.navigableClosed());
                 }
                 case "opener": return null;
-                case "length": return target.length >>> 0;
+                case "length": return state().childCount();
                 case "parent": {
                     const parent = state().parent();
                     return parent ? windowForRealm(parent.window) : view;
@@ -35677,32 +35838,45 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             }
             return crossOriginFallback(key);
         }
+        function descriptor(key) {
+            if (childIndex(key) !== null)
+                return {value:value(key), writable:false, enumerable:true, configurable:true};
+            if (isCrossOriginWindowName(key)) {
+                let entry = descriptors.get(key);
+                if (!entry) {
+                    if (Object.prototype.hasOwnProperty.call(methods,key))
+                        entry = {value:methods[key], writable:false, enumerable:false, configurable:true};
+                    else {
+                        entry = {get() { return value(key); }, set:undefined, enumerable:false, configurable:true};
+                        if (key === "location") entry.set = function (newValue) {
+                            windowMessageState(target).window.location.href = `${newValue}`;
+                        };
+                    }
+                    descriptors.set(key,entry);
+                }
+                return entry;
+            }
+            if (typeof key === "string" && state().namedChild(key))
+                return {value:value(key), writable:false, enumerable:false, configurable:true};
+            return crossOriginFallbackDescriptor(key);
+        }
         view = new ProxyConstructor(createObject(null), {
             get(_, key) { return value(key); },
             set(_, key, newValue) {
                 if (key !== "location") throw crossOriginSecurityError();
-                windowMessageState(target).window.location.href = `${newValue}`;
+                descriptor(key).set(newValue);
                 return true;
             },
-            has(_, key) {
-                if (isCrossOriginWindowName(key) ||
-                    (typeof key === "string" && state().namedChild(key))) return true;
-                throw crossOriginSecurityError();
-            },
-            getOwnPropertyDescriptor(_, key) {
-                if (isCrossOriginWindowName(key) ||
-                    (typeof key === "string" && state().namedChild(key))) {
-                    return { value: value(key), writable: false, enumerable: false, configurable: true };
-                }
-                crossOriginFallback(key);
-                return undefined;
-            },
+            has(_, key) { descriptor(key); return true; },
+            getOwnPropertyDescriptor(_, key) { return descriptor(key); },
             defineProperty() { throw crossOriginSecurityError(); },
             deleteProperty() { throw crossOriginSecurityError(); },
             ownKeys() {
+                // HTML #windowproxy-ownpropertykeys puts child indices first;
+                // named access exists without adding those names to this list.
                 const keys = [];
-                for (let i = 0; i < crossOriginWindowNames.length; i++) keys[i] = crossOriginWindowNames[i];
-                return keys;
+                for (let i = 0; i < state().childCount(); i++) keys.push(String(i));
+                return keys.concat(crossOriginWindowNames,crossOriginFallbackKeys);
             },
             getPrototypeOf() { return null; },
             setPrototypeOf(_, prototype) { return prototype === null; },
@@ -44303,6 +44477,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     const typedArrayProto = getPrototypeOf(Uint8Array.prototype);
     const typedArraySubarray = typedArrayProto.subarray;
     const typedArrayTag = getOwn(typedArrayProto, Symbol.toStringTag).get;
+    const serviceBufferTransfer=ArrayBuffer.prototype.transfer;
+    const serviceViewBuffer=getOwn(typedArrayProto,"buffer").get;
+    const serviceViewOffset=getOwn(typedArrayProto,"byteOffset").get;
+    const serviceViewLength=getOwn(typedArrayProto,"byteLength").get;
     const charCodeAt = String.prototype.charCodeAt, stringSlice = String.prototype.slice;
     const fromCharCode = String.fromCharCode, toWellFormed = String.prototype.toWellFormed;
     const arraySort = Array.prototype.sort, iteratorSymbol = Symbol.iterator, toStringTag = Symbol.toStringTag;
@@ -45989,7 +46167,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (sync) {
             return hostResponse(request, httpFetchSync(request.url, request.method, bodyBytes, contentType, headerWire,
                 request.mode, request.credentials, initiator, undefined, undefined, useCORSPreflight, false,
-                referrer, referrerPolicy, request.redirect));
+                referrer, referrerPolicy, request.redirect,request.integrity,request.priority));
         }
         let resolveFetch = null, settled = false;
         const promise = new PromiseCtor(function (resolve) { resolveFetch = resolve; });
@@ -46006,7 +46184,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // stopping the document cancels.
         react(httpFetchAsync(request.url, request.method, bodyBytes, contentType, headerWire,
             request.mode, request.credentials, initiator, !!stream, request.cache, useCORSPreflight,
-            !!request.keepalive, referrer, referrerPolicy, request.redirect), function (result) {
+            !!request.keepalive, referrer, referrerPolicy, request.redirect,request.integrity,request.priority), function (result) {
             if (settled) {
                 // Aborted meanwhile: release a transfer that already began.
                 if (result && typeof result[8] === "number") httpFetchCancel(result[8]);
@@ -46399,6 +46577,83 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         createRequest(url, method, headerList, guard) {
             return createRequestObject(newRequestRecord({url, urlList: [url], method, headerList}), guard || "request",
                 abortAPI.any([]));
+        },
+        // SW #create-fetch-event-and-dispatch: native request fields cannot
+        // be reconstructed with the public constructor (notably navigate).
+        createServiceRequest(fields) {
+            const controller = abortAPI.newController();
+            const request = newRequestRecord({url:fields.url,urlList:[fields.url],method:fields.method,
+                headerList:fields.headers,mode:fields.mode,credentials:fields.credentials,
+                destination:fields.destination === "empty" ? "" : fields.destination,
+                redirect:fields.redirect,referrer:fields.referrer,referrerPolicy:fields.referrerPolicy,
+                cache:fields.cache,integrity:fields.integrity,keepalive:fields.keepalive,priority:fields.priority,
+                reloadNavigation:fields.reloadNavigation,historyNavigation:fields.historyNavigation,
+                useCORSPreflight:fields.useCORSPreflight});
+            if (fields.body !== null) {
+                const bytes = new Uint8ArrayCtor(fields.body);
+                request.body = bodyFromBytes(bytes, bytes, bytes.length);
+            }
+            const signal = abortAPI.controllerSignal(controller);
+            return {request:createRequestObject(request,"immutable",signal),opaque:false,
+                abort() { abortAPI.signalAbort(signal,domException("The fetch was aborted","AbortError")); }};
+        },
+        servicePreload(request, promise) {
+            return react(promise,result=>{
+                const response=hostResponse(requestState(request),result);
+                if(response.type==="error")throw new TypeErrorCtor("Navigation preload failed");
+                return createResponseObject(response,"immutable");
+            });
+        },
+        // Acquire a reader when respondWith settles, but pull only on demand
+        // from the native consumer. Bound each native crossing to 64 KiB.
+        openServiceResponse(value) {
+            const response = responseState(value);
+            if (bodyUnusable(response)) throw new TypeErrorCtor("Response body is unusable");
+            const body = response.body;
+            const stream = body === null ? null : bodyStream(body);
+            const reader = stream === null ? null : streamsAPI.getReader(stream);
+            let pending = null, offset = 0, closed = false;
+            const head = {type:response.type,status:response.status,statusMessage:response.statusMessage,
+                headerList:response.headerList,urlList:response.urlList,hasBody:body !== null,
+                privateToken:response.privateResponse === null ? null : response.privateResponse.token};
+            function piece(send) {
+                const end = MathMin(offset + 65536,pending.length);
+                const bytes = new Uint8ArrayCtor(end-offset);
+                for(let i=offset;i<end;i++)bytes[i-offset]=pending[i];
+                offset=end;
+                if(offset===pending.length){pending=null;offset=0;}
+                send(bytes);
+            }
+            function cancelReader(reason) {
+                closed=true;pending=null;
+                if(stream!==null)react(streamsAPI.cancel(stream,reason),
+                    ()=>streamsAPI.releaseReader(reader),()=>streamsAPI.releaseReader(reader));
+            }
+            return {head,
+                pull(send) {
+                    if(closed||reader===null){send(null);return;}
+                    if(pending!==null){piece(send);return;}
+                    streamsAPI.readChunk(reader,{
+                        chunk(chunk) {
+                            if(!isView(chunk)||apply(typedArrayTag,chunk,[])!=="Uint8Array"){
+                                cancelReader(new TypeErrorCtor("Invalid response body chunk"));send(false);return;
+                            }
+                            try {
+                                const offset=apply(serviceViewOffset,chunk,[]),length=apply(serviceViewLength,chunk,[]);
+                                const buffer=apply(serviceBufferTransfer,apply(serviceViewBuffer,chunk,[]),[]);
+                                pending=new Uint8ArrayCtor(buffer,offset,length);piece(send);
+                            } catch(error) {
+                                cancelReader(error);send(false);
+                            }
+                        },
+                        close(){closed=true;streamsAPI.releaseReader(reader);send(null);},
+                        error(){closed=true;streamsAPI.releaseReader(reader);send(false);}
+                    });
+                },
+                cancel() {
+                    if(!closed)cancelReader(undefined);
+                }
+            };
         },
         createResponse(fields, bytes) {
             const privateMetadata = fields.privateToken ? privateResponseMetadata(fields.privateToken) : null;
@@ -53953,9 +54208,19 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     apply(weakGet, __platform_slots("controls", new WeakMap()), [g]).wasm = bridge;
 })(typeof globalThis !== "undefined" ? globalThis : this);
 /*__WASM_END__*/
+    const paintTimingConnected = __dom_is_connected, paintTimingNodeType = __dom_node_type;
     g.__performance_adapter = {
         config: cfg, add: addL, remove: removeL,
-        bufferFull(target) { dispatch(target,createTrustedEvent(Event,'resourcetimingbufferfull'),false); }
+        bufferFull(target) { dispatch(target,createTrustedEvent(Event,'resourcetimingbufferfull'),false); },
+        paintElement(id, documentId) {
+            // Paint Timing #exposed-for-paint-timing: connected, in this
+            // active Document, and outside a shadow tree. Keep arena identity
+            // rather than strongly retaining an otherwise collectable Element.
+            if (!g.document || internalsFor(g.document).destroyed || nodeIds.get(g.document) !== documentId ||
+                !paintTimingConnected(id) || paintTimingNodeType(id) !== 1) return null;
+            const element = wrap(id);
+            return rootOfNode(element) === g.document ? element : null;
+        }
     };
 /*__PERFORMANCE_BEGIN__*/
 // Window/Worker User Timing and Performance Timeline: w3c/user-timing mark-method,
@@ -53981,6 +54246,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     const mapSet = Function.prototype.call.bind(Map.prototype.set);
     const mapDelete = Function.prototype.call.bind(Map.prototype.delete);
     const finite = Number.isFinite, floor = Math.floor, TypeErrorCtor = TypeError, DOMExceptionCtor = g.DOMException;
+    const SetCtor = Set;
     const clone = g.structuredClone, oldPerformance = g.performance;
     const navigationData = adapter.config.navigationTiming;
     const navigationOrigin = navigationData && navigationData.timeOrigin;
@@ -54021,7 +54287,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const state = read(value);
         if (!state || (state.kind !== 'mark' && state.kind !== 'measure' &&
             state.kind !== 'resource' && state.kind !== 'navigation' &&
-            state.kind !== 'visibility-state'))
+            state.kind !== 'visibility-state' && state.kind !== 'largest-contentful-paint'))
             throw new TypeErrorCtor('Illegal PerformanceEntry invocation');
         return state;
     }
@@ -54078,10 +54344,13 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (entry === undefined) throw new DOMExceptionCtor('Unknown performance mark', 'SyntaxError');
         return read(entry).startTime;
     }
-    function filtered(entries, name, type) {
+    function filtered(entries, name, type, fromTimeline = false) {
         const out = [];
         for (let i=0;i<entries.length;i++) {
             const entry = entries[i], state = requireEntry(entry);
+            // Performance Timeline #filter-buffer-map-by-name-and-type:
+            // LCP's registry entry is available only through observers.
+            if (fromTimeline && state.kind === 'largest-contentful-paint') continue;
             if ((name === null || state.name === name) && (type === null || state.kind === type)) append(out,entry);
         }
         apply(sort,out,[(a,b) => read(a).startTime - read(b).startTime]);
@@ -54178,6 +54447,29 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     class PerformanceMeasure extends PerformanceEntry {
         constructor() { throw new TypeErrorCtor('Illegal constructor'); }
         get detail() { return requireKind(this,'measure').detail; }
+    }
+    // Largest Contentful Paint #sec-largest-contentful-paint-interface,
+    // f79fc4c8; Paint Timing #sec-PaintTimingMixin, 053f575b. These entry
+    // objects have no public constructor and immutable native paint records.
+    class LargestContentfulPaint extends PerformanceEntry {
+        constructor() { throw new TypeErrorCtor('Illegal constructor'); }
+        get loadTime() { return requireKind(this,'largest-contentful-paint').loadTime; }
+        get renderTime() { return requireKind(this,'largest-contentful-paint').startTime; }
+        get size() { return requireKind(this,'largest-contentful-paint').size; }
+        get id() { return requireKind(this,'largest-contentful-paint').id; }
+        get url() { return requireKind(this,'largest-contentful-paint').url; }
+        get element() {
+            const state = requireKind(this,'largest-contentful-paint');
+            return state.expose(state.node,state.document);
+        }
+        get paintTime() { return requireKind(this,'largest-contentful-paint').startTime; }
+        get presentationTime() { requireKind(this,'largest-contentful-paint'); return null; }
+        toJSON() {
+            const state = requireKind(this,'largest-contentful-paint');
+            return {name:'',entryType:'largest-contentful-paint',startTime:state.startTime,duration:0,
+                loadTime:state.loadTime,renderTime:state.startTime,size:state.size,id:state.id,url:state.url,
+                element:state.expose(state.node,state.document),paintTime:state.startTime,presentationTime:null};
+        }
     }
     const resourceNumbers = ['workerStart','redirectStart','redirectEnd','fetchStart',
         'domainLookupStart','domainLookupEnd','connectStart','connectEnd','secureConnectionStart',
@@ -54342,15 +54634,15 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 state.resourceListener = null;
             }
         }
-        getEntries() { return filtered(requireKind(this,'performance').entries,null,null); }
+        getEntries() { return filtered(requireKind(this,'performance').entries,null,null,true); }
         getEntriesByType(type) {
             const state = requireKind(this,'performance'); required(arguments.length);
-            return filtered(state.entries,null,`${type}`);
+            return filtered(state.entries,null,`${type}`,true);
         }
         getEntriesByName(name, type) {
             const state = requireKind(this,'performance'); required(arguments.length);
             const converted = `${name}`, entryType = type === undefined ? null : `${type}`;
-            return filtered(state.entries,converted,entryType);
+            return filtered(state.entries,converted,entryType,true);
         }
     }
     // PerformanceObserver implementation follows here; all delivery enters
@@ -54358,9 +54650,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // Navigation Timing is Window-only; the supported list and observe()
     // filtering must agree in every global, including workers.
     const supportedTypes = freeze(worker ? ['mark','measure','resource']
-        : ['mark','measure','navigation','resource','visibility-state']);
+        : ['largest-contentful-paint','mark','measure','navigation','resource','visibility-state']);
     const supported = type => type === 'mark' || type === 'measure' || type === 'resource' ||
-        (!worker && (type === 'navigation' || type === 'visibility-state'));
+        (!worker && (type === 'navigation' || type === 'visibility-state' || type === 'largest-contentful-paint'));
     function observerOptions(value) {
         const input = dictionary(value);
         const bufferedValue = input == null ? undefined : input.buffered;
@@ -54464,7 +54756,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (!state.buffer.length) continue;
             const entries = copy(state.buffer); state.buffer = [];
             const list = create(PerformanceObserverEntryList.prototype); write(list,{kind:'entry-list',entries});
-            const options = state.requiresDropped ? {droppedEntriesCount:state.types.resource ? owner.resourceDropped : 0} : {};
+            const dropped = (state.types.resource ? owner.resourceDropped : 0) +
+                (state.types['largest-contentful-paint'] ? owner.lcpDropped || 0 : 0);
+            const options = state.requiresDropped ? {droppedEntriesCount:dropped} : {};
             state.requiresDropped = false;
             // "report" callback exceptions; one throwing observer must not
             // prevent delivery to the remaining registered observers.
@@ -54491,6 +54785,41 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         [PerformanceResourceTiming,'PerformanceResourceTiming'],
         [PerformanceObserver,'PerformanceObserver'],[PerformanceObserverEntryList,'PerformanceObserverEntryList']]) installInterface(C,name);
     if (!worker) {
+        installInterface(LargestContentfulPaint,'LargestContentfulPaint');
+        owner.lcp = {document:null,stopped:false,seen:new SetCtor(),size:0,width:0,height:0,count:0};
+        const seenHas = Function.prototype.call.bind(Set.prototype.has);
+        const seenAdd = Function.prototype.call.bind(Set.prototype.add);
+        host.stopLargestContentfulPaint = function () { owner.lcp.stopped = true; };
+        host.wantsLargestContentfulPaint = function () { return !owner.lcp.stopped; };
+        host.recordLargestContentfulPaint = function (rows, at, documentId) {
+            let lcp = owner.lcp;
+            if (lcp.document !== documentId) {
+                lcp = owner.lcp = {document:documentId,stopped:false,seen:new SetCtor(),size:0,width:0,height:0,count:0};
+            }
+            if (lcp.stopped) return;
+            let candidate = null, size = lcp.size;
+            for (let i=0;i<rows.length;i++) {
+                const row = rows[i], key = `${row[0]}:${row[8] === undefined ? row[4] : row[8]}`;
+                if (seenHas(lcp.seen,key)) continue;
+                seenAdd(lcp.seen,key);
+                if (row[1] <= size) continue;
+                size = row[1]; candidate = row;
+            }
+            if (candidate === null) return;
+            if (lcp.size > 0 && candidate[2]-lcp.width <= 3 && candidate[3]-lcp.height <= 3) return;
+            lcp.size = size; lcp.width = candidate[2]; lcp.height = candidate[3];
+            const startTime = floor(at * 10) / 10 - owner.timeOrigin;
+            const loadTime = candidate[5] === 0 ? 0 : floor(candidate[5] * 10) / 10 - owner.timeOrigin;
+            const entry = create(LargestContentfulPaint.prototype);
+            write(entry,{kind:'largest-contentful-paint',name:'',startTime,duration:0,
+                loadTime,size:floor(size) >>> 0,id:candidate[6],url:candidate[4],node:candidate[0],document:documentId,
+                expose:adapter.paintElement});
+            notifyEntry(owner,entry);
+            // Performance Timeline's LCP registry buffer is 150 entries;
+            // observers still receive subsequent candidates when it is full.
+            if (lcp.count < 150) { append(owner.entries,entry); lcp.count++; }
+            else owner.lcpDropped = (owner.lcpDropped || 0) + 1;
+        };
         installInterface(PerformanceNavigationTiming,'PerformanceNavigationTiming');
         installInterface(PerformanceTiming,'PerformanceTiming');
         installInterface(VisibilityStateEntry,'VisibilityStateEntry');
@@ -54591,6 +54920,14 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         for (let i=0;i<owner.entries.length;i++)
             if (read(owner.entries[i]).kind !== 'navigation') append(kept,owner.entries[i]);
         owner.entries = kept; owner.navigation = null;
+        if (!worker) {
+            owner.lcp = {document:null,stopped:false,seen:new SetCtor(),size:0,width:0,height:0,count:0};
+            owner.lcpDropped = 0;
+            const remaining = [];
+            for (let i=0;i<owner.entries.length;i++)
+                if (read(owner.entries[i]).kind !== 'largest-contentful-paint') append(remaining,owner.entries[i]);
+            owner.entries = remaining;
+        }
         installNavigation(data);
     };
     installNavigation(navigationData);
@@ -58065,5 +58402,17 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     /*__CLASS_STRINGS_END__*/
     // All platform globals have now been installed. New logical Windows clone
     // this pristine descriptor surface before author script can patch it.
+    if (cfg.resumedDocument && typeof parsedStyleResourcesNative === 'function') {
+        // The existing Document already attempted its original linked sheets.
+        // Restore success/error bookkeeping without replaying its resource
+        // events. A later inserted link has fresh state and fetches normally.
+        for (const [id, obtained] of parsedStyleResourcesNative(nodeIds.get(g.document))) {
+            const link = wrap(id);
+            if (!link) continue;
+            const state = internalsFor(link);
+            state.cssStarted = true;
+            state.trustResourceSettled = obtained ? 'load' : 'error';
+        }
+    }
     initializeScopedWindowGlobals();
 })();

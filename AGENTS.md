@@ -162,19 +162,43 @@ host-boundary work is upstreamed. TRust supplies networking and TLS.
 When the sibling engine is on an incompatible work branch, build against a
 separate clone of its local `main` without changing that checkout or this
 repository's dependency path. Keep the TRust manifest path through the symlink
-so Cargo resolves `../trust-js` in the isolated directory:
+so Cargo resolves `../trust-js` in the isolated directory. For the Servo
+follow-up revision, apply the companion engine patch described below before
+running Cargo:
 
 ```sh
 trust_build_root=$(mktemp -d /tmp/trust-main-build-XXXXXX)
 git clone --no-hardlinks --single-branch --branch main /big/Code/trust-js "$trust_build_root/trust-js"
 ln -s /big/Code/TRust "$trust_build_root/TRust"
-cargo build --release --locked --manifest-path "$trust_build_root/TRust/Cargo.toml"
 ```
 
 Use that same `--manifest-path` for debug/release tests and Clippy. The normal
 `target/release` artifacts remain in this repository through the symlink.
 Record the cloned engine revision with validation results. Do not switch,
 reset, patch, or build in the active engine checkout to make this work.
+
+The Servo follow-up also uses `trust_js::inspect_module` and
+`Ctx::set_host_object_invariants`. Until these APIs reach the engine's local
+`main`, reproduce the isolated build from engine base
+`e33109935c25e291da71c082cfd03d2f24c12a12` and apply
+`docs/patches/trust-js-servo-host-api.patch` **inside the separate clone**:
+
+```sh
+git -C "$trust_build_root/trust-js" checkout --detach e33109935c25e291da71c082cfd03d2f24c12a12
+git -C "$trust_build_root/trust-js" apply /big/Code/TRust/docs/patches/trust-js-servo-host-api.patch
+```
+
+The prepared isolated engine commit is
+`ec4e4b742559222909101b14698a5d6f4b793fb7`. Do not reapply the patch when the
+engine already includes it. The patch supplies parse-only module validation,
+complete top-level-await detection, Window's host object invariants, and
+correct settings for Promise callbacks crossing Window realms.
+
+Build through the prepared manifest path:
+
+```sh
+cargo build --release --locked --manifest-path "$trust_build_root/TRust/Cargo.toml"
+```
 
 Build and test from the repository root:
 

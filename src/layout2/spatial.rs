@@ -19,6 +19,7 @@ type Chain = Option<usize>;
 #[derive(Clone, Copy, Debug, Default)]
 struct Space {
     chain: Chain,
+    sticky: Chain,
     viewport_fixed: bool,
 }
 
@@ -52,12 +53,37 @@ pub(super) struct ScrollLink {
 #[derive(Clone, Debug, Default)]
 pub(super) struct ScrollTree {
     links: Vec<ScrollLink>,
+    stickies: Vec<StickyLink>,
     nodes: FxHashMap<NodeId, NodeSpaces>,
 }
 
+#[derive(Clone, Debug)]
+struct StickyLink {
+    parent: Chain,
+    geometry: super::sticky::Geometry,
+    basis: [f32; 4],
+}
+
 impl ScrollTree {
-    pub fn new(dom: &Dom, root: &Frag, fixed: &[Frag], top_layer: &[TopFrag]) -> Self {
+    pub fn new(
+        dom: &Dom,
+        root: &Frag,
+        fixed: &[Frag],
+        top_layer: &[TopFrag],
+        vp: super::value::Vp,
+    ) -> Self {
         let mut tree = Self::default();
+        let mut constraints = FxHashMap::default();
+        for root in std::iter::once(root)
+            .chain(fixed)
+            .chain(top_layer.iter().map(|top| &top.fragment))
+        {
+            constraints.extend(
+                super::sticky::collect(dom, root, vp, None)
+                    .into_iter()
+                    .map(|geometry| (geometry.constraint.node, geometry)),
+            );
+        }
         let document_root = dom.document_element().unwrap_or(NO_NODE);
         let context = Context {
             normal: Space::default(),
@@ -70,7 +96,7 @@ impl ScrollTree {
             root: document_root,
             viewport_source: viewport_overflow_source_for(dom, document_root),
         };
-        tree.walk(dom, root, context);
+        tree.walk(dom, root, context, &constraints);
         for fragment in fixed {
             tree.walk(
                 dom,
@@ -80,6 +106,7 @@ impl ScrollTree {
                     absolute: context.fixed,
                     ..context
                 },
+                &constraints,
             );
         }
         for top in top_layer {
@@ -96,6 +123,7 @@ impl ScrollTree {
                     fixed: space,
                     ..context
                 },
+                &constraints,
             );
         }
         tree
@@ -123,11 +151,17 @@ impl ScrollTree {
         }
     }
 
-    fn walk(&mut self, dom: &Dom, fragment: &Frag, context: Context) {
+    fn walk(
+        &mut self,
+        dom: &Dom,
+        fragment: &Frag,
+        context: Context,
+        constraints: &FxHashMap<NodeId, super::sticky::Geometry>,
+    ) {
         if matches!(fragment.kind, FragKind::Fixed(_) | FragKind::Oof(..)) {
             return;
         }
-        let border = match fragment.paint.position {
+        let mut border = match fragment.paint.position {
             // CSS Position 3 #absolute-cb: a positioned inline box of the
             // parent's formatting context contains it; that box scrolls and
             // clips with the parent's in-flow content.
@@ -136,6 +170,15 @@ impl ScrollTree {
             Pos::Fixed => context.fixed,
             _ => context.normal,
         };
+        if let Some(geometry) = constraints.get(&fragment.node) {
+            let id = self.stickies.len();
+            self.stickies.push(StickyLink {
+                parent: border.sticky,
+                geometry: geometry.clone(),
+                basis: context.transform.0[..4].try_into().unwrap(),
+            });
+            border.sticky = Some(id);
+        }
         let transform = context.transform.then(super::transform::matrix(fragment));
         let mut content = border;
         let is_box = matches!(fragment.kind, FragKind::Block | FragKind::TableCell(_));
@@ -208,13 +251,15 @@ impl ScrollTree {
                 ..fixed_clip
             };
             child.normal.viewport_fixed = false;
+            child.normal.sticky = None;
+            child.fixed.sticky = None;
             child.absolute = child.normal;
             child.transform = Affine2d::IDENTITY;
             child.root = fragment.children.first().map_or(NO_NODE, |f| f.node);
             child.viewport_source = viewport_overflow_source_for(dom, child.root);
         }
         for fragment in &fragment.children {
-            self.walk(dom, fragment, child);
+            self.walk(dom, fragment, child, constraints);
         }
     }
 
@@ -250,7 +295,12 @@ impl ScrollTree {
             .map_or([false; 2], |link| link.axes)
     }
 
+    #[cfg(test)]
     pub fn offset(&self, dom: &Dom, node: NodeId) -> CssPoint {
+        self.offset_at(dom, node, CssPoint::default())
+    }
+
+    pub fn offset_at(&self, dom: &Dom, node: NodeId, viewport_scroll: CssPoint) -> CssPoint {
         let mut delta = CssPoint::default();
         for link in self.chain(node, false) {
             if link.viewport {
@@ -272,11 +322,67 @@ impl ScrollTree {
             delta.x -= a * x + c * y;
             delta.y -= b * x + d * y;
         }
+        let sticky = self.sticky_offset(dom, node, viewport_scroll, true);
+        CssPoint::new(delta.x + sticky.x, delta.y + sticky.y)
+    }
+
+    pub fn sticky_offset(
+        &self,
+        dom: &Dom,
+        node: NodeId,
+        viewport_scroll: CssPoint,
+        visual: bool,
+    ) -> CssPoint {
+        let viewport_scroll = if self.viewport_fixed(node) {
+            CssPoint::default()
+        } else {
+            viewport_scroll
+        };
+        let mut next = self
+            .nodes
+            .get(&node)
+            .and_then(|spaces| spaces.border.sticky);
+        let mut delta = CssPoint::default();
+        let mut chain = Vec::new();
+        while let Some(link) = next.and_then(|id| self.stickies.get(id)) {
+            chain.push(link);
+            next = link.parent;
+        }
+        let mut parent = CssPoint::default();
+        for link in chain.into_iter().rev() {
+            let sample = |container: Option<usize>| {
+                container.map_or(viewport_scroll, |container| {
+                    CssPoint::new(
+                        dom.scroll_metric(container, 1).unwrap_or(0.) as f32,
+                        dom.scroll_metric(container, 0).unwrap_or(0.) as f32,
+                    )
+                })
+            };
+            let scroll = CssPoint::new(
+                sample(link.geometry.constraint.horizontal_container).x,
+                sample(link.geometry.constraint.container).y,
+            );
+            let offset =
+                link.geometry
+                    .constraint
+                    .offset_with_parent(scroll, link.geometry.viewport, parent);
+            parent.x += offset.x;
+            parent.y += offset.y;
+            if visual {
+                let [a, b, c, d] = link.basis;
+                delta.x += a * offset.x + c * offset.y;
+                delta.y += b * offset.x + d * offset.y;
+            } else {
+                delta.x += offset.x;
+                delta.y += offset.y;
+            }
+        }
         delta
     }
 
     pub fn retained_bytes(&self) -> usize {
         self.links.capacity() * std::mem::size_of::<ScrollLink>()
+            + self.stickies.capacity() * std::mem::size_of::<StickyLink>()
             + self.nodes.capacity() * std::mem::size_of::<(NodeId, NodeSpaces)>()
     }
 }

@@ -710,6 +710,17 @@ impl PagePaint {
                         .animations
                         .iter()
                         .filter_map(|animation| css_animation_wake(animation, elapsed_seconds))
+                        .chain(
+                            scope
+                                .composition
+                                .as_ref()
+                                .and_then(|composition| {
+                                    composition
+                                        .stack
+                                        .transition_wake(f64::from(elapsed_seconds))
+                                })
+                                .map(|wake| wake as f32),
+                        )
                         .reduce(f32::min),
                     Primitive::BeginMarquee(scope) => scope.running.then_some(0.0),
                     _ => None,
@@ -953,6 +964,9 @@ impl DisplayCommand {
                     .retained_bytes()
                     .saturating_add(shadows.capacity() * std::mem::size_of::<TextShadowPaint>())
                     .saturating_add(std::mem::size_of_val(selection.spans()));
+                if let Some(sources) = &selection.paint_timing_sources {
+                    bytes = bytes.saturating_add(std::mem::size_of_val(sources.as_ref()));
+                }
                 if let Some(original) = &selection.original {
                     bytes = bytes
                         .saturating_add(std::mem::size_of_val(original.as_ref()))
@@ -1392,8 +1406,10 @@ impl ScrollContainer {
 pub struct StickyConstraint {
     pub node: usize,
     pub rect: CssRect,
-    /// Nearest overflow scroll container; `None` means the page viewport.
+    /// Nearest vertical scroll container; `None` means the page viewport.
     pub container: Option<usize>,
+    /// CSS Position 3 permits a different nearest scrollport in each axis.
+    pub horizontal_container: Option<usize>,
     /// Computed top/right/bottom/left insets in CSS pixels when definite.
     pub insets: [Option<f32>; 4],
     /// Allowed TRBL movement of the position box inside its containing block.
@@ -1404,7 +1420,17 @@ pub struct StickyConstraint {
 }
 
 impl StickyConstraint {
-    fn offset(&self, scroll: CssPoint, viewport: CssRect) -> CssPoint {
+    #[cfg(test)]
+    pub(crate) fn offset(&self, scroll: CssPoint, viewport: CssRect) -> CssPoint {
+        self.offset_with_parent(scroll, viewport, CssPoint::default())
+    }
+
+    pub(crate) fn offset_with_parent(
+        &self,
+        scroll: CssPoint,
+        viewport: CssRect,
+        parent: CssPoint,
+    ) -> CssPoint {
         // CSS Position 3 §3.4: fit the border box in the sticky view rectangle,
         // reducing the writing-mode end inset if necessary, then limit each
         // inward shift so the position box does not escape its containing block.
@@ -1440,7 +1466,7 @@ impl StickyConstraint {
         };
         CssPoint::new(
             axis(
-                self.rect.x,
+                self.rect.x + parent.x,
                 self.rect.width,
                 scroll.x + viewport.x,
                 viewport.width,
@@ -1451,7 +1477,7 @@ impl StickyConstraint {
                 self.reverse[0],
             ),
             axis(
-                self.rect.y,
+                self.rect.y + parent.y,
                 self.rect.height,
                 scroll.y + viewport.y,
                 viewport.height,
@@ -1573,6 +1599,24 @@ pub struct CssAnimationScope {
     pub(crate) composition: Option<ComposedPaint>,
 }
 
+impl CssAnimationScope {
+    pub(crate) fn owns_transform(&self) -> bool {
+        self.composition.is_some()
+            || self
+                .animations
+                .iter()
+                .any(|animation| !animation.transform.is_empty())
+    }
+
+    pub(crate) fn owns_opacity(&self) -> bool {
+        self.composition.is_some()
+            || self
+                .animations
+                .iter()
+                .any(|animation| !animation.opacity.is_empty())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ComposedPaint {
     pub stack: Arc<crate::dom::CompositorStack>,
@@ -1580,7 +1624,8 @@ pub(crate) struct ComposedPaint {
     pub viewport: crate::layout2::value::Vp,
     pub reference: CssRect,
     pub origin: CssPoint,
-    pub inverse_static: Affine2d,
+    pub origin_z: f32,
+    pub individuals: matrix3d::Matrix3d,
 }
 
 impl PartialEq for ComposedPaint {
@@ -1588,7 +1633,8 @@ impl PartialEq for ComposedPaint {
         self.stack == other.stack
             && self.reference == other.reference
             && self.origin == other.origin
-            && self.inverse_static == other.inverse_static
+            && self.origin_z == other.origin_z
+            && self.individuals == other.individuals
             && self.viewport == other.viewport
             && self.units.fs == other.units.fs
             && self.units.root == other.units.root
@@ -1621,11 +1667,14 @@ pub struct CssPaintAnimation {
     /// about `transform_origin` while the animation applies.
     pub transform: Vec<CssTransformFrame>,
     pub transform_origin: CssPoint,
-    /// The element's static transform matrix, which the paint inside the
-    /// animation scope already applies.
+    pub transform_origin_z: f32,
+    /// Individual transforms precede the animated transform list.
+    pub individual_transform: [f32; 16],
+    /// The fallback matrix before/after an unfilled transform animation.
     pub static_transform: Affine2d,
-    /// Group opacity relative to the element's static opacity layer, in
-    /// each point's `x`.
+    /// Fallback opacity before/after an unfilled opacity animation.
+    pub static_opacity: f32,
+    /// Absolute group opacity, stored in each point's `x`.
     pub opacity: Vec<CssAnimationPoint>,
 }
 
@@ -1889,7 +1938,19 @@ pub(crate) fn interpolate_transform_steps_for_test(
 /// first pair that does not, after which the remaining functions of each
 /// list are composed into matrices and interpolated by decomposition. The
 /// box is then flattened into its parent's plane (Transforms 2).
+#[cfg(test)]
 fn interpolate_transform_steps(from: &[TransformStep], to: &[TransformStep], t: f32) -> Affine2d {
+    matrix3d::flatten(
+        &interpolate_transform_matrix(from, to, t),
+        crate::core::CssPoint::default(),
+    )
+}
+
+fn interpolate_transform_matrix(
+    from: &[TransformStep],
+    to: &[TransformStep],
+    t: f32,
+) -> matrix3d::Matrix3d {
     let length = from.len().max(to.len());
     let pad = |steps: &[TransformStep], other: &[TransformStep]| -> Vec<TransformStep> {
         (0..length)
@@ -1912,7 +1973,7 @@ fn interpolate_transform_steps(from: &[TransformStep], to: &[TransformStep], t: 
             }
         }
     }
-    matrix3d::flatten(&matrix, crate::core::CssPoint::default())
+    matrix
 }
 
 /// A 2D matrix decomposed by CSS Transforms 1 #decomposing-a-2d-matrix.
@@ -3497,6 +3558,8 @@ impl Scene {
         // Resolve each scope by identity, without scanning every unrelated
         // scrollport for every command on a large page.
         let mut animation_layers = Vec::new();
+        let mut sticky_movements: Vec<CssPoint> = Vec::new();
+        let mut fixed_depth = 0usize;
         for command in commands {
             // A new coordinate space ends the line a highlight could join.
             if let Some(cursor) = selection.as_mut()
@@ -3520,29 +3583,39 @@ impl Scene {
             }
             match command {
                 Primitive::BeginSticky(constraint) => {
-                    let (scroll, viewport) = constraint
-                        .container
-                        .and_then(|node| {
-                            scroll_containers
-                                .get(&node)
-                                .map(|container| (container.offset, container.viewport))
-                        })
-                        .unwrap_or((
-                            viewport_scroll,
-                            CssRect::new(
-                                0.0,
-                                0.0,
-                                self.content_viewport.width,
-                                self.content_viewport.height,
-                            ),
-                        ));
-                    let offset = constraint.offset(scroll, viewport);
+                    let resolve = |node: Option<usize>| {
+                        node.and_then(|node| scroll_containers.get(&node))
+                            .map(|container| (container.offset, container.viewport))
+                            .unwrap_or((
+                                if fixed_depth == 0 {
+                                    viewport_scroll
+                                } else {
+                                    CssPoint::default()
+                                },
+                                CssRect::new(
+                                    0.0,
+                                    0.0,
+                                    self.content_viewport.width,
+                                    self.content_viewport.height,
+                                ),
+                            ))
+                    };
+                    let (x_scroll, x_view) = resolve(constraint.horizontal_container);
+                    let (y_scroll, y_view) = resolve(constraint.container);
+                    let scroll = CssPoint::new(x_scroll.x, y_scroll.y);
+                    let viewport = CssRect::new(x_view.x, y_view.y, x_view.width, y_view.height);
+                    let parent = sticky_movements.last().copied().unwrap_or_default();
+                    let offset = constraint.offset_with_parent(scroll, viewport, parent);
+                    sticky_movements.push(CssPoint::new(parent.x + offset.x, parent.y + offset.y));
                     self.primitives
                         .push(Primitive::PushTransform(Affine2d::translate(
                             offset.x, offset.y,
                         )));
                 }
-                Primitive::EndSticky => self.primitives.push(Primitive::PopTransform),
+                Primitive::EndSticky => {
+                    sticky_movements.pop();
+                    self.primitives.push(Primitive::PopTransform);
+                }
                 Primitive::BeginScroll(node) => {
                     let offset = scroll_containers
                         .get(node)
@@ -3555,13 +3628,17 @@ impl Scene {
                 }
                 Primitive::EndScroll => self.primitives.push(Primitive::PopTransform),
                 Primitive::BeginFixed => {
+                    fixed_depth += 1;
                     self.primitives
                         .push(Primitive::PushTransform(Affine2d::translate(
                             viewport_scroll.x,
                             viewport_scroll.y,
                         )))
                 }
-                Primitive::EndFixed => self.primitives.push(Primitive::PopTransform),
+                Primitive::EndFixed => {
+                    fixed_depth = fixed_depth.saturating_sub(1);
+                    self.primitives.push(Primitive::PopTransform);
+                }
                 Primitive::BeginCssAnimation(scope) => {
                     self.primitives
                         .push(Primitive::PushTransform(sample_css_animation_scope(
@@ -3570,12 +3647,11 @@ impl Scene {
                         )));
                     let opacity = sample_css_animation_opacity(scope, elapsed_seconds);
                     if let Some(opacity) = opacity {
-                        self.primitives
-                            .push(Primitive::PushLayer(CompositingLayer::new(
-                                opacity,
-                                BlendMode::Normal,
-                                Arc::from([]),
-                            )));
+                        let mut layer =
+                            CompositingLayer::new(opacity, BlendMode::Normal, Arc::from([]));
+                        layer.backdrop_root =
+                            css_animation_opacity_backdrop_root(scope, elapsed_seconds, opacity);
+                        self.primitives.push(Primitive::PushLayer(layer));
                     }
                     animation_layers.push(opacity.is_some());
                 }
@@ -3777,7 +3853,7 @@ fn sample_marquee_scope(scope: &MarqueeScope, elapsed_seconds: f32) -> CssPoint 
 /// The transform a CSS animation scope applies around the element's paint.
 /// CSS Animations 1 §4.2: later animations override earlier animations that
 /// affect the same property. An animated `top` translates; an animated
-/// `transform` replaces the static transform the paint already applies.
+/// `transform` owns the group's matrix, including its unfilled fallback.
 fn sample_css_animation_scope(scope: &CssAnimationScope, elapsed_seconds: f32) -> Affine2d {
     if let Some(composed) = &scope.composition {
         return composed
@@ -3792,15 +3868,20 @@ fn sample_css_animation_scope(scope: &CssAnimationScope, elapsed_seconds: f32) -
                 )
             })
             .map_or(Affine2d::IDENTITY, |steps| {
-                let origin = composed.origin;
-                Affine2d::translate(origin.x, origin.y)
-                    .then(interpolate_transform_steps(&steps, &steps, 0.))
-                    .then(Affine2d::translate(-origin.x, -origin.y))
-                    .then(composed.inverse_static)
+                transform_about_origin(
+                    compose_transform_steps(&steps),
+                    composed.individuals,
+                    composed.origin,
+                    composed.origin_z,
+                )
             });
     }
     let mut position = None;
-    let mut transform = None;
+    let mut transform = scope
+        .animations
+        .iter()
+        .find(|animation| !animation.transform.is_empty())
+        .map(|animation| animation.static_transform);
     for animation in &scope.animations {
         let Some(progress) = css_animation_progress(animation, elapsed_seconds) else {
             continue;
@@ -3813,22 +3894,35 @@ fn sample_css_animation_scope(scope: &CssAnimationScope, elapsed_seconds: f32) -
             ));
         }
         if !animation.transform.is_empty() {
-            let animated =
-                sample_transform_track(&animation.transform, progress, &animation.timing_function);
-            let origin = animation.transform_origin;
-            let animated = Affine2d::translate(origin.x, origin.y)
-                .then(animated)
-                .then(Affine2d::translate(-origin.x, -origin.y));
-            transform = Some(
-                animation
-                    .static_transform
-                    .inverse()
-                    .map_or(animated, |inverse| animated.then(inverse)),
-            );
+            transform = Some(transform_about_origin(
+                sample_transform_track(&animation.transform, progress, &animation.timing_function),
+                animation.individual_transform,
+                animation.transform_origin,
+                animation.transform_origin_z,
+            ));
         }
     }
     let position = position.unwrap_or_default();
     Affine2d::translate(position.x, position.y).then(transform.unwrap_or(Affine2d::IDENTITY))
+}
+
+/// CSS Transforms 2 #ctm: origin depth, individual transforms, and the
+/// complete animated list are composed before flattening. Applying an
+/// inverse of the initial matrix would prevent a singular start from ever
+/// becoming visible (CSS Transforms 1 #transform-function-lists).
+fn transform_about_origin(
+    transform: matrix3d::Matrix3d,
+    individuals: matrix3d::Matrix3d,
+    origin: CssPoint,
+    depth: f32,
+) -> Affine2d {
+    let matrix = matrix3d::multiply(
+        &matrix3d::translate(origin.x, origin.y, depth),
+        &individuals,
+    );
+    let matrix = matrix3d::multiply(&matrix, &transform);
+    let matrix = matrix3d::multiply(&matrix, &matrix3d::translate(-origin.x, -origin.y, -depth));
+    matrix3d::flatten(&matrix, origin)
 }
 
 /// The transform list's matrix at `progress`, each keyframe interval eased
@@ -3837,11 +3931,10 @@ fn sample_transform_track(
     track: &[CssTransformFrame],
     progress: f32,
     timing_function: &str,
-) -> Affine2d {
-    let compose =
-        |frame: &CssTransformFrame| interpolate_transform_steps(&frame.steps, &frame.steps, 0.);
+) -> matrix3d::Matrix3d {
+    let compose = |frame: &CssTransformFrame| compose_transform_steps(&frame.steps);
     let (Some(first), Some(last)) = (track.first(), track.last()) else {
-        return Affine2d::IDENTITY;
+        return matrix3d::IDENTITY;
     };
     if progress <= first.offset {
         return compose(first);
@@ -3857,11 +3950,11 @@ fn sample_transform_track(
     };
     let span = (window[1].offset - window[0].offset).max(f32::EPSILON);
     let t = css_timing_progress(timing_function, (progress - window[0].offset) / span);
-    interpolate_transform_steps(&window[0].steps, &window[1].steps, t)
+    interpolate_transform_matrix(&window[0].steps, &window[1].steps, t)
 }
 
-/// The group opacity of a scope's last active opacity animation (CSS
-/// Animations 1 §4.2), relative to the element's static opacity.
+/// The absolute group opacity of a scope's last active opacity animation
+/// (CSS Animations 1 §4.2, CSS Color 4 #transparency).
 fn sample_css_animation_opacity(scope: &CssAnimationScope, elapsed_seconds: f32) -> Option<f32> {
     if let Some(composed) = &scope.composition {
         return composed
@@ -3887,7 +3980,35 @@ fn sample_css_animation_opacity(scope: &CssAnimationScope, elapsed_seconds: f32)
             )
         })
         .next_back()
+        .or_else(|| {
+            scope
+                .animations
+                .iter()
+                .find(|animation| !animation.opacity.is_empty())
+                .map(|animation| animation.static_opacity)
+        })
         .map(|opacity| opacity.clamp(0.0, 1.0))
+}
+
+/// Filter Effects 2 #BackdropRoot and CSS Animations 1 #animations: a
+/// transform alone is not a backdrop root. Opacity animation acts as an
+/// implicit will-change hint before it finishes and while it fills forwards;
+/// an underlying transition only needs the root while opacity is below one.
+fn css_animation_opacity_backdrop_root(
+    scope: &CssAnimationScope,
+    seconds: f32,
+    opacity: f32,
+) -> bool {
+    opacity < 1.
+        || scope.animations.iter().any(|animation| {
+            !animation.opacity.is_empty()
+                && (matches!(animation.fill_mode.as_str(), "forwards" | "both")
+                    || animation.current_time(seconds)
+                        < (animation.delay_seconds
+                            + animation.duration_seconds
+                                * animation.iteration_count.unwrap_or(f32::INFINITY))
+                        .max(0.))
+        })
 }
 
 /// When one animation's sampled value next changes; see
@@ -5316,6 +5437,7 @@ mod tests {
             node: 1,
             rect: CssRect::new(150., 150., 80., 80.),
             container: None,
+            horizontal_container: None,
             insets: [None, Some(10.), Some(20.), None],
             movement: [-150., 400., 400., -150.],
             reverse: [false, false],
@@ -5976,12 +6098,15 @@ mod tests {
                     },
                 ],
                 transform_origin: CssPoint::new(50., 50.),
+                transform_origin_z: 0.,
+                individual_transform: matrix3d::IDENTITY,
                 static_transform,
+                static_opacity: 1.,
             }],
         };
         // A quarter of the way: 90 degrees about (50, 50), and no
         // translateX, so (100, 50) maps to (50, 100).
-        let applied = sample_css_animation_scope(&scope, 1.0).then(static_transform);
+        let applied = sample_css_animation_scope(&scope, 1.0);
         let point = applied.map_point(CssPoint::new(100., 50.));
         assert!(
             (point.x - 50.).abs() < 1.0e-3 && (point.y - 100.).abs() < 1.0e-3,
@@ -6018,7 +6143,10 @@ mod tests {
                     ],
                     transform: Vec::new(),
                     transform_origin: CssPoint::default(),
+                    transform_origin_z: 0.,
+                    individual_transform: matrix3d::IDENTITY,
                     static_transform: Affine2d::IDENTITY,
+                    static_opacity: 1.,
                 },
                 CssPaintAnimation {
                     name: "shake".into(),
@@ -6044,7 +6172,10 @@ mod tests {
                         },
                     ],
                     transform_origin: CssPoint::default(),
+                    transform_origin_z: 0.,
+                    individual_transform: matrix3d::IDENTITY,
                     static_transform: Affine2d::IDENTITY,
+                    static_opacity: 1.,
                 },
             ],
         };
@@ -6209,8 +6340,7 @@ mod tests {
                     < 0.0002
             );
             let composed = scope.composition.as_ref().unwrap();
-            let matrix = sample_css_animation_scope(scope, seconds as f32)
-                .then(composed.inverse_static.inverse().unwrap());
+            let matrix = sample_css_animation_scope(scope, seconds as f32);
             let css = dom.computed_value_resolved(id, "transform").unwrap();
             let steps = crate::layout2::transform::animation_steps(
                 &css,
@@ -6245,6 +6375,481 @@ mod tests {
         );
     }
 
+    fn compositor_followup_paint(dom: &crate::dom::Dom) -> PagePaint {
+        crate::layout2::lay_out_graphical(
+            dom,
+            &url::Url::parse("https://animation.test/").unwrap(),
+            crate::layout2::Viewport::new(400., 200.),
+            &[],
+            &Default::default(),
+            &Default::default(),
+        )
+        .paint
+    }
+
+    fn compositor_followup_scope(paint: &PagePaint) -> &CssAnimationScope {
+        paint
+            .primitives
+            .iter()
+            .find_map(|command| match command {
+                Primitive::BeginCssAnimation(scope) => Some(scope),
+                _ => None,
+            })
+            .expect("animated element has a retained scope")
+    }
+
+    fn compositor_followup_matrix(actual: Affine2d, expected: Affine2d) {
+        assert!(
+            actual
+                .0
+                .iter()
+                .zip(expected.0)
+                .all(|(a, b)| (*a - b).abs() < 0.001),
+            "{actual:?} != {expected:?}"
+        );
+    }
+
+    #[test]
+    fn compositor_followup_singular_initial_transforms_can_become_visible() {
+        // CSS Transforms 1 #transform-function-lists: a singular *current*
+        // transform is invisible; a singular initial transform must not
+        // prevent later non-singular animation samples from being painted.
+        for composition in ["replace", "accumulate"] {
+            let (from, to) = if composition == "accumulate" {
+                (1, 3)
+            } else {
+                (0, 2)
+            };
+            let mut dom = crate::dom::Dom::parse_document(&format!(
+                r#"<style>body{{margin:0}}
+                #box{{width:50px;height:30px;background:red;transform:scale(0);transform-origin:0 0;
+                animation:grow 2s linear both;animation-composition:{composition}}}
+                @keyframes grow{{from{{transform:scale({from})}}to{{transform:scale({to})}}}}</style><div id=box></div>"#
+            ));
+            dom.set_viewport_px(400., 200.);
+            dom.update_css_animations(0.);
+            assert!(
+                dom.css_composition_can_composite(dom.get_by_id("box").unwrap()),
+                "{composition}: {:?}",
+                dom.css_animation_definitions(dom.get_by_id("box").unwrap())
+            );
+            let paint = compositor_followup_paint(&dom);
+            let scope = paint
+                .primitives
+                .iter()
+                .find_map(|command| match command {
+                    Primitive::BeginCssAnimation(scope) => Some(scope),
+                    _ => None,
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{composition} has no retained scope; cells={:?}",
+                        crate::text::cell_metrics()
+                    )
+                });
+            assert!(scope.owns_transform());
+            assert!(!paint.primitives.iter().any(|command| matches!(command, Primitive::PushTransform(matrix) if matrix.inverse().is_none())));
+            compositor_followup_matrix(
+                sample_css_animation_scope(scope, 0.),
+                Affine2d::scale(0., 0.),
+            );
+            compositor_followup_matrix(
+                sample_css_animation_scope(scope, 1.),
+                Affine2d::scale(1., 1.),
+            );
+            compositor_followup_matrix(
+                sample_css_animation_scope(scope, 2.),
+                Affine2d::scale(2., 2.),
+            );
+            let mut scene = chromeless_scene(
+                &PagePaint::default(),
+                CssSize::new(400., 200.),
+                CssPoint::default(),
+            );
+            scene.append_page_at(&paint, CssPoint::default(), 1.);
+            let node = dom.get_by_id("box").unwrap();
+            assert!(
+                scene
+                    .page_element_hits_at(CssPoint::new(10., 10.))
+                    .iter()
+                    .any(|hit| hit.node == node)
+            );
+            dom.update_css_timeline_for_paint(1.);
+            dom.update_css_animations(1.);
+            let measured = crate::layout2::measure_retained_layout(
+                &dom,
+                &url::Url::parse("https://animation.test/").unwrap(),
+                crate::layout2::Viewport::new(400., 200.),
+                &[],
+                &Default::default(),
+                &Default::default(),
+            );
+            assert!(
+                (measured.boxes[&node].width - 50.).abs() < 0.001,
+                "CSSOM geometry must re-read the sampled transform"
+            );
+        }
+    }
+
+    #[test]
+    fn compositor_followup_affine_3d_composes_depth_and_individual_transforms_before_flattening() {
+        let mut dom = crate::dom::Dom::parse_document(
+            r#"<style>body{margin:0}
+            #box{width:50px;height:30px;opacity:.4;transform:translate3d(10px,0,30px);
+            translate:5px 7px 3px;rotate:y 20deg;scale:1.2 .8 1;transform-origin:10px 20px 40px;
+            animation:turn 2s linear both;animation-composition:add}
+            @keyframes turn{from{transform:rotateY(0deg) translateZ(0)}to{transform:rotateY(60deg) translateZ(20px)}}
+            </style><div id=box></div>"#,
+        );
+        dom.set_viewport_px(400., 200.);
+        dom.update_css_animations(0.);
+        let paint = compositor_followup_paint(&dom);
+        let scope = compositor_followup_scope(&paint);
+        assert!(scope.composition.is_some());
+        assert!(dom.css_animation_frame_targets().is_empty());
+        let epoch = dom.layout_presentation_epoch();
+        dom.update_css_timeline_for_paint(1.);
+        assert_eq!(dom.layout_presentation_epoch(), epoch);
+        let mut matrix = matrix3d::translate(10., 20., 40.);
+        for operation in [
+            matrix3d::translate(5., 7., 3.),
+            matrix3d::rotate(0., 1., 0., 20_f32.to_radians()),
+            matrix3d::scale(1.2, 0.8, 1.),
+            matrix3d::translate(10., 0., 30.),
+            matrix3d::rotate(0., 1., 0., 30_f32.to_radians()),
+            matrix3d::translate(0., 0., 10.),
+            matrix3d::translate(-10., -20., -40.),
+        ] {
+            matrix = matrix3d::multiply(&matrix, &operation);
+        }
+        compositor_followup_matrix(
+            sample_css_animation_scope(scope, 1.),
+            matrix3d::flatten(&matrix, CssPoint::new(10., 20.)),
+        );
+        assert!((sample_css_animation_opacity(scope, 1.).unwrap() - 0.4).abs() < 0.001);
+        assert!(!paint.primitives.iter().any(|command| matches!(command, Primitive::PushLayer(layer) if (layer.opacity - 0.4).abs() < 0.001)));
+    }
+
+    #[test]
+    fn compositor_followup_mixed_layout_tracks_keep_actor_layout_and_compositor_values() {
+        let mut dom = crate::dom::Dom::parse_document(
+            r#"<style>body{margin:0}
+            #box{width:50px;height:30px;animation:grow 2s linear both,move 2s linear both;animation-composition:replace,add}
+            @keyframes grow{from{width:50px}to{width:150px}}
+            @keyframes move{from{transform:translateX(0)}to{transform:translateX(100px)}}
+            </style><div id=box></div>"#,
+        );
+        dom.set_viewport_px(400., 200.);
+        let node = dom.get_by_id("box").unwrap();
+        dom.update_css_animations(0.);
+        let paint = compositor_followup_paint(&dom);
+        let scope = compositor_followup_scope(&paint);
+        assert!(scope.composition.is_some());
+        assert!(
+            scope
+                .composition
+                .as_ref()
+                .unwrap()
+                .stack
+                .sample("width", 1.)
+                .is_none()
+        );
+        let targets = dom.css_animation_frame_targets();
+        assert!(
+            targets
+                .iter()
+                .any(|target| target.node == node && !target.paint_only)
+        );
+        let epoch = dom.layout_presentation_epoch();
+        dom.update_css_timeline_for_paint(1.);
+        assert!(
+            dom.layout_presentation_epoch() > epoch,
+            "width still requires layout"
+        );
+        assert_eq!(
+            dom.computed_value_resolved(node, "width").as_deref(),
+            Some("100px")
+        );
+        compositor_followup_matrix(
+            sample_css_animation_scope(scope, 1.),
+            Affine2d::translate(50., 0.),
+        );
+
+        let mut dom = crate::dom::Dom::parse_document(
+            r#"<style>body{margin:0}
+            #box{position:relative;top:10px;width:50px;height:30px;animation:motion 2s linear both;animation-composition:add}
+            @keyframes motion{from{top:0;transform:translateY(0)}to{top:100px;transform:translateY(20px)}}
+            </style><div id=box></div>"#,
+        );
+        dom.set_viewport_px(400., 200.);
+        dom.update_css_animations(0.);
+        let _ = compositor_followup_paint(&dom);
+        dom.update_css_timeline_for_paint(1.);
+        let paint = compositor_followup_paint(&dom);
+        let scope = compositor_followup_scope(&paint);
+        assert!(
+            scope
+                .animations
+                .iter()
+                .all(|animation| animation.position.is_empty())
+        );
+        assert_eq!(
+            dom.computed_value_resolved(dom.get_by_id("box").unwrap(), "top")
+                .as_deref(),
+            Some("60px")
+        );
+        compositor_followup_matrix(
+            sample_css_animation_scope(scope, 1.),
+            Affine2d::translate(0., 10.),
+        );
+    }
+
+    #[test]
+    fn compositor_followup_underlying_transition_clocks_remain_live_and_cssom_flushes_geometry() {
+        let mut dom = crate::dom::Dom::parse_document(
+            r#"<style>body{margin:0}
+            #box{width:50px;height:30px;transform:translateX(10px);opacity:.5;transition:transform 4s linear,opacity 4s linear}
+            #box.on{transform:translateX(90px);opacity:1}
+            #box.animate{animation:delta 2s linear both;animation-composition:add}
+            @keyframes delta{from{transform:translateX(0)}to{transform:translateX(20px)}}
+            </style><div id=box></div>"#,
+        );
+        dom.set_viewport_px(400., 200.);
+        let node = dom.get_by_id("box").unwrap();
+        dom.update_css_transitions(0.);
+        dom.set_attr(node, "class", "on");
+        dom.update_css_transitions(1.);
+        dom.update_css_transitions(1.5);
+        dom.set_attr(node, "class", "on animate");
+        dom.update_css_transitions(1.5);
+        dom.update_css_animations(1.5);
+        let paint = compositor_followup_paint(&dom);
+        let scope = compositor_followup_scope(&paint);
+        assert!(scope.composition.is_some());
+        let epoch = dom.layout_presentation_epoch();
+        dom.update_css_timeline_for_paint(2.5);
+        assert_eq!(dom.layout_presentation_epoch(), epoch);
+        compositor_followup_matrix(
+            sample_css_animation_scope(scope, 2.5),
+            Affine2d::translate(50., 0.),
+        );
+        assert!((sample_css_animation_opacity(scope, 2.5).unwrap() - 0.6875).abs() < 0.001);
+        assert_eq!(
+            paint.css_animation_wake(4.),
+            Some(0.),
+            "transition continues after the animation fills"
+        );
+        assert_eq!(paint.css_animation_wake(5.), None);
+        assert!(!css_animation_opacity_backdrop_root(
+            scope,
+            5.,
+            sample_css_animation_opacity(scope, 5.).unwrap()
+        ));
+        dom.update_css_animations(2.5);
+        assert!(dom.layout_presentation_epoch() > epoch);
+        let css = dom.computed_value_resolved(node, "transform").unwrap();
+        let composition = scope.composition.as_ref().unwrap();
+        let steps = crate::layout2::transform::animation_steps(
+            &css,
+            composition.units,
+            composition.viewport,
+            composition.reference,
+        )
+        .unwrap();
+        compositor_followup_matrix(
+            matrix3d::flatten(&compose_transform_steps(&steps), CssPoint::default()),
+            Affine2d::translate(50., 0.),
+        );
+    }
+
+    #[test]
+    fn compositor_followup_html_svg_wrappers_keep_resource_dependent_tracks_on_the_actor() {
+        let mut dom = crate::dom::Dom::parse_document(
+            r#"<style>body{margin:0}
+            #wrapper{width:50px;height:30px;color:red;animation:move 2s linear both,shade 2s linear both;animation-composition:add,replace}
+            #inner{animation:move 2s linear both;animation-composition:add}
+            @keyframes move{from{transform:translateX(0)}to{transform:translateX(20px)}}
+            @keyframes shade{from{color:red}to{color:blue}}</style>
+            <div id=wrapper><svg id=inner width=20 height=20><rect width=20 height=20 fill=currentColor /></svg></div>"#,
+        );
+        dom.set_viewport_px(400., 200.);
+        dom.update_css_animations(0.);
+        let wrapper = dom.get_by_id("wrapper").unwrap();
+        let inner = dom.get_by_id("inner").unwrap();
+        assert!(dom.css_composition_can_composite(wrapper));
+        assert!(!dom.css_composition_can_composite(inner));
+        let paint = compositor_followup_paint(&dom);
+        assert!(compositor_followup_scope(&paint).composition.is_some());
+        let targets = dom.css_animation_frame_targets();
+        assert!(
+            targets
+                .iter()
+                .any(|target| target.node == wrapper && !target.paint_only)
+        );
+        assert!(targets.iter().any(|target| target.node == inner));
+    }
+
+    #[test]
+    fn compositor_followup_ancestor_overflow_clip_stays_outside_the_moving_group() {
+        let mut dom = crate::dom::Dom::parse_document(
+            r#"<style>body{margin:0}#clip{width:100px;height:40px;overflow:hidden}
+            #box{display:block;width:50px;height:30px;animation:move 2s linear both;animation-composition:add}
+            @keyframes move{from{transform:translateX(0)}to{transform:translateX(160px)}}
+            </style><div id=clip><a id=box href=/next></a></div>"#,
+        );
+        dom.set_viewport_px(400., 200.);
+        dom.update_css_animations(0.);
+        let paint = compositor_followup_paint(&dom);
+        let mut scene = chromeless_scene(
+            &PagePaint::default(),
+            CssSize::new(400., 200.),
+            CssPoint::default(),
+        );
+        scene.append_page_at(&paint, CssPoint::default(), 1.);
+        let node = dom.get_by_id("box").unwrap();
+        assert!(
+            scene
+                .page_element_hits_at(CssPoint::new(90., 10.))
+                .iter()
+                .any(|hit| hit.node == node)
+        );
+        assert!(
+            !scene
+                .page_element_hits_at(CssPoint::new(110., 10.))
+                .iter()
+                .any(|hit| hit.node == node),
+            "the ancestor's clip must not move with its child"
+        );
+    }
+
+    #[test]
+    fn compositor_followup_projective_stacks_keep_the_actor_sampling_path() {
+        let mut dom = crate::dom::Dom::parse_document(
+            r#"<style>
+            #box{width:50px;height:30px;animation:turn 2s linear both;animation-composition:add}
+            @keyframes turn{from{transform:perspective(400px) rotateY(0deg)}to{transform:perspective(400px) rotateY(60deg)}}
+            </style><div id=box></div>"#,
+        );
+        dom.set_viewport_px(400., 200.);
+        dom.update_css_animations(0.);
+        let node = dom.get_by_id("box").unwrap();
+        assert!(!dom.css_composition_can_composite(node));
+        assert!(
+            dom.css_animation_frame_targets()
+                .iter()
+                .any(|target| target.node == node)
+        );
+        assert!(
+            !compositor_followup_paint(&dom)
+                .primitives
+                .iter()
+                .any(|command| matches!(command, Primitive::BeginCssAnimation(_)))
+        );
+
+        for frames in [
+            "from{opacity:0}to{opacity:1}",
+            "from{transform:translateX(0)}to{transform:translateX(20px)}",
+        ] {
+            let mut dom = crate::dom::Dom::parse_document(&format!(
+                r#"<style>
+                #box{{width:50px;height:30px;transform:perspective(400px) rotateY(30deg);animation:turn 2s linear both}}
+                @keyframes turn{{{frames}}}</style><div id=box></div>"#
+            ));
+            dom.set_viewport_px(400., 200.);
+            dom.update_css_animations(0.);
+            assert!(!dom.css_composition_can_composite(dom.get_by_id("box").unwrap()));
+            assert!(
+                !compositor_followup_paint(&dom)
+                    .primitives
+                    .iter()
+                    .any(|command| matches!(command, Primitive::BeginCssAnimation(_)))
+            );
+        }
+
+        let mut dom = crate::dom::Dom::parse_document(
+            r#"<style>
+            #box{width:50px;height:30px;transform:translateX(5px)!important;opacity:.6!important;animation:move 2s linear both}
+            @keyframes move{from{transform:translateX(100px);opacity:0}to{transform:translateX(200px);opacity:1}}
+            </style><div id=box></div>"#,
+        );
+        dom.set_viewport_px(400., 200.);
+        dom.update_css_animations(1.);
+        assert!(
+            !compositor_followup_paint(&dom)
+                .primitives
+                .iter()
+                .any(|command| matches!(command, Primitive::BeginCssAnimation(_)))
+        );
+        assert!(
+            (dom.computed_value_resolved(dom.get_by_id("box").unwrap(), "opacity")
+                .unwrap()
+                .parse::<f32>()
+                .unwrap()
+                - 0.6)
+                .abs()
+                < 0.001
+        );
+    }
+
+    #[test]
+    fn compositor_followup_replace_opacity_owns_one_absolute_group_and_restores_the_base() {
+        // CSS Color 4 #transparency: the element and all descendants receive
+        // opacity once. Dividing by a static layer cannot represent a rise
+        // from a low/zero static opacity to a higher animated opacity.
+        for base in [0., 0.2, 1.] {
+            let mut dom = crate::dom::Dom::parse_document(&format!(
+                r#"<style>body{{margin:0}}
+                #box{{width:50px;height:30px;opacity:{base};animation:fade 2s linear 1s}}
+                @keyframes fade{{from{{opacity:.8}}to{{opacity:1}}}}</style><div id=box></div>"#
+            ));
+            dom.set_viewport_px(400., 200.);
+            dom.update_css_animations(0.);
+            let paint = compositor_followup_paint(&dom);
+            let scope = compositor_followup_scope(&paint);
+            assert!(scope.composition.is_some());
+            assert!(scope.owns_opacity());
+            assert!((sample_css_animation_opacity(scope, 0.).unwrap() - base).abs() < 0.001);
+            assert!((sample_css_animation_opacity(scope, 2.).unwrap() - 0.9).abs() < 0.001);
+            assert!((sample_css_animation_opacity(scope, 4.).unwrap() - base).abs() < 0.001);
+            assert!(
+                css_animation_opacity_backdrop_root(scope, 0., base),
+                "an unfinished opacity animation implies will-change"
+            );
+            assert_eq!(
+                css_animation_opacity_backdrop_root(scope, 4., base),
+                base < 1.
+            );
+            let mut scene = chromeless_scene(
+                &PagePaint::default(),
+                CssSize::new(400., 200.),
+                CssPoint::default(),
+            );
+            scene.append_page_at(&paint, CssPoint::default(), 2.);
+            let layers: Vec<_> = scene
+                .primitives
+                .iter()
+                .filter_map(|command| match command {
+                    Primitive::PushLayer(layer) => Some(layer.opacity),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(layers.len(), 1, "{layers:?}");
+            assert!((layers[0] - 0.9).abs() < 0.001);
+            dom.update_css_timeline_for_paint(4.);
+            assert!(!dom.css_animation_definitions(dom.get_by_id("box").unwrap())[0].will_change);
+            let finished = compositor_followup_paint(&dom);
+            if base == 1. {
+                assert!(
+                    !finished
+                        .primitives
+                        .iter()
+                        .any(|command| matches!(command, Primitive::BeginCssAnimation(_))),
+                    "an unfilled finished opacity effect no longer creates a stacking context"
+                );
+            }
+        }
+    }
+
     #[test]
     fn css_animation_wake_follows_the_effect_phases() {
         // Web Animations 1 #animation-effect-phases-and-states: only the
@@ -6277,7 +6882,10 @@ mod tests {
                 position: Vec::new(),
                 transform: Vec::new(),
                 transform_origin: CssPoint::default(),
+                transform_origin_z: 0.,
+                individual_transform: matrix3d::IDENTITY,
                 static_transform: Affine2d::IDENTITY,
+                static_opacity: 1.,
             };
         let page = |animations: Vec<CssPaintAnimation>| PagePaint {
             primitives: vec![

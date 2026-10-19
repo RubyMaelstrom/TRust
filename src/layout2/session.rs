@@ -147,10 +147,21 @@ impl LayoutFragments {
     }
 
     pub(super) fn scroll_tree(&self, dom: &Dom) -> &spatial::ScrollTree {
-        self.scroll_tree
-            .get_or_init(|| spatial::ScrollTree::new(dom, &self.root, &self.fixed, &self.top_layer))
+        self.scroll_tree.get_or_init(|| {
+            spatial::ScrollTree::new(
+                dom,
+                &self.root,
+                &self.fixed,
+                &self.top_layer,
+                Vp {
+                    w: self.viewport.width,
+                    h: self.viewport.height,
+                },
+            )
+        })
     }
 
+    #[cfg(test)]
     pub(crate) fn scroll_placement(
         &self,
         dom: &Dom,
@@ -158,6 +169,29 @@ impl LayoutFragments {
     ) -> (crate::core::CssPoint, bool) {
         let tree = self.scroll_tree(dom);
         (tree.offset(dom, node), tree.viewport_fixed(node))
+    }
+
+    pub(crate) fn scroll_placement_at(
+        &self,
+        dom: &Dom,
+        node: NodeId,
+        viewport_scroll: crate::core::CssPoint,
+    ) -> (crate::core::CssPoint, bool) {
+        let tree = self.scroll_tree(dom);
+        (
+            tree.offset_at(dom, node, viewport_scroll),
+            tree.viewport_fixed(node),
+        )
+    }
+
+    pub(crate) fn sticky_layout_placement(
+        &self,
+        dom: &Dom,
+        node: NodeId,
+        viewport_scroll: crate::core::CssPoint,
+    ) -> crate::core::CssPoint {
+        self.scroll_tree(dom)
+            .sticky_offset(dom, node, viewport_scroll, false)
     }
 
     pub(crate) fn scroll_axes(&self, dom: &Dom, node: NodeId) -> [bool; 2] {
@@ -226,7 +260,7 @@ impl LayoutFragments {
     /// Requested-storage lower bound for the host memory inventory. Shaping
     /// and link internals are opaque here, and reported as such by the caller.
     pub(crate) fn retained_bytes(&self) -> usize {
-        fn fragment(frag: &flow::Frag) -> usize {
+        fn fragment(frag: &flow::Frag, contexts: &mut rustc_hash::FxHashSet<usize>) -> usize {
             let mut bytes = frag.children.capacity() * std::mem::size_of::<flow::Frag>();
             match &frag.kind {
                 flow::FragKind::Line(line) => {
@@ -244,7 +278,7 @@ impl LayoutFragments {
                                 * std::mem::size_of::<inline::Piece>()
                     });
                     for piece in line.pieces.iter().chain(&line.atom_boxes).chain(laid) {
-                        bytes += piece.item.text.capacity();
+                        bytes += piece.item.text.capacity() + piece.shaping_bytes(contexts);
                         for value in [
                             &piece.item.terminal_text,
                             &piece.item.graphical_image,
@@ -262,8 +296,14 @@ impl LayoutFragments {
             if let Some(collapsed) = &frag.paint.collapsed_borders {
                 bytes += collapsed.retained_bytes();
             }
-            bytes + frag.children.iter().map(fragment).sum::<usize>()
+            bytes
+                + frag
+                    .children
+                    .iter()
+                    .map(|frag| fragment(frag, contexts))
+                    .sum::<usize>()
         }
+        let mut contexts = rustc_hash::FxHashSet::default();
         std::mem::size_of::<Self>()
             + self
                 .scroll_tree
@@ -285,12 +325,16 @@ impl LayoutFragments {
             + self.fixed.capacity() * std::mem::size_of::<flow::Frag>()
             + self.top_layer.capacity() * std::mem::size_of::<flow::TopFrag>()
             + self.anchors.capacity() * std::mem::size_of::<(NodeId, f32)>()
-            + fragment(&self.root)
-            + self.fixed.iter().map(fragment).sum::<usize>()
+            + fragment(&self.root, &mut contexts)
+            + self
+                .fixed
+                .iter()
+                .map(|frag| fragment(frag, &mut contexts))
+                .sum::<usize>()
             + self
                 .top_layer
                 .iter()
-                .map(|top| fragment(&top.fragment))
+                .map(|top| fragment(&top.fragment, &mut contexts))
                 .sum::<usize>()
     }
 }

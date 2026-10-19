@@ -81,7 +81,9 @@ impl Sender {
         }
     }
 
-    fn try_send(&self, event: &mut Option<CoreEvent>) -> Result<(), TrySendError<()>> {
+    /// Attempt one enqueue; on backpressure or closure, ownership remains
+    /// in `event` so a native operation can settle its reply immediately.
+    pub(super) fn try_send(&self, event: &mut Option<CoreEvent>) -> Result<(), TrySendError<()>> {
         let (wake, retired) = {
             let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
             if state.closed {

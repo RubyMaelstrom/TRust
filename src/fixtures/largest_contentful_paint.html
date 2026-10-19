@@ -1,0 +1,54 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Largest Contentful Paint acceptance</title>
+<style>
+  body { margin: 0; font: 16px/20px sans-serif; background: white; }
+  #initial { position: absolute; left: 20px; top: 20px; width: 180px; margin: 0; }
+  video, img { position: absolute; left: 20px; top: 20px; object-fit: fill; }
+  #result { position: absolute; left: 20px; top: 280px; margin: 0; visibility: hidden; }
+</style>
+<p id="initial">Paint timing starts with this visible paragraph.</p>
+<p id="result">Waiting for text, video poster, and image paints…</p>
+<script>
+  globalThis.lcpProbe = [];
+  const result = document.getElementById('result');
+  const observer = new PerformanceObserver(list => {
+    for (const entry of list.getEntries()) {
+      lcpProbe.push({ id: entry.id, size: entry.size, loadTime: entry.loadTime,
+        renderTime: entry.renderTime, paintTime: entry.paintTime,
+        presentationTime: entry.presentationTime, element: entry.element && entry.element.id,
+        imageURL: entry.url.startsWith('data:image/svg+xml,') });
+    }
+  });
+  observer.observe({ type: 'largest-contentful-paint', buffered: true });
+  function source(width, height, hue) {
+    let content = '';
+    for (let row = 0; row < 8; row++) for (let column = 0; column < 12; column++) {
+      content += `<rect x="${column * width / 12}" y="${row * height / 8}" ` +
+        `width="${width / 12 + 1}" height="${height / 8 + 1}" ` +
+        `fill="hsl(${hue + row * 5 + column * 3} 65% ${35 + row * 4}%)"/>`;
+    }
+    return 'data:image/svg+xml,' + encodeURIComponent(
+      `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}">${content}</svg>`);
+  }
+  setTimeout(() => {
+    const video = document.createElement('video');
+    video.id = 'poster'; video.width = 300; video.height = 180;
+    video.poster = source(300, 180, 170);
+    document.body.append(video);
+  }, 100);
+  setTimeout(() => {
+    const image = new Image(); image.id = 'hero'; image.width = 420; image.height = 240;
+    image.src = source(420, 240, 260);
+    document.body.append(image);
+  }, 350);
+  setTimeout(() => {
+    const ids = lcpProbe.map(entry => entry.id);
+    const pass = ids.includes('initial') && ids.includes('poster') && ids.includes('hero') &&
+      lcpProbe.every(entry => entry.size > 0 && entry.renderTime === entry.paintTime &&
+        entry.presentationTime === null && entry.element === entry.id);
+    document.body.dataset.lcpResult = pass ? 'PASS' : 'FAIL';
+    result.style.visibility = 'visible';
+    result.textContent = (pass ? 'PASS: ' : 'FAIL: ') + ids.join(' → ');
+  }, 1000);
+</script>

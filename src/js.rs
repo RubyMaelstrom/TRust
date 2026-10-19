@@ -197,6 +197,9 @@ pub(crate) fn headers_to_blob(headers: &[(String, String)]) -> String {
 pub struct PageEnv {
     pub url: String,
     pub navigation_timing: Option<Box<crate::http::FetchTiming>>,
+    /// The original Document's loading transition, retained through inert
+    /// presentation and later Realm materialization (Navigation Timing 2).
+    pub(crate) document_creation_time: Option<f64>,
     pub(crate) resource_timings: Vec<crate::performance::ResourceTiming>,
     pub viewport: (u16, u16),
     pub cell_px: (u16, u16),
@@ -214,6 +217,11 @@ pub struct PageEnv {
     pub storage: Option<WebStorage>,
     pub blobs: BlobMap,
     pub(crate) service_client: Option<DocumentClient>,
+    /// Completed inert-frame navigations retained if a child script promotes
+    /// the document to the resident actor. Each container owns its response.
+    pub(crate) prefetched_frames: crate::http::frames::FrameDocuments,
+    /// Materialize globals for an already loaded inert native document.
+    pub(crate) resume_static: bool,
     /// A frame document of this page has scripts. Nested documents run
     /// their own scripts (HTML #the-iframe-element), which only the live
     /// actor can do, so the page stays live even without scripts of its own.
@@ -293,6 +301,7 @@ impl PageEnv {
         Self {
             url: url.to_string(),
             navigation_timing: None,
+            document_creation_time: None,
             resource_timings: Vec::new(),
             viewport: (80, 24),
             cell_px: (8, 16),
@@ -306,6 +315,8 @@ impl PageEnv {
             storage: None,
             blobs: Default::default(),
             service_client: None,
+            prefetched_frames: Default::default(),
+            resume_static: false,
             scripted_frames: false,
             last_modified: None,
             document_encoding: encoding_rs::UTF_8,

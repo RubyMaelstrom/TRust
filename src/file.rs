@@ -799,7 +799,12 @@ mod tests {
         // Each actor event drains that dispatch's console; retain earlier
         // observations rather than expecting the last event to replay them.
         let mut console = outcome.console.clone();
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        // The positive fixture creates several child Window realms, including
+        // two successive Blob navigations. Debug bootstrap under the full
+        // parallel suite can exceed 15 seconds after the first presentation.
+        // This bounds completion, not browser performance; retain every
+        // resource, origin and error assertion below.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
         while !expected.iter().all(|line| {
             console
                 .iter()

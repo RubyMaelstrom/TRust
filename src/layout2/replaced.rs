@@ -111,12 +111,6 @@ pub(crate) fn size(
         natural
     };
     let u = Units::of(dom, node);
-    let css = |prop: &str, basis: Option<f32>| {
-        dom.computed_value_resolved(node, prop)
-            .and_then(|v| Len::parse(&v, u, vp))
-            .and_then(|l| l.resolve(basis))
-            .filter(|&v| v >= 0.0)
-    };
     // The HTML width/height attributes are presentational hints for the
     // specified size (and, as a pair, the modern pre-decode ratio source).
     // HTML #maps-to-the-dimension-property: a percentage is of the
@@ -148,9 +142,9 @@ pub(crate) fn size(
     // to the border box; the content box is that less the padding and
     // border, floored at zero. Every caller treats the result as the
     // content box, which receives the edges outside it.
+    let style = super::style::BoxStyle::of(dom, node, vp);
     let (edges_w, edges_h) =
         if dom.computed_value_resolved(node, "box-sizing").as_deref() == Some("border-box") {
-            let style = super::style::BoxStyle::of(dom, node, vp);
             // CSS Box 4 #padding-physical: percentages refer to the containing
             // block's inline size, in both axes.
             let padding = |side: usize| style.padding[side].resolve(cb_w).unwrap_or(0.0).max(0.0);
@@ -164,6 +158,26 @@ pub(crate) fn size(
         };
     let content_w = |value: f32| (value - edges_w).max(0.0);
     let content_h = |value: f32| (value - edges_h).max(0.0);
+    let stretch = |value: &Len, axis: usize, basis: Option<f32>| {
+        let sides = if axis == 0 { [3, 1] } else { [0, 2] };
+        let bp = sides
+            .into_iter()
+            .map(|side| {
+                style.border[side] + style.padding[side].resolve(cb_w).unwrap_or(0.).max(0.)
+            })
+            .sum();
+        super::stretch::content_size(dom, node, &style, value, axis, basis, cb_w, bp)
+    };
+    let css = |prop: &str, basis: Option<f32>| {
+        let value = dom
+            .computed_value_resolved(node, prop)
+            .and_then(|v| Len::parse(&v, u, vp))?;
+        let axis = usize::from(prop == "height");
+        stretch(&value, axis, basis)
+            .map(|content| content + if axis == 0 { edges_w } else { edges_h })
+            .or_else(|| value.resolve(basis))
+            .filter(|&v| v >= 0.)
+    };
     let css_w = css("width", cb_w);
     let css_h = css("height", cb_h);
     let spec_w = if dom.author_declares(node, "width") {
@@ -286,6 +300,7 @@ pub(crate) fn size(
             .and_then(|v| Len::parse(&v, u, vp))?
         {
             Len::MinContent | Len::MaxContent | Len::FitContent | Len::FitContentLimit(_) => auto,
+            value @ Len::Stretch => stretch(&value, usize::from(prop.ends_with("height")), basis),
             length => length.resolve(basis).filter(|&v| v >= 0.0).map(content),
         };
     let auto_w = || auto_size(None, spec_h).map(|(w, _)| w);

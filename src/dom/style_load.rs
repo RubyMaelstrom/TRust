@@ -110,8 +110,13 @@ impl Dom {
 
     /// How far obtaining the sheet an `@import` of absolute URL `url`
     /// imports got; `in_flight` reports the fetches the host has started.
-    pub(crate) fn import_state(&self, url: &str, in_flight: &dyn Fn(&str) -> bool) -> ImportState {
-        if self.imported_sheets.contains_key(url) {
+    pub(crate) fn document_import_state(
+        &self,
+        document: NodeId,
+        url: &str,
+        in_flight: &dyn Fn(&str) -> bool,
+    ) -> ImportState {
+        if self.imported_sheet_for_document(document, url).is_some() {
             return ImportState::Obtained;
         }
         let requests = self.import_requests.borrow();
@@ -198,9 +203,10 @@ impl Dom {
                 continue;
             }
             seen.push(url.clone());
-            match self.import_state(&url, in_flight) {
+            let document = self.owner_document(owner).unwrap_or(self.document());
+            match self.document_import_state(document, &url, in_flight) {
                 ImportState::Obtained => {
-                    let Some(sheet) = self.imported_sheets.get(&url) else {
+                    let Some(sheet) = self.imported_sheet_for_document(document, &url) else {
                         continue;
                     };
                     let base = url::Url::parse(&sheet.base).ok();

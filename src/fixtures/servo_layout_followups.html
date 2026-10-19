@@ -1,0 +1,59 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Servo layout follow-up acceptance</title>
+<style>
+  body { margin: 20px; color: #18314a; background: #f4f8fc; font: 16px/24px sans-serif; }
+  h1 { font: 24px/32px sans-serif; margin: 0 0 16px; }
+  section { display: inline-block; vertical-align: top; margin: 0 24px 16px 0; padding: 12px; background: white; }
+  .sample { font: 32px/40px "DejaVu Sans"; }
+  .wide { width: max-content; }
+  .wrapped { width: 110px; overflow-wrap: anywhere; }
+  #grid { display: grid; width: 300px; height: 150px; grid-template-columns: 100px 200px; grid-template-rows: 50px 100px; background: #dbe7ef; }
+  #middle, #inner { display: grid; grid-column: span 2; grid-row: span 2; grid-template-columns: subgrid; grid-template-rows: subgrid; }
+  #middle { writing-mode: vertical-rl; }
+  #inner { writing-mode: horizontal-tb; }
+  #target { grid-column: 2; grid-row: 2; background: #62d8b8; }
+  #stretch-parent { display: flow-root; width: 120px; height: 100px; background: #dbe7ef; }
+  #stretched { height: stretch; margin: 25px; background: #62d8b8; }
+  #empty-parent { font: 20px/40px serif; }
+  #empty { padding-left: 10px; background: #dfa8fa; }
+  #result { margin: 0; white-space: pre-wrap; }
+</style>
+<h1>Shaping, logical subgrid, stretch, and Window behavior</h1>
+<section>
+  <div class="sample wide" id="plain">affinity</div>
+  <div class="sample wide" id="split">a<span>f</span><span style="color:#c33;text-decoration:underline">fi</span>nity</div>
+  <div class="sample wide" id="arabic-plain" dir="rtl">سلام</div>
+  <div class="sample wide" id="arabic-split" dir="rtl">س<span>ل</span><span style="color:#438">ا</span>م</div>
+</section>
+<section>
+  <div class="sample wrapped" id="wrap-plain">affinity affinity</div>
+  <div class="sample wrapped" id="wrap-split"><span>a</span><span>f</span><span>f</span><span>i</span><span>n</span><span>i</span><span>t</span><span>y</span> <span>a</span><span>f</span><span>f</span><span>i</span><span>n</span><span>i</span><span>t</span><span>y</span></div>
+</section>
+<section>
+  <div id="grid"><div id="middle"><div id="inner"><div id="target"></div></div></div></div>
+</section>
+<section>
+  <div id="stretch-parent"><span><div id="stretched"></div></span></div>
+  <div id="empty-parent"><span id="empty"></span></div>
+</section>
+<pre id="result">Checking…</pre>
+<script>
+  const results = [];
+  const box = id => document.getElementById(id).getBoundingClientRect();
+  const near = (a, b) => Math.abs(a - b) < 0.1;
+  const check = (label, pass) => results.push({label, pass});
+  check('Latin shaping through inline wrappers', near(box('plain').width, box('split').width));
+  check('Arabic joining through inline wrappers', near(box('arabic-plain').width, box('arabic-split').width));
+  check('Wrapping and line metrics through inline wrappers', near(box('wrap-plain').height, box('wrap-split').height));
+  const grid = box('grid'), target = box('target');
+  check('Nested orthogonal subgrid maps both axes', near(target.x - grid.x, 100) && near(target.y - grid.y, 50) && near(target.width, 200) && near(target.height, 100));
+  check('Stretch uses containing block through inline wrapper', near(box('stretched').height, 50));
+  check('Nonzero empty inline edge creates a line', near(box('empty-parent').height, 40));
+  check('Window prototype is immutable and stays extensible', !Reflect.setPrototypeOf(window, {}) && !Reflect.preventExtensions(window) && Reflect.isExtensible(window));
+  const descriptor = Reflect.getOwnPropertyDescriptor(location, 'href');
+  check('Location default descriptor follows exotic rules', descriptor.configurable && !Reflect.defineProperty(location, 'href', descriptor) && !Reflect.deleteProperty(location, 'href'));
+  globalThis.servoLayoutResults = results;
+  document.body.dataset.result = results.every(result => result.pass) ? 'PASS' : 'FAIL';
+  document.getElementById('result').textContent = results.map(result => `${result.pass ? 'PASS' : 'FAIL'} ${result.label}`).join('\n');
+</script>

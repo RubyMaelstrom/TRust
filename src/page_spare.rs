@@ -243,6 +243,7 @@ fn warm(engine: &mut trust_js::Engine, snapshot: &'static [u8]) -> Result<(), St
         false,
         MainWindowTraces::default(),
         crate::js::TraversableState::SHOWN,
+        None,
     );
 
     // As in `host_create_window_realm`, creation and bootstrap are one

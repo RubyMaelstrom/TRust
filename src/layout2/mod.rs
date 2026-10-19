@@ -69,7 +69,9 @@ mod overflow;
 mod replaced;
 mod session;
 mod spatial;
+mod sticky;
 pub(crate) use overflow::{Overflow, scroll_reverse};
+mod stretch;
 mod style;
 mod table;
 mod text_overflow;
@@ -1765,6 +1767,7 @@ fn page_media_fallback(model: &terminal::TerminalPaintModel, cols: usize, rows: 
 
 #[cfg(test)]
 mod tests {
+    include!("servo_regressions.rs");
     use super::*;
     use crate::layout2::{Item, ItemKind, display_width};
 

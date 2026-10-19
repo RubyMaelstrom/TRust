@@ -31,7 +31,7 @@ pub(crate) use inline_svg::document_svg_data_url_for_navigation;
 pub(crate) use inline_svg::{
     begin_document_svg_navigation, cors_image_source, cors_image_target, document_svg_data_url,
     document_svg_geometry_tree, document_svg_image_requests, document_svg_image_target,
-    document_svg_image_url, document_svg_navigation, document_svg_revision,
+    document_svg_image_url, document_svg_navigation, document_svg_revision, is_document_svg_source,
     record_document_svg_image,
 };
 

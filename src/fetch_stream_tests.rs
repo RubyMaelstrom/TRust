@@ -11,6 +11,388 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 
+include!("service_worker_initial_tests.rs");
+
+#[test]
+fn service_worker_response_filtering_redirects_head_and_range_provenance() {
+    let runtime = runtime();
+    let (listener, base) = listen(&runtime);
+    let (remote, remote_base) = listen(&runtime);
+    let remote_url = remote_base.clone();
+    let remote_server=runtime.spawn(async move {
+        loop {
+            let(mut socket,_)=remote.accept().await.unwrap();let head=read_head(&mut socket).await;
+            let status=if head.starts_with("get /range-source "){
+                assert!(head.contains("range: bytes=0-2\r\n"),"native range was lost: {head}");206
+            }else{200};
+            socket.write_all(format!("HTTP/1.1 {status} OK\r\nContent-Type: text/plain\r\nContent-Length: 3\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\nabc").as_bytes()).await.unwrap();
+        }
+    });
+    let server=runtime.spawn(async move {
+        loop {
+            let(mut socket,_)=listener.accept().await.unwrap();let head=read_head(&mut socket).await;
+            assert!(head.starts_with("get /sw.js "),"unexpected fallback {head}");
+            let source=r#"
+                let ranged;
+                addEventListener('activate',e=>e.waitUntil(clients.claim()));
+                addEventListener('fetch',e=>{
+                    const path=new URL(e.request.url).pathname;
+                    if(path==='/cors')e.respondWith(fetch('REMOTE/cors'));
+                    else if(path==='/opaque')e.respondWith(fetch('REMOTE/opaque',{mode:'no-cors'}));
+                    else if(path==='/range-source')e.respondWith(fetch(e.request).then(r=>{ranged=r.clone();return r;}));
+                    else if(path==='/range')e.respondWith(ranged.clone());
+                    else if(path==='/redirect')e.respondWith(Response.redirect('/target'));
+                    else if(path==='/options'){
+                        let immutable=false;try{e.request.headers.set('x-worker','bad')}catch(error){immutable=error.name==='TypeError';}
+                        e.respondWith(new Response([e.request.cache,e.request.keepalive,e.request.destination,immutable].join('|')));
+                    } else e.respondWith(new Response('result'));
+                });
+            "#.replace("REMOTE",&remote_base);
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{source}",source.len()).as_bytes()).await.unwrap();
+        }
+    });
+    let (mut engine, mut tasks) = page(&runtime, &format!("{base}/page"));
+    eval(&mut engine,r#"
+        globalThis.done=false;
+        (async()=>{
+            globalThis.reg=await navigator.serviceWorker.register('/sw.js');await navigator.serviceWorker.ready;
+            if(!navigator.serviceWorker.controller)await new Promise(r=>navigator.serviceWorker.oncontrollerchange=r);
+        })().finally(()=>done=true);
+    "#,"worker range setup").unwrap();
+    run_until(&runtime, &mut engine, &mut tasks, "done");
+    // Range is a privileged no-CORS header. Author Headers mutations remove
+    // it; start with an actual native media request, then replay its response.
+    let context =
+        service_worker_host::fetch::for_context(engine.ctx().host::<HostState>().unwrap(), 0);
+    for target in [
+        format!("{remote_url}/range-source"),
+        format!("{base}/range"),
+    ] {
+        let mut request = crate::http::Request::subresource(
+            url::Url::parse(&target).unwrap(),
+            &url::Url::parse(&base).unwrap(),
+            "video",
+            None,
+        );
+        request.headers.push(("range".into(), "bytes=0-2".into()));
+        request.service_worker = context.clone();
+        let mut response = runtime.block_on(crate::http::fetch(&request)).unwrap();
+        assert!(
+            response
+                .internal
+                .as_ref()
+                .is_some_and(|r| r.range_requested)
+        );
+        response.unfilter();
+        assert_eq!(response.body, b"abc");
+    }
+    eval(&mut engine,r#"
+        globalThis.done=false;
+        (async()=>{
+            log.push(await(await fetch('/cors')).text());
+            for(const [url,options] of [['/cors',{mode:'same-origin'}],['/opaque',{}],['/range',{mode:'no-cors'}],['/redirect',{redirect:'error'}]]){
+                try{await fetch(url,options);log.push('BAD')}catch(error){log.push(error.name)}
+            }
+            const opaque=await fetch('/opaque',{mode:'no-cors'});log.push(opaque.type,opaque.body===null);
+            log.push((await fetch('/redirect',{redirect:'manual'})).type);
+            log.push(await(await fetch('/redirect')).text());
+            const head=await fetch('/head',{method:'HEAD'});log.push(head.body===null,await head.text()==='');
+            log.push(await(await fetch('/options',{cache:'reload',keepalive:true})).text());
+            await reg.unregister();
+        })().catch(e=>log.push('ERROR:'+e.name+':'+e.message)).finally(()=>done=true);
+    "#,"worker response filters").unwrap();
+    run_until(&runtime, &mut engine, &mut tasks, "done");
+    assert_eq!(
+        log(&mut engine),
+        "abc|TypeError|TypeError|TypeError|TypeError|opaque|true|opaqueredirect|result|true|true|reload|true||true"
+    );
+    server.abort();
+    remote_server.abort();
+}
+
+#[test]
+fn service_worker_controls_worker_scripts_and_their_subresources() {
+    let runtime = runtime();
+    let (listener, base) = listen(&runtime);
+    let server=runtime.spawn(async move {
+        loop {
+            let(mut socket,_)=listener.accept().await.unwrap();let head=read_head(&mut socket).await;
+            let source=if head.starts_with("get /actual/child.js?") {
+                r#"fetch('inner').then(r=>r.text()).then(v=>postMessage(v+'|'+new URL(location.href).searchParams.get('id')+'|'+location.pathname));"#
+            }else {
+            assert!(head.starts_with("get /sw.js "),"intercepted resource reached network: {head}");
+            r#"
+                addEventListener('activate',e=>e.waitUntil(clients.claim()));
+                addEventListener('fetch',e=>{
+                    if(new URL(e.request.url).pathname==='/child.js'){
+                        e.respondWith(fetch('/actual/child.js?id='+e.resultingClientId));
+                    }else e.respondWith(clients.get(e.clientId).then(c=>new Response(c.type+'|'+c.id+'|'+e.resultingClientId+'|'+new URL(e.request.url).pathname)));
+                });
+            "#};
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{source}",source.len()).as_bytes()).await.unwrap();
+        }
+    });
+    let (mut engine, mut tasks) = page(&runtime, &format!("{base}/page"));
+    eval(&mut engine,r#"
+        globalThis.done=false;
+        (async()=>{
+            const reg=await navigator.serviceWorker.register('/sw.js');await navigator.serviceWorker.ready;
+            if(!navigator.serviceWorker.controller)await new Promise(r=>navigator.serviceWorker.oncontrollerchange=r);
+            const worker=new Worker('/child.js');
+            const result=await new Promise((resolve,reject)=>{worker.onmessage=e=>resolve(e.data);worker.onerror=e=>reject(Error(e.message));});
+            const fields=result.split('|');log.push(fields[0],fields[1]===fields[4],fields[2],fields[3],fields[5]);
+            worker.terminate();await reg.unregister();
+        })().catch(e=>log.push('ERROR:'+e.name+':'+e.message)).finally(()=>done=true);
+    "#,"controlled worker").unwrap();
+    run_until(&runtime, &mut engine, &mut tasks, "done");
+    assert_eq!(
+        log(&mut engine),
+        "worker|true||/actual/inner|/actual/child.js"
+    );
+    server.abort();
+}
+
+#[test]
+fn service_worker_response_cancel_aborts_request_and_releases_the_source_reader() {
+    let runtime = runtime();
+    let (listener, base) = listen(&runtime);
+    let server=runtime.spawn(async move {
+        let(mut socket,_)=listener.accept().await.unwrap();let _=read_head(&mut socket).await;
+        let source=r#"
+            let bytes,source,aborted=false,canceled=false;
+            addEventListener('activate',e=>e.waitUntil(clients.claim()));
+            addEventListener('fetch',e=>{
+                if(new URL(e.request.url).pathname==='/state'){
+                    e.respondWith(new Response(aborted+':'+canceled+':'+bytes.buffer.byteLength+':'+source.locked));return;
+                }
+                let finish;
+                e.waitUntil(new Promise(resolve=>finish=resolve));
+                function check(){if(aborted&&canceled)clients.get(e.clientId).then(c=>{c.postMessage('canceled');finish();});}
+                e.request.signal.addEventListener('abort',()=>{aborted=true;check();});
+                bytes=new Uint8Array([1,2,3]);
+                source=new ReadableStream({start(c){c.enqueue(bytes);},cancel(){canceled=true;check();}});
+                e.respondWith(new Response(source));
+            });
+            // The response metadata bridge must not consult author-installed
+            // collection hooks when serializing its private header records.
+            Array.prototype.toJSON=()=>{throw new Error('unexpected collection hook');};
+        "#;
+        socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{source}",source.len()).as_bytes()).await.unwrap();
+    });
+    let (mut engine, mut tasks) = page(&runtime, &format!("{base}/page"));
+    eval(&mut engine,r#"
+        globalThis.done=false;
+        (async()=>{
+            const reg=await navigator.serviceWorker.register('/sw.js');await navigator.serviceWorker.ready;
+            if(!navigator.serviceWorker.controller)await new Promise(r=>navigator.serviceWorker.oncontrollerchange=r);
+            const canceled=new Promise(r=>navigator.serviceWorker.onmessage=e=>r(e.data));
+            const controller=new AbortController();
+            const response=await fetch('/stream',{signal:controller.signal});const reader=response.body.getReader();
+            log.push(Array.from((await reader.read()).value).join(','));
+            controller.abort();
+            try{await reader.read();log.push('BAD');}catch(e){log.push(e.name);}
+            log.push(await canceled);log.push(await(await fetch('/state')).text());await reg.unregister();
+        })().catch(e=>log.push('ERROR:'+e.name+':'+e.message)).finally(()=>done=true);
+    "#,"service worker cancellation").unwrap();
+    run_until(&runtime, &mut engine, &mut tasks, "done");
+    assert_eq!(
+        log(&mut engine),
+        "1,2,3|AbortError|canceled|true:true:0:false"
+    );
+    runtime.block_on(server).unwrap();
+}
+
+#[test]
+fn service_worker_module_graph_rejects_await_before_execution_and_runs_saved_imports() {
+    let runtime = runtime();
+    let (listener, base) = listen(&runtime);
+    let server=runtime.spawn(async move {
+        loop {
+            let(mut socket,_)=listener.accept().await.unwrap();let head=read_head(&mut socket).await;
+            let source=if head.starts_with("get /dep.js "){"export const word='module'; async function nested(){await 1;}"}
+            else if head.starts_with("get /async.js "){"class C { [await 1]() {} } export const value=1;"}
+            else if head.starts_with("get /bad.js "){r#"import './async.js'; cookieStore.set({name:'module-ran',value:'bad'});"#}
+            else {r#"import {word} from './dep.js'; import extra from 'data:application/json,%7B%22suffix%22%3A%22-local%22%7D' with {type:'json'}; addEventListener('activate',e=>e.waitUntil(clients.claim())); addEventListener('fetch',e=>e.respondWith(new Response(word+extra.suffix)));"#};
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{source}",source.len()).as_bytes()).await.unwrap();
+        }
+    });
+    let (mut engine, mut tasks) = page(&runtime, &format!("{base}/page"));
+    eval(&mut engine,r#"
+        globalThis.done=false;
+        (async()=>{
+            try{await navigator.serviceWorker.register('/bad.js',{type:'module'});log.push('BAD');}catch(e){log.push(e.name);}
+            log.push(await cookieStore.get('module-ran')===null);
+            const reg=await navigator.serviceWorker.register('/sw.js',{type:'module'});
+            await navigator.serviceWorker.ready;
+            if(!navigator.serviceWorker.controller)await new Promise(r=>navigator.serviceWorker.oncontrollerchange=r);
+            log.push(await(await fetch('/result')).text());
+            await reg.unregister();
+        })().catch(e=>log.push('ERROR:'+e.name+':'+e.message)).finally(()=>done=true);
+    "#,"module service worker").unwrap();
+    run_until(&runtime, &mut engine, &mut tasks, "done");
+    assert_eq!(log(&mut engine), "TypeError|true|module-local");
+    server.abort();
+}
+
+#[test]
+fn service_worker_navigation_preload_keeps_reserved_client_and_streams_response() {
+    let runtime = runtime();
+    let (listener, base) = listen(&runtime);
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = requests.clone();
+    let server=runtime.spawn(async move {
+        loop {
+            let(mut socket,_)=listener.accept().await.unwrap();let head=read_head(&mut socket).await;
+            seen.lock().unwrap().push(head.clone());
+            let (mime,source)=if head.starts_with("get /sw.js "){("text/javascript",r#"
+                addEventListener('activate',e=>e.waitUntil((async()=>{
+                    await registration.navigationPreload.enable();
+                    await registration.navigationPreload.setHeaderValue('  preload-test\t');
+                })()));
+                addEventListener('fetch',e=>e.respondWith((async()=>{
+                    const r=await e.preloadResponse;
+                    return new Response(e.request.mode+'|'+e.resultingClientId+'|'+await r.text(),{headers:{'content-type':'text/html'}});
+                })()));
+            "#)}else{("text/html","preloaded")};
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{source}",source.len()).as_bytes()).await.unwrap();
+        }
+    });
+    let (mut engine, mut tasks) = page(&runtime, &format!("{base}/page"));
+    eval(&mut engine,r#"
+        globalThis.done=false;
+        (async()=>{
+            const reg=await navigator.serviceWorker.register('/sw.js');await navigator.serviceWorker.ready;
+            if(reg.active.state!=='activated')await new Promise(r=>reg.active.addEventListener('statechange',()=>{if(reg.active.state==='activated')r();}));
+            const state=await reg.navigationPreload.getState();log.push(state.enabled,state.headerValue,reg.navigationPreload===reg.navigationPreload);
+        })().catch(e=>log.push('ERROR:'+e.name+':'+e.message)).finally(()=>done=true);
+    "#,"preload manager").unwrap();
+    run_until(&runtime, &mut engine, &mut tasks, "done");
+    assert_eq!(log(&mut engine), "true|preload-test|true");
+    let storage = engine.ctx().host::<HostState>().unwrap().storage.clone();
+    let response = runtime
+        .block_on(crate::http::fetch_navigation(
+            &url::Url::parse(&format!("{base}/next")).unwrap(),
+            None,
+            None,
+            &storage,
+            false,
+        ))
+        .unwrap();
+    let id = response
+        .service_client
+        .as_ref()
+        .unwrap()
+        .client()
+        .id
+        .clone();
+    assert_eq!(
+        String::from_utf8(response.body).unwrap(),
+        format!("navigate|{id}|preloaded")
+    );
+    assert!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|h| h.starts_with("get /next ")
+                && h.contains("service-worker-navigation-preload: preload-test\r\n"))
+    );
+    runtime.block_on(async {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|h| h.starts_with("get /sw.js "))
+            .count()
+            < 2
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "navigation did not schedule Soft Update"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    });
+    server.abort();
+}
+
+#[test]
+fn service_worker_fetch_streams_falls_back_and_rejects_invalid_responses() {
+    // SW 92aba3be Handle Fetch/respondWith, Fetch 394d20d HTTP fetch.
+    let runtime = runtime();
+    let (listener, base) = listen(&runtime);
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = requests.clone();
+    let server = runtime.spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let head = read_head(&mut socket).await;
+            seen.lock().unwrap().push(head.clone());
+            let body = if head.starts_with("get /sw.js ") { r#"
+                addEventListener('activate',e=>e.waitUntil(clients.claim()));
+                addEventListener('fetch',e=>{
+                    const path=new URL(e.request.url).pathname;
+                    if(path==='/fallback')return;
+                    if(path==='/cancel'){e.preventDefault();return;}
+                    if(path==='/bad'){e.respondWith({});return;}
+                    if(path==='/error'){e.respondWith(Response.error());return;}
+                    if(path==='/used'){
+                        const r=new Response('used');r.text();e.respondWith(r);return;
+                    }
+                    if(path==='/echo'){
+                        e.respondWith(e.request.text().then(body=>new Response(body+':'+e.request.method)));return;
+                    }
+                    if(path==='/forward'){e.respondWith(fetch('/fallback'));return;}
+                    if(path==='/stream'){
+                        let n=0;
+                        e.respondWith(new Response(new ReadableStream({pull(c){
+                            if(n++===0)c.enqueue(new TextEncoder().encode('first'));
+                            else {c.enqueue(new TextEncoder().encode('second'));c.close();}
+                        }}),{headers:{'x-worker':'yes'}}));return;
+                    }
+                    e.respondWith(new Response([e.request.mode,e.request.destination,e.clientId.length>0,
+                        e.resultingClientId,e.isTrusted,e.cancelable].join('|')));
+                });
+            "# } else { "network" };
+            let mime=if head.starts_with("get /sw.js "){"text/javascript"}else{"text/plain"};
+            let response=format!("HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len());
+            socket.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+    let (mut engine, mut tasks) = page(&runtime, &format!("{base}/page"));
+    eval(&mut engine,r#"
+        globalThis.done=false;
+        (async()=>{
+            const reg=await navigator.serviceWorker.register('/sw.js');
+            await navigator.serviceWorker.ready;
+            if(!navigator.serviceWorker.controller)await new Promise(r=>navigator.serviceWorker.oncontrollerchange=r);
+            log.push(await(await fetch('/inspect')).text());
+            const stream=await fetch('/stream');log.push(stream.headers.get('x-worker'));
+            log.push(await stream.text());
+            log.push(await(await fetch('/echo',{method:'POST',body:'hello'})).text());
+            log.push(await(await fetch('/fallback')).text());
+            log.push(await(await fetch('/forward')).text());
+            for(const path of ['/cancel','/bad','/error','/used']){
+                try{await fetch(path);log.push('BAD:'+path);}catch(e){log.push(e.name);}
+            }
+            await reg.unregister();
+        })().catch(e=>log.push('ERROR:'+e.name+':'+e.message)).finally(()=>done=true);
+    "#,"service worker fetch").unwrap();
+    run_until(&runtime, &mut engine, &mut tasks, "done");
+    assert_eq!(
+        log(&mut engine),
+        "cors||true||true|true|yes|firstsecond|hello:POST|network|network|TypeError|TypeError|TypeError|TypeError"
+    );
+    let heads = requests.lock().unwrap();
+    assert_eq!(
+        heads.len(),
+        3,
+        "Only script, fallback, and worker's own fetch reach the network: {heads:?}"
+    );
+    server.abort();
+}
+
 #[test]
 fn service_worker_registration_runs_install_and_activate_with_ram_cache() {
     let runtime = runtime();
@@ -412,29 +794,58 @@ fn service_worker_documents_keep_controllers_after_their_actors_retire() {
                 .unwrap();
             crate::http::execute_js(response, (80, 24), (8, 16), storage.clone()).await
         });
-        if let Some(mut live) = response.live.take() {
-            // First paint may precede load/rendering tasks. Require the
-            // actor to retire once those finish, not before first paint.
-            runtime.block_on(async {
-                tokio::time::timeout(Duration::from_secs(30), async {
-                    loop {
-                        match live.events.recv().await {
-                            Some(crate::js::PageEvt::Static { html, outcome }) => {
-                                assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
-                                response.body = html.into_bytes();
-                                break;
-                            }
-                            Some(crate::js::PageEvt::Trouble(errors)) => panic!("{errors:?}"),
-                            Some(_) => {}
-                            None => panic!("document closed without retiring"),
+        let mut live = response
+            .live
+            .take()
+            .expect("controlled Documents retain their native Window actor");
+        // SW 92aba3be #client-focus / #client-navigate require later tasks
+        // on this Window's event loop even without author event handlers.
+        // Verify that endpoint before explicitly retiring the actor. Its
+        // native Document owner remains held by `response`, so actor teardown
+        // must not discard the client or revoke its document-owned blob URLs
+        // (#service-worker-client-concept / #navigator-service-worker-unregister).
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(30), async {
+                live.handle
+                    .cmds
+                    .send(crate::js::PageCmd::Resync)
+                    .await
+                    .unwrap();
+                live.handle
+                    .cmds
+                    .send(crate::js::PageCmd::CheckUnload { request: 1 })
+                    .await
+                    .unwrap();
+                let mut resynced = false;
+                loop {
+                    match live.events.recv().await {
+                        Some(crate::js::PageEvt::Updated { html, outcome }) => {
+                            assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                            response.body = html.into_bytes();
+                            resynced = true;
                         }
+                        Some(crate::js::PageEvt::UnloadChecked {
+                            request: 1,
+                            proceed,
+                        }) => {
+                            assert!(proceed);
+                            assert!(resynced, "Window task overtook its preceding resync");
+                            break;
+                        }
+                        Some(crate::js::PageEvt::Static { .. }) => {
+                            panic!("controlled Window retired before its native task")
+                        }
+                        Some(crate::js::PageEvt::Trouble(errors)) => panic!("{errors:?}"),
+                        Some(_) => {}
+                        None => panic!("controlled Window closed before its native task"),
                     }
-                    assert!(live.events.recv().await.is_none());
-                })
-                .await
-                .expect("inert document retained an actor");
-            });
-        }
+                }
+                live.handle.retire();
+                while live.events.recv().await.is_some() {}
+            })
+            .await
+            .expect("controlled Window task or explicit actor teardown did not finish");
+        });
         if path == "/scripted" {
             assert!(
                 response
@@ -1865,6 +2276,7 @@ fn a_module_scripts_static_graph_is_fetched_as_its_responses_arrive() {
         Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         page.join("/a.js").unwrap(),
         b"import {b} from \"./b.js\";\nimport('./dynamic.js');",
+        None,
     );
     let heads = runtime
         .block_on(async { tokio::time::timeout(Duration::from_secs(10), server).await })

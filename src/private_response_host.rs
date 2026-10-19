@@ -152,6 +152,21 @@ pub(super) fn public_urls(urls: &[url::Url], kind: &str) -> Vec<String> {
         .map_or_else(Vec::new, |url| vec![url.to_string(); urls.len().min(2)])
 }
 
+/// Fetch's service-worker response path can forward the internal response,
+/// but only from a capability owned by this worker's storage partition.
+pub(super) fn for_service_worker(ctx: &mut Ctx, token: &str) -> Option<Arc<Payload>> {
+    let key = owner(ctx);
+    let state = ctx.host::<HostState>()?;
+    profile(&state.storage)
+        .state
+        .lock()
+        .unwrap()
+        .tokens
+        .get(token)
+        .and_then(Weak::upgrade)
+        .filter(|payload| payload.owner == key)
+}
+
 pub(super) fn install(
     ctx: &mut Ctx,
     mut internal: crate::http::InternalResponse,

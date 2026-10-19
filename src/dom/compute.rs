@@ -82,6 +82,9 @@ pub(super) trait StyleBackend {
     fn css_transitions_active(&self) -> bool;
     fn animation_value(&self, id: NodeId, name: &str) -> Option<String>;
     fn animation_private_row(&self, id: NodeId) -> bool;
+    fn animation_will_change(&self, _: NodeId, _: &str, _: usize) -> Option<bool> {
+        None
+    }
     /// The transition- or animation-origin value of `name` on `id`'s
     /// `which` pseudo-element.
     fn pseudo_origin(&self, id: NodeId, which: PseudoEl, name: &str) -> Option<String>;
@@ -155,6 +158,10 @@ pub(super) trait StyleBackend {
 
 impl StyleBackend for Dom {
     type Index = std::rc::Rc<StyleIndex>;
+
+    fn animation_will_change(&self, id: NodeId, name: &str, occurrence: usize) -> Option<bool> {
+        Dom::animation_will_change(self, id, name, occurrence)
+    }
 
     #[inline]
     #[cfg_attr(feature = "architecture-diagnostics", track_caller)]

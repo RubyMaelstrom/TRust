@@ -15,6 +15,7 @@
 //! baseline-aligned text and atomic inlines.
 
 mod bidi;
+mod shaping;
 
 use url::Url;
 
@@ -94,6 +95,9 @@ pub(crate) struct Piece {
     /// Ordinary text pieces retain their CSS text style so adjacent words can
     /// be accumulated by advance and shaped once when the line closes.
     text_style: Option<crate::text::TextStyle>,
+    /// Shared glyph context across inline boundaries; each piece retains
+    /// its own text, source spans, inline boxes and paint style.
+    pub(crate) shaping: Option<crate::text::context::ContextSlice>,
     /// Whether this piece's text is justification-stretchable (built under a
     /// collapsing white-space mode — preserved spaces never stretch).
     stretch: bool,
@@ -649,6 +653,19 @@ impl Piece {
             })
     }
 
+    /// Shared shaping contexts can span many pieces and lines. Count their
+    /// allocation once for the retained subtree whose budget is being read.
+    pub(super) fn shaping_bytes(&self, seen: &mut rustc_hash::FxHashSet<usize>) -> usize {
+        self.shaping.as_ref().map_or(0, |slice| {
+            let key = std::sync::Arc::as_ptr(&slice.context) as usize;
+            if seen.insert(key) {
+                slice.context.retained_bytes()
+            } else {
+                0
+            }
+        })
+    }
+
     /// An atomic piece with an explicit box (a replaced flex item laid at
     /// an imposed size), with an independent object-fit paint rectangle.
     pub(crate) fn boxed(
@@ -676,6 +693,7 @@ impl Piece {
             item,
             shaped: None,
             text_style: None,
+            shaping: None,
             stretch: false,
             space_before: false,
             atom_box: false,
@@ -711,6 +729,7 @@ impl Piece {
             item,
             shaped: Some(shaped),
             text_style: None,
+            shaping: None,
             stretch: false,
             space_before: false,
             atom_box: false,
@@ -873,6 +892,9 @@ pub(crate) struct Ifc<'a, 'f, 't> {
     pen: f32,
     line_start: f32,
     pending_space: bool,
+    /// The first collapsed space owns its typography, even across a style
+    /// boundary. Shared shaping can give it a contextual advance as well.
+    pending_space_width: Option<f32>,
     /// Whether the pending space allows a soft wrap: CSS Text 3 #line-breaking
     /// lets the box containing a space control the opportunity there, and
     /// of a run of collapsible spaces the first is the one kept.
@@ -978,6 +1000,8 @@ pub(crate) struct Ifc<'a, 'f, 't> {
     /// remains borrowed for this IFC, so run addresses are stable keys.
     text_content: Option<&'t [Inline]>,
     transform_context: std::cell::OnceCell<InlineTextContext>,
+    shaping: shaping::Plan,
+    shaping_cursor: Option<shaping::Cursor>,
 }
 
 struct InlineTextContext {
@@ -1147,6 +1171,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             pen: 0.0,
             line_start: 0.0,
             pending_space: false,
+            pending_space_width: None,
             pending_space_wraps: false,
             word_end: None,
             preserved_break: false,
@@ -1184,6 +1209,8 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             source: None,
             text_content: None,
             transform_context: std::cell::OnceCell::new(),
+            shaping: shaping::Plan::default(),
+            shaping_cursor: None,
         };
         ifc.begin_line();
         ifc
@@ -1321,6 +1348,13 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 )
             })
             .map(Piece::layout_height)
+            .chain(self.cur_empty.iter().filter_map(|empty| {
+                matches!(
+                    empty.entry.vertical_align,
+                    VerticalAlign::Top | VerticalAlign::Bottom
+                )
+                .then_some(empty.entry.line_height)
+            }))
             .fold(0.0, f32::max);
         let ascent = pieces
             .iter()
@@ -1332,6 +1366,17 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 VerticalAlign::TextBottom(descent) => p.layout_height() - descent,
                 _ => p.ascent,
             })
+            .chain(self.cur_empty.iter().map(|empty| {
+                let entry = empty.entry;
+                match entry.vertical_align {
+                    VerticalAlign::Top | VerticalAlign::Bottom => 0.,
+                    VerticalAlign::Shift(rise) => entry.baseline + rise,
+                    VerticalAlign::Middle(half_x) => entry.line_height / 2. + half_x,
+                    VerticalAlign::TextTop(ascent) => ascent,
+                    VerticalAlign::TextBottom(descent) => entry.line_height - descent,
+                    _ => entry.baseline,
+                }
+            }))
             .fold(strut.baseline, f32::max);
         let descent = pieces
             .iter()
@@ -1345,6 +1390,18 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             })
             // CSS 2.2 §10.8.1: a line-height below the content area gives a
             // negative half-leading, so these depths can be negative.
+            .chain(self.cur_empty.iter().map(|empty| {
+                let entry = empty.entry;
+                let descent = entry.line_height - entry.baseline;
+                match entry.vertical_align {
+                    VerticalAlign::Top | VerticalAlign::Bottom => 0.,
+                    VerticalAlign::Shift(rise) => descent - rise,
+                    VerticalAlign::Middle(half_x) => entry.line_height / 2. - half_x,
+                    VerticalAlign::TextTop(ascent) => entry.line_height - ascent,
+                    VerticalAlign::TextBottom(descent) => descent,
+                    _ => descent,
+                }
+            }))
             .fold(strut.line_height - strut.baseline, f32::max);
         let ascent = match self.first_line_ascent {
             Some(marker_ascent) if self.lines.is_empty() => ascent.max(marker_ascent),
@@ -1432,6 +1489,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         // inline formatting context starts at its own baseline. In particular
         // a table cell's top/middle alignment must not align every descendant.
         root.vertical_align = VerticalAlign::Baseline;
+        self.shaping = shaping::Plan::new(self, content, &root);
         self.strut = crate::text::shape(" ", &root.text_style());
         let document = self
             .dom
@@ -1739,12 +1797,14 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             // idiom); it neither paints nor owes spaces.
             return;
         }
+        self.shaping_cursor = self.shaping.cursor(t);
         let t = self.transformed_text(t, origin, ctx);
         // Painted layouts keep where each placed segment came from.
         self.source = (!origin.is_none() && !self.measuring && self.cells.is_none())
             .then(|| SourceCursor::new(origin, &t));
         self.place_text(&t.text, ctx, following);
         self.source = None;
+        self.shaping_cursor = None;
     }
 
     fn transformed_text<'s>(
@@ -1780,15 +1840,67 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
     }
 
     fn skip_source(&mut self, text: &str) {
+        if let Some(cursor) = self.shaping_cursor.as_mut() {
+            cursor.byte += text.len();
+        }
         if let Some(source) = self.source.as_mut() {
             source.skip(text);
         }
     }
 
     fn take_source(&mut self, text: &str) -> Vec<TextSourceSpan> {
+        if let Some(cursor) = self.shaping_cursor.as_mut() {
+            cursor.byte += text.len();
+        }
         self.source
             .as_mut()
             .map_or_else(Vec::new, |source| source.take(text))
+    }
+
+    fn context_for(&self, text: &str) -> Option<crate::text::context::ContextSlice> {
+        let slice = self
+            .shaping
+            .range(self.shaping_cursor.as_ref()?, text.len())?;
+        (slice.context.text.get(slice.range.clone()) == Some(text)).then_some(slice)
+    }
+
+    fn shape_current(&self, text: &str, ctx: &InlineStyle) -> crate::text::ShapedText {
+        self.context_for(text).map_or_else(
+            || crate::text::shape(text, &ctx.text_style()),
+            |context| context.shape(&ctx.text_style()),
+        )
+    }
+
+    fn advance_in(
+        text: &str,
+        ctx: &InlineStyle,
+        context: Option<&crate::text::context::ContextSlice>,
+    ) -> f32 {
+        context.map_or_else(
+            || crate::text::shape(text, &ctx.text_style()).advance,
+            |context| context.advance(),
+        )
+    }
+
+    fn first_line_in(
+        text: &str,
+        ctx: &InlineStyle,
+        width: f32,
+        breaks: crate::text::TextBreakStyle,
+        context: Option<&crate::text::context::ContextSlice>,
+    ) -> usize {
+        context.map_or_else(
+            || crate::text::first_line_end(text, &ctx.text_style(), width, breaks),
+            |context| {
+                crate::text::context::first_line_end(
+                    context,
+                    text,
+                    width,
+                    breaks,
+                    !ctx.ws.collapses_spaces() && !ctx.ws.breaks_spaces(),
+                )
+            },
+        )
     }
 
     /// `text_followed`'s laid-out text `t`, placed word by word or as
@@ -1805,12 +1917,19 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                         self.word(&word, ctx, 0.0);
                         word.clear();
                     }
+                    let space_width = self
+                        .shaping_cursor
+                        .as_ref()
+                        .and_then(|cursor| self.shaping.range(cursor, c.len_utf8()))
+                        .map(|context| context.advance())
+                        .unwrap_or_else(|| Self::space_advance(ctx));
                     self.skip_source(c.encode_utf8(&mut [0; 4]));
                     if c == '\n' && ctx.ws.preserves_newlines() {
                         self.forced_break();
                     } else {
                         if !self.pending_space {
                             self.pending_space_wraps = ctx.ws.wraps();
+                            self.pending_space_width = Some(space_width);
                             // The collapsed space is one U+0020 of the bidi
                             // paragraph, at its logical place among the
                             // inline boxes' controls, whether or not it is
@@ -1922,7 +2041,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             false,
             false,
             ctx.vertical_align,
-            Self::space_advance(ctx),
+            self.pending_space_advance(ctx),
             ctx.ws.wraps(),
         );
     }
@@ -1994,6 +2113,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                     if !ctx.ws.collapses_spaces() || ctx.font_zero {
                         return Continues::Stopped;
                     }
+                    let original = text.as_str();
                     let text = self.transformed_text(text, *origin, ctx).text;
                     let lead = text.split(is_collapsible_space).next().unwrap_or("");
                     if lead.is_empty() {
@@ -2020,7 +2140,12 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                         }
                         previous = c;
                     }
-                    *width += crate::text::shape(&lead[..cut], &ctx.text_style()).advance;
+                    *width += self
+                        .shaping
+                        .prefix_advance(original, cut)
+                        .unwrap_or_else(|| {
+                            crate::text::shape(&lead[..cut], &ctx.text_style()).advance
+                        });
                     if cut < text.len() {
                         return Continues::Stopped;
                     }
@@ -2085,6 +2210,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         // lines' widths unequal; such runs take the per-line path.
         let following = (self.cap - self.break_inset).max(0.0);
         if t.len() >= 256
+            && self.context_for(t).is_none()
             && self.fc.as_ref().is_none_or(|fc| fc.is_empty())
             && available > 0.0
             && following > 0.0
@@ -2177,10 +2303,20 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         mut spaced: bool,
         continuation: f32,
     ) {
+        // Validate the source/context mapping once. Each chosen break then
+        // advances that slice together with the source cursor, rather than
+        // comparing the whole shrinking source tail on every line.
+        let mut context = self.context_for(rest);
         while !rest.is_empty() {
+            // A control's scrollport can expose only the budgeted lines.
+            // Preserve the whole paragraph's shaping context, but do not
+            // retain or break its unseen tail after that budget is laid.
+            if self.line_budget_spent() {
+                return;
+            }
             let gap = self.pending_gap_px;
             let space = if spaced && self.pending_space && self.pen > self.line_start {
-                Self::space_advance(ctx)
+                self.pending_space_advance(ctx)
             } else {
                 0.0
             };
@@ -2192,7 +2328,10 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             // wrapped its last word inside its own max-content box).
             let (line_end, line_right) = (self.pen + gap + space, self.line_right);
             let fits = move |width: f32| super::css_px_fits(line_end + width, line_right);
-            let full = crate::text::shape(rest, &ctx.text_style());
+            // Fitting needs only an advance. Materializing this entire
+            // shrinking tail on every line would copy and reshape a long
+            // paragraph quadratically, despite its shared retained context.
+            let full = Self::advance_in(rest, ctx, context.as_ref());
             // Parley line breaking is substantially more expensive than
             // retaining an already-shaped run. If the complete run fits,
             // there cannot be a chosen soft wrap inside it; only ask Parley
@@ -2208,7 +2347,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 && self.pending_space
                 && self.pending_space_wraps
                 && self.pen > self.line_start
-                && !fits(full.advance)
+                && !fits(full)
             {
                 self.soft_break();
                 spaced = false;
@@ -2221,7 +2360,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             if break_style.wrap
                 && emergency_wrap
                 && may_wrap
-                && !fits(full.advance)
+                && !fits(full)
                 && self.pen > self.line_start
             {
                 // CSS Text 3 §5/§5.4: overflow wrapping adds an
@@ -2231,14 +2370,15 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 // inside it (for example after punctuation) may still fill
                 // the current line, but absent one the preceding collapsible
                 // space wins and the intact word moves to a fresh line.
-                let normal_cut = crate::text::first_line_end(
+                let normal_cut = Self::first_line_in(
                     rest,
-                    &ctx.text_style(),
+                    ctx,
                     avail,
                     crate::text::TextBreakStyle {
                         overflow_wrap: crate::text::TextOverflowWrap::Normal,
                         ..break_style
                     },
+                    context.as_ref(),
                 );
                 // A legal punctuation break may itself be beyond the line's
                 // remaining width ("significantly—Median"). It must not let
@@ -2246,7 +2386,14 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 // the preceding space still supplies an acceptable break.
                 if normal_cut == 0
                     || normal_cut == rest.len()
-                    || !fits(crate::text::shape(&rest[..normal_cut], &ctx.text_style()).advance)
+                    || !fits(Self::advance_in(
+                        &rest[..normal_cut],
+                        ctx,
+                        context
+                            .as_ref()
+                            .map(|context| context.subrange(0..normal_cut))
+                            .as_ref(),
+                    ))
                 {
                     self.soft_break();
                     spaced = false;
@@ -2268,14 +2415,14 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 ) && rest
                     .chars()
                     .all(|character| character.is_ascii_alphanumeric() || character == '_'));
-            let cut = if fits(full.advance) || plainly_unbreakable {
+            let cut = if fits(full) || plainly_unbreakable {
                 rest.len()
             } else {
-                crate::text::first_line_end(rest, &ctx.text_style(), avail, break_style)
+                Self::first_line_in(rest, ctx, avail, break_style, context.as_ref())
             };
             if break_style.wrap
                 && !emergency_wrap
-                && (cut == 0 || (cut == rest.len() && !fits(full.advance)))
+                && (cut == 0 || (cut == rest.len() && !fits(full)))
                 && self.move_line_below_floats()
             {
                 spaced = false;
@@ -2287,8 +2434,8 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 && may_wrap
                 && break_style.wrap
                 && self.pen > self.line_start
-                && fits(full.advance)
-                && !fits(full.advance + continuation)
+                && fits(full)
+                && !fits(full + continuation)
             {
                 self.soft_break();
                 spaced = false;
@@ -2303,7 +2450,14 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 // soft-wrap opportunity. Take that earlier opportunity first;
                 // on the fresh line the whole word may fit, or Parley can
                 // choose its internal opportunity against the full line box.
-                let head_width = crate::text::shape(head, &ctx.text_style()).advance;
+                let head_width = Self::advance_in(
+                    head,
+                    ctx,
+                    context
+                        .as_ref()
+                        .map(|context| context.subrange(0..cut))
+                        .as_ref(),
+                );
                 if may_wrap
                     && ctx.ws.wraps()
                     && self.pen > self.line_start
@@ -2315,6 +2469,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 }
                 self.place(head, ctx, false, spaced);
                 self.soft_break();
+                context = context.map(|context| context.subrange(cut..rest.len()));
                 rest = tail;
                 spaced = false;
                 continue;
@@ -2323,9 +2478,15 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             // it overflows with the content it continues ("oll" + an
             // element starting ".neocities") rather than wrapping alone.
             if ctx.ws.wraps()
-                && !fits(full.advance)
+                && !fits(full)
                 && self.pen > self.line_start
-                && (may_wrap || (cut == 0 && !glued))
+                && (may_wrap
+                    || (cut == 0 && !glued)
+                    || ((emergency_wrap
+                        || break_style.word_break == crate::text::TextWordBreak::BreakAll)
+                        && context
+                            .as_ref()
+                            .is_none_or(|context| context.is_grapheme_boundary())))
             {
                 self.soft_break();
                 // Collapsible leading whitespace is discarded at the break;
@@ -2342,6 +2503,12 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         crate::text::shape(" ", &ctx.text_style()).advance.max(0.0)
     }
 
+    fn pending_space_advance(&self, ctx: &InlineStyle) -> f32 {
+        self.pending_space_width
+            .filter(|_| self.pending_space)
+            .unwrap_or_else(|| Self::space_advance(ctx))
+    }
+
     fn tab_advance(&self, ctx: &InlineStyle) -> f32 {
         match ctx.tab {
             TabSize::Spaces(n) => Self::space_advance(ctx) * n.max(0.0),
@@ -2353,7 +2520,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
     /// allowed; `spaced` = an owed collapsible space applies before it (false
     /// between CJK segments of one word).
     fn place(&mut self, seg: &str, ctx: &InlineStyle, may_wrap: bool, spaced: bool) {
-        let shaped = crate::text::shape(seg, &ctx.text_style());
+        let shaped = self.shape_current(seg, ctx);
         self.place_shaped(seg, shaped, ctx, may_wrap, spaced);
     }
 
@@ -2365,13 +2532,21 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         may_wrap: bool,
         spaced: bool,
     ) {
+        let context = self.context_for(seg);
+        let shaped = context
+            .as_ref()
+            .map_or(shaped, |context| context.shape(&ctx.text_style()));
         let w = shaped.advance;
-        if w <= 0.0 {
+        if seg.is_empty() {
             self.skip_source(seg);
             return;
         }
         let space = spaced && self.pending_space && self.pen > self.line_start;
-        let space_width = if space { Self::space_advance(ctx) } else { 0.0 };
+        let space_width = if space {
+            self.pending_space_advance(ctx)
+        } else {
+            0.0
+        };
         let gap = self.take_gap();
         if may_wrap
             && ctx.ws.wraps()
@@ -2400,6 +2575,11 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             && gap == 0.0
             && self.pending_opens.is_empty()
             && let Some(last) = self.cur.last_mut()
+            && match (&last.shaping, &context) {
+                (None, None) => true,
+                (Some(previous), Some(next)) => previous.joins(next),
+                _ => false,
+            }
             && last.item.kind == ctx.kind
             && last.item.emph == ctx.emph
             && last.item.node == ctx.node
@@ -2434,6 +2614,9 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             last.box_width += space_width + w;
             last.paint_width = last.box_width;
             last.shaped = None;
+            if let (Some(previous), Some(next)) = (last.shaping.as_mut(), context.as_ref()) {
+                previous.range.end = next.range.end;
+            }
             last.text_style = Some(ctx.text_style());
             self.pen = last.x + last.box_width;
             self.pending_space = false;
@@ -2476,6 +2659,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             },
             shaped: Some(shaped),
             text_style: Some(ctx.text_style()),
+            shaping: context,
             stretch: ctx.ws.collapses_spaces(),
             space_before: space,
             atom_box: false,
@@ -2550,7 +2734,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                     false,
                     false,
                     ctx.vertical_align,
-                    Self::space_advance(ctx),
+                    self.pending_space_advance(ctx),
                     can_wrap,
                 );
             }
@@ -2637,7 +2821,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                     false,
                     true,
                     ctx.vertical_align,
-                    Self::space_advance(ctx),
+                    self.pending_space_advance(ctx),
                     can_wrap,
                 );
                 // `place_atom` always ends by pushing this control's piece.
@@ -2897,7 +3081,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             false,
             false,
             ctx.vertical_align,
-            Self::space_advance(ctx),
+            self.pending_space_advance(ctx),
             false,
         );
         if let Some(piece) = self.cur.last_mut() {
@@ -3024,7 +3208,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 false,
                 false,
                 ctx.vertical_align,
-                Self::space_advance(ctx),
+                self.pending_space_advance(ctx),
                 can_wrap,
             );
             return;
@@ -3136,7 +3320,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 false,
                 false,
                 ctx.vertical_align,
-                Self::space_advance(ctx),
+                self.pending_space_advance(ctx),
                 can_wrap,
             );
             return; // the drawn preview IS the mpv affordance
@@ -3286,6 +3470,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             item,
             shaped,
             text_style: None,
+            shaping: None,
             stretch: false,
             space_before: space,
             atom_box,
@@ -3348,7 +3533,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             true,
             false,
             own.vertical_align,
-            Self::space_advance(ctx),
+            self.pending_space_advance(ctx),
             ctx.ws.wraps(),
         );
         if let Some(baseline) = sz.baseline
@@ -3398,7 +3583,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         {
             let (_, start, start_edge) = self.pending_opens.remove(index);
             let space = if self.pending_space && self.pen > self.line_start {
-                Self::space_advance(ctx)
+                self.pending_space_advance(ctx)
             } else {
                 0.0
             };
@@ -3527,7 +3712,15 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
     fn flush_line(&mut self, forced: bool) {
         let mut pieces = std::mem::take(&mut self.cur);
         let align = self.line_align(forced);
-        if pieces.is_empty() && !forced {
+        let empty_edges = self.cur_empty.iter().any(|empty| {
+            let edge = empty.entry.edges;
+            (empty.edges[0] && (edge[0] != 0. || edge[1] != 0.))
+                || (empty.edges[1] && (edge[2] != 0. || edge[3] != 0.))
+        });
+        // CSS Inline 3 #invisible-line-boxes: an empty inline with any
+        // nonzero inline-axis margin, border or padding prevents a phantom
+        // line, even when those edges cancel or a margin is negative.
+        if pieces.is_empty() && !forced && !empty_edges {
             self.align_oof_marks(0.0, align);
             // CSS 2 §9.4.2: a line holding only empty inline boxes is a
             // zero-height line box for positioning the boxes inside it and
@@ -3566,7 +3759,10 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 continue;
             }
             let old_width = piece.box_width;
-            let shaped = crate::text::shape(&piece.item.text, style);
+            let shaped = piece.shaping.as_ref().map_or_else(
+                || crate::text::shape(&piece.item.text, style),
+                |context| context.shape(style),
+            );
             piece.box_width = shaped.advance;
             piece.paint_width = shaped.advance;
             piece.box_height = shaped.line_height;

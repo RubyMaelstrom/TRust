@@ -46,6 +46,14 @@ impl Flow<'_> {
         basis: Option<f32>,
         inl: &InlineStyle,
     ) -> Option<f32> {
+        if matches!(value, Len::Stretch) {
+            let s = &b.style;
+            let bp = s.border[3]
+                + s.border[1]
+                + s.padding[3].resolve(basis).unwrap_or(0.).max(0.)
+                + s.padding[1].resolve(basis).unwrap_or(0.).max(0.);
+            return super::stretch::content_size(self.dom, b.node, s, value, 0, basis, basis, bp);
+        }
         let mode = match value {
             Len::MinContent => Some(IMode::Min),
             Len::MaxContent => Some(IMode::Max),
@@ -448,7 +456,7 @@ impl Flow<'_> {
             let bt = s.border[super::style::TOP] + side(&s.padding[super::style::TOP]).max(0.0);
             let bb =
                 s.border[super::style::BOTTOM] + side(&s.padding[super::style::BOTTOM]).max(0.0);
-            self.ratio_auto_width(b, bp, bt, bb, cb_h)
+            self.ratio_auto_width(b, bp, bt, bb, 0., cb_h)
         };
         let ratio_width = || {
             ratio.and_then(|ratio| {

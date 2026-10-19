@@ -673,6 +673,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
 
     // --- location (WorkerLocation) ---
     var lp = __url_parse(cfg.url, null) || [cfg.url, "", "", "", "", "/", "", "", "", "", ""];
+    // HTML #run-a-worker uses the fetched script's response URL as its API
+    // base URL. This includes a response forwarded by a service worker.
+    WK.scriptURL=function(url){cfg.url=url;lp=__url_parse(url,null)||lp;};
     // The worker's storage key: its origin, partitioned by the top-level site
     // when its owner had a cross-site ancestor (the Window prelude's
     // `storageKeyFor`; Client-Side Storage Partitioning). "null" has none.
@@ -803,7 +806,14 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
 
     if (cfg.service) {
         const encode = JSON.stringify, parse = workerJsonParse, create = Object.create, each = Map.prototype.forEach, setPrototype=Object.setPrototypeOf;
-        const apply = Reflect.apply;
+        const apply = Reflect.apply, fetchKeys=Object.keys;
+        const fetchEvents=create(null), fetchBodies=create(null);
+        let eventControl, serviceFetch;
+        const nativeFetch=(op,id,fields)=>{
+            const input=create(null);input.id=id;
+            if(fields)for(const key of fetchKeys(fields))input[key]=fields[key];
+            return parse(__service_worker(op,0,portAPI.stringify(input)));
+        };
         WK.serviceTypes = () => {
             const types=[]; setPrototype(types,null);
             apply(each,LS,[(listeners,type)=>{if(listeners.length)types[types.length]=type;}]);
@@ -821,8 +831,34 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             createTrusted(C, type, init) { return trustedScopeEvent(C, type, init); },
             dispatch(event) { dispatchScopeEvent(event, true, g); },
             complete(id, ok) { const input=create(null);input.id=id;input.ok=ok;__service_worker("complete", 0, encode(input)); },
-            bind(control) { WK.serviceEvent = (id, type, init) => {
+            response(id, response) {
+                let body;
+                try {
+                    if(response===null)throw null;
+                    body=serviceFetch.openServiceResponse(response);
+                    if(fetchEvents[id])fetchEvents[id].opaque=body.head.type==="opaque"||body.head.type==="opaqueredirect";
+                    fetchBodies[id]=body;
+                    const result=nativeFetch("fetchResponse",id,{head:body.head});
+                    if(!result.value){body.cancel();delete fetchBodies[id];}
+                    else if(!body.head.hasBody)delete fetchBodies[id];
+                } catch (_) {
+                    if(body)body.cancel();delete fetchBodies[id];
+                    nativeFetch("fetchResponse",id,{head:null});
+                }
+            },
+            fallback(id,canceled){nativeFetch("fetchFallback",id,{canceled});},
+            bind(control) {
+                eventControl=control;serviceFetch=g.__fetch_api;
+                WK.serviceEvent = (id, type, init) => {
                 const data = parse(init) || {};
+                if(type==="fetch"){
+                    const request=serviceFetch.createServiceRequest(data);
+                    fetchEvents[id]=request;
+                    control.dispatch(id,type,{cancelable:true,request:request.request,
+                        preloadResponse:data.preload?serviceFetch.servicePreload(request.request,__service_worker("fetchPreload",id)):undefined,
+                        clientId:data.clientId,resultingClientId:data.resultingClientId,replacesClientId:data.replacesClientId});
+                    return;
+                }
                 if (type === "message" && typeof data.packet === "string") {
                     // ServiceWorker/postMessage: deserialize in this Realm;
                     // failure dispatches ExtendableMessageEvent messageerror.
@@ -837,6 +873,26 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 }
                 control.dispatch(id, type, data);
             }; },
+        };
+        WK.serviceControl=(id,op)=>{
+            if(op==="pull"){
+                const body=fetchBodies[id];
+                if(!body){__service_worker("fetchChunk",id,false);return;}
+                body.pull(chunk=>{__service_worker("fetchChunk",id,chunk);if(chunk===null||chunk===false){delete fetchBodies[id];delete fetchEvents[id];}});
+            } else if(op==="ended"){
+                delete fetchEvents[id];delete fetchBodies[id];
+            } else if(op==="discard"){
+                const body=fetchBodies[id];if(body)body.cancel();delete fetchBodies[id];delete fetchEvents[id];
+            } else if(op==="cancel"){
+                const request=fetchEvents[id];if(request)request.abort();delete fetchEvents[id];
+                const body=fetchBodies[id];if(body)body.cancel();delete fetchBodies[id];
+                if(eventControl)eventControl.handled(id,false);
+            } else {
+                if(eventControl)eventControl.handled(id,op==="handled");
+                // An opaque body's native cursor still owns the fetch, even
+                // though its bytes never enter this Realm.
+                if(!fetchBodies[id]&&!fetchEvents[id]?.opaque)delete fetchEvents[id];
+            }
         };
     }
 

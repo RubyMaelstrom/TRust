@@ -243,6 +243,7 @@ impl<'a> Builder<'a> {
             },
             None => RunSelection {
                 unselectable: true,
+                paint_timing_sources: Some(std::sync::Arc::from(sources)),
                 ..RunSelection::default()
             },
         }
@@ -350,7 +351,14 @@ impl<'a> Builder<'a> {
             scroll_tree: scroll_tree.map_or_else(
                 || {
                     std::borrow::Cow::Owned(super::spatial::ScrollTree::new(
-                        dom, root, fixed, top_layer,
+                        dom,
+                        root,
+                        fixed,
+                        top_layer,
+                        Vp {
+                            w: viewport_w,
+                            h: viewport_h,
+                        },
                     ))
                 },
                 std::borrow::Cow::Borrowed,
@@ -856,130 +864,19 @@ impl<'a> Builder<'a> {
     }
 
     fn collect_sticky(&mut self, fragment: &Frag) {
-        self.collect_sticky_in(fragment, &mut Vec::new());
-    }
-
-    fn collect_sticky_in<'f>(&mut self, fragment: &'f Frag, ancestors: &mut Vec<&'f Frag>) {
-        if fragment.node != NO_NODE && self.dom.position_scheme(fragment.node) == super::Pos::Sticky
-        {
-            let mut parent = self.dom.parent_flat(fragment.node);
-            let mut container = None;
-            while let Some(node) = parent {
-                if self.dom.is_scroll_container(node) || self.dom.is_hscroll_container(node) {
-                    container = Some(node);
-                    break;
-                }
-                parent = self.dom.parent_flat(node);
-            }
-            let vp = Vp {
-                w: self.viewport_w,
-                h: self.viewport_h,
-            };
-            let scrollport = container
-                .and_then(|node| self.scroll_containers.iter().find(|s| s.node == node))
-                .map(|s| s.viewport)
-                .unwrap_or(CssRect::new(0., 0., vp.w, vp.h));
-            let units = Units::of(self.dom, fragment.node);
-            // Static/relative/sticky boxes use the formatting-context content
-            // box, not the nearest scrollport, as their containing block.
-            let mut blocks = ancestors
-                .iter()
-                .rev()
-                .copied()
-                .filter(|f| matches!(f.kind, FragKind::Block | FragKind::TableCell(_)));
-            let cb = if let Some(parent) = blocks.next() {
-                let basis = blocks
-                    .next()
-                    .map(|f| f.content_size.map_or(f.w, |s| s[0]))
-                    .unwrap_or(vp.w);
-                let padding = padding_box_with_style(parent);
-                let pad = PaintStyle::of(parent)
-                    .map(|style| {
-                        let units = Units::of(self.dom, style.node());
-                        ["top", "right", "bottom", "left"].map(|side| {
-                            style
-                                .value(self.dom, &format!("padding-{side}"))
-                                .as_deref()
-                                .and_then(|s| Len::parse(s, units, vp))
-                                .and_then(|n| n.resolve(Some(basis)))
-                                .unwrap_or(0.)
-                                .max(0.)
-                        })
-                    })
-                    .unwrap_or([0.; 4]);
-                let size = parent.content_size.unwrap_or([
-                    (padding.width - pad[1] - pad[3]).max(0.),
-                    (padding.height - pad[0] - pad[2]).max(0.),
-                ]);
-                CssRect::new(padding.x + pad[3], padding.y + pad[0], size[0], size[1])
-            } else {
-                CssRect::new(0., 0., vp.w, vp.h)
-            };
-            let margin = ["top", "right", "bottom", "left"].map(|side| {
-                self.dom
-                    .computed_value_resolved(fragment.node, &format!("margin-{side}"))
-                    .as_deref()
-                    .and_then(|s| Len::parse(s, units, vp))
-                    .and_then(|n| n.resolve(Some(cb.width)))
-                    .unwrap_or(0.)
-            });
-            let distance = [
-                fragment.y - cb.y,
-                cb.x + cb.width - fragment.x - fragment.w,
-                cb.y + cb.height - fragment.y - fragment.h,
-                fragment.x - cb.x,
-            ];
-            let position_margin: [f32; 4] =
-                std::array::from_fn(|i| margin[i].min(distance[i] - margin[i]));
-            let vertical = self
-                .dom
-                .computed_value_resolved(fragment.node, "writing-mode")
-                .unwrap_or_default();
-            let rtl = self
-                .dom
-                .computed_value_resolved(fragment.node, "direction")
-                .as_deref()
-                == Some("rtl");
-            self.sticky_constraints.push(StickyConstraint {
-                node: fragment.node,
-                rect: CssRect::new(fragment.x, fragment.y, fragment.w, fragment.h),
-                container,
-                movement: [
-                    position_margin[0] - distance[0],
-                    distance[1] - position_margin[1],
-                    distance[2] - position_margin[2],
-                    position_margin[3] - distance[3],
-                ],
-                reverse: [
-                    if vertical.starts_with("vertical") {
-                        vertical == "vertical-rl"
-                    } else {
-                        rtl
-                    },
-                    vertical.starts_with("vertical") && rtl,
-                ],
-                // CSS Position 3 §3.4: insets are lengths/percentages relative
-                // to the scrollport, not a px-only decoration shorthand.
-                insets: ["top", "right", "bottom", "left"].map(|side| {
-                    self.dom
-                        .computed_value_resolved(fragment.node, side)
-                        .as_deref()
-                        .and_then(|s| Len::parse(s, units, vp))
-                        .and_then(|n| {
-                            n.resolve(Some(if matches!(side, "top" | "bottom") {
-                                scrollport.height
-                            } else {
-                                scrollport.width
-                            }))
-                        })
-                }),
-            });
-        }
-        ancestors.push(fragment);
-        for child in &fragment.children {
-            self.collect_sticky_in(child, ancestors);
-        }
-        ancestors.pop();
+        self.sticky_constraints.extend(
+            super::sticky::collect(
+                self.dom,
+                fragment,
+                Vp {
+                    w: self.viewport_w,
+                    h: self.viewport_h,
+                },
+                Some(&self.scrolling),
+            )
+            .into_iter()
+            .map(|geometry| geometry.constraint),
+        );
     }
 
     fn collect_marquees(&mut self, fragment: &Frag) {
@@ -1422,24 +1319,28 @@ fn build_sc(fragment: &Frag, builder: &mut Builder<'_>) {
             .push(DisplayCommand::BeginSticky(constraint.clone()));
     }
     let animation = paint_animation_scope(fragment, builder);
-    if let Some(animation) = &animation {
-        builder
-            .commands
-            .push(DisplayCommand::BeginCssAnimation(animation.clone()));
-    }
     let transform = paint_transform(fragment, builder);
+    let animated_transform = animation
+        .as_ref()
+        .is_some_and(CssAnimationScope::owns_transform);
     // CSS Overflow 3 §3.1 requires hidden overflow to clip descendants,
     // while CSS Transforms 1 §2 paints a transformed element's layer in its
     // parent stacking context. `Frag::clip` is already in absolute parent
     // coordinates, so establish it before the child's transform; pushing it
     // afterwards would transform the ancestor clip a second time.
-    let inherited_clip =
-        transform.and_then(|_| builder.ancestor_clip(fragment.node, fragment.clip));
+    let inherited_clip = (transform.is_some() || animated_transform)
+        .then(|| builder.ancestor_clip(fragment.node, fragment.clip))
+        .flatten();
     let context_clip = inherited_clip.is_some_and(|clip| builder.push_hard_clip(clip));
     if let Some(clip) = inherited_clip {
         builder.transformed_clips.push(clip);
     }
-    let transformed = if let Some(transform) = transform {
+    if let Some(animation) = &animation {
+        builder
+            .commands
+            .push(DisplayCommand::BeginCssAnimation(animation.clone()));
+    }
+    let transformed = if let Some(transform) = transform.filter(|_| !animated_transform) {
         builder
             .commands
             .push(DisplayCommand::PushTransform(transform));
@@ -1473,7 +1374,14 @@ fn build_sc(fragment: &Frag, builder: &mut Builder<'_>) {
     // CSS Masking 1 #placement: filter effects, clipping, masking and
     // opacity apply to the group, in that order.
     let mask = mask_paint(fragment, builder);
-    let layers = push_layer(fragment, builder, mask.as_ref().map(|mask| mask.bounds));
+    let layers = push_layer(
+        fragment,
+        builder,
+        mask.as_ref().map(|mask| mask.bounds),
+        animation
+            .as_ref()
+            .is_some_and(CssAnimationScope::owns_opacity),
+    );
     paint_cache::paint_leaf(fragment, builder);
     let mut negative = Vec::new();
     let mut zero = Vec::new();
@@ -1529,14 +1437,14 @@ fn build_sc(fragment: &Frag, builder: &mut Builder<'_>) {
     if transformed {
         builder.commands.push(DisplayCommand::PopTransform);
     }
+    if animation.is_some() {
+        builder.commands.push(DisplayCommand::EndCssAnimation);
+    }
     if context_clip {
         builder.pop_hard_clip();
     }
     if inherited_clip.is_some() {
         builder.transformed_clips.pop();
-    }
-    if animation.is_some() {
-        builder.commands.push(DisplayCommand::EndCssAnimation);
     }
     if sticky.is_some() {
         builder.commands.push(DisplayCommand::EndSticky);
@@ -1554,10 +1462,10 @@ fn build_sc(fragment: &Frag, builder: &mut Builder<'_>) {
 }
 
 /// Resolve the CSS Animations keyframe values supported by the graphical
-/// display list into translation tracks. CSS Animations 1 §3 samples the
-/// animated value without relaying out the document; the stable fragment
-/// geometry therefore remains the underlying value and each point stores only
-/// its delta from that value. Percentages on `top` use the fixed-position
+/// display list into retained tracks. CSS Animations 1 §3 samples the
+/// animated value without relaying out the document. Insets store deltas from
+/// stable layout geometry; transforms own an absolute group matrix, allowing
+/// even singular initial transforms to animate. Percentages on `top` use the fixed-position
 /// containing block (CSS Positioned Layout 3 §3.5), while transform
 /// percentages use the element's own border box (CSS Transforms 1 §9).
 fn paint_animation_scope(fragment: &Frag, builder: &Builder<'_>) -> Option<CssAnimationScope> {
@@ -1575,6 +1483,24 @@ fn paint_animation_scope(fragment: &Frag, builder: &Builder<'_>) -> Option<CssAn
     if definitions.is_empty() {
         return None;
     }
+    let retained_stack = builder.dom.css_composition_can_composite(fragment.node);
+    if !retained_stack
+        && definitions.iter().any(|definition| {
+            definition
+                .keyframes
+                .iter()
+                .any(|frame| frame.transform.is_some() || frame.opacity.is_some())
+                && builder
+                    .dom
+                    .css_animation_clock(fragment.node, &definition.name, 0)
+                    .is_some()
+        })
+    {
+        // A resident actor samples every transform/opacity stack. Unsupported
+        // geometry and animation properties masked by !important must not
+        // fall back to an independent, raw-keyframe paint animation.
+        return None;
+    }
     let units = Units::of(builder.dom, fragment.node);
     let viewport = Vp {
         w: builder.viewport_w,
@@ -1587,25 +1513,15 @@ fn paint_animation_scope(fragment: &Frag, builder: &Builder<'_>) -> Option<CssAn
         .and_then(|value| Len::parse(value, units, viewport))
         .and_then(|value| value.resolve(Some(builder.viewport_h)))
         .unwrap_or(0.0);
-    // Opacity keyframes scale a group relative to the static opacity layer
-    // the element already paints with; missing 0%/100% keyframes take the
-    // underlying computed value (CSS Animations 1 §3.3).
+    // The animation scope owns one absolute group opacity (CSS Color 4
+    // #transparency); missing endpoints take the underlying value.
     let static_opacity = fragment.paint.opacity.clamp(0.0, 1.0);
-    let relative = |opacity: f32| {
-        if static_opacity > 0.0 {
-            opacity / static_opacity
-        } else {
-            opacity
-        }
-    };
-    let underlying_opacity = relative(
-        builder
-            .dom
-            .computed_value_resolved(fragment.node, "opacity")
-            .as_deref()
-            .and_then(parse_opacity)
-            .unwrap_or(1.0),
-    );
+    let underlying_opacity = builder
+        .dom
+        .computed_value_resolved(fragment.node, "opacity")
+        .as_deref()
+        .and_then(parse_opacity)
+        .unwrap_or(1.0);
     // CSS Animations 1 §3.3: missing transform keyframes take the static
     // transform, which the animation replaces while it applies.
     let (reference, transform_origin) = super::transform::animation_origin(
@@ -1613,6 +1529,17 @@ fn paint_animation_scope(fragment: &Frag, builder: &Builder<'_>) -> Option<CssAn
         units,
         viewport,
         fragment,
+    );
+    let transform_origin_z = builder
+        .dom
+        .computed_value_resolved(fragment.node, "transform-origin")
+        .and_then(|value| super::transform::origin_depth(&value, units, viewport))
+        .unwrap_or(0.);
+    let individual_transform = super::transform::animation_individuals(
+        |property| builder.dom.computed_value_resolved(fragment.node, property),
+        units,
+        viewport,
+        reference,
     );
     let underlying_transform = builder
         .dom
@@ -1641,7 +1568,7 @@ fn paint_animation_scope(fragment: &Frag, builder: &Builder<'_>) -> Option<CssAn
             .filter_map(|frame| {
                 Some(CssAnimationPoint {
                     offset: frame.offset,
-                    value: CssPoint::new(relative(parse_opacity(frame.opacity.as_deref()?)?), 0.0),
+                    value: CssPoint::new(parse_opacity(frame.opacity.as_deref()?)?, 0.0),
                 })
             })
             .collect::<Vec<_>>();
@@ -1661,6 +1588,12 @@ fn paint_animation_scope(fragment: &Frag, builder: &Builder<'_>) -> Option<CssAn
                 })
             })
             .collect::<Vec<_>>();
+        if retained_stack {
+            // Mixed layout tracks are sampled by the actor. Applying their
+            // keyframes again as a graphical delta would compose `top`
+            // twice (and discard an additive underlying inset).
+            position.clear();
+        }
         let mut transform = definition
             .keyframes
             .iter()
@@ -1712,24 +1645,24 @@ fn paint_animation_scope(fragment: &Frag, builder: &Builder<'_>) -> Option<CssAn
             position,
             transform,
             transform_origin,
+            transform_origin_z,
+            individual_transform,
             static_transform: super::transform::matrix(fragment),
+            static_opacity,
             opacity,
         });
     }
-    let composition = super::transform::matrix(fragment)
-        .inverse()
-        .and_then(|inverse_static| {
-            builder
-                .dom
-                .css_composition_stack(fragment.node)
-                .map(|stack| crate::render::ComposedPaint {
-                    stack,
-                    units,
-                    viewport,
-                    reference,
-                    origin: transform_origin,
-                    inverse_static,
-                })
+    let composition = builder
+        .dom
+        .css_composition_stack(fragment.node)
+        .map(|stack| crate::render::ComposedPaint {
+            stack,
+            units,
+            viewport,
+            reference,
+            origin: transform_origin,
+            origin_z: transform_origin_z,
+            individuals: individual_transform,
         });
     if composition.is_none() && builder.dom.css_composition_can_composite(fragment.node) {
         return None;
@@ -2434,6 +2367,46 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
                     Some(paint) => paint.shadows.clone(),
                     None => text_shadows(builder.dom, style_node, current_color),
                 };
+                let stroke_width = paint_style
+                    .value(builder.dom, "-webkit-text-stroke-width")
+                    .as_deref()
+                    .and_then(|value| {
+                        crate::dom::text_stroke_width_px(
+                            value,
+                            super::Units {
+                                fs: label.runs.first().map_or(16., |run| run.font_size),
+                                root: builder.dom.root_font_px(),
+                                ch: label.runs.first().map_or(8., |run| run.font_size * 0.5),
+                            },
+                            builder.dom.viewport_px(),
+                        )
+                    })
+                    .filter(|width| *width > 0.);
+                let outset = shadows
+                    .iter()
+                    .map(|shadow| {
+                        shadow.offset.x.abs() + shadow.blur_radius * 3. + shadow.spread.abs()
+                    })
+                    .fold(stroke_width.unwrap_or(0.), f32::max)
+                    + 2.;
+                if let Some([left, right]) = piece
+                    .shaping
+                    .as_ref()
+                    .and_then(|context| context.clip(outset))
+                {
+                    // Keep full glyphs, clipped at the source's caret edges.
+                    // Bound the open sides by actual ink plus effects: huge
+                    // sentinel widths rounded fractional caret edges in f32.
+                    clip = intersect_css_rects(
+                        clip,
+                        CssRect::new(
+                            content_origin.x + left,
+                            -super::value::LENGTH_LIMIT,
+                            (right - left).max(0.),
+                            super::value::LENGTH_LIMIT * 2.,
+                        ),
+                    );
+                }
                 let label_hidden = placeholder_paint.as_ref().is_some_and(|p| p.hidden);
                 // A control's label and generated text are not the
                 // document's text; only a Text node's runs are selectable.
@@ -2517,22 +2490,7 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
                     // glyph edges even when their foreground fill is transparent.
                     // Reuse the shaped outline (including font variation/skew)
                     // and the shared path command so both raster backends agree.
-                    if let Some(width) = paint_style
-                        .value(builder.dom, "-webkit-text-stroke-width")
-                        .as_deref()
-                        .and_then(|value| {
-                            crate::dom::text_stroke_width_px(
-                                value,
-                                super::Units {
-                                    fs: shaped.runs.first().map_or(16., |run| run.font_size),
-                                    root: builder.dom.root_font_px(),
-                                    ch: shaped.runs.first().map_or(8., |run| run.font_size * 0.5),
-                                },
-                                builder.dom.viewport_px(),
-                            )
-                        })
-                        .filter(|width| *width > 0.)
-                    {
+                    if let Some(width) = stroke_width {
                         let stroke_color = paint_style
                             .value(builder.dom, "-webkit-text-stroke-color")
                             .as_deref()
@@ -3429,11 +3387,12 @@ fn push_layer(
     fragment: &Frag,
     builder: &mut Builder<'_>,
     mask: Option<Option<CssRect>>,
+    animated_opacity: bool,
 ) -> ContextLayers {
     let Some(style) = PaintStyle::of(fragment) else {
         return ContextLayers::default();
     };
-    let opacity = if builder.dom.css_composition_is_painted(fragment.node) {
+    let opacity = if animated_opacity {
         1.0
     } else {
         fragment.paint.opacity.clamp(0.0, 1.0)
@@ -3460,8 +3419,7 @@ fn push_layer(
     // clip-path, a backdrop-filter, a blend mode, or will-change naming one
     // of those. Only needed once some box uses a backdrop filter.
     let backdrop_root = builder.backdrop_filters
-        && (opacity < 1.0
-            || builder.dom.css_composition_is_painted(fragment.node)
+        && ((!animated_opacity && fragment.paint.opacity < 1.0)
             || !filters.is_empty()
             || mask.is_some()
             || backdrop.is_some()

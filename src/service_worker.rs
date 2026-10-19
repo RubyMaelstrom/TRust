@@ -248,6 +248,24 @@ pub(crate) struct Registration {
     registered: AtomicBool,
     state: Mutex<RegistrationState>,
     pub cookies: Mutex<CookieSubscriptions>,
+    pub navigation_preload: Mutex<NavigationPreload>,
+    pub last_update_check: Mutex<Option<std::time::Instant>>,
+    pub soft_update_pending: AtomicBool,
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct NavigationPreload {
+    pub enabled: bool,
+    pub header_value: String,
+}
+impl Default for NavigationPreload {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            header_value: "true".into(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -341,6 +359,11 @@ impl Drop for EventLease {
     rename_all_fields = "camelCase"
 )]
 pub(crate) enum Notice {
+    WindowAction {
+        #[serde(skip)]
+        action: Arc<WindowAction>,
+    },
+    FocusWindow,
     /// The Window's user-interaction task reads current presentation state.
     Inspect {
         #[serde(skip)]
@@ -396,6 +419,63 @@ impl Drop for Checkpoint {
 }
 
 pub(crate) type Notify = Arc<dyn Fn(Notice) + Send + Sync>;
+pub(crate) type WindowActions = Arc<dyn Fn(Arc<WindowAction>) + Send + Sync>;
+
+#[derive(Clone, Debug)]
+pub(crate) enum WindowOperation {
+    Focus,
+    Navigate(Url),
+    Open(Url),
+}
+
+type WindowReplySender = tokio::sync::oneshot::Sender<Result<Option<ClientInfo>, Error>>;
+
+#[derive(Debug)]
+pub(crate) struct WindowReply {
+    pub key: String,
+    sender: Mutex<Option<WindowReplySender>>,
+}
+impl WindowReply {
+    pub(crate) fn pending(&self) -> bool {
+        self.sender.lock().unwrap().is_some()
+    }
+    pub(crate) fn complete(&self, result: Result<Option<ClientInfo>, Error>) {
+        if let Some(sender) = self.sender.lock().unwrap().take() {
+            let _ = sender.send(result);
+        }
+    }
+    pub(crate) fn document(&self, document: &DocumentClient) {
+        let client = document.client();
+        self.client(&client);
+    }
+    pub(crate) fn client(&self, client: &Client) {
+        self.complete(if client.storage_key() == self.key {
+            client.info()
+        } else {
+            Ok(None)
+        });
+    }
+}
+impl Drop for WindowReply {
+    fn drop(&mut self) {
+        self.complete(Err(Error::type_error(
+            "The window operation did not complete",
+        )));
+    }
+}
+pub(crate) struct WindowAction {
+    pub client: Arc<Client>,
+    pub operation: WindowOperation,
+    pub reply: Arc<WindowReply>,
+}
+impl std::fmt::Debug for WindowAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WindowAction")
+            .field("client", &self.client.id)
+            .field("operation", &self.operation)
+            .finish()
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct ClientInspection(
@@ -418,20 +498,36 @@ struct Controller {
 }
 
 struct ClientState {
+    document_url: Option<Url>,
+    document_origin: Option<url::Origin>,
+    storage_key: Option<String>,
     controller: Option<Controller>,
     notify: Option<Notify>,
     attachment: u64,
     discarded: bool,
     execution_ready: bool,
     secure: bool,
+    // Native file transport permission is separate from the document's
+    // opaque origin (URL #concept-url-origin / Fetch #scheme-fetch).
+    // Sandbox/data origins cannot acquire it from a file base URL.
+    local_file_access: bool,
     kind: ClientKind,
     window: WindowState,
+    presentation: Option<(bool, bool)>,
     focus_order: Option<u64>,
     // The container's client message queue (SW #dfn-client-message-queue),
     // initially disabled. Packets are held natively until taken.
     messages: VecDeque<PendingMessage>,
     message_bytes: usize,
     messages_enabled: bool,
+    window_actions: VecDeque<PendingWindowAction>,
+    pending_focus: bool,
+}
+
+struct PendingWindowAction {
+    client: Weak<Client>,
+    operation: WindowOperation,
+    reply: Arc<WindowReply>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -446,6 +542,8 @@ pub(crate) enum ClientKind {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct WindowState {
+    #[serde(default, skip_serializing)]
+    pub transient_activation: bool,
     pub frame_type: String,
     pub visibility_state: String,
     pub focused: bool,
@@ -458,6 +556,7 @@ pub(crate) struct WindowState {
 impl Default for WindowState {
     fn default() -> Self {
         Self {
+            transient_activation: false,
             frame_type: "top-level".into(),
             visibility_state: "visible".into(),
             focused: false,
@@ -503,13 +602,14 @@ impl ClientInfo {
 
 pub(crate) struct Client {
     pub id: String,
-    pub key: String,
+    initial_key: String,
     pub url: Url,
-    pub origin: url::Origin,
+    initial_origin: url::Origin,
     creation_order: u64,
     registry: Weak<Registry>,
     state: Mutex<ClientState>,
     ready: tokio::sync::Notify,
+    actions: Mutex<Option<WindowActions>>,
 }
 
 /// The lifetime of a Document's environment, independently of its JavaScript
@@ -532,6 +632,8 @@ struct DocumentOwner {
     blobs: Mutex<Vec<Arc<DocumentBlobs>>>,
     children: Mutex<HashMap<u64, DocumentClient>>,
     parent: Mutex<Option<(WeakDocumentClient, u64)>>,
+    navigation_reply: Mutex<Option<Arc<WindowReply>>>,
+    deferred_page: Mutex<Option<crate::http::frames::DeferredPage>>,
 }
 
 /// File API #lifeTime follows the Document, not a retained presentation
@@ -575,21 +677,93 @@ impl DocumentClient {
             blobs: Mutex::default(),
             children: Mutex::default(),
             parent: Mutex::default(),
+            navigation_reply: Mutex::default(),
+            deferred_page: Mutex::default(),
         }))
     }
     pub(crate) fn client(&self) -> Arc<Client> {
         self.0.client.clone()
     }
+    pub(crate) fn defer_page(&self, page: crate::http::frames::DeferredPage) {
+        *self.0.deferred_page.lock().unwrap() = Some(page);
+    }
+    pub(crate) fn take_deferred_page(&self) -> Option<crate::http::frames::DeferredPage> {
+        self.0.deferred_page.lock().unwrap().take()
+    }
+    pub(crate) fn navigation_reply(&self, reply: Option<Arc<WindowReply>>) {
+        *self.0.navigation_reply.lock().unwrap() = reply;
+    }
+    pub(crate) fn take_navigation_reply(&self) -> Option<Arc<WindowReply>> {
+        self.0.navigation_reply.lock().unwrap().take()
+    }
+    /// HTML #populating-a-session-history-entry / #finalize-a-cross-document-
+    /// navigation: a 204/205 response creates no Document. Retire its reserved
+    /// environment, then SW #client-navigate reads the still-active Window.
+    pub(crate) fn abort_navigation(&self, current: Option<&Arc<Client>>) {
+        let reply = self.take_navigation_reply();
+        if !current.is_some_and(|client| Arc::ptr_eq(client, &self.0.client)) {
+            self.discard();
+        }
+        if let Some(reply) = reply {
+            match current {
+                Some(client) => reply.client(client),
+                None => reply.complete(Err(Error::type_error(
+                    "The window no longer has an active document",
+                ))),
+            }
+        }
+    }
+    pub(crate) fn committed(&self) {
+        if let Some(reply) = self.0.navigation_reply.lock().unwrap().take() {
+            reply.document(self);
+        }
+    }
+    pub(crate) fn bind_actions(&self, actions: WindowActions) {
+        let mut pending = vec![self.clone()];
+        while let Some(document) = pending.pop() {
+            *document.0.client.actions.lock().unwrap() = Some(actions.clone());
+            pending.extend(document.0.children.lock().unwrap().values().cloned());
+        }
+    }
+    pub(crate) fn contains(&self, id: &str) -> bool {
+        let mut pending = vec![self.clone()];
+        while let Some(document) = pending.pop() {
+            if document.0.client.id == id {
+                return true;
+            }
+            pending.extend(document.0.children.lock().unwrap().values().cloned());
+        }
+        false
+    }
     pub(crate) fn downgrade(&self) -> WeakDocumentClient {
         WeakDocumentClient(Arc::downgrade(&self.0))
     }
     pub(crate) fn adopt_child(&self, context: u64, child: &Self) {
-        *child.0.parent.lock().unwrap() = Some((self.downgrade(), context));
-        self.0
-            .children
-            .lock()
-            .unwrap()
-            .insert(context, child.clone());
+        if let Some(actions) = self.0.client.actions.lock().unwrap().clone() {
+            child.bind_actions(actions);
+        }
+        let mut parent_slot = child.0.parent.lock().unwrap();
+        if let Some((previous, key)) = parent_slot.as_ref()
+            && let Some(previous) = previous.upgrade()
+        {
+            let mut children = previous.0.children.lock().unwrap();
+            if children
+                .get(key)
+                .is_some_and(|existing| Arc::ptr_eq(&existing.0, &child.0))
+            {
+                children.remove(key);
+            }
+        }
+        let mut children = self.0.children.lock().unwrap();
+        // A static native child acquires its real settings token when its
+        // Realm is materialized. Transfer its ownership slot rather than
+        // retaining a second alias under the old static DOM identity.
+        children.retain(|&key, existing| key == context || !Arc::ptr_eq(&existing.0, &child.0));
+        let replaced = children.insert(context, child.clone());
+        *parent_slot = Some((self.downgrade(), context));
+        drop(children);
+        drop(parent_slot);
+        drop(replaced);
     }
     pub(crate) fn static_child(
         &self,
@@ -597,6 +771,7 @@ impl DocumentClient {
         url: Url,
         origin: url::Origin,
         key: String,
+        local_file_access: bool,
         window: WindowState,
     ) -> Result<Self, Error> {
         // Static DOM node identities occupy a separate namespace from the
@@ -614,6 +789,7 @@ impl DocumentClient {
         let navigation = secure && matches!(url.scheme(), "http" | "https");
         let client = registry.reserve_client_with_origin(key, url, origin, navigation)?;
         client.set_secure_context(secure);
+        client.set_local_file_access(local_file_access);
         client.configure(ClientKind::Window, window);
         client.set_execution_ready();
         let child = Self::new(client);
@@ -628,6 +804,7 @@ impl DocumentClient {
         // Drain child ownership before dropping any handle, even if another
         // presentation or the unloading actor still holds that child.
         while let Some(document) = pending.pop() {
+            document.0.deferred_page.lock().unwrap().take();
             document.0.client.discard();
             for blobs in document.0.blobs.lock().unwrap().iter() {
                 blobs.remove();
@@ -638,7 +815,13 @@ impl DocumentClient {
             if let Some((parent, context)) = parent
                 && let Some(parent) = parent.upgrade()
             {
-                parent.0.children.lock().unwrap().remove(&context);
+                let mut children = parent.0.children.lock().unwrap();
+                if children
+                    .get(&context)
+                    .is_some_and(|child| Arc::ptr_eq(&child.0, &document.0))
+                {
+                    children.remove(&context);
+                }
             }
         }
     }
@@ -661,6 +844,7 @@ impl DocumentClient {
         while let Some((document, parent_focus, root)) = pending.pop() {
             let client = &document.0.client;
             let mut state = client.state.lock().unwrap();
+            state.presentation = Some((hidden, focused));
             let focused = parent_focus && (root || state.window.focus_within);
             client.update_focus(&mut state, focused);
             state.window.visibility_state = if hidden { "hidden" } else { "visible" }.into();
@@ -694,6 +878,230 @@ impl PartialEq for DocumentClient {
 impl Eq for DocumentClient {}
 
 impl Client {
+    /// HTML #initialise-the-document-object reuses the initial Window/ESO.
+    /// Keep its id, attachment and message queue while committing the
+    /// navigation's controller and document metadata (SW #control-and-use-window-client).
+    pub(crate) fn adopt_initial_navigation(&self, reserved: &Client) {
+        self.copy_controller_from(reserved, true);
+    }
+
+    pub(crate) fn inherit_controller(&self, creator: &Client) {
+        self.copy_controller_from(creator, false);
+    }
+
+    fn copy_controller_from(&self, source: &Client, initial_navigation: bool) {
+        let previous = loop {
+            let registration = source
+                .state
+                .lock()
+                .unwrap()
+                .controller
+                .as_ref()
+                .map(|controller| controller.registration.clone());
+            // SW #activation-algorithm first replaces registration.active,
+            // then updates its using clients. The source can still contain
+            // the previous (now redundant) worker during that second phase.
+            // Select the current active worker and publish the destination
+            // under the same guard Try Activate/Try Clear Registration use.
+            let registration_state = registration.as_ref().map(|r| r.state.lock().unwrap());
+            let source_state = source.state.lock().unwrap();
+            let actual_registration = source_state
+                .controller
+                .as_ref()
+                .map(|controller| &controller.registration);
+            if !match (registration.as_ref(), actual_registration) {
+                (Some(expected), Some(actual)) => Arc::ptr_eq(expected, actual),
+                (None, None) => true,
+                _ => false,
+            } {
+                // Navigation, claim or discard changed the source while we
+                // acquired its registration. Never publish that stale choice.
+                drop(source_state);
+                drop(registration_state);
+                continue;
+            }
+            let controller = (!source_state.discarded)
+                .then(|| {
+                    let registration = registration.as_ref()?;
+                    let worker = registration_state.as_ref()?.active.clone()?;
+                    (worker.state() != WorkerState::Redundant).then(|| Controller {
+                        registration: registration.clone(),
+                        worker,
+                    })
+                })
+                .flatten();
+            let document = (initial_navigation && !source_state.discarded).then(|| {
+                (
+                    source_state
+                        .document_url
+                        .clone()
+                        .unwrap_or_else(|| source.url.clone()),
+                    source_state
+                        .document_origin
+                        .clone()
+                        .unwrap_or_else(|| source.initial_origin.clone()),
+                    source_state
+                        .storage_key
+                        .clone()
+                        .unwrap_or_else(|| source.initial_key.clone()),
+                    source_state.secure,
+                    source_state.local_file_access,
+                )
+            });
+            drop(source_state);
+            let mut state = self.state.lock().unwrap();
+            let previous = if state.discarded {
+                None
+            } else {
+                if let Some((url, origin, key, secure, local_file_access)) = document {
+                    state.document_url = Some(url);
+                    state.document_origin = Some(origin);
+                    state.storage_key = Some(key);
+                    state.secure = secure;
+                    state.local_file_access = local_file_access;
+                    state.execution_ready = false;
+                }
+                std::mem::replace(&mut state.controller, controller)
+            };
+            drop(state);
+            drop(registration_state);
+            break previous;
+        };
+        // Unload cleanup can reenter Try Activate/Try Clear Registration.
+        // Neither the registration nor either client lock may be held here.
+        if let Some(previous) = previous
+            && let Some(registry) = self.registry.upgrade()
+        {
+            registry.client_left(&previous.registration);
+        }
+    }
+
+    pub(crate) fn notify_controller_change(&self) {
+        self.send(Notice::Controller {
+            worker: self.controller().map(|worker| worker.info()),
+        });
+    }
+
+    pub(crate) fn origin(&self) -> url::Origin {
+        self.state
+            .lock()
+            .unwrap()
+            .document_origin
+            .clone()
+            .unwrap_or_else(|| self.initial_origin.clone())
+    }
+    pub(crate) fn storage_key(&self) -> String {
+        self.state
+            .lock()
+            .unwrap()
+            .storage_key
+            .clone()
+            .unwrap_or_else(|| self.initial_key.clone())
+    }
+    /// HTML #initialise-the-document-object takes the origin from the
+    /// response, independently of the request-derived creation URL. Setting
+    /// up the Window environment transfers the reserved id/controller intact.
+    pub(crate) fn set_document_origin(&self, origin: url::Origin) {
+        let key = if self.initial_key == "null" || !origin.is_tuple() {
+            "null".into()
+        } else if let Some((_, partition)) = self.initial_key.split_once('^') {
+            format!("{}^{partition}", origin.ascii_serialization())
+        } else {
+            origin.ascii_serialization()
+        };
+        let mut state = self.state.lock().unwrap();
+        if state
+            .document_origin
+            .as_ref()
+            .unwrap_or(&self.initial_origin)
+            != &origin
+        {
+            state.local_file_access = false;
+        }
+        state.document_origin = Some(origin);
+        state.storage_key = Some(key);
+    }
+    pub(crate) fn set_storage_key(&self, key: String) {
+        self.state.lock().unwrap().storage_key = Some(key);
+    }
+    pub(crate) fn url(&self) -> Url {
+        self.state
+            .lock()
+            .unwrap()
+            .document_url
+            .clone()
+            .unwrap_or_else(|| self.url.clone())
+    }
+    pub(crate) fn set_document_url(&self, url: Url) {
+        self.state.lock().unwrap().document_url = Some(url);
+    }
+    pub(crate) fn registry(&self) -> Option<Arc<Registry>> {
+        self.registry.upgrade()
+    }
+    pub(crate) async fn window_action(
+        self: &Arc<Self>,
+        operation: WindowOperation,
+        key: String,
+    ) -> Result<Option<ClientInfo>, Error> {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let action = Arc::new(WindowAction {
+            client: self.clone(),
+            operation,
+            reply: Arc::new(WindowReply {
+                key,
+                sender: Mutex::new(Some(sender)),
+            }),
+        });
+        let actions = self.actions.lock().unwrap().clone();
+        if let Some(actions) = actions {
+            actions(action);
+        } else {
+            self.send_window_action(action);
+        }
+        receiver
+            .await
+            .unwrap_or_else(|_| Err(Error::type_error("The window is no longer available")))
+    }
+    pub(crate) fn send_window_action(&self, action: Arc<WindowAction>) {
+        let mut state = self.state.lock().unwrap();
+        if state.discarded {
+            drop(state);
+            action
+                .reply
+                .complete(Err(Error::type_error("The window is no longer available")));
+        } else if let Some(notify) = state.notify.clone() {
+            drop(state);
+            notify(Notice::WindowAction { action });
+        } else if state.window_actions.len() < 32 {
+            // Starting an inert document's actor is asynchronous. Retain the
+            // native task until its Window endpoint exists, without an Arc
+            // back to this Client that could create an ownership cycle.
+            state.window_actions.push_back(PendingWindowAction {
+                client: Arc::downgrade(&action.client),
+                operation: action.operation.clone(),
+                reply: action.reply.clone(),
+            });
+        } else {
+            drop(state);
+            action
+                .reply
+                .complete(Err(Error::type_error("Too many pending Window actions")));
+        }
+    }
+    pub(crate) fn focus_window(&self) {
+        let notify = {
+            let mut state = self.state.lock().unwrap();
+            if state.discarded {
+                return;
+            }
+            state.window.focus_within = true;
+            state.pending_focus = state.notify.is_none();
+            state.notify.clone()
+        };
+        if let Some(notify) = notify {
+            notify(Notice::FocusWindow);
+        }
+    }
     pub(crate) fn secure_context(&self) -> bool {
         self.state.lock().unwrap().secure
     }
@@ -723,8 +1131,15 @@ impl Client {
         }
         state.window.focused = focused;
     }
-    pub(crate) fn configure(&self, kind: ClientKind, window: WindowState) {
+    pub(crate) fn configure(&self, kind: ClientKind, mut window: WindowState) {
         let mut state = self.state.lock().unwrap();
+        // System presentation belongs to the frontend. A realm inspection
+        // can run before its queued SystemFocus/Visibility command; retain
+        // native truth while taking the document's focus chain from the realm.
+        if let Some((hidden, focused)) = state.presentation {
+            window.focused = focused && !hidden && window.focus_within;
+            window.visibility_state = if hidden { "hidden" } else { "visible" }.into();
+        }
         self.update_focus(&mut state, window.focused);
         state.kind = kind;
         state.window = window;
@@ -739,7 +1154,7 @@ impl Client {
         }
         Ok(Some(ClientInfo {
             id: self.id.clone(),
-            url: self.url.to_string(),
+            url: state.document_url.as_ref().unwrap_or(&self.url).to_string(),
             kind: state.kind,
             window: state.window.clone(),
             creation_order: self.creation_order,
@@ -754,6 +1169,9 @@ impl Client {
             .as_ref()
             .map(|c| c.worker.clone())
     }
+    pub(crate) fn kind(&self) -> ClientKind {
+        self.state.lock().unwrap().kind
+    }
     pub(crate) fn registration(&self) -> Option<Arc<Registration>> {
         self.state
             .lock()
@@ -762,24 +1180,66 @@ impl Client {
             .as_ref()
             .map(|c| c.registration.clone())
     }
+    #[cfg(test)]
     pub(crate) fn attach(&self, notify: Notify) {
         self.attach_with_readiness(notify, true);
     }
     pub(crate) fn attach_with_readiness(&self, notify: Notify, execution_ready: bool) -> u64 {
-        let mut state = self.state.lock().unwrap();
-        if state.discarded {
-            return 0;
+        let attachment = {
+            let mut state = self.state.lock().unwrap();
+            if state.discarded {
+                return 0;
+            }
+            state.execution_ready = execution_ready;
+            state.notify = None;
+            state.attachment += 1;
+            state.attachment
+        };
+        // Publish the endpoint only after its previously queued native tasks.
+        // In particular, await_attachment's subsequent Inspect task must not
+        // overtake the focus task that caused this actor to be materialized.
+        loop {
+            let (focus, actions) = {
+                let mut state = self.state.lock().unwrap();
+                if state.discarded || state.attachment != attachment {
+                    return 0;
+                }
+                if !state.pending_focus && state.window_actions.is_empty() {
+                    state.notify = Some(notify.clone());
+                    drop(state);
+                    self.ready.notify_waiters();
+                    return attachment;
+                }
+                (
+                    std::mem::take(&mut state.pending_focus),
+                    std::mem::take(&mut state.window_actions),
+                )
+            };
+            if focus {
+                notify(Notice::FocusWindow);
+            }
+            for action in actions {
+                if let Some(client) = action.client.upgrade() {
+                    notify(Notice::WindowAction {
+                        action: Arc::new(WindowAction {
+                            client,
+                            operation: action.operation,
+                            reply: action.reply,
+                        }),
+                    });
+                } else {
+                    action
+                        .reply
+                        .complete(Err(Error::type_error("The window is no longer available")));
+                }
+            }
         }
-        state.execution_ready = execution_ready;
-        state.notify = Some(notify);
-        state.attachment += 1;
-        self.ready.notify_waiters();
-        state.attachment
     }
     pub(crate) fn detach(&self, attachment: u64) {
         let mut state = self.state.lock().unwrap();
         if state.attachment == attachment {
             state.notify = None;
+            state.pending_focus = false;
         }
     }
     pub(crate) fn set_execution_ready(&self) {
@@ -791,6 +1251,16 @@ impl Client {
     /// the environment's secure-context result before exposing its global.
     pub(crate) fn set_secure_context(&self, secure: bool) {
         self.state.lock().unwrap().secure = secure;
+    }
+    pub(crate) fn local_file_access(&self) -> bool {
+        let state = self.state.lock().unwrap();
+        state.local_file_access && !state.discarded
+    }
+    pub(crate) fn set_local_file_access(&self, allowed: bool) {
+        let mut state = self.state.lock().unwrap();
+        if !state.discarded {
+            state.local_file_access = allowed;
+        }
     }
     pub(crate) async fn await_ready(&self) -> bool {
         loop {
@@ -807,6 +1277,26 @@ impl Client {
                 }
             }
             ready.await;
+        }
+    }
+    /// An on-demand page actor may not yet have attached the restored
+    /// Window's task endpoint. Native focus work waits for that endpoint,
+    /// while ordinary client queries can still inspect static documents.
+    pub(crate) async fn await_attachment(&self) -> bool {
+        loop {
+            let attached = self.ready.notified();
+            tokio::pin!(attached);
+            attached.as_mut().enable();
+            {
+                let state = self.state.lock().unwrap();
+                if state.discarded {
+                    return false;
+                }
+                if state.notify.is_some() {
+                    return true;
+                }
+            }
+            attached.await;
         }
     }
     fn send(&self, notice: Notice) {
@@ -836,7 +1326,7 @@ impl Client {
         }
         Some(ClientInfo {
             id: self.id.clone(),
-            url: self.url.to_string(),
+            url: state.document_url.as_ref().unwrap_or(&self.url).to_string(),
             kind: state.kind,
             window: state.window.clone(),
             creation_order: self.creation_order,
@@ -890,16 +1380,25 @@ impl Client {
         }
     }
     pub(crate) fn discard(&self) {
-        let (controller, queued) = {
+        let (controller, queued, actions) = {
             let mut state = self.state.lock().unwrap();
             state.discarded = true;
             state.notify = None;
             state.message_bytes = 0;
-            (state.controller.take(), std::mem::take(&mut state.messages))
+            (
+                state.controller.take(),
+                std::mem::take(&mut state.messages),
+                std::mem::take(&mut state.window_actions),
+            )
         };
         self.ready.notify_waiters();
         for pending in queued {
             self.release_packet(&pending.packet);
+        }
+        for action in actions {
+            action
+                .reply
+                .complete(Err(Error::type_error("The window is no longer available")));
         }
         if let (Some(registry), Some(controller)) = (self.registry.upgrade(), controller) {
             registry.client_left(&controller.registration);
@@ -938,6 +1437,28 @@ pub(crate) struct Registry {
 }
 
 impl Registry {
+    pub(crate) fn select_navigation(&self, client: &Arc<Client>, url: &Url) {
+        let registration = client
+            .secure_context()
+            .then(|| self.matching(&client.storage_key(), url))
+            .flatten();
+        let registration_state = registration.as_ref().map(|r| r.state.lock().unwrap());
+        let controller = registration.as_ref().and_then(|registration| {
+            registration_state
+                .as_ref()?
+                .active
+                .clone()
+                .map(|worker| Controller {
+                    registration: registration.clone(),
+                    worker,
+                })
+        });
+        let previous = std::mem::replace(&mut client.state.lock().unwrap().controller, controller);
+        drop(registration_state);
+        if let Some(previous) = previous {
+            self.client_left(&previous.registration);
+        }
+    }
     pub(crate) fn new(actions: ActionSink, release: Option<PacketRelease>) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::default(),
@@ -1037,6 +1558,9 @@ impl Registry {
                         revision: self.revision(),
                     }),
                     cookies: Mutex::default(),
+                    navigation_preload: Mutex::default(),
+                    last_update_check: Mutex::default(),
+                    soft_update_pending: AtomicBool::new(false),
                 })
             })
             .clone())
@@ -1101,26 +1625,34 @@ impl Registry {
         let secure = crate::http::potentially_trustworthy(&url);
         let client = Arc::new(Client {
             id,
-            key,
+            initial_key: key,
             url,
-            origin,
+            initial_origin: origin,
             creation_order: self.revision(),
             registry: Arc::downgrade(self),
             state: Mutex::new(ClientState {
+                document_url: None,
+                document_origin: None,
+                storage_key: None,
                 controller,
                 notify: None,
                 attachment: 0,
                 discarded: false,
                 execution_ready: false,
                 secure,
+                local_file_access: false,
                 kind: ClientKind::Window,
                 window: WindowState::default(),
+                presentation: None,
                 focus_order: None,
                 messages: VecDeque::new(),
+                window_actions: VecDeque::new(),
+                pending_focus: false,
                 message_bytes: 0,
                 messages_enabled: false,
             }),
             ready: tokio::sync::Notify::new(),
+            actions: Mutex::default(),
         });
         let mut state = self.state.lock().unwrap();
         state.clients.retain(|_, client| client.strong_count() != 0);
@@ -1131,7 +1663,7 @@ impl Registry {
         drop(registration_state);
         Ok(client)
     }
-    fn clients(&self, key: &str) -> Vec<Arc<Client>> {
+    fn all_clients(&self) -> Vec<Arc<Client>> {
         let clients: Vec<_> = self
             .state
             .lock()
@@ -1145,7 +1677,13 @@ impl Registry {
         clients
             .into_iter()
             .filter_map(|client| client.upgrade())
-            .filter(|client| client.key == key && !client.state.lock().unwrap().discarded)
+            .filter(|client| !client.state.lock().unwrap().discarded)
+            .collect()
+    }
+    fn clients(&self, key: &str) -> Vec<Arc<Client>> {
+        self.all_clients()
+            .into_iter()
+            .filter(|client| client.storage_key() == key)
             .collect()
     }
     pub(crate) fn get_client(&self, key: &str, id: &str) -> Option<Arc<Client>> {
@@ -1274,7 +1812,10 @@ impl Registry {
         (self.actions)(actions);
     }
     fn using(&self, registration: &Registration) -> Vec<Arc<Client>> {
-        self.clients(&registration.key)
+        // SW #try-activate-algorithm counts every client using this
+        // registration. A forwarded navigation can commit a different
+        // document origin/storage key without changing its controller.
+        self.all_clients()
             .into_iter()
             .filter(|client| {
                 client
@@ -1317,7 +1858,7 @@ impl Registry {
         self.registration_changed(registration, false);
         for client in self.clients(&registration.key) {
             if self
-                .matching(&client.key, &client.url)
+                .matching(&client.storage_key(), &client.url())
                 .is_some_and(|r| r.id == registration.id)
             {
                 client.send(Notice::Ready {
@@ -1374,7 +1915,7 @@ impl Registry {
         let mut departed = Vec::new();
         for client in &clients {
             if !self
-                .matching(&client.key, &client.url)
+                .matching(&client.storage_key(), &client.url())
                 .is_some_and(|r| r.id == registration.id)
             {
                 continue;
@@ -1500,6 +2041,145 @@ impl Registry {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn no_document_navigation_settles_with_current_client_and_retires_reservation() {
+        let (registry, _) = registry();
+        let key = "https://service-worker.test";
+        let current = DocumentClient::new(
+            registry
+                .reserve_client(
+                    key.into(),
+                    Url::parse(&format!("{key}/active")).unwrap(),
+                    false,
+                )
+                .unwrap(),
+        );
+        current.client().set_execution_ready();
+        let reserved = DocumentClient::new(
+            registry
+                .reserve_client(
+                    key.into(),
+                    Url::parse(&format!("{key}/no-content")).unwrap(),
+                    true,
+                )
+                .unwrap(),
+        );
+        let retained_request_reference = reserved.client();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        reserved.navigation_reply(Some(Arc::new(WindowReply {
+            key: key.into(),
+            sender: Mutex::new(Some(sender)),
+        })));
+        reserved.abort_navigation(Some(&current.client()));
+        let result = receiver.await.unwrap().unwrap().unwrap();
+        assert_eq!(result.id, current.client().id);
+        assert_eq!(result.url, format!("{key}/active"));
+        assert!(
+            registry
+                .get_client(key, &retained_request_reference.id)
+                .is_none()
+        );
+        assert!(retained_request_reference.info().unwrap().is_none());
+        assert!(current.client().info().unwrap().is_some());
+        // A later response drop or repeated cleanup cannot retire the active
+        // environment or settle the native reply a second time.
+        reserved.abort_navigation(Some(&current.client()));
+        assert!(current.client().info().unwrap().is_some());
+    }
+
+    #[test]
+    fn static_frames_transfer_native_ownership_without_aliases_or_stale_removal() {
+        let (registry, _) = registry();
+        let key = "https://service-worker.test";
+        let document = |path: &str| {
+            DocumentClient::new(
+                registry
+                    .reserve_client(
+                        key.into(),
+                        Url::parse(&format!("{key}/{path}")).unwrap(),
+                        false,
+                    )
+                    .unwrap(),
+            )
+        };
+        let first_parent = document("first-parent");
+        let second_parent = document("second-parent");
+        let child = document("child");
+        first_parent.adopt_child(1u64 << 63, &child);
+        first_parent.adopt_child(7, &child);
+        assert_eq!(first_parent.0.children.lock().unwrap().len(), 1);
+        assert!(first_parent.contains(&child.client().id));
+        second_parent.adopt_child(9, &child);
+        assert!(!first_parent.contains(&child.client().id));
+        assert_eq!(second_parent.0.children.lock().unwrap().len(), 1);
+        let replacement = document("replacement");
+        second_parent.adopt_child(9, &replacement);
+        child.discard();
+        assert!(!second_parent.contains(&child.client().id));
+        assert!(
+            second_parent.contains(&replacement.client().id),
+            "retiring an older occupant removed its replacement"
+        );
+        replacement.discard();
+        assert!(!second_parent.contains(&replacement.client().id));
+    }
+
+    #[tokio::test]
+    async fn static_frames_pending_native_tasks_precede_attachment_and_do_not_form_cycles() {
+        let (registry, _) = registry();
+        let url = Url::parse("https://service-worker.test/child").unwrap();
+        let client = registry
+            .reserve_client(url.origin().ascii_serialization(), url, false)
+            .unwrap();
+        client.set_execution_ready();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let reply = Arc::new(WindowReply {
+            key: client.storage_key(),
+            sender: Mutex::new(Some(sender)),
+        });
+        client.focus_window();
+        client.send_window_action(Arc::new(WindowAction {
+            client: client.clone(),
+            operation: WindowOperation::Navigate(
+                Url::parse("https://service-worker.test/next").unwrap(),
+            ),
+            reply,
+        }));
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let events = log.clone();
+        client.attach_with_readiness(
+            Arc::new(move |notice| match notice {
+                Notice::FocusWindow => events.lock().unwrap().push("focus"),
+                Notice::WindowAction { action } => {
+                    events.lock().unwrap().push("navigate");
+                    action.reply.complete(action.client.info());
+                }
+                _ => {}
+            }),
+            true,
+        );
+        assert!(client.await_attachment().await);
+        assert_eq!(*log.lock().unwrap(), ["focus", "navigate"]);
+        assert!(receiver.await.unwrap().unwrap().is_some());
+        client.detach(1);
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        client.send_window_action(Arc::new(WindowAction {
+            client: client.clone(),
+            operation: WindowOperation::Focus,
+            reply: Arc::new(WindowReply {
+                key: client.storage_key(),
+                sender: Mutex::new(Some(sender)),
+            }),
+        }));
+        let weak = Arc::downgrade(&client);
+        drop(client);
+        assert!(
+            weak.upgrade().is_none(),
+            "a queued action retained its own target"
+        );
+        assert!(receiver.await.unwrap().is_err());
+    }
+
     fn parse(script: &str, scope: Option<&str>) -> Result<RegistrationOptions, Error> {
         let base = Url::parse("https://service-worker.test/page/index").unwrap();
         RegistrationOptions::parse(
@@ -1534,6 +2214,41 @@ mod tests {
         registry.installing(registration, &worker, options.update_via_cache);
         registry.installed(registration, &worker, true);
         worker
+    }
+
+    #[test]
+    fn forwarded_document_origin_keeps_its_registration_in_use() {
+        let (registry, _) = registry();
+        let key = "https://service-worker.test";
+        let registration = registry.set_registration(key, &parse("/v1.js", Some("/")).unwrap());
+        let first = install(&registry, &registration, "/v1.js");
+        registry.try_activate(&registration);
+        registry.activated(&registration, &first);
+        let client = registry
+            .reserve_client(
+                key.into(),
+                Url::parse("https://service-worker.test/page").unwrap(),
+                true,
+            )
+            .unwrap();
+        client.set_document_origin(
+            Url::parse("https://response-origin.test/")
+                .unwrap()
+                .origin(),
+        );
+        assert!(registry.clients(key).is_empty());
+        let second = install(&registry, &registration, "/v2.js");
+        registry.try_activate(&registration);
+        assert_eq!(second.state(), WorkerState::Installed);
+        second.skip_waiting.store(true, Ordering::Release);
+        registry.try_activate(&registration);
+        assert_eq!(second.state(), WorkerState::Activating);
+        assert_eq!(client.controller().unwrap().id, second.id);
+        registry.activated(&registration, &second);
+        registry.unregister_resolving(&registration, |_| {});
+        assert_eq!(second.state(), WorkerState::Activated);
+        client.discard();
+        assert_eq!(second.state(), WorkerState::Redundant);
     }
 
     #[test]
@@ -1727,6 +2442,162 @@ mod tests {
                 assert_eq!(second.state(), WorkerState::Activating);
             }
         }
+    }
+
+    #[test]
+    fn initial_controller_copy_observes_activation_before_source_client_updates() {
+        let (registry, _) = registry();
+        let key = "https://service-worker.test";
+        let registration = registry.set_registration(key, &parse("/v1.js", Some("/")).unwrap());
+        let first = install(&registry, &registration, "/v1.js");
+        registry.try_activate(&registration);
+        registry.activated(&registration, &first);
+        let source = registry
+            .reserve_client(
+                key.into(),
+                registration.scope.join("committed").unwrap(),
+                true,
+            )
+            .unwrap();
+        let initial = registry
+            .reserve_client(key.into(), Url::parse("about:blank").unwrap(), false)
+            .unwrap();
+        let inherited = registry
+            .reserve_client(key.into(), Url::parse("about:blank").unwrap(), false)
+            .unwrap();
+        let initial_id = initial.id.clone();
+        initial.set_execution_ready();
+        let second = install(&registry, &registration, "/v2.js");
+        second.skip_waiting.store(true, Ordering::Release);
+        let (paused, reached) = std::sync::mpsc::sync_channel(1);
+        let (resume, resumed) = std::sync::mpsc::sync_channel(1);
+        let resumed = Mutex::new(resumed);
+        let previous_id = first.id;
+        source.attach(Arc::new(move |notice| {
+            if matches!(notice, Notice::Worker { worker }
+                if worker.id == previous_id && worker.state == WorkerState::Redundant)
+            {
+                paused.send(()).unwrap();
+                resumed
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap();
+            }
+        }));
+        let activate_registry = registry.clone();
+        let activate_registration = registration.clone();
+        let activation = std::thread::spawn(move || {
+            activate_registry.try_activate(&activate_registration);
+        });
+        reached
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        // This is the real Activate interval after active=B and redundant=A,
+        // before its per-client loop has changed the source from A to B.
+        let source_before_copy = source.controller().map(|worker| worker.id);
+        initial.adopt_initial_navigation(&source);
+        inherited.inherit_controller(&source);
+        let chosen = [
+            initial.controller().map(|worker| worker.id),
+            inherited.controller().map(|worker| worker.id),
+        ];
+        resume.send(()).unwrap();
+        activation.join().unwrap();
+        assert_eq!(source_before_copy, Some(first.id));
+        assert_eq!(chosen, [Some(second.id), Some(second.id)]);
+        assert_eq!(initial.controller().unwrap().id, second.id);
+        assert_eq!(inherited.controller().unwrap().id, second.id);
+        assert_eq!(initial.id, initial_id);
+        assert_eq!(initial.url(), source.url());
+        assert!(initial.secure_context());
+        assert!(!initial.state.lock().unwrap().execution_ready);
+    }
+
+    #[test]
+    fn initial_controller_copy_and_activation_publish_atomically() {
+        for _ in 0..64 {
+            let (registry, _) = registry();
+            let key = "https://service-worker.test";
+            let registration = registry.set_registration(key, &parse("/v1.js", Some("/")).unwrap());
+            let first = install(&registry, &registration, "/v1.js");
+            registry.try_activate(&registration);
+            registry.activated(&registration, &first);
+            let source = registry
+                .reserve_client(key.into(), registration.scope.clone(), true)
+                .unwrap();
+            let initial = registry
+                .reserve_client(key.into(), Url::parse("about:blank").unwrap(), false)
+                .unwrap();
+            let inherited = registry
+                .reserve_client(key.into(), Url::parse("about:blank").unwrap(), false)
+                .unwrap();
+            let second = install(&registry, &registration, "/v2.js");
+            second.skip_waiting.store(true, Ordering::Release);
+            let barrier = Arc::new(std::sync::Barrier::new(3));
+            let adopt_source = source.clone();
+            let adopt_client = initial.clone();
+            let adopt_barrier = barrier.clone();
+            let adoption = std::thread::spawn(move || {
+                adopt_barrier.wait();
+                adopt_client.adopt_initial_navigation(&adopt_source);
+            });
+            let inherit_source = source.clone();
+            let inherit_client = inherited.clone();
+            let inherit_barrier = barrier.clone();
+            let inheritance = std::thread::spawn(move || {
+                inherit_barrier.wait();
+                inherit_client.inherit_controller(&inherit_source);
+            });
+            barrier.wait();
+            registry.try_activate(&registration);
+            adoption.join().unwrap();
+            inheritance.join().unwrap();
+            assert_eq!(first.state(), WorkerState::Redundant);
+            assert_eq!(initial.controller().unwrap().id, second.id);
+            assert_eq!(inherited.controller().unwrap().id, second.id);
+        }
+    }
+
+    #[test]
+    fn initial_controller_copy_preserves_unregistered_use_and_final_discard() {
+        let (registry, _) = registry();
+        let key = "https://service-worker.test";
+        let registration = registry.set_registration(key, &parse("/v1.js", Some("/")).unwrap());
+        let worker = install(&registry, &registration, "/v1.js");
+        registry.try_activate(&registration);
+        registry.activated(&registration, &worker);
+        let source = registry
+            .reserve_client(key.into(), registration.scope.clone(), true)
+            .unwrap();
+        let inherited = registry
+            .reserve_client(key.into(), Url::parse("about:blank").unwrap(), false)
+            .unwrap();
+        registry.unregister(&registration);
+        // SW #try-clear-registration-algorithm preserves an unregistered
+        // registration while a live creator still uses its active worker.
+        inherited.inherit_controller(&source);
+        assert_eq!(inherited.controller().unwrap().id, worker.id);
+        inherited.set_execution_ready();
+        inherited.discard();
+        inherited.adopt_initial_navigation(&source);
+        inherited.inherit_controller(&source);
+        assert!(inherited.controller().is_none());
+        let state = inherited.state.lock().unwrap();
+        assert!(state.discarded);
+        assert!(state.execution_ready, "discarded readiness must stay final");
+        assert!(state.document_url.is_none());
+        drop(state);
+        source.discard();
+        assert!(registration.active().is_none());
+        assert_eq!(worker.state(), WorkerState::Redundant);
+        let later = registry
+            .reserve_client(key.into(), Url::parse("about:blank").unwrap(), false)
+            .unwrap();
+        later.inherit_controller(&source);
+        later.adopt_initial_navigation(&source);
+        assert!(later.controller().is_none());
+        assert!(later.state.lock().unwrap().document_url.is_none());
     }
 
     #[test]

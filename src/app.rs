@@ -27,6 +27,9 @@ use crate::oneshot;
 use crate::telnet;
 use crate::ui;
 
+#[path = "app/service_windows.rs"]
+mod service_windows;
+
 const RESIZE_WRAP_DEBOUNCE: Duration = Duration::from_millis(200);
 
 /// How long the pointer (mouse cursor or keyboard selection) must REST on a
@@ -250,6 +253,15 @@ async fn prepare_http_payload(
     storage: crate::js::WebStorage,
     js_on: bool,
 ) -> Payload {
+    // HTML #navigation-as-a-download precedes the no-content status gate.
+    if crate::download::response_is_attachment(&response) {
+        return Payload::Download(Box::new(response));
+    }
+    // HTML #populating-a-session-history-entry: these statuses do not
+    // create a Document, regardless of MIME or body metadata.
+    if matches!(response.status, 204 | 205) {
+        return Payload::Http(Box::new(response));
+    }
     // Classify the final URL after HTTP redirects, but before either the JS
     // actor or the CSS/layout pipeline sees the playback document.
     if crate::media::is_youtube_video_url(&response.url) {
@@ -608,6 +620,7 @@ pub struct App {
     js_enabled: bool,
     /// Origin-keyed web storage; bookmarked localStorage may survive restarts.
     web_storage: crate::js::WebStorage,
+    service_windows: service_windows::ServiceWindows,
     /// The living page behind the current browser doc, if its JS left
     /// anything to interact with. ONE live engine, ever.
     live_page: Option<crate::js::PageHandle>,
@@ -1032,6 +1045,7 @@ impl App {
             encoding: Encoding::Utf8,
             js_enabled: true,
             web_storage: crate::site_storage::web_storage(),
+            service_windows: Default::default(),
             live_page: None,
             page_fullscreen: false,
             fullscreen_reply: None,
@@ -1407,6 +1421,7 @@ impl App {
                 Some(msg) = self.bookmark_rx.recv() => self.on_bookmark(msg),
                 Some(msg) = self.imgs_rx.recv() => self.on_img_load(msg),
                 Some(msg) = self.enc_rx.recv() => self.on_enc(msg),
+                Some(action) = self.service_windows.rx.recv() => self.service_window_action(action),
                 evt = recv_opt(&mut self.page_rx) => match evt {
                     Some(evt) => {
                         from_page = true;
@@ -1540,6 +1555,7 @@ impl App {
             // reacts. A no-op when the scroll row didn't move (the common case).
             // The true viewport goes FIRST (the engine's scroll clamp and IO
             // root read innerHeight), then the settled scroll position.
+            self.sync_terminal_focus();
             self.sync_page_viewport();
             self.answer_fullscreen_request();
             self.sync_page_scroll();
@@ -1993,6 +2009,13 @@ impl App {
     }
 
     async fn on_terminal_event(&mut self, event: TermEvent) {
+        match &event {
+            TermEvent::FocusGained | TermEvent::Key(_) | TermEvent::Paste(_) => {
+                self.terminal_focus_changed(true);
+            }
+            TermEvent::FocusLost => self.terminal_focus_changed(false),
+            _ => {}
+        }
         let key = match event {
             TermEvent::Key(key) => key,
             TermEvent::Mouse(mouse) => {
@@ -3957,6 +3980,16 @@ impl App {
         let (tx, rx) = mpsc::channel(1);
         self.fetch_rx = Some(rx);
         self.status = format!("Fetching {target} ...");
+        if matches!(target, Link::Http(_))
+            && !initiator
+                .as_ref()
+                .is_some_and(|source| source.document_aborted)
+            && let Some(page) = &self.live_page
+        {
+            // Abort the old Document's fetches, retaining its Realm until
+            // a real replacement commits (HTML #navigate).
+            page.stop_loading();
+        }
         let f = self.picker.font_size();
         let viewport = self.last_inner;
         let cell_px = (f.width, f.height);
@@ -4105,7 +4138,13 @@ impl App {
             let result = if let Some(body) = about {
                 Ok(Payload::About(body))
             } else {
-                match crate::core::fetch_protocol(&target, fallback_http, initiator.as_ref()).await
+                match crate::core::fetch_protocol_in_profile(
+                    &target,
+                    fallback_http,
+                    initiator.as_ref(),
+                    Some(&storage),
+                )
+                .await
                 {
                     Ok(crate::core::FetchedDocument::Gopher(raw)) => Ok(Payload::Gopher(raw.reply)),
                     Ok(crate::core::FetchedDocument::Gemini(response)) => {
@@ -4169,6 +4208,13 @@ impl App {
         }
         self.retire_fetch("Incomplete reply: request replaced");
         self.pending_travel = None;
+        if !initiator
+            .as_ref()
+            .is_some_and(|source| source.document_aborted)
+            && let Some(page) = &self.live_page
+        {
+            page.stop_loading();
+        }
         let (tx, rx) = mpsc::channel(1);
         self.fetch_rx = Some(rx);
         self.status = format!("POSTing to {url} ...");
@@ -4187,7 +4233,14 @@ impl App {
             let result = match if url.scheme() == "blob" {
                 Err(String::from("blob URLs accept only GET navigations"))
             } else {
-                http::fetch(&request).await
+                http::fetch_navigation(
+                    &url,
+                    request.body.clone(),
+                    initiator.as_ref(),
+                    &storage,
+                    false,
+                )
+                .await
             } {
                 Ok(response) => {
                     Ok(prepare_http_payload(response, viewport, cell_px, storage, js_on).await)
@@ -5376,7 +5429,11 @@ impl App {
                 self.navigate_to(crate::rdap::render(page, width));
             }
             (Ok(Payload::Http(response)), _) => self.on_http_response(*response, width),
-            (Ok(Payload::Download(response)), _) => {
+            (Ok(Payload::Download(mut response)), _) => {
+                http::settle_aborted_navigation(
+                    &mut response,
+                    self.current_service_client().as_ref(),
+                );
                 let referrer = self.http_referrer();
                 let offer = crate::download::DownloadOffer::from_response(*response, referrer);
                 self.status = format!("Cannot display {}.", offer.content_type);
@@ -5547,6 +5604,14 @@ impl App {
     /// server sent a usable body (error pages are content); the status
     /// code always lands in the status bar.
     fn on_http_response(&mut self, mut response: http::Response, width: usize) {
+        if http::settle_no_content_navigation(&mut response, self.current_service_client().as_ref())
+        {
+            self.replace_nav = false;
+            self.nav_from_post = false;
+            self.pending_travel = None;
+            self.status = format!("HTTP {} — keeping current page", response.status);
+            return;
+        }
         let declarative_refresh = response.declarative_refresh.take();
         let live = response.live.take();
         // A challenge response is still a normal HTML navigation. Its body
@@ -5563,6 +5628,7 @@ impl App {
             .trim()
             .to_ascii_lowercase();
         if response.body.is_empty() {
+            http::settle_aborted_navigation(&mut response, self.current_service_client().as_ref());
             self.status = format!(
                 "{}: HTTP {} (empty response)",
                 response.url, response.status
@@ -5575,6 +5641,7 @@ impl App {
         if media.starts_with("image/")
             || (media == "application/octet-stream" && img::sniff(&response.body).is_some())
         {
+            http::settle_aborted_navigation(&mut response, self.current_service_client().as_ref());
             self.open_image(Link::Http(response.url), response.body);
             return;
         }
@@ -5647,23 +5714,7 @@ impl App {
         self.page_images = response.images.take();
         // navigate_to dropped the previous living page; install this one.
         if let Some(live) = live {
-            self.live_page = Some(live.handle);
-            self.page_rx = Some(live.events);
-            // Force the next tick to push the current scroll position (0 on a
-            // fresh nav; a restored row on revive-on-back) to the new engine.
-            self.last_scroll_sent = None;
-            // And the decoded-image sizes (warm on revive-on-back), so the
-            // engine's geometry pass lays images like the render does.
-            self.image_sizes_sent = None;
-            // And the true browser viewport (the engine only has the
-            // fetch-time size until the first push).
-            self.viewport_sent = None;
-            // And its top-level traversable's session history.
-            self.session_history_sent = None;
-            self.page_history_updates = 0;
-            // A fresh engine holds no hover chain; start the app's view clean.
-            self.hover_sent = None;
-            self.hover_want = None;
+            self.attach_service_live_page(live);
             self.page_js_errors = response
                 .js
                 .as_ref()
@@ -7968,6 +8019,7 @@ impl App {
         // The shown doc's POST-ness (for the entry it'll be parked into
         // later); a travel refetch is a GET, so `from_post` is false there.
         self.current_from_post = from_post;
+        self.bind_service_document();
         // Strict memory: evict docs that just became non-adjacent, then
         // drop decoded images nothing retained references anymore.
         if let Some(g) = &mut self.browser {
@@ -10429,6 +10481,7 @@ impl App {
             );
         }
         let image_urls = g.doc.image_urls.clone();
+        self.bind_service_document();
         // Whatever living page was foreground froze when we left.
         self.drop_live_page();
         self.sweep_image_caches();
@@ -18224,6 +18277,10 @@ mod tests {
         app.start_image_loads(page, vec![String::from("http://127.0.0.1:9/a.png")]);
         app.on_terminal_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::SHIFT)))
             .await;
+        assert!(
+            matches!(rx.try_recv(), Ok(crate::js::PageCmd::SystemFocus(true))),
+            "native keyboard focus precedes the close request"
+        );
         assert!(matches!(
             rx.try_recv(),
             Ok(crate::js::PageCmd::CloseRequest { modifiers }) if modifiers.shift
@@ -18232,6 +18289,7 @@ mod tests {
         app.on_page_evt(crate::js::PageEvt::CloseRequestHandled { consumed: true });
         assert!(app.live_page.is_some() && !app.imgs_in_flight.is_empty());
         app.on_page_evt(crate::js::PageEvt::CloseRequestHandled { consumed: false });
+        assert!(matches!(rx.try_recv(), Ok(crate::js::PageCmd::StopLoading)));
         assert!(
             app.live_page.is_some(),
             "the page and its scripts keep running"
@@ -19580,6 +19638,10 @@ mod file_picker_tests {
         app.on_terminal_event(Event::Key(KeyEvent::from(KeyCode::Tab)))
             .await;
         assert_eq!(app.mode, mode);
+        assert!(
+            matches!(rx.try_recv(), Ok(PageCmd::SystemFocus(true))),
+            "native keyboard focus precedes the picker response"
+        );
         let picker = app.file_picker.as_ref().expect("picker stays open");
         assert_eq!(
             picker
@@ -19658,6 +19720,10 @@ mod file_picker_tests {
         app.on_terminal_event(Event::Key(KeyEvent::from(KeyCode::Tab)))
             .await;
         assert!(app.unload_prompt.is_some());
+        assert!(
+            matches!(rx.try_recv(), Ok(PageCmd::SystemFocus(true))),
+            "native keyboard focus precedes later navigation commands"
+        );
         app.on_terminal_event(Event::Key(KeyEvent::from(KeyCode::Char('s'))))
             .await;
         assert_eq!(reply.try_recv(), Ok(false));
@@ -19678,6 +19744,11 @@ mod file_picker_tests {
             proceed: true,
         });
         assert!(app.fetch_rx.is_some(), "the navigation started");
+        assert!(matches!(rx.try_recv(), Ok(PageCmd::StopLoading)));
+        assert!(
+            app.live_page.is_some(),
+            "the old Document remains until a replacement commits"
+        );
         // Killing the page retires it without unloading.
         app.stop_loading();
         assert!(rx.try_recv().is_err());

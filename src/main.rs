@@ -110,7 +110,8 @@ async fn main() -> ExitCode {
         let _ = crossterm::execute!(
             std::io::stdout(),
             crossterm::event::DisableMouseCapture,
-            crossterm::event::DisableBracketedPaste
+            crossterm::event::DisableBracketedPaste,
+            crossterm::event::DisableFocusChange
         );
         pop_terminal_title();
         ratatui_hook(info);
@@ -128,7 +129,8 @@ async fn main() -> ExitCode {
     let _ = crossterm::execute!(
         std::io::stdout(),
         crossterm::event::EnableMouseCapture,
-        crossterm::event::EnableBracketedPaste
+        crossterm::event::EnableBracketedPaste,
+        crossterm::event::EnableFocusChange
     );
     // Take over the terminal title for the run. Push the terminal's current
     // title onto its title stack first (CSI 22;2t — title-only, no icon:
@@ -144,7 +146,8 @@ async fn main() -> ExitCode {
     let _ = crossterm::execute!(
         std::io::stdout(),
         crossterm::event::DisableMouseCapture,
-        crossterm::event::DisableBracketedPaste
+        crossterm::event::DisableBracketedPaste,
+        crossterm::event::DisableFocusChange
     );
     pop_terminal_title();
     ratatui::restore();

@@ -769,31 +769,48 @@ impl SharedBytes {
 }
 
 fn fragment_bytes(fragment: &Frag, shared: &mut SharedBytes) -> usize {
-    let own = match &fragment.kind {
-        FragKind::Line(line) => shared.line(line),
-        FragKind::TableCell(layers) => std::mem::size_of_val(layers.as_ref()),
-        FragKind::Oof(b, placeholder) => {
-            // Count every shared dependency conservatively, even when also
-            // reachable from another cache entry or the box-tree cache.
-            let inl = &placeholder.ctx;
-            shared.boxed(b)
-                + size_of::<super::flow::OofStatic>()
-                + inl.font_family.capacity()
-                + inl.language.as_ref().map_or(0, String::capacity)
-                + inl.link.as_ref().map_or(0, |link| link.retained_memory().0)
-        }
-        _ => 0,
-    } + fragment
-        .paint
-        .collapsed_borders
-        .as_ref()
-        .map_or(0, |collapsed| collapsed.retained_bytes());
-    own + fragment.children.capacity() * size_of::<Frag>()
-        + fragment
-            .children
-            .iter()
-            .map(|child| fragment_bytes(child, shared))
-            .sum::<usize>()
+    fn visit(fragment: &Frag, shared: &mut SharedBytes, contexts: &mut FxHashSet<usize>) -> usize {
+        let own = match &fragment.kind {
+            FragKind::Line(line) => {
+                let contexts = line
+                    .pieces
+                    .iter()
+                    .chain(&line.atom_boxes)
+                    .chain(
+                        line.laid
+                            .iter()
+                            .flat_map(|laid| laid.pieces.iter().chain(&laid.atom_boxes)),
+                    )
+                    .map(|piece| piece.shaping_bytes(contexts))
+                    .sum::<usize>();
+                shared.line(line) + contexts
+            }
+            FragKind::TableCell(layers) => std::mem::size_of_val(layers.as_ref()),
+            FragKind::Oof(b, placeholder) => {
+                // Count every shared dependency conservatively, even when also
+                // reachable from another cache entry or the box-tree cache.
+                let inl = &placeholder.ctx;
+                shared.boxed(b)
+                    + size_of::<super::flow::OofStatic>()
+                    + inl.font_family.capacity()
+                    + inl.language.as_ref().map_or(0, String::capacity)
+                    + inl.link.as_ref().map_or(0, |link| link.retained_memory().0)
+            }
+            _ => 0,
+        } + fragment
+            .paint
+            .collapsed_borders
+            .as_ref()
+            .map_or(0, |collapsed| collapsed.retained_bytes());
+        own + fragment.children.capacity() * size_of::<Frag>()
+            + fragment
+                .children
+                .iter()
+                .map(|child| visit(child, shared, contexts))
+                .sum::<usize>()
+    }
+
+    visit(fragment, shared, &mut FxHashSet::default())
 }
 
 #[cfg(test)]

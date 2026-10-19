@@ -562,6 +562,13 @@ impl Values {
             return;
         };
         row.typed = Typed::default();
+        // CSS Cascade 5 #computed / #used: retained typed records derive
+        // from these values too. A geometry read after a compositor sample
+        // must not recover the pre-animation BoxStyle from the common row.
+        row.inline = None;
+        if let Some(common) = &row.common {
+            common.borrow_mut().boxes = [None, None];
+        }
         if contextual(property) {
             row.contextual.forget(property);
         } else if let Some(common) = &row.common {

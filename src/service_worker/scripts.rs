@@ -110,6 +110,7 @@ pub(crate) struct Version {
     pub root: Arc<Script>,
     pub resources: Arc<Resources>,
     pub environment: Environment,
+    pub modules: std::collections::BTreeMap<(String, Option<String>), Arc<Script>>,
 }
 
 /// No HTTP cache is used by this loader: updates check network bytes, and
@@ -124,10 +125,24 @@ pub(crate) async fn fetch(
     // A stalled import must not indefinitely hold the registration's job queue.
     tokio::time::timeout(
         std::time::Duration::from_secs(30),
-        fetch_inner(url, environment, top, budget),
+        fetch_inner(url, environment, top, budget, false, None),
     )
     .await
     .map_err(|_| Error::new("NetworkError", "Service-worker script fetch timed out"))?
+}
+
+pub(crate) async fn fetch_module(
+    url: Url,
+    environment: &Environment,
+    budget: &Arc<Budget>,
+    kind: Option<&str>,
+) -> Result<Arc<Script>, Error> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        fetch_inner(url, environment, None, budget, true, kind),
+    )
+    .await
+    .map_err(|_| Error::new("NetworkError", "Module fetch timed out"))?
 }
 
 async fn fetch_inner(
@@ -135,6 +150,8 @@ async fn fetch_inner(
     environment: &Environment,
     top: Option<&RegistrationOptions>,
     budget: &Arc<Budget>,
+    module: bool,
+    module_type: Option<&str>,
 ) -> Result<Arc<Script>, Error> {
     if !matches!(url.scheme(), "http" | "https")
         || !crate::http::subresource_allowed(&environment.origin, &url)
@@ -179,9 +196,24 @@ async fn fetch_inner(
     } else {
         request.fetch_policy = Some(FetchPolicy {
             origin: environment.origin.clone(),
-            mode: RequestMode::NoCors,
+            mode: if module {
+                RequestMode::Cors
+            } else {
+                RequestMode::NoCors
+            },
             credentials: CredentialsMode::SameOrigin,
         });
+        if module {
+            request
+                .headers
+                .push(("Service-Worker".into(), "script".into()));
+            crate::http::set_fetch_metadata(
+                &mut request,
+                &environment.origin,
+                "serviceworker",
+                "cors",
+            );
+        }
     }
     let (mut response, mut stream) = crate::http::fetch_script_streaming(&request)
         .await
@@ -191,7 +223,11 @@ async fn fetch_inner(
         .as_ref()
         .is_some_and(|internal| internal.kind == "opaque");
     response.unfilter();
-    if !crate::http::is_javascript_mime_type(&response.content_type) {
+    if if module {
+        !crate::http::module_response_allowed(response.status, &response.content_type, module_type)
+    } else {
+        !crate::http::is_javascript_mime_type(&response.content_type)
+    } {
         return Err(Error::new(
             if top.is_some() {
                 "SecurityError"

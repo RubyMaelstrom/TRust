@@ -573,6 +573,16 @@ fn direct(piece: &mut Piece, level: Level, cells: bool) -> bool {
     let Some(style) = piece.text_style.clone() else {
         return false;
     };
+    if let Some(context) = piece.shaping.as_ref() {
+        if context.reads_direction(rtl) {
+            return false;
+        }
+        let context = context.directed(rtl);
+        let shaped = context.shape(&style);
+        piece.shaping = Some(context);
+        reshape(piece, shaped);
+        return true;
+    }
     let reads = piece.shaped.as_ref().is_some_and(|shaped| {
         if cells {
             !rtl || shaped.clusters.iter().all(|cluster| cluster.rtl)
@@ -1085,7 +1095,14 @@ fn reorder_line(
             }
             part.bidi_level = level.number();
             let style = part.text_style.clone().unwrap_or_default();
-            let shaped = crate::text::shape_directed(&part.item.text, &style, level.is_rtl());
+            part.shaping = piece
+                .shaping
+                .as_ref()
+                .map(|context| context.subrange(range));
+            let shaped = part.shaping.as_ref().map_or_else(
+                || crate::text::shape_directed(&part.item.text, &style, level.is_rtl()),
+                |context| context.shape(&style),
+            );
             reshape(&mut part, shaped);
             pieces.push(part);
         }

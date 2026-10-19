@@ -62,8 +62,8 @@ StructuredSerializeWithTransfer and StructuredDeserializeWithTransfer,
 including partial failure and per-holder transfer-receiving steps.
 These are local official snapshots, not a fresh upstream verification.
 
-Remaining service-worker work
------------------------------
+Remaining service-worker work at this handoff (historical)
+---------------------------------------------------------
 - Reserved navigation clients and request interception, including response/body
   lifetime and cancellation through Fetch.
 - Client focus/navigate/openWindow and navigation preload.
@@ -130,3 +130,12 @@ with PC zero and a return address in libvulkan.so.1.4.365 at offset 0x45c18.
 The truncated core and stack/map evidence remain in target/servo-fourth/
 touch-unbounded-test*. This is not a root-cause conclusion or proof that it is
 the same issue as the reported desktop startup crash.
+
+Subsequent implementation
+-------------------------
+The user authorized completing these follow-ups after this messaging review.
+Request interception, navigation clients/actions/preload and module service
+workers are now implemented; see the fifth-batch record and current validation
+in docs/servo-follow-ups-20261018.txt. The engine helper patch is preserved in
+docs/patches/trust-js-servo-host-api.patch, with isolated-build instructions in
+AGENTS.md. The active engine checkout remains untouched.

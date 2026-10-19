@@ -267,6 +267,9 @@ pub enum LineStart {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RunSelection {
     pub sources: Option<Arc<[TextSourceSpan]>>,
+    /// DOM Text identity for paint timing even when `user-select:none`
+    /// suppresses selectable spans. It must not enter selection operations.
+    pub paint_timing_sources: Option<Arc<[TextSourceSpan]>>,
     /// CSS Text #text-transform-property: copying uses original data. Only
     /// transformed runs need these snapshots; each holds its source slice.
     pub original: Option<Arc<[OriginalText]>>,
@@ -806,6 +809,7 @@ impl Scene {
                 link: link.clone(),
                 selection: RunSelection {
                     sources,
+                    paint_timing_sources: selection.paint_timing_sources.clone(),
                     original: selection.original.clone(),
                     highlight: selection.highlight,
                     line_start: if from <= 0.0 {

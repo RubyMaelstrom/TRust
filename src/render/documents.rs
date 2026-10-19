@@ -296,6 +296,7 @@ pub fn paint_doc_selected(
             } else {
                 super::RunSelection {
                     original: None,
+                    paint_timing_sources: None,
                     sources: Some(std::sync::Arc::from([super::TextSourceSpan {
                         start: 0,
                         end: shaped.text.len() as u32,

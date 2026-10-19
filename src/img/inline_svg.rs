@@ -395,6 +395,23 @@ pub(crate) fn document_svg_image_requests(source: &str) -> Vec<String> {
         .collect()
 }
 
+/// Whether a retained image command is the browser's snapshot of inline
+/// document SVG. Inspect only its small, unforgeable context prefix so paint
+/// timing never attributes an ordinary CSS SVG image to inline DOM children.
+pub(crate) fn is_document_svg_source(source: &str) -> bool {
+    let Some(payload) = source.strip_prefix(DATA_PREFIX) else {
+        return false;
+    };
+    let take = payload.len().min(128) / 4 * 4;
+    let Some(bytes) = base64_decode(&payload[..take]) else {
+        return false;
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    text.strip_prefix("<?trust-document-svg ")
+        .and_then(|text| text.strip_prefix(nonce()))
+        .is_some_and(|text| text.starts_with(' '))
+}
+
 /// Whether decoded text (possibly only a prefix of the source) can still
 /// begin with the marker `DocumentSvgContext::of` recognizes.
 fn may_open_with_marker(text: &str) -> bool {

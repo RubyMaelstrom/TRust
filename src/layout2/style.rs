@@ -540,16 +540,20 @@ impl BoxStyle {
             vp,
         );
         let mut has_transform = transform.is_some();
-        // CSS Animations 1 §4 gives a transform animation the same stacking-
-        // context behavior as a non-none computed transform even when the
-        // underlying value is `none`. This also keeps the animated element's
-        // subtree atomic in the retained display list.
-        has_transform |= dom.css_animation_definitions(id).iter().any(|animation| {
-            animation
-                .keyframes
-                .iter()
-                .any(|frame| frame.transform.is_some())
-        });
+        // CSS Animations 1 #animations implies will-change for unfinished
+        // and forwards-filled effects, including the delay. Transform also
+        // establishes a containing block; opacity forms only a stacking
+        // context, even when its current computed value is one.
+        let animations = dom.css_animation_definitions(id);
+        has_transform |= animations
+            .iter()
+            .filter(|animation| animation.will_change)
+            .any(|animation| {
+                animation
+                    .keyframes
+                    .iter()
+                    .any(|frame| frame.transform.is_some())
+            });
         // CSS Custom Properties §3: substitute var() references at computed-
         // value time, before the typed layout snapshot parses lengths. Feeding
         // raw `var(--x)` into Len made a valid declaration silently fall back
@@ -648,7 +652,14 @@ impl BoxStyle {
             has_transform,
             has_clip_path: cv("clip-path").is_some_and(|value| super::clip_path::supports(&value)),
             has_mask: cv("mask-image").is_some_and(|value| has_mask_image(&value)),
-            compositing_group: compositing_group(cv("mix-blend-mode"), cv("isolation")),
+            compositing_group: compositing_group(cv("mix-blend-mode"), cv("isolation"))
+                || animations.iter().any(|animation| {
+                    animation.will_change
+                        && animation
+                            .keyframes
+                            .iter()
+                            .any(|frame| frame.opacity.is_some())
+                }),
             filters: filters_of(&cv, u, vp),
             filter_containing_block: !dom.is_document_element(id),
             backdrop_filter: has_backdrop_filter(cv("backdrop-filter")),

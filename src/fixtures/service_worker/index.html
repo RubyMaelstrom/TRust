@@ -1,0 +1,56 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Service worker acceptance</title>
+<style>
+  body { margin: 20px; font: 18px/1.5 sans-serif; background: white; color: #152030; }
+  #navigate { display: block; height: 36px; }
+  iframe { width: 360px; height: 60px; border: 1px solid #aaa; }
+</style>
+<a id="navigate" href="navigation">Continue through navigation preload</a>
+<h1>Service worker acceptance</h1>
+<p id="result">Starting…</p>
+<script>
+  const result = document.getElementById('result');
+  let ticks = 0;
+  const progress = setInterval(() => { result.textContent = `Working (${++ticks})…`; }, 200);
+  const checks = [];
+  function check(value, name) { if (!value) throw Error(name); checks.push(name); }
+  (async () => {
+    const registration = await navigator.serviceWorker.register('sw.js', {type:'module'});
+    await navigator.serviceWorker.ready;
+    if (!navigator.serviceWorker.controller)
+      await new Promise(resolve => navigator.serviceWorker.addEventListener('controllerchange', resolve, {once:true}));
+    check(await (await fetch('virtual')).text() === 'module response', 'module interception');
+    check(await (await fetch('stream')).text() === 'first second', 'streaming response');
+    check(await (await fetch('echo', {method:'POST', body:'posted'})).text() === 'posted', 'request body');
+    check((await fetch('virtual', {method:'HEAD'})).body === null, 'HEAD response');
+    const worker = new Worker('child.js');
+    const message = await new Promise((resolve, reject) => {
+      worker.onmessage = event => resolve(event.data);
+      worker.onerror = event => reject(Error(event.message));
+    });
+    check(message === 'module response', 'controlled worker');
+    worker.terminate();
+    const frame = document.createElement('iframe');
+    const fromFrame = new Promise(resolve => addEventListener('message', event => {
+      if (event.source === frame.contentWindow) resolve(event.data);
+    }));
+    frame.src = 'frame'; document.body.append(frame);
+    const frameURL = await fromFrame;
+    check(frameURL === new URL('frame', location.href).href, 'controlled iframe navigation');
+    const channel = new MessageChannel();
+    const client = new Promise(resolve => { channel.port1.onmessage = event => resolve(event.data); });
+    navigator.serviceWorker.controller.postMessage(frameURL, [channel.port2]);
+    check((await client).frameType === 'nested', 'client lookup');
+    channel.port1.close();
+    await cookieStore.set('servo-acceptance', 'ram');
+    check((await cookieStore.get('servo-acceptance')).value === 'ram', 'CookieStore');
+    const cache = await caches.open('servo-acceptance');
+    await cache.put('results', new Response(checks.join(', ')));
+    document.title = 'PASS service worker acceptance';
+    result.textContent = `PASS: ${checks.join(', ')}`;
+  })().catch(error => {
+    document.title = 'FAIL service worker acceptance';
+    result.textContent = `FAIL: ${error.name}: ${error.message}`;
+  }).finally(() => clearInterval(progress));
+</script>

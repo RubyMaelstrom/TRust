@@ -17,6 +17,10 @@ use crate::doc::Link;
 use crate::{gemini, gopher, http, oneshot};
 
 mod events;
+#[cfg(test)]
+mod service_worker_no_content_tests;
+#[cfg(test)]
+mod service_worker_static_tests;
 
 /// A DOM boundary point in a Text node (DOM #concept-boundary-point): the
 /// node's arena id and an offset in UTF-16 code units of its data. Layout
@@ -598,6 +602,8 @@ enum AfterUnloadCheck {
     Action(UserAction),
     /// The Document's declarative refresh (HTML #shared-declarative-refresh-steps).
     Refresh(url::Url),
+    /// SW #client-navigate uses the same unload check as other navigations.
+    ServiceNavigation(Arc<crate::service_worker::WindowAction>),
     /// The frontend leaves the page itself (`ask_unload`): closing the
     /// traversable, or a navigation the controller does not run.
     Frontend,
@@ -640,6 +646,7 @@ struct PendingNavigation {
 
 #[derive(Debug)]
 enum CoreEvent {
+    ServiceWindow(Arc<crate::service_worker::WindowAction>),
     Gemini {
         generation: u64,
         response: Box<crate::gemini::Response>,
@@ -865,6 +872,7 @@ pub struct BrowserController {
     /// or to show it (`PageEvt::FocusTraversable`).
     close_requested: bool,
     focus_requested: bool,
+    service_focus: Vec<Arc<crate::service_worker::WindowAction>>,
     external_media: VecDeque<(url::Url, Option<url::Url>)>,
     download_offer: Option<crate::download::DownloadOffer>,
     prompt: Option<crate::prompt::Prompt>,
@@ -998,6 +1006,7 @@ impl BrowserController {
             pending_new_traversables: VecDeque::new(),
             close_requested: false,
             focus_requested: false,
+            service_focus: Vec::new(),
             pending_clipboard_writes: VecDeque::new(),
             page_selection: None,
             page_selection_generation: 0,
@@ -1411,6 +1420,126 @@ impl BrowserController {
         }
     }
 
+    fn current_service_client_id(&self) -> String {
+        self.current
+            .as_ref()
+            .and_then(|page| match &page.document {
+                FetchedDocument::Http(response) => response.service_client.as_ref(),
+                _ => None,
+            })
+            .map(|document| document.client().id.clone())
+            .unwrap_or_default()
+    }
+
+    fn service_window_action(&mut self, action: Arc<crate::service_worker::WindowAction>) {
+        self.service_window_action_after_unload(action, false);
+    }
+
+    fn service_window_action_after_unload(
+        &mut self,
+        action: Arc<crate::service_worker::WindowAction>,
+        unload_checked: bool,
+    ) {
+        use crate::service_worker::{Error, WindowOperation};
+        let document = self.current.as_ref().and_then(|page| match &page.document {
+            FetchedDocument::Http(response) => response.service_client.clone(),
+            _ => None,
+        });
+        let Some(document) = document.filter(|d| d.contains(&action.client.id)) else {
+            action.reply.complete(Err(Error::type_error(
+                "The document is no longer fully active",
+            )));
+            return;
+        };
+        if action.client.id != document.client().id && self.live_page.is_none() {
+            if let Some(live) =
+                http::frames::resume_static_page(&document, self.traversable_state())
+            {
+                self.render_is_final = false;
+                self.attach_live_page(self.document_generation, live);
+                self.send_live(crate::js::PageCmd::Viewport(layout_viewport(self.viewport)));
+                self.send_live(crate::js::PageCmd::DevicePixelRatio(
+                    self.device_pixel_ratio,
+                ));
+                self.send_live(crate::js::PageCmd::ScreenPosition(
+                    self.screen_position.0,
+                    self.screen_position.1,
+                ));
+            } else {
+                action.reply.complete(Err(Error::type_error(
+                    "The nested document is no longer available",
+                )));
+                return;
+            }
+        }
+        match &action.operation {
+            WindowOperation::Focus => {
+                self.service_focus.retain(|action| action.reply.pending());
+                if self.service_focus.len() >= 32 {
+                    action
+                        .reply
+                        .complete(Err(Error::type_error("Too many pending focus requests")));
+                    return;
+                }
+                action.client.focus_window();
+                self.focus_requested = true;
+                let reply = action.reply.clone();
+                let focused_client = action.client.clone();
+                self.runtime.spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    if !focused_client.window_state().focused {
+                        reply.complete(Err(Error::type_error(
+                            "The frontend did not focus the window",
+                        )));
+                    }
+                });
+                self.service_focus.push(action);
+                self.sync_traversable();
+            }
+            WindowOperation::Navigate(_) if action.client.id != document.client().id => {
+                action.client.send_window_action(action.clone());
+            }
+            WindowOperation::Navigate(url) | WindowOperation::Open(url) => {
+                if matches!(&action.operation, WindowOperation::Navigate(_))
+                    && !unload_checked
+                    && self.unload_needs_check()
+                {
+                    self.begin_unload_check(AfterUnloadCheck::ServiceNavigation(action));
+                    return;
+                }
+                let mut initiator =
+                    http::NavigationInitiator::document(&action.client.url(), Default::default());
+                initiator.service_worker_context =
+                    crate::trust_js_backend::service_worker_fetch::for_document(&document);
+                initiator.service_worker_reply = Some(action.reply.clone());
+                if matches!(&action.operation, WindowOperation::Open(_)) {
+                    if !self.new_traversables_available {
+                        action.reply.complete(Err(Error::type_error(
+                            "This frontend cannot open another window",
+                        )));
+                        return;
+                    }
+                    self.pending_new_traversables
+                        .push_back(NewTraversableRequest::Navigate(crate::js::NewTraversable {
+                            url: url.to_string(),
+                            initiator: Some(Box::new(initiator)),
+                            name: String::new(),
+                            noopener: true,
+                            foreground: true,
+                            submission: None,
+                        }));
+                } else {
+                    self.begin_fetch_from(
+                        Link::Http(url.clone()),
+                        false,
+                        NavigationIntent::New,
+                        Some(initiator),
+                    );
+                }
+            }
+        }
+    }
+
     /// HTML #page-visibility: this traversable cannot currently be seen,
     /// because its window is occluded or it is a background tab.
     fn system_hidden(&self) -> bool {
@@ -1441,6 +1570,54 @@ impl BrowserController {
             && let Some(client) = &response.service_client
         {
             client.presentation(state.hidden, state.focused);
+            let tx = self.tx.clone();
+            client.bind_actions(Arc::new(move |action| {
+                let mut event = Some(CoreEvent::ServiceWindow(action));
+                if tx.try_send(&mut event).is_err() {
+                    let Some(CoreEvent::ServiceWindow(action)) = event else {
+                        unreachable!()
+                    };
+                    action
+                        .reply
+                        .complete(Err(crate::service_worker::Error::type_error(
+                            "The frontend cannot accept another Window action",
+                        )));
+                }
+            }));
+            client.committed();
+        }
+        if state.focused {
+            for action in self.service_focus.drain(..) {
+                let nested = action.client.window_state().frame_type == "nested";
+                self.runtime.spawn(async move {
+                    let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                        let attached = !nested || action.client.await_attachment().await;
+                        if attached {
+                            action.client.inspect().await
+                        } else {
+                            Err(crate::service_worker::Error::type_error(
+                                "The window is no longer available",
+                            ))
+                        }
+                    })
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(crate::service_worker::Error::type_error(
+                            "The window did not complete its focus task",
+                        ))
+                    })
+                    .and_then(|info| {
+                        if info.as_ref().is_some_and(|i| i.window.focused) {
+                            Ok(info)
+                        } else {
+                            Err(crate::service_worker::Error::type_error(
+                                "The window could not be focused",
+                            ))
+                        }
+                    });
+                    action.reply.complete(result);
+                });
+            }
         }
         self.window_environment.send_if_modified(|env| {
             let changed = env.traversable.hidden != state.hidden
@@ -2449,8 +2626,12 @@ impl BrowserController {
             );
             animation_frames = Some(animation_frames.unwrap_or(true) && animation_frame);
             match event {
+                CoreEvent::ServiceWindow(action) => {
+                    self.service_window_action(action);
+                    changed = true;
+                }
                 CoreEvent::UserInputReady { generation, permit } => {
-                    if generation == self.generation {
+                    if generation == self.document_generation {
                         self.user_input_retry = None;
                         if let (Some(page), Some(permit)) = (&self.live_page, permit) {
                             if let Some((command, _navigation)) =
@@ -2514,7 +2695,7 @@ impl BrowserController {
                     changed |= self.finish_gopher_download(generation, *offer);
                 }
                 CoreEvent::Page { generation, event } => {
-                    if generation == self.generation {
+                    if generation == self.document_generation && self.live_page.is_some() {
                         changed |= self.handle_page_event(event);
                     }
                 }
@@ -2816,7 +2997,20 @@ impl BrowserController {
         self.prompt = None;
         self.retire_query("Incomplete reply: request replaced");
         self.abort_declarative_refresh();
-        self.drop_live_page();
+        if matches!(target, Link::Http(_)) {
+            // HTML #navigate aborts the active Document's fetches after the
+            // beforeunload check, but unloads it only when a replacement
+            // Document commits. A 204/205 or download keeps this actor alive.
+            if !initiator
+                .as_ref()
+                .is_some_and(|source| source.document_aborted)
+                && let Some(page) = &self.live_page
+            {
+                page.stop_loading();
+            }
+        } else {
+            self.drop_live_page();
+        }
         self.external_address = None;
         self.download_offer = None;
         // Only the document that replaces a discarded one was discarded.
@@ -2836,7 +3030,13 @@ impl BrowserController {
         let tx = self.tx.clone();
         let window_environment = self.window_environment.subscribe();
         let storage = self.storage.clone();
-        let group = self.group_link.clone();
+        let group = self
+            .live_page
+            .as_ref()
+            .filter(|page| page.link().shared())
+            .map(|page| page.link().clone())
+            .or_else(|| self.group_link.clone());
+        let replaces_client_id = self.current_service_client_id();
         self.task = Some(self.runtime.spawn(async move {
             if let Link::Gemini(url) = &target {
                 let result = gemini::fetch_updates(url, |response| {
@@ -3001,6 +3201,7 @@ impl BrowserController {
                 None,
                 intent,
                 group,
+                &replaces_client_id,
             )
             .await;
             let event = interactive_fetch_event(generation, result);
@@ -3032,7 +3233,7 @@ impl BrowserController {
         self.invalidation.request_redraw();
     }
 
-    fn finish_download(&mut self, generation: u64, response: http::Response) -> bool {
+    fn finish_download(&mut self, generation: u64, mut response: http::Response) -> bool {
         let Some(_pending) = self
             .pending
             .take_if(|pending| pending.generation == generation)
@@ -3040,6 +3241,15 @@ impl BrowserController {
             return false;
         };
         self.task = None;
+        let current = self
+            .current
+            .as_ref()
+            .and_then(|page| match &page.document {
+                FetchedDocument::Http(response) => response.service_client.as_ref(),
+                _ => None,
+            })
+            .map(|document| document.client());
+        http::settle_aborted_navigation(&mut response, current.as_ref());
         let referrer = self.current.as_ref().and_then(|page| match &page.target {
             Link::Http(url) => Some(url.clone()),
             _ => None,
@@ -3547,6 +3757,26 @@ impl BrowserController {
         self.task = None;
         match result {
             Ok(mut document) => {
+                let current = self
+                    .current
+                    .as_ref()
+                    .and_then(|page| match &page.document {
+                        FetchedDocument::Http(response) => response.service_client.as_ref(),
+                        _ => None,
+                    })
+                    .map(|document| document.client());
+                if let FetchedDocument::Http(response) = &mut document
+                    && http::settle_no_content_navigation(response, current.as_ref())
+                {
+                    self.render_is_final = self.live_page.is_none();
+                    self.restore_scroll
+                        .take_if(|(restored, _)| *restored == generation);
+                    self.status = self.current.as_ref().map_or_else(
+                        || format!("HTTP {} — no document", response.status),
+                        |page| page.status.clone(),
+                    );
+                    return true;
+                }
                 if matches!(pending.target, Link::Http(_))
                     && let FetchedDocument::Http(response) = &document
                 {
@@ -3601,6 +3831,7 @@ impl BrowserController {
                     FetchedDocument::Http(response) => response.rendered.as_deref().cloned(),
                     _ => None,
                 };
+                self.drop_live_page();
                 let page = BrowserPage {
                     status: fetched_status(&pending.target, &document),
                     target: pending.target.clone(),
@@ -3615,6 +3846,7 @@ impl BrowserController {
                 self.status = page.status.clone();
                 let old = self.current.replace(page);
                 self.document_generation = generation;
+                self.sync_traversable();
                 match pending.intent {
                     NavigationIntent::New => {
                         if let Some(old) = old {
@@ -3677,8 +3909,10 @@ impl BrowserController {
                 }
             }
             Err(error) => {
-                self.render_is_final = true;
-                self.group_link = None;
+                self.render_is_final = self.live_page.is_none();
+                if self.live_page.is_none() {
+                    self.group_link = None;
+                }
                 self.status = format!("{} — {error}", pending.target);
             }
         }
@@ -3738,8 +3972,8 @@ impl BrowserController {
         }
         self.abort_declarative_refresh();
         if let Some(pending) = pending {
-            // A navigation in flight has no live page beside it (`begin_fetch`
-            // retired it); retire its fetch and streams exactly like `stop`.
+            // Cancel the pending replacement while the current Document and
+            // its scripts remain active until a later navigation commits.
             self.retire_query("Incomplete reply: stopped");
             self.generation = self.generation.wrapping_add(1);
             self.render_is_final = self.live_page.is_none();
@@ -3869,7 +4103,7 @@ impl BrowserController {
                     self.pending_user_input.push_front((command, navigation));
                     let sender = page.user_input_sender();
                     let tx = self.tx.clone();
-                    let generation = self.generation;
+                    let generation = self.document_generation;
                     // Sleep on real channel capacity, not a timer/poll loop. The
                     // reserved slot crosses back with the wake so it cannot be
                     // stolen by a later input. Only one retry task exists per page.
@@ -4183,7 +4417,11 @@ impl BrowserController {
                 self.begin_page_address(&address, NavigationIntent::New, initiator)
             }
             PageEvt::Reload(address) => {
-                self.begin_page_address(&address, NavigationIntent::Reload, None)
+                let initiator = self.document_initiator().map(|mut source| {
+                    source.document_aborted = true;
+                    Box::new(source)
+                });
+                self.begin_page_address(&address, NavigationIntent::Reload, initiator)
             }
             PageEvt::Replace(address, initiator) => {
                 self.begin_page_address(&address, NavigationIntent::Replace, initiator)
@@ -4500,6 +4738,15 @@ impl BrowserController {
                 self.handle_action(action);
             }
             AfterUnloadCheck::Refresh(url) if proceed => self.follow_refresh(url),
+            AfterUnloadCheck::ServiceNavigation(action) => {
+                if proceed {
+                    self.service_window_action_after_unload(action, true);
+                } else {
+                    // HTML #navigate returned before creating a replacement;
+                    // SW #client-navigate reads the still-active Window.
+                    action.reply.client(&action.client);
+                }
+            }
             AfterUnloadCheck::Frontend => self.unload_answers.push_back((request, proceed)),
             AfterUnloadCheck::Action(_) | AfterUnloadCheck::Refresh(_) => {}
         }
@@ -4793,7 +5040,13 @@ impl BrowserController {
             task.abort();
         }
         self.abort_declarative_refresh();
-        self.drop_live_page();
+        if !source
+            .as_ref()
+            .is_some_and(|source| source.document_aborted)
+            && let Some(page) = &self.live_page
+        {
+            page.stop_loading();
+        }
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
         let target = Link::Http(url.clone());
@@ -4807,7 +5060,13 @@ impl BrowserController {
         let tx = self.tx.clone();
         let window_environment = self.window_environment.subscribe();
         let storage = self.storage.clone();
-        let group = self.group_link.clone();
+        let group = self
+            .live_page
+            .as_ref()
+            .filter(|page| page.link().shared())
+            .map(|page| page.link().clone())
+            .or_else(|| self.group_link.clone());
+        let replaces_client_id = self.current_service_client_id();
         self.task = Some(self.runtime.spawn(async move {
             let result = fetch_protocol_interactive(
                 &target,
@@ -4818,6 +5077,7 @@ impl BrowserController {
                 Some((content_type, body)),
                 NavigationIntent::New,
                 group,
+                &replaces_client_id,
             )
             .await;
             let event = interactive_fetch_event(generation, result);
@@ -4835,6 +5095,15 @@ pub async fn fetch_protocol(
     target: &Link,
     fallback_http: bool,
     initiator: Option<&http::NavigationInitiator>,
+) -> Result<FetchedDocument, String> {
+    fetch_protocol_in_profile(target, fallback_http, initiator, None).await
+}
+
+pub(crate) async fn fetch_protocol_in_profile(
+    target: &Link,
+    fallback_http: bool,
+    initiator: Option<&http::NavigationInitiator>,
+    storage: Option<&crate::js::WebStorage>,
 ) -> Result<FetchedDocument, String> {
     match target {
         Link::Gopher(url) if url.is_binary_file() => match gopher::fetch_file(url).await? {
@@ -4864,7 +5133,9 @@ pub async fn fetch_protocol(
         Link::Http(url) if url.scheme() == "blob" => http::blob_navigation_response(url, initiator)
             .map(|response| FetchedDocument::Http(Box::new(response))),
         Link::Http(url) => {
-            let response = if fallback_http {
+            let response = if let Some(storage) = storage {
+                http::fetch_navigation(url, None, initiator, storage, fallback_http).await
+            } else if fallback_http {
                 http::fetch_web_default_with_referrer(url, initiator).await
             } else {
                 http::fetch(&http::navigation_request(url.clone(), None, initiator)).await
@@ -4905,6 +5176,7 @@ async fn fetch_protocol_interactive(
     post_body: Option<(String, Vec<u8>)>,
     intent: NavigationIntent,
     group: Option<crate::js::TraversableLink>,
+    replaces_client_id: &str,
 ) -> Result<InteractiveFetch, String> {
     if let Link::Gopher(url) = target
         && (url.is_image() || url.is_html() || url.is_binary_file())
@@ -4966,20 +5238,30 @@ async fn fetch_protocol_interactive(
                 return Err(String::from("blob URLs accept only GET navigations"));
             }
             http::blob_navigation_response(url, initiator)?
-        } else if let Some(body) = post_body {
-            http::fetch(&http::navigation_request(
-                url.clone(),
-                Some(body),
-                initiator,
-            ))
-            .await?
-        } else if fallback_http {
-            http::fetch_web_default_with_referrer(url, initiator).await?
         } else {
-            http::fetch(&http::navigation_request(url.clone(), None, initiator)).await?
+            http::fetch_navigation_with_type(
+                url,
+                post_body,
+                initiator,
+                &storage,
+                fallback_http,
+                intent.timing_type(),
+                replaces_client_id,
+            )
+            .await?
         };
         if let Some(timing) = response.timing.as_mut() {
             timing.navigation_type = intent.timing_type();
+        }
+        // HTML #navigation-as-a-download precedes the no-Document status
+        // gate; a 204/205 attachment can still offer its empty response.
+        if crate::download::response_is_attachment(&response) {
+            return Ok(InteractiveFetch::Download(Box::new(response)));
+        }
+        if matches!(response.status, 204 | 205) {
+            return Ok(InteractiveFetch::Document(FetchedDocument::Http(Box::new(
+                response,
+            ))));
         }
         let computed_type = crate::download::computed_mime_type(&response);
         // Media plays inline in graphical frontends: a media document
@@ -5448,6 +5730,7 @@ mod tests {
             None,
             NavigationIntent::New,
             None,
+            "",
         )
         .await
         .unwrap();
@@ -5511,6 +5794,7 @@ mod tests {
                 None,
                 NavigationIntent::New,
                 None,
+                "",
             )
             .await
             .unwrap();
@@ -6032,6 +6316,317 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_worker_forwarded_navigation_keeps_url_and_commits_response_origin() {
+        // HTML #initialise-the-document-object / #determining-the-origin:
+        // creation URL comes from the request, origin from the response.
+        let remote_base = Arc::new(std::sync::Mutex::new(String::new()));
+        let remote_for_document = remote_base.clone();
+        let remote=crate::http::referer_server::Server::start(move |path| {
+            let base=remote_for_document.lock().unwrap().clone();
+            let body=if path=="/document" {format!(r#"<!doctype html><body>forwarded<script>
+                (async()=>{{
+                    const result={{origin:globalThis.origin,locationOrigin:location.origin,url:location.href,
+                        storage:localStorage.getItem('servo-origin-key'),controlled:!!navigator.serviceWorker.controller}};
+                    if(self!==top){{parent.postMessage(result,'*');return;}}
+                    localStorage.setItem('servo-origin-key','new');
+                    result.after=localStorage.getItem('servo-origin-key');
+                    try{{result.same=await(await fetch('{base}/echo',{{method:'POST',mode:'same-origin',body:'probe'}})).text();}}
+                    catch(error){{result.same=error.name;}}
+                    const workerURL=URL.createObjectURL(new Blob([
+                        "fetch('{base}/echo',{{mode:'same-origin'}}).then(r=>r.text()).then(v=>postMessage(v),e=>postMessage(e.name))"
+                    ],{{type:'text/javascript'}}));
+                    const worker=new Worker(workerURL);
+                    result.worker=await new Promise(resolve=>{{worker.onmessage=e=>resolve(e.data);worker.onerror=e=>resolve(e.message);}});
+                    worker.terminate();URL.revokeObjectURL(workerURL);
+                    try{{await fetch('/wrong-origin',{{mode:'same-origin'}});result.cross='BAD';}}
+                    catch(error){{result.cross=error.name;}}
+                    await fetch('/origin-report?'+encodeURIComponent(JSON.stringify(result)),{{mode:'no-cors'}});
+                }})().catch(error=>fetch('/origin-failed?'+encodeURIComponent(error.message),{{mode:'no-cors'}}));
+            </script>"#)}else{"echo".into()};
+            (if path=="/document"{"text/html"}else{"text/plain"}.into(),"Access-Control-Allow-Origin: *\r\n".into(),body.into_bytes())
+        }).await;
+        // Distinct ports give distinct origins while respecting the browser's
+        // existing local-network subresource policy. Cross-site cookie context
+        // is covered separately by the native effective-origin regression.
+        let remote_url = remote.base.clone();
+        *remote_base.lock().unwrap() = remote_url.clone();
+        let remote_for_worker = remote_url.clone();
+        let server=crate::http::referer_server::Server::start(move |path| {
+            let (mime,body)=match path {
+                "/sw.js"=>("text/javascript",format!(r#"
+                    addEventListener('activate',event=>event.waitUntil(clients.claim()));
+                    addEventListener('fetch',event=>{{
+                        if(['/frame','/forward'].includes(new URL(event.request.url).pathname))
+                            event.respondWith(fetch('{remote_for_worker}/document').catch(error=>{{
+                                fetch('/origin-failed?'+encodeURIComponent('worker '+error.message));throw error;
+                            }}));
+                    }});
+                "#)),
+                "/start"=>("text/html",r#"<!doctype html><body>original<script>
+                    (async()=>{
+                        localStorage.setItem('servo-origin-key','old');
+                        await navigator.serviceWorker.register('/sw.js');await navigator.serviceWorker.ready;
+                        if(!navigator.serviceWorker.controller)await new Promise(r=>navigator.serviceWorker.oncontrollerchange=r);
+                        const frame=document.createElement('iframe');
+                        const message=new Promise(resolve=>addEventListener('message',event=>{
+                            if(event.source===frame.contentWindow)resolve(event);
+                        }));
+                        frame.src='/frame';document.body.append(frame);
+                        const event=await message;
+                        await fetch('/frame-report?'+encodeURIComponent(JSON.stringify({data:event.data,origin:event.origin,hidden:frame.contentDocument===null})));
+                        location.assign('/forward');
+                    })().catch(error=>fetch('/origin-failed?'+encodeURIComponent(error.message)));
+                </script>"#.into()),
+                _=>("text/plain","ok".into()),
+            };
+            (mime.into(),"Access-Control-Allow-Origin: *\r\n".into(),body.into_bytes())
+        }).await;
+        let mut browser =
+            BrowserController::new(Handle::current(), || {}, CssSize::new(800., 600.));
+        browser.handle_action(UserAction::Navigate(format!("{}/start", server.base)));
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        let report = loop {
+            browser.process_async_events();
+            if let Some((path, _)) = server
+                .log
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(path, _)| path.starts_with("/origin-report?"))
+                .cloned()
+            {
+                break path;
+            }
+            assert!(
+                !server
+                    .log
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(path, _)| path.starts_with("/origin-failed?")),
+                "forwarded navigation script failed: {:?}",
+                server.log.lock().unwrap()
+            );
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "forwarded navigation did not finish: {:?}, remote {:?}, {}",
+                server.log.lock().unwrap(),
+                remote.log.lock().unwrap(),
+                browser.status
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+        let decode = |path: &str| -> serde_json::Value {
+            let query = format!("value={}", path.split_once('?').unwrap().1);
+            let value = url::form_urlencoded::parse(query.as_bytes())
+                .next()
+                .unwrap()
+                .1;
+            serde_json::from_str(&value).unwrap()
+        };
+        let result = decode(&report);
+        let frame_path = server
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(path, _)| path.starts_with("/frame-report?"))
+            .unwrap()
+            .0
+            .clone();
+        let frame = decode(&frame_path);
+        assert_eq!(result["origin"], remote_url);
+        assert_eq!(result["locationOrigin"], server.base);
+        assert_eq!(result["url"], format!("{}/forward", server.base));
+        assert_eq!(result["storage"], serde_json::Value::Null);
+        assert_eq!(result["after"], "new");
+        assert_eq!(result["same"], "echo");
+        assert_eq!(result["worker"], "echo");
+        assert_eq!(result["cross"], "TypeError");
+        assert_eq!(result["controlled"], true);
+        assert_eq!(frame["origin"], remote_url);
+        assert_eq!(frame["hidden"], true);
+        assert_eq!(frame["data"]["origin"], remote_url);
+        assert_eq!(frame["data"]["locationOrigin"], server.base);
+        assert_eq!(frame["data"]["storage"], serde_json::Value::Null);
+        assert!(
+            !server
+                .log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(path, _)| path == "/wrong-origin")
+        );
+        let remote_heads = remote.heads.lock().unwrap();
+        let head = remote_heads
+            .iter()
+            .find(|head| head.starts_with("POST /echo "))
+            .unwrap();
+        assert!(
+            head.to_ascii_lowercase()
+                .contains(&format!("origin: {remote_url}\r\n")),
+            "{head}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_worker_focus_and_open_window_use_native_frontend_actions() {
+        let server=crate::http::referer_server::Server::start(|path|{
+            let(mime,body)=match path {
+                "/sw.js"=>("text/javascript",r#"
+                    addEventListener('activate',e=>e.waitUntil(clients.claim()));
+                    addEventListener('message',e=>e.waitUntil((async()=>{
+                        try {
+                            const focused=await e.source.focus();
+                            const opened=await clients.openWindow('/opened');
+                            e.source.postMessage(focused.focused+'|'+(opened.id!==focused.id)+'|'+new URL(opened.url).pathname);
+                        } catch(error) {e.source.postMessage('ERROR:'+error.name+':'+error.message);}
+                    })()));
+                "#),
+                "/start"=>("text/html",r#"<body>start<script>
+                    (async()=>{
+                        await navigator.serviceWorker.register('/sw.js');await navigator.serviceWorker.ready;
+                        if(!navigator.serviceWorker.controller)await new Promise(r=>navigator.serviceWorker.oncontrollerchange=r);
+                        navigator.serviceWorker.onmessage=e=>fetch('/report?'+encodeURIComponent(e.data));
+                        addEventListener('keydown',()=>navigator.serviceWorker.controller.postMessage('open'),{once:true});
+                        await fetch('/ready');
+                    })();
+                </script>"#),
+                "/opened"=>("text/html","<body>opened"),
+                _=>("text/plain","ok"),
+            };
+            (mime.into(),String::new(),body.as_bytes().to_vec())
+        }).await;
+        let mut browser =
+            BrowserController::new(Handle::current(), || {}, CssSize::new(800., 600.));
+        browser.set_new_traversables_available(true);
+        let mut opened = BrowserController::new(Handle::current(), || {}, CssSize::new(800., 600.));
+        opened.storage = browser.storage.clone();
+        browser.handle_action(UserAction::Navigate(format!("{}/start", server.base)));
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut activated = false;
+        let mut focused = false;
+        let mut created = false;
+        let report = loop {
+            browser.process_async_events();
+            opened.process_async_events();
+            if !activated
+                && browser.live_page.is_some()
+                && server
+                    .log
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(path, _)| path == "/ready")
+            {
+                activated = true;
+                browser.handle_action(UserAction::Key(KeyInput {
+                    key: Key::Character("a".into()),
+                    code: "KeyA".into(),
+                    location: 0,
+                    state: KeyState::Pressed,
+                    modifiers: Modifiers::default(),
+                    repeat: false,
+                    composing: false,
+                }));
+            }
+            if browser.take_focus_request() {
+                focused = true;
+                browser.handle_action(UserAction::Focus(true));
+            }
+            if let Some(NewTraversableRequest::Navigate(request)) = browser.take_new_traversable() {
+                created = true;
+                opened.open_new_traversable(request);
+            }
+            if let Some((path, _)) = server
+                .log
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(path, _)| path.starts_with("/report?"))
+                .cloned()
+            {
+                break path;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "window action did not finish: {:?}, {}",
+                server.log.lock().unwrap(),
+                browser.status
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+        assert_eq!(report, "/report?true%7Ctrue%7C%2Fopened");
+        assert!(activated && focused && created);
+        assert!(opened.address().ends_with("/opened"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_worker_navigate_commits_a_real_document_and_returns_its_client() {
+        // SW #client-navigate / #client-focus / #clients-openwindow. The
+        // promise resolves after a real frontend navigation commits.
+        let server=crate::http::referer_server::Server::start(|path|{
+            let(mime,body)=match path {
+                "/sw.js"=>("text/javascript",r#"
+                    let navigation;
+                    addEventListener('activate',e=>e.waitUntil(clients.claim()));
+                    addEventListener('fetch',e=>{if(new URL(e.request.url).pathname==='/next'){navigation=e;e.respondWith(fetch('/template'));}});
+                    addEventListener('message',e=>e.waitUntil((async()=>{
+                        const log=[];
+                        for(const f of [()=>e.source.focus(),()=>clients.openWindow('/opened'),()=>e.source.navigate('about:blank')]){
+                            try{await f();log.push('BAD');}catch(error){log.push(error.name);}
+                        }
+                        const next=await e.source.navigate('/next');
+                        next.postMessage(log.join('|')+'|'+(next.id!==e.source.id)+'|'+new URL(next.url).pathname+'|'+
+                            (navigation.replacesClientId===e.source.id)+'|'+(navigation.resultingClientId===next.id));
+                    })()));
+                "#),
+                "/start"=>("text/html",r#"<body>start<script>
+                    (async()=>{
+                        await navigator.serviceWorker.register('/sw.js');await navigator.serviceWorker.ready;
+                        if(!navigator.serviceWorker.controller)await new Promise(r=>navigator.serviceWorker.oncontrollerchange=r);
+                        navigator.serviceWorker.controller.postMessage('navigate');
+                    })().catch(e=>fetch('/failure?'+encodeURIComponent(e.message)));
+                </script>"#),
+                "/template"=>("text/html",r#"<body>next<script>
+                    navigator.serviceWorker.onmessage=e=>fetch('/report?'+encodeURIComponent(e.data));
+                </script>"#),
+                _=>("text/plain","ok"),
+            };
+            (mime.into(),String::new(),body.as_bytes().to_vec())
+        }).await;
+        let mut browser =
+            BrowserController::new(Handle::current(), || {}, CssSize::new(800., 600.));
+        browser.handle_action(UserAction::Navigate(format!("{}/start", server.base)));
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let report = loop {
+            browser.process_async_events();
+            if let Some((path, _)) = server
+                .log
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(path, _)| path.starts_with("/report?"))
+                .cloned()
+            {
+                break path;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "window action did not finish: {:?}, {}",
+                server.log.lock().unwrap(),
+                browser.status
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+        assert_eq!(
+            report,
+            "/report?InvalidAccessError%7CInvalidAccessError%7CTypeError%7Ctrue%7C%2Fnext%7Ctrue%7Ctrue"
+        );
+        assert!(browser.address().ends_with("/next"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn desktop_navigations_use_the_source_referrer_policy_and_load_blob_documents() {
         // HTML #navigate and Fetch #main-fetch steps 7-8: a page-directed navigation's
         // referrer is its source Document's URL under the navigation's referrerPolicy, else
@@ -6401,10 +6996,19 @@ mod tests {
             browser.pending.as_ref().map(|pending| pending.intent),
             Some(NavigationIntent::Reload)
         );
-        // Leaving unloads the page rather than killing it.
-        assert!(matches!(next(&mut rx), Ok(crate::js::PageCmd::Unload)));
-        assert!(browser.live_page.is_none());
+        // HTML #navigate aborts fetches now; an eventual 204/205 must
+        // preserve the old Document and its actor until a real commit.
+        assert!(matches!(next(&mut rx), Ok(crate::js::PageCmd::StopLoading)));
+        assert!(browser.live_page.is_some());
+        assert!(next(&mut rx).is_err(), "the old Document has not unloaded");
+        let generation = browser.pending.as_ref().unwrap().generation;
         browser.task.take().unwrap().abort();
+        assert!(browser.finish_fetch(generation, Ok(desktop_page(&page_url, None).document)));
+        assert!(matches!(next(&mut rx), Ok(crate::js::PageCmd::Unload)));
+        assert!(
+            browser.live_page.is_none(),
+            "the replacement committed before unloading"
+        );
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         browser.current = Some(desktop_page(&page_url, None));
@@ -6423,6 +7027,8 @@ mod tests {
                 .map(|pending| pending.target.to_string()),
             Some(String::from("https://leave.test/late"))
         );
+        assert!(matches!(next(&mut rx), Ok(crate::js::PageCmd::StopLoading)));
+        assert!(browser.live_page.is_some());
         browser.task.take().unwrap().abort();
 
         // Killing a page retires it without unloading; a frontend without
@@ -7195,6 +7801,8 @@ mod tests {
             .unwrap();
         let mut browser =
             BrowserController::new(runtime.handle().clone(), || {}, CssSize::new(640., 480.));
+        let (commands, _receiver) = tokio::sync::mpsc::channel(16);
+        browser.live_page = Some(crate::js::PageHandle::from_test_sender(commands));
         let generation = browser.generation;
         let update = |animation_frame| CoreEvent::Page {
             generation,
@@ -8255,6 +8863,7 @@ mod whois_tests {
             None,
             NavigationIntent::New,
             None,
+            "",
         )
         .await
         .unwrap();

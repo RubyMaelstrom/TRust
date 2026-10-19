@@ -337,7 +337,7 @@ fn absolute_length(text: &str, units: Units, viewport: Vp) -> Option<f32> {
 }
 
 /// The z component of `transform-origin` (its third value), in px.
-fn origin_depth(text: &str, units: Units, viewport: Vp) -> Option<f32> {
+pub(super) fn origin_depth(text: &str, units: Units, viewport: Vp) -> Option<f32> {
     let parts = components(text)?;
     absolute_length(parts.get(2)?, units, viewport)
 }
@@ -699,6 +699,33 @@ pub(crate) fn animation_steps(
         });
     }
     Some(steps)
+}
+
+/// CSS Transforms 2 #ctm: individual translate/rotate/scale precede the
+/// animated transform list, all within the same three-dimensional origin.
+pub(super) fn animation_individuals(
+    value: impl Fn(&str) -> Option<String>,
+    units: Units,
+    viewport: Vp,
+    reference: CssRect,
+) -> m3::Matrix3d {
+    Transform::parse(
+        |property| {
+            matches!(property, "translate" | "rotate" | "scale")
+                .then(|| value(property))
+                .flatten()
+        },
+        units,
+        viewport,
+    )
+    .map_or(m3::IDENTITY, |transform| {
+        transform
+            .operations
+            .iter()
+            .fold(m3::IDENTITY, |matrix, operation| {
+                m3::multiply(&matrix, &operation.matrix3d(reference))
+            })
+    })
 }
 
 /// The reference box and absolute transform origin (CSS Transforms 1

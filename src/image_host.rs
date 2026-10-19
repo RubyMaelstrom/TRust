@@ -32,6 +32,8 @@ pub(super) struct LoadedImage {
 /// Bytes behind one element request record (see `LoadedImage`).
 pub(super) struct ImagePayload {
     bytes: Arc<[u8]>,
+    pub(super) loaded_at: f64,
+    pub(super) source_handle: crate::render::ImageHandle,
 }
 
 impl ImagePayload {
@@ -56,6 +58,7 @@ pub(super) fn result_value(ctx: &mut Ctx, result: Option<LoadedImage>) -> Value 
     let Some(state) = ctx.host_mut::<HostState>() else {
         return Value::Null;
     };
+    let source_handle = crate::render::ImageHandle::for_source(&loaded.source);
     let previous = state
         .images
         .borrow_mut()
@@ -78,6 +81,8 @@ pub(super) fn result_value(ctx: &mut Ctx, result: Option<LoadedImage>) -> Value 
         token,
         ImagePayload {
             bytes: loaded.bytes,
+            loaded_at: crate::performance::now_ms(),
+            source_handle,
         },
     );
     // Promise resolution must not consult an author-supplied Array/Object
@@ -163,10 +168,12 @@ pub(super) fn document_request(
     let client = super::request_context_url(ctx, context);
     let restricted = super::cookie_context_for_id(ctx, context).cross_site_ancestor;
     let state = ctx.host_mut::<HostState>().expect("image host");
+    let origin = super::request_origin_for_context(state, context, &client);
     let store = state.network.as_ref()?.cache.images();
     let policy = cors.map(|credentials| (RequestMode::Cors, credentials));
     let Some((handle, cache, mut request)) = super::prepare_uncounted_client_request(
         state,
+        context,
         &client,
         source,
         "GET".into(),
@@ -179,7 +186,7 @@ pub(super) fn document_request(
                 ImageRequestKey {
                     url: url.to_string(),
                     cors,
-                    origin: client.origin(),
+                    origin: origin.origin(),
                     cookie_restricted: restricted,
                 },
                 context,
@@ -194,12 +201,13 @@ pub(super) fn document_request(
         referrer_policy,
         &mut request,
     );
+    request.service_worker = super::service_worker_host::fetch::for_context(state, context);
     let referrer_policy =
         referrer_policy.unwrap_or_else(|| super::environment_referrer_policy(state, context));
     crate::http::set_image_accept(&mut request);
     crate::http::set_fetch_metadata(
         &mut request,
-        &client,
+        &origin,
         "image",
         if cors.is_some() { "cors" } else { "no-cors" },
     );
@@ -211,7 +219,7 @@ pub(super) fn document_request(
     let key = ImageRequestKey {
         url: request.url.to_string(),
         cors,
-        origin: client.origin(),
+        origin: origin.origin(),
         cookie_restricted: request
             .cookie_context
             .as_ref()
@@ -221,7 +229,13 @@ pub(super) fn document_request(
     // a matching `<link rel=preload as=image>`, retaining taint through every
     // redirect hop. A raw page-cache entry cannot authorize a CORS image.
     if cors.is_none()
-        && let Some(preloaded) = cache.peek_resource(&request.url, &client, "image", None)
+        && let Some(preloaded) = cache.peek_resource_for_client(
+            &request.url,
+            &client,
+            "image",
+            None,
+            request.service_worker.as_ref(),
+        )
     {
         let (fetch, join) = store.adopt(key, context, async move {
             preloaded

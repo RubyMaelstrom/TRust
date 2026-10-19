@@ -461,6 +461,51 @@ struct Running {
     generation: u64,
     tree_order: usize,
 }
+
+/// DOM-free operands for a transition underneath a retained animation stack.
+/// CSS Animations 2 #animation-composition / Web Animations #effect-composition.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct CompositorTransition {
+    from: Animated,
+    to: Animated,
+    start: f64,
+    duration: f64,
+    easing: Easing,
+}
+
+impl CompositorTransition {
+    pub(super) fn sample(&self, now: f64) -> values::Value {
+        let progress = if now < self.start {
+            0.
+        } else if self.duration == 0. {
+            1.
+        } else {
+            ((now - self.start) / self.duration).clamp(0., 1.) as f32
+        };
+        match self
+            .from
+            .mix(&self.to, self.easing.sample(progress), &|| None)
+        {
+            Animated::Transform(transform) => values::Value::Transform(transform),
+            Animated::Linear(value) => values::Value::Number(value.px.clamp(0., 1.)),
+            Animated::Value(_, value) => value,
+        }
+    }
+
+    pub(super) fn wake(&self, now: f64) -> Option<f64> {
+        if now < self.start {
+            Some(self.start - now)
+        } else if now < self.start + self.duration {
+            Some(0.)
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.from.retained_bytes() + self.to.retained_bytes()
+    }
+}
 impl Running {
     fn progress(&self, now: f64) -> f32 {
         if now < self.start {
@@ -654,6 +699,31 @@ impl State {
         }
         let property = property_index(name)?;
         self.values.get(&((id, None), property)).cloned()
+    }
+
+    pub(super) fn compositor_transition(
+        &self,
+        id: NodeId,
+        name: &str,
+    ) -> Option<CompositorTransition> {
+        if !matches!(name, "transform" | "opacity") {
+            return None;
+        }
+        let property = property_index(name)?;
+        let transition = self.running.get(&((id, None), property))?;
+        if [&transition.from, &transition.to]
+            .into_iter()
+            .any(|value| matches!(value, Animated::Transform(transform) if !transform.affine()))
+        {
+            return None;
+        }
+        Some(CompositorTransition {
+            from: transition.from.clone(),
+            to: transition.to.clone(),
+            start: transition.start,
+            duration: transition.duration,
+            easing: transition.easing,
+        })
     }
     /// The transition-origin value of `name` on `id`'s `which`
     /// pseudo-element.
@@ -1439,19 +1509,32 @@ impl Dom {
         if state.values != values {
             // A presentation revision, not a DOM mutation: live collections
             // and MutationObservers must not see style interpolation as edits.
-            self.layout_presentation_epoch = self.layout_presentation_epoch.wrapping_add(1);
             let changed = state
                 .values
                 .keys()
                 .chain(values.keys())
                 .filter(|key| state.values.get(key) != values.get(key))
-                .map(|((node, _), _)| *node)
+                .copied()
+                .collect::<FxHashSet<_>>()
+                .into_iter()
+                .filter_map(|((node, pseudo), property)| {
+                    if pseudo.is_none()
+                        && self.defer_css_compositor_change(node, property_name(property))
+                    {
+                        None
+                    } else {
+                        Some(node)
+                    }
+                })
                 .collect::<FxHashSet<_>>();
-            self.invalidate_transition_layout(&changed.into_iter().collect::<Vec<_>>());
-            self.hidden_cache.get_mut().slots.clear();
-            self.unattributed_geometry_change();
-            self.dirty_attributed = false;
-            self.dirty = true;
+            if !changed.is_empty() {
+                self.layout_presentation_epoch = self.layout_presentation_epoch.wrapping_add(1);
+                self.invalidate_transition_layout(&changed.into_iter().collect::<Vec<_>>());
+                self.hidden_cache.get_mut().slots.clear();
+                self.unattributed_geometry_change();
+                self.dirty_attributed = false;
+                self.dirty = true;
+            }
         }
         state.values = values;
         state.now = now;

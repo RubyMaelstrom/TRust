@@ -16,6 +16,7 @@
     const parse = JSON.parse, stringify = JSON.stringify, toWellFormed = String.prototype.toWellFormed;
     const split = String.prototype.split, test = RegExp.prototype.test, encodedSeparator=/%2f|%5c/i;
     const iterator = Symbol.iterator, setPrototype=Object.setPrototypeOf;
+    const fetchAPI=g.__fetch_api;
     const workers = create(null), registrations = create(null), pending = create(null);
     const own = value => { const shared=apply(weakGet, slots, [value]);return shared&&apply(hasOwn,shared,["serviceWorker"])&&shared.serviceWorker; };
     const remember = (value, record) => {
@@ -115,6 +116,10 @@
                 const value=create(CookieStoreManager.prototype), manager=record("CookieStoreManager");
                 manager.owner=r;remember(value,manager);return value;
             };
+            r.makePreload=()=>{
+                const value=create(NavigationPreloadManager.prototype),manager=record("NavigationPreloadManager");
+                manager.owner=r;remember(value,manager);return value;
+            };
             remember(value,r);registrations[info.id]=value;
         }
         const r=own(value);
@@ -181,9 +186,24 @@
         get visibilityState(){return brand(this,"WindowClient").info.visibilityState;}
         get focused(){return brand(this,"WindowClient").info.focused;}
         get ancestorOrigins(){return brand(this,"WindowClient").ancestors;}
+        focus(){
+            try{const r=brand(this,"WindowClient"),input=inputFor(r);input.client=r.info.id;
+                return r.transport("focusClient",input,value=>client(value));}
+            catch(error){return rejected(error);}
+        }
+        navigate(url){
+            try{const r=brand(this,"WindowClient"),input=inputFor(r);if(!arguments.length)throw new TypeErrorCtor("navigate requires a URL");
+                input.client=r.info.id;input.url=usv(url);return r.transport("navigateClient",input,value=>value===null?null:client(value));}
+            catch(error){return rejected(error);}
+        }
     }
     class Clients {
         constructor(){throw new TypeErrorCtor("Illegal constructor");}
+        openWindow(url){
+            try{const r=brand(this,"Clients"),input=inputFor(r);if(!arguments.length)throw new TypeErrorCtor("openWindow requires a URL");
+                input.url=usv(url);return r.transport("openWindow",input,value=>value===null?null:client(value));}
+            catch(error){return rejected(error);}
+        }
         get(id){
             try{
                 const r=brand(this,"Clients");
@@ -215,6 +235,11 @@
         get active() { return brand(this,"ServiceWorkerRegistration").active; }
         get scope() { return brand(this,"ServiceWorkerRegistration").scope; }
         get updateViaCache() { return brand(this,"ServiceWorkerRegistration").updateViaCache; }
+        get navigationPreload() {
+            const r=brand(this,"ServiceWorkerRegistration");
+            if(!r.preload)r.preload=r.makePreload();
+            return r.preload;
+        }
         update() {
             try {const r=brand(this,"ServiceWorkerRegistration");return r.transport("update",inputFor(r),r.convert);}
             catch(error) {return rejected(error);}
@@ -223,6 +248,28 @@
             try {const r=brand(this,"ServiceWorkerRegistration");return r.transport("unregister",inputFor(r),value=>value);}
             catch(error) {return rejected(error);}
         }
+    }
+    class NavigationPreloadManager {
+        constructor(){throw new TypeErrorCtor("Illegal constructor");}
+        enable(){return preloadOperation(this,"preloadEnable");}
+        disable(){return preloadOperation(this,"preloadDisable");}
+        getState(){return preloadOperation(this,"preloadState",undefined,true);}
+        setHeaderValue(value){
+            try{
+                brand(this,"NavigationPreloadManager");
+                if(arguments.length<1)throw new TypeErrorCtor("setHeaderValue requires a value");
+                value=fetchAPI.normalizeHeaderValue(fetchAPI.toByteString(value));
+                if(!fetchAPI.isHeaderValue(value))throw new TypeErrorCtor("Invalid header value");
+                return preloadOperation(this,"preloadHeader",value);
+            }catch(error){return rejected(error);}
+        }
+    }
+    function preloadOperation(receiver,op,value,result=false){
+        try{
+            const r=brand(receiver,"NavigationPreloadManager"),input=inputFor(r.owner);
+            if(value!==undefined)input.value=value;
+            return r.owner.transport(op,input,result?v=>v:()=>undefined);
+        }catch(error){return rejected(error);}
     }
     function subscriptions(value) {
         if(!object(value))throw new TypeErrorCtor("Subscriptions must be a sequence");
@@ -335,7 +382,7 @@
     handlers(ServiceWorker,["statechange","error"]);
     handlers(ServiceWorkerRegistration,["updatefound"]);
     handlers(ServiceWorkerContainer,["controllerchange","message","messageerror"]);
-    const interfaces=[ServiceWorker,ServiceWorkerRegistration,ServiceWorkerContainer];
+    const interfaces=[ServiceWorker,ServiceWorkerRegistration,ServiceWorkerContainer,NavigationPreloadManager];
     if(adapter.window||adapter.service)interfaces[interfaces.length]=CookieStoreManager;
     if(adapter.service){interfaces[interfaces.length]=Client;interfaces[interfaces.length]=WindowClient;interfaces[interfaces.length]=Clients;}
     for(const C of interfaces) {
@@ -392,6 +439,16 @@
         },
         clientInfo(){return stringify(adapter.clientInfo());},
         clientChanged(){if(adapter.window)native("clientState",adapter.clientInfo());},
+        initialNavigation(snapshot){
+            // HTML reuses the initial Window/ESO and its container object.
+            // Expose the committed controller before its new document scripts;
+            // a native notice queues any controllerchange event separately.
+            state.controller=worker(snapshot.controller);state.readyInfo=snapshot.ready;
+            if(state.readyInfo!==null&&state.readyResolve)adapter.queue(()=>{
+                if(state.readyResolve){state.readyResolve(registration(state.readyInfo));state.readyResolve=null;}
+            });
+            if(adapter.documentLoaded&&!state.messagesEnabled)adapter.documentLoaded(enableMessages);
+        },
         resident(){
             for(const id in pending)return true;
             if(state.readyResolve!==null)return true;

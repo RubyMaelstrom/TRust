@@ -824,6 +824,9 @@ pub struct Dom {
     /// index splices them in place of each `@import`, and the CSSOM exposes
     /// each as a CSSImportRule's style sheet.
     imported_sheets: FxHashMap<String, cssom::ImportedSheet>,
+    // CSSOM #concept-css-style-sheet-owner-node / CSS Cascade 5 #at-import:
+    // identical URLs in different documents can have different responses.
+    document_imported_sheets: FxHashMap<NodeId, FxHashMap<String, cssom::ImportedSheet>>,
     /// CSSOM edits replace a sheet's rule list, without mutating its DOM text.
     cssom_sheets: FxHashMap<NodeId, cssom::Sheet>,
     cssom_sheet_versions: FxHashMap<NodeId, u64>,
@@ -1342,6 +1345,7 @@ impl Dom {
             adopted_styles,
             external_sheets,
             imported_sheets,
+            document_imported_sheets,
             cssom_sheets,
             cssom_sheet_versions,
             cssom_inline,
@@ -1616,6 +1620,19 @@ impl Dom {
         for (url, sheet) in imported_sheets {
             bytes = bytes
                 .saturating_add(url.capacity() + sheet.text.capacity() + sheet.base.capacity());
+        }
+        fixed_map!(
+            document_imported_sheets,
+            (NodeId, FxHashMap<String, cssom::ImportedSheet>)
+        );
+        for sheets in document_imported_sheets.values() {
+            bytes = bytes.saturating_add(
+                sheets.capacity() * std::mem::size_of::<(String, cssom::ImportedSheet)>(),
+            );
+            for (url, sheet) in sheets {
+                bytes = bytes
+                    .saturating_add(url.capacity() + sheet.text.capacity() + sheet.base.capacity());
+            }
         }
 
         match style_cache.try_borrow() {
@@ -1986,6 +2003,7 @@ impl Dom {
             adopted_styles: FxHashMap::default(),
             external_sheets: FxHashMap::default(),
             imported_sheets: FxHashMap::default(),
+            document_imported_sheets: FxHashMap::default(),
             cssom_sheets: FxHashMap::default(),
             cssom_sheet_versions: FxHashMap::default(),
             cssom_inline: FxHashMap::default(),
@@ -6240,6 +6258,7 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
             return Vec::new();
         }
 
+        let mut occurrences = std::collections::HashMap::<String, usize>::new();
         names
             .iter()
             .enumerate()
@@ -6308,6 +6327,12 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
                             .map(|frame| frame.value.clone()),
                     })
                     .collect::<Vec<_>>();
+                let occurrence = occurrences.entry(name.clone()).or_default();
+                let will_change = self
+                    .0
+                    .animation_will_change(id, &name, *occurrence)
+                    .unwrap_or(true);
+                *occurrence += 1;
                 (!keyframes.is_empty()).then_some(CssAnimationDefinition {
                     name,
                     duration_seconds,
@@ -6317,6 +6342,7 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
                     fill_mode,
                     timing_function,
                     running,
+                    will_change,
                     keyframes,
                 })
             })
@@ -10530,15 +10556,21 @@ impl Dom {
                     .then_some((sheet.location.as_str(), sheet.referrer_policy))
             })
             .or_else(|| {
-                self.imported_sheets.iter().find_map(|(location, sheet)| {
-                    (sheet.base == base.as_str())
-                        .then_some((location.as_str(), sheet.referrer_policy))
-                })
+                self.document_imported_sheets
+                    .get(&document)
+                    .into_iter()
+                    .flat_map(|sheets| sheets.iter())
+                    .chain(self.imported_sheets.iter())
+                    .find_map(|(location, sheet)| {
+                        (sheet.base == base.as_str())
+                            .then_some((location.as_str(), sheet.referrer_policy))
+                    })
             })?;
         Some(crate::http::SheetReferrer {
             source: Some(url::Url::parse(location).ok()?),
             policy: policy.unwrap_or(document_policy),
             document_policy,
+            service_worker: None,
         })
     }
 
@@ -11139,13 +11171,36 @@ impl Dom {
     /// candidate links (this used to walk the whole document once per
     /// sheet — O(sheets × nodes) on a 48-sheet page).
     pub fn attach_external_sheets(&mut self, sheets: &[crate::http::PageSheet]) {
+        self.attach_external_sheets_in_document(sheets, None);
+    }
+
+    /// Every nested Document owns its linked sheets, even if a worker gives
+    /// two identical request URLs different bodies (HTML #link-type-stylesheet).
+    pub(crate) fn attach_document_sheets(
+        &mut self,
+        document: NodeId,
+        sheets: &[crate::http::PageSheet],
+    ) {
+        self.attach_external_sheets_in_document(sheets, Some(document));
+    }
+
+    fn attach_external_sheets_in_document(
+        &mut self,
+        sheets: &[crate::http::PageSheet],
+        document: Option<NodeId>,
+    ) {
         if sheets.is_empty() {
             return;
         }
         // Imported sheets first: a link's cascade text splices them.
         let mut imported = false;
         for sheet in sheets.iter().filter(|sheet| sheet.link_href.is_none()) {
-            self.imported_sheets.insert(
+            let imports = if let Some(document) = document {
+                self.document_imported_sheets.entry(document).or_default()
+            } else {
+                &mut self.imported_sheets
+            };
+            imports.insert(
                 sheet.url.clone(),
                 cssom::ImportedSheet {
                     text: sheet.text.clone(),
@@ -11160,6 +11215,7 @@ impl Dom {
             .shadow_including_subtree(self.document())
             .into_iter()
             .filter(|&id| self.is_stylesheet_link(id))
+            .filter(|&id| document.is_none_or(|document| self.owner_document(id) == Some(document)))
             .filter_map(|id| self.attr(id, "href").map(|h| (id, h.to_string())))
             .collect();
         for sheet in sheets {
@@ -11177,9 +11233,9 @@ impl Dom {
             if hits.is_empty() {
                 continue;
             }
-            let linked = self.linked_sheet(sheet);
             for id in hits {
-                self.external_sheets.insert(id, linked.clone());
+                let linked = self.linked_sheet(sheet, Some(id));
+                self.external_sheets.insert(id, linked);
                 self.touch_style_at(id);
             }
         }
@@ -11188,6 +11244,9 @@ impl Dom {
                 .shadow_including_subtree(self.document())
                 .into_iter()
                 .filter(|&id| self.tag_name(id) == Some("style"))
+                .filter(|&id| {
+                    document.is_none_or(|document| self.owner_document(id) == Some(document))
+                })
                 .collect();
             for id in styles {
                 self.touch_style_at(id);
@@ -11197,10 +11256,14 @@ impl Dom {
 
     /// A `<link>` sheet's record, with its cascade text spliced from the
     /// imported sheets already attached.
-    fn linked_sheet(&self, sheet: &crate::http::PageSheet) -> cssom::LinkedSheet {
+    fn linked_sheet(
+        &self,
+        sheet: &crate::http::PageSheet,
+        owner: Option<NodeId>,
+    ) -> cssom::LinkedSheet {
         let base = url::Url::parse(&sheet.base).ok();
         let cascade = self
-            .splice_imported_sheets(&sheet.text, base.as_ref(), Some(&sheet.url), None)
+            .splice_imported_sheets(&sheet.text, base.as_ref(), Some(&sheet.url), owner)
             .unwrap_or_else(|| sheet.text.clone());
         cssom::LinkedSheet {
             text: sheet.text.clone(),
@@ -11246,7 +11309,7 @@ impl Dom {
             );
         }
         self.reset_cssom_sheet(id);
-        let linked = self.linked_sheet(&sheet);
+        let linked = self.linked_sheet(&sheet, Some(id));
         self.external_sheets.insert(id, linked);
         self.touch_style_at(id);
     }
@@ -12176,7 +12239,17 @@ impl Dom {
         self.document_modes
             .insert(document, doc.document_mode(doc.document()));
         if let Ok(base_url) = url::Url::parse(base) {
-            self.absolutize_subtree_urls(new_html, &base_url);
+            // HTML #document-base-url: a frame's first base[href] resolves
+            // against its own fallback base, before rewriting its resource
+            // attributes for the shared presentation arena.
+            let resource_base = self
+                .descendants(new_html)
+                .find(|&node| {
+                    self.tag_name(node) == Some("base") && self.attr(node, "href").is_some()
+                })
+                .and_then(|node| base_url.join(self.attr(node, "href")?.trim()).ok())
+                .unwrap_or_else(|| base_url.clone());
+            self.absolutize_subtree_urls(new_html, &resource_base);
             self.properties
                 .document_bases
                 .insert(document, base_url.clone());
@@ -23043,6 +23116,9 @@ pub(crate) struct CssAnimationDefinition {
     pub fill_mode: String,
     pub timing_function: String,
     pub running: bool,
+    /// CSS Animations 1 #animations: implicit will-change until finished,
+    /// retained afterwards only by a forwards/both fill mode.
+    pub will_change: bool,
     pub keyframes: Vec<CssAnimationKeyframe>,
 }
 
@@ -23687,10 +23763,9 @@ fn parse_decl_in(decl: &str, quirks: bool) -> Option<(String, String, bool)> {
     }
     // CSS Sizing 3 #sizing-values: the sizing properties take `auto` (or
     // `none` for the maxima), a non-negative <length-percentage>,
-    // `min-content`, `max-content`, `fit-content` and `fit-content()`.
-    // Anything else, including box sizes layout does not implement such as
-    // `stretch` and its `-webkit-fill-available` alias, is invalid at parse
-    // time, so an earlier fallback declaration stays in force.
+    // `min-content`, `max-content`, `fit-content`, `fit-content()` and
+    // `stretch`. Unsupported aliases such as `-webkit-fill-available` remain
+    // invalid, preserving an earlier supported fallback.
     if is_sizing_property(&k)
         && wide_keyword(&value).is_none()
         && find_var_function(&value).is_none()
@@ -30786,7 +30861,7 @@ mod tests {
     fn invalid_sizing_declarations_preserve_earlier_fallbacks() {
         let dom = Dom::parse_document(
             "<style>#x {min-height:100vh; min-height:-webkit-fill-available; \
-             width:50%; width:-10px; height:2em; height:stretch; \
+             width:50%; width:-10px; height:2em; height:unsupported-size; \
              max-width:none; max-width:auto; min-width:min-content; min-width:none; \
              max-height:fit-content(20px); flex-basis:content}</style><p id=x>x</p>",
         );
