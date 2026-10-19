@@ -936,6 +936,7 @@ pub(super) fn accepts_longhand(property: &str, value: &str) -> bool {
         }
         "overflow-x" | "overflow-y" => one_of("visible hidden clip scroll auto overlay"),
         "overscroll-behavior-x" | "overscroll-behavior-y" => one_of("auto contain none chain"),
+        "touch-action" => crate::touch::TouchAction::parse(value).is_some(),
         "overflow-wrap" => one_of("normal break-word anywhere"),
         "word-break" => one_of("normal break-all keep-all break-word"),
         "text-wrap-mode" => one_of("wrap nowrap"),
@@ -1472,6 +1473,11 @@ fn public_value(property: &str, value: String) -> String {
     }
     if let Some(number) = opacity_percentage_number(property, &value) {
         return number;
+    }
+    if property == "touch-action"
+        && let Some(action) = crate::touch::TouchAction::parse(&value)
+    {
+        return action.to_css();
     }
     match crate::dom::serialize_css_value_components(&value) {
         std::borrow::Cow::Borrowed(_) => value,
@@ -2474,6 +2480,62 @@ mod tests {
             dom.computed_value_resolved(p, "width").as_deref(),
             Some("50px")
         );
+    }
+
+    #[test]
+    fn touch_action_validates_groups_and_is_not_inherited() {
+        for (value, serialized) in [
+            ("PAN-y pAn-x", "pan-x pan-y"),
+            ("pinch-zoom pan-up pan-right", "pan-right pan-up pinch-zoom"),
+            ("pan-y pinch-zoom pan-x", "manipulation"),
+            (r"pan-\78", "pan-x"),
+        ] {
+            assert_eq!(public_value("touch-action", value.into()), serialized);
+            let dom = Dom::new();
+            assert_eq!(
+                dom.cssom_serialize_resolved(dom.document(), "touch-action", value),
+                serialized
+            );
+        }
+        for value in [
+            "auto",
+            "none",
+            "manipulation",
+            "pan-y pinch-zoom",
+            "pan-down pan-left",
+            r"pan-\78",
+        ] {
+            assert!(supports("touch-action", value), "{value}");
+        }
+        for value in [
+            "pan-x pan-right",
+            "pan-up pan-down",
+            "none pinch-zoom",
+            "pan-inline",
+            "pan-x,",
+        ] {
+            assert!(!supports("touch-action", value), "{value}");
+        }
+        let dom = Dom::parse_document(
+            "<style>#parent{touch-action:none} #child{touch-action:initial}\
+             #explicit{touch-action:inherit} #invalid{touch-action:pan-y;touch-action:pan-y pan-up}</style>\
+             <div id=parent><span id=child></span><span id=default></span><span id=explicit></span></div>\
+             <div id=invalid></div>",
+        );
+        for (id, expected) in [
+            ("parent", "none"),
+            ("child", "auto"),
+            ("default", "auto"),
+            ("explicit", "none"),
+            ("invalid", "pan-y"),
+        ] {
+            assert_eq!(
+                dom.cssom_resolved_value(dom.get_by_id(id).unwrap(), "touch-action")
+                    .as_deref(),
+                Some(expected),
+                "{id}"
+            );
+        }
     }
 
     #[test]

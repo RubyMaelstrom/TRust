@@ -1213,6 +1213,8 @@ mod tests {
         // Asking for a far lazy image would hold the snapshot until its
         // deadline; a page without a running observer loads it eagerly.
         let response = trust::http::Response {
+            internal: None,
+            service_client: None,
             url: Url::parse("https://images.example/page").unwrap(),
             status: 200,
             status_text: String::new(),
@@ -1271,6 +1273,8 @@ mod tests {
         // nothing about whether the server answered 404, so the driver reads the
         // verdict from the document itself.
         let missing = FetchedDocument::Http(Box::new(trust::http::Response {
+            internal: None,
+            service_client: None,
             url: Url::parse("https://example.com/gone").unwrap(),
             status: 404,
             status_text: String::new(),

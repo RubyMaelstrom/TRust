@@ -159,6 +159,32 @@ impl Agent {
 }
 
 impl Registry {
+    /// Discard in-flight transferred endpoints by capability key, returning
+    /// packets still queued for them so their own transfers can be released
+    /// too. Used when a serialized packet will never be deserialized.
+    pub(super) fn discard_transfers(&mut self, keys: &[String]) -> Vec<String> {
+        let mut queued = Vec::new();
+        for key in keys {
+            let Some(id) = self.ports.iter().find_map(|(&id, port)| {
+                (port.owner.is_none() && port.transfer_key.as_ref() == Some(key)).then_some(id)
+            }) else {
+                continue;
+            };
+            if let Some(port) = self.ports.remove(&id) {
+                self.queued_bytes -= port
+                    .messages
+                    .iter()
+                    .map(|(_, message)| message.len())
+                    .sum::<usize>();
+                queued.extend(port.messages.into_iter().map(|(_, message)| message));
+                if let Some(peer) = port.peer.and_then(|peer| self.ports.get_mut(&peer)) {
+                    peer.peer = None;
+                }
+            }
+        }
+        queued
+    }
+
     fn ready(&self, owner: Owner) -> Option<u64> {
         self.ports
             .iter()

@@ -685,6 +685,10 @@ impl DesktopWindow {
     /// with its page, tell the page it is hidden, and release what only
     /// presentation needs.
     fn hide_shown_tab(&mut self) {
+        self.cancel_touches();
+        // Pointer Events #dom-pointerevent-pointerid: another top-level
+        // context must not influence the identifiers assigned to this one.
+        self.touches = Default::default();
         self.close_context_menu();
         self.close_select_popup();
         self.release_native_pointer_lock(true);

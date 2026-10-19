@@ -1178,6 +1178,8 @@ mod tests {
 
     fn response(content_type: &str, body: &[u8], headers: Vec<(String, String)>) -> http::Response {
         http::Response {
+            internal: None,
+            service_client: None,
             url: Url::parse("https://example.test/files/report").unwrap(),
             status: 200,
             status_text: String::new(),

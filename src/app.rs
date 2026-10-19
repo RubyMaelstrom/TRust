@@ -4505,6 +4505,7 @@ impl App {
         let forms = std::mem::take(&mut g.doc.forms);
         let raw = std::mem::take(&mut g.doc.raw);
         let blobs = g.doc.blobs.take();
+        let service_client = g.doc.service_client.take();
         let referrer_policy = g.doc.referrer_policy;
         g.doc = http::parse_seeded(
             &url,
@@ -4519,6 +4520,7 @@ impl App {
         );
         // Same page, same blob mirror (a re-parse must not orphan blob: images).
         g.doc.blobs = blobs;
+        g.doc.service_client = service_client;
         g.doc.referrer_policy = referrer_policy;
         // A re-wrap of the SAME HTML (image relayout): the baked scroll signal is
         // stale, so the on-screen offset wins (prefer_signal = false).
@@ -5604,6 +5606,7 @@ impl App {
         // The blob byte mirror rides the Doc (into history too) so the image
         // pipeline can decode this page's `<img src="blob:…">` at any time.
         doc.blobs = response.blobs.clone().map(crate::doc::BlobsHandle);
+        doc.service_client = response.service_client.take();
         doc.referrer_policy = http::response_referrer_policy(&response);
         let eager_image_urls = doc.eager_image_urls.clone();
         let page = response.url.clone();
@@ -7215,6 +7218,7 @@ impl App {
         // The live page keeps minting into the same shared blob map, so the
         // replacement presentation must keep carrying it.
         doc.blobs = g.doc.blobs.clone();
+        doc.service_client = g.doc.service_client.clone();
         doc.referrer_policy = g.doc.referrer_policy;
         // Carry scroll-region scroll positions across the re-layout (restored
         // below, before the selection re-anchor reads the windowed rows).
@@ -7845,6 +7849,14 @@ impl App {
     /// instead; a pending reload (`replace_nav`) swaps in place.
     fn navigate_to(&mut self, doc: Doc) {
         self.document_generation = self.document_generation.wrapping_add(1);
+        // This history retains rendered snapshots, not the unloaded Window
+        // environment. SW #on-client-unload-algorithm must run even after
+        // an inert document's JavaScript actor has already retired.
+        drop(
+            self.browser
+                .as_mut()
+                .and_then(|g| g.doc.service_client.take()),
+        );
         // A new page replaces any image that was being viewed, and ends
         // whatever living page came before it (freeze: its last render
         // is already the doc going into history).
@@ -9147,6 +9159,7 @@ impl App {
         let dict_page = g.doc.dict.take();
         let raw = std::mem::take(&mut g.doc.raw);
         let blobs = g.doc.blobs.take();
+        let service_client = g.doc.service_client.take();
         let referrer_policy = g.doc.referrer_policy;
         g.doc = match g.doc.url.clone() {
             url if gemini_view.is_some() => gemini::render(
@@ -9238,6 +9251,7 @@ impl App {
             g.scroll = sources.iter().position(|&n| n >= source).unwrap_or(0);
         }
         g.doc.blobs = blobs;
+        g.doc.service_client = service_client;
         g.doc.referrer_policy = referrer_policy;
         if g.doc.laid_out() {
             // Re-flow at the new width re-laid the rows; re-anchor the
@@ -10362,6 +10376,7 @@ impl App {
         } else {
             &mut g.history[target_index]
         };
+        drop(g.doc.service_client.take());
         let old = std::mem::replace(&mut g.doc, target.doc.take().expect("just checked"));
         let parked = HistEntry {
             same_document_generation: None,
@@ -10398,6 +10413,21 @@ impl App {
         // action URL is a different page, the retained doc stands.
         let revive = entry.pos.was_live && js && !entry.post;
         let url = g.doc.url.clone();
+        if let Link::Http(url) = &url
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        {
+            let blobs = g
+                .doc
+                .blobs
+                .get_or_insert_with(|| crate::doc::BlobsHandle(Default::default()));
+            g.doc.service_client = crate::trust_js_backend::prepare_service_worker_document(
+                &self.web_storage,
+                &blobs.0,
+                handle,
+                url,
+                crate::js::TraversableState::SHOWN,
+            );
+        }
         let image_urls = g.doc.image_urls.clone();
         // Whatever living page was foreground froze when we left.
         self.drop_live_page();
@@ -11334,6 +11364,8 @@ mod tests {
     #[tokio::test]
     async fn unsupported_navigation_becomes_prompt_before_page_execution() {
         let response = crate::http::Response {
+            internal: None,
+            service_client: None,
             url: url::Url::parse("https://example.test/report.pdf").unwrap(),
             status: 200,
             status_text: String::new(),
@@ -16257,6 +16289,8 @@ mod tests {
         let mut app = super::App::new(None, 23);
         app.last_inner = (80, 10);
         let response = crate::http::Response {
+            internal: None,
+            service_client: None,
             url: url::Url::parse("https://www.imdb.com/list/ls123/").unwrap(),
             status: 202,
             status_text: String::new(),
@@ -16323,6 +16357,8 @@ mod tests {
         let mut app = super::App::new(None, 23);
         app.last_inner = (60, 10);
         let response = crate::http::Response {
+            internal: None,
+            service_client: None,
             url: base,
             status: 200,
             status_text: String::new(),
@@ -17784,6 +17820,8 @@ mod tests {
         let url = url::Url::parse("https://example.com/logo.svg").unwrap();
         app.on_http_response(
             crate::http::Response {
+                internal: None,
+                service_client: None,
                 url: url.clone(),
                 status: 200,
                 status_text: String::new(),

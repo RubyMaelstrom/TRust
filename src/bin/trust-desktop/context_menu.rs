@@ -367,6 +367,7 @@ impl DesktopWindow {
             link,
             media,
         });
+        self.cancel_touches();
         self.refresh_page_bookmark();
         self.apply_cursor_icon(CursorIcon::Default);
         self.request_overlay_redraw();

@@ -605,6 +605,99 @@ const OPENER: &str = r#"<button id=b>open</button><output id=o></output><script>
 </script>"#;
 
 #[tokio::test]
+async fn native_touch_ids_are_independent_between_top_level_contexts() {
+    // Pointer Events #dom-pointerevent-pointerid: two top-level contexts
+    // may have active contacts with the same ID. Capture uses the receiving
+    // element's context even when its method came from the other Window.
+    let html = r#"<style>body{margin:0}#pad{position:absolute;left:0;top:0;width:100px;height:100px}</style>
+        <div id=pad>parent</div><button id=b>open</button><output id=o></output><script>
+        let popup; const log=[], pad=document.getElementById('pad');
+        for(const type of ['pointerdown','pointerup','pointercancel'])pad.addEventListener(type,e=>{
+            if(type==='pointerdown') {
+                pad.releasePointerCapture(e.pointerId);
+                popup.Element.prototype.setPointerCapture.call(pad,e.pointerId);
+            }
+            log.push(type+':'+e.pointerId+':'+pad.hasPointerCapture(e.pointerId));
+            document.getElementById('o').textContent=log.join('|');
+        });
+        document.getElementById('b').onclick=()=>{
+            popup=window.open('','touch');
+            popup.document.body.style.margin='0';
+            popup.document.body.innerHTML='<div id=pad style="width:100px;height:100px">popup</div><output id=o>ready</output>';
+            popup.eval(`const log=[],pad=document.getElementById('pad');
+                for(const type of ['pointerdown','pointerup','pointercancel'])pad.addEventListener(type,e=>{
+                    if(type==='pointerdown') {
+                        pad.releasePointerCapture(e.pointerId);
+                        opener.Element.prototype.setPointerCapture.call(pad,e.pointerId);
+                    }
+                    log.push(type+':'+e.pointerId+':'+pad.hasPointerCapture(e.pointerId));
+                    document.getElementById('o').textContent=log.join('|');
+                });`);
+        };
+    </script>"#;
+    let mut env = PageEnv::bare(URL);
+    env.terminal_presentation = false;
+    env.traversable = TABS;
+    let (page, mut events) = crate::js::spawn_page(html.into(), env);
+    tokio::time::timeout(Duration::from_secs(30), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    page.try_send_user(PageCmd::Click(node(html, "b"))).unwrap();
+    let auxiliary = loop {
+        match tokio::time::timeout(Duration::from_secs(30), events.recv()).await {
+            Ok(Some(PageEvt::OpenAuxiliary(auxiliary))) => break *auxiliary,
+            Ok(Some(PageEvt::Trouble(errors))) => panic!("{errors:?}"),
+            Ok(Some(_)) => {}
+            other => panic!("no touch popup: {other:?}"),
+        }
+    };
+    let mut popup_events = auxiliary.events;
+    let popup = auxiliary.handle;
+    async fn reported(events: &mut tokio::sync::mpsc::Receiver<PageEvt>, expected: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            match tokio::time::timeout_at(deadline, events.recv()).await {
+                Ok(Some(PageEvt::Updated { html, .. })) if output(&html).contains(expected) => {
+                    return;
+                }
+                Ok(Some(PageEvt::Trouble(errors))) => panic!("{errors:?}"),
+                Ok(Some(_)) => {}
+                other => panic!("missing touch result {expected}: {other:?}"),
+            }
+        }
+    }
+    reported(&mut popup_events, "ready").await;
+    let input = |phase, primary| {
+        PageCmd::Touch(crate::touch::TouchInput {
+            id: 2,
+            phase,
+            node: None,
+            position: crate::core::CssPoint::new(20.0, 20.0),
+            metadata: Default::default(),
+            pressure: 0.5,
+            primary,
+            mouse: false,
+            tap: false,
+        })
+    };
+    page.try_send_user(input(crate::touch::TouchPhase::Down, true))
+        .unwrap();
+    reported(&mut events, "pointerdown:2:true").await;
+    popup
+        .try_send_user(input(crate::touch::TouchPhase::Down, false))
+        .unwrap();
+    reported(&mut popup_events, "pointerdown:2:true").await;
+    popup
+        .try_send_user(input(crate::touch::TouchPhase::Cancel, false))
+        .unwrap();
+    reported(&mut popup_events, "pointercancel:2:true").await;
+    page.try_send_user(input(crate::touch::TouchPhase::Up, true))
+        .unwrap();
+    reported(&mut events, "pointerup:2:true").await;
+}
+
+#[tokio::test]
 async fn window_open_creates_an_auxiliary_browsing_context_its_opener_reaches() {
     // HTML #window-open-steps: `window.open('', name)` creates an auxiliary
     // browsing context (#creating-a-new-auxiliary-browsing-context) whose

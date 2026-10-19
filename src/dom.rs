@@ -7312,6 +7312,11 @@ impl Dom {
         name: &str,
         value: &'a str,
     ) -> Cow<'a, str> {
+        if name == "touch-action"
+            && let Some(action) = crate::touch::TouchAction::parse(value)
+        {
+            return Cow::Owned(action.to_css());
+        }
         if name.starts_with("--")
             && ComputeView(self)
                 .property_registration(id, name)
@@ -19112,6 +19117,9 @@ const PROPS: &[PropDef] = &[
     prop("overflow-y", false, true),
     prop("overscroll-behavior-x", false, true),
     prop("overscroll-behavior-y", false, true),
+    // Pointer Events #the-touch-action-css-property: non-inherited input
+    // policy, retained in the presentation DOM for native gestures.
+    prop("touch-action", false, true),
     // CSS 2.2 §11.1.2 legacy clipping. It applies only to absolutely
     // positioned boxes and clips the complete border box and descendants.
     prop("clip", false, true),

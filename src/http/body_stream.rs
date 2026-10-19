@@ -46,12 +46,12 @@ impl Http1Framing {
     }
 }
 
-/// Responses whose bodies are read incrementally. Redirects are consumed by
-/// the redirect loop, and 421 is retried on another connection, so their
-/// bodies are always read whole (Fetch #http-redirect-fetch,
-/// #http-network-or-cache-fetch).
+/// Responses whose bodies are read incrementally. Manual redirects retain
+/// their private body, while followed redirects cancel it before the next
+/// request. 421 is retried on another connection and is read whole (Fetch
+/// #http-redirect-fetch, #http-network-or-cache-fetch).
 pub(crate) fn streamable_status(status: u16) -> bool {
-    status >= 200 && !matches!(status, 301 | 302 | 303 | 307 | 308 | 421)
+    status >= 200 && status != 421
 }
 
 /// Bytes read from an HTTP/1.1 connection per step.
@@ -221,6 +221,14 @@ enum BodySource {
     Http1(Box<Http1Body>),
     Http2(Box<http2::StreamingBody>),
     Http3(Box<http3::StreamingBody>),
+    External(Box<dyn ExternalBody>),
+}
+
+/// Fetch #fetch-event-respondwith pipes a service worker's response stream.
+/// The producer only receives a pull when the consumer has buffer capacity.
+/// Dropping its implementation must cancel that producer's reader.
+pub(crate) trait ExternalBody: Send {
+    fn next(&mut self) -> futures::future::BoxFuture<'_, Result<Option<Vec<u8>>, String>>;
 }
 
 /// One response body read incrementally, decoded as it arrives.
@@ -255,11 +263,18 @@ impl BodyStream {
         Self::new(BodySource::Http3(body), headers)
     }
 
+    pub(crate) fn external(body: Box<dyn ExternalBody>) -> Self {
+        // These bytes already belong to a Response body. A Content-Encoding
+        // header copied from a network Response does not decode them again.
+        Self::new(BodySource::External(body), &Headers::new())
+    }
+
     async fn next_transmitted(&mut self) -> Result<Option<Vec<u8>>, String> {
         match &mut self.source {
             BodySource::Http1(body) => body.next().await,
             BodySource::Http2(body) => body.next().await.map(|bytes| bytes.map(Vec::from)),
             BodySource::Http3(body) => body.next().await.map(|bytes| bytes.map(Vec::from)),
+            BodySource::External(body) => body.next().await,
         }
     }
 
@@ -549,9 +564,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn redirects_are_read_whole_and_only_the_final_body_streams() {
-        // Fetch #http-redirect-fetch consumes the redirect; its body never
-        // reaches the consumer, and the final response's body streams.
+    async fn redirects_cancel_unread_bodies_and_only_the_final_body_streams() {
+        // Fetch #http-redirect-fetch does not wait for an irrelevant body.
+        // Deliberately never finish it: cancel that connection and stream
+        // the final response from a fresh connection.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -559,10 +575,19 @@ mod tests {
             read_head(&mut socket).await;
             socket
                 .write_all(
-                    b"HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 8\r\n\r\nredirect",
+                    b"HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 1000000\r\n\r\n",
                 )
                 .await
                 .unwrap();
+            let mut byte = [0; 1];
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), socket.read(&mut byte))
+                    .await
+                    .expect("redirect body is canceled")
+                    .unwrap(),
+                0
+            );
+            let (mut socket, _) = listener.accept().await.unwrap();
             let head = read_head(&mut socket).await;
             socket
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfinal")
@@ -570,9 +595,13 @@ mod tests {
                 .unwrap();
             head
         });
-        let (response, body) = fetch_script_streaming(&request(address, "/start"))
-            .await
-            .unwrap();
+        let (response, body) = tokio::time::timeout(
+            Duration::from_secs(2),
+            fetch_script_streaming(&request(address, "/start")),
+        )
+        .await
+        .expect("redirect does not wait for its body")
+        .unwrap();
         assert_eq!(response.url.path(), "/final");
         let mut body = body.expect("the final body streams");
         assert_eq!(body.next().await.unwrap().unwrap(), b"final");

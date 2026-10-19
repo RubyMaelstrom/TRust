@@ -128,21 +128,23 @@ Third implementation batch (user-approved scope)
 Remaining features to consider
 -----------------------------
 
-- Touch-action and axis-locked panning. Native touchscreen input currently
-  becomes mouse-style interaction. Implement the permitted panning/zooming
-  intersection along the appropriate ancestor chain, transformed axes,
-  gesture-start decisions, and pointer cancellation. Preserve independent
-  wheel/mouse behavior. Pointer Events #the-touch-action-css-property;
-  Servo #47043 and #46983.
+- Touch-action and axis-locked panning (implementation complete; final
+  verification in progress). Native touch PointerEvents now have independent
+  contact IDs, implicit/explicit capture, cancellation, iframe routing and tap
+  activation. Panning freezes policy and transformed axes at gesture start,
+  follows containing-block scroll ancestry, and preserves wheel/mouse input.
+  CSSOM validates and canonically serializes touch-action. Native pinch zoom
+  and legacy TouchEvent dispatch are not introduced by this panning feature.
+  Pointer Events #the-touch-action-css-property; Servo #47043 and #46983.
 - Accessibility semantics (explicitly deferred by the user). The geometry/AccessKit bridge exists, but the role
   mapping lacks many landmarks, live regions and structural roles in the
   post. Extend native role/state/name mappings with ARIA and HTML-AAM tests,
   including multiple-token fallback roles and dynamic updates. Servo #47318.
-- Service workers and CookieStore. Cache and CacheStorage already work.
-  ServiceWorkerContainer.register explicitly rejects; ready never finds a
-  registration. There is no CookieStore interface. A real service-worker
-  lifecycle, registration/update/storage and fetch interception are separate
-  work from exposing interfaces. Servo #47044 and #47220.
+- Service workers and CookieStore (fourth batch in progress below). The initial
+  audit found CacheStorage but no working service-worker registration or
+  CookieStore. The remaining implementation includes request interception,
+  client messaging/navigation, module validation and navigation preload.
+  Servo #47044 and #47220.
 - Persistent HTTP cache (explicitly deferred by the user). PageCache is an in-memory document response/preload
   cache. Persistent caching needs RFC 9111 freshness/revalidation, Vary and
   request-context partitioning, bounded storage and user clearing controls.
@@ -326,3 +328,148 @@ Third-batch validation
 Detailed third-batch logs, probes and crash evidence are retained under
 target/servo-third/. Failed intermediate runs are retained alongside their
 successful reruns. No installation, source commit or push has been performed.
+
+Fourth batch in progress — 2026-10-19
+------------------------------------
+
+The authorized batch is still in progress. The following component checks do
+not replace the required final debug/release suites, Clippy, release build and
+release-browser acceptance. Installed binaries and the active trust-js checkout
+remain unchanged; builds use the isolated main-engine checkout described above.
+
+- CookieStore now uses the existing cookie jar and bookmark persistence policy.
+  HttpOnly cookies remain inaccessible; partitioned/session/unbookmarked cookies
+  and CacheStorage remain in RAM. A release checkpoint verified the cookie
+  persistence policy across restart and bookmark removal.
+- CacheStorage retains opaque response data natively, without exposing hidden
+  headers or bytes through JavaScript records or JSON hooks. Cache references
+  survive deletion of a cache name and release storage when no longer retained.
+- Classic service-worker registration, saved script versions/importScripts,
+  install/activate lifetimes, state notifications, ready, update and unregister
+  are connected to real agents. Registrations and scripts are RAM-only. Idle
+  agents stop; their saved version can restart without a network refetch.
+- CookieStoreManager subscriptions and ExtendableCookieChangeEvent are connected
+  to registration-owned observers. Tests cover overlapping subscriptions,
+  wildcard round trips, partial changes before an invalid subscription URL,
+  trusted change/delete events, waitUntil work and restart from saved scripts.
+- Clients.get/matchAll/claim use native document ownership and settings origins.
+  Static documents and script-free frames keep their client identity after an
+  idle page actor retires. Focused checks cover inherited sandbox flags,
+  srcdoc, nested document cleanup, blob URL lifetime and shared message ports.
+- Structured cloning and IndexedDB now keep internal serialization records
+  separate from author JSON hooks, collection methods and indexed setters.
+  Checks cover Window and worker realms, key cloning/storage, transferred ports,
+  array holes/cycles, property deletion and collection mutation during cloning.
+- Focused component runs passed 29 service-worker checks, the sandbox/srcdoc
+  checks, 22 clone/transfer/crypto checks and 13 IndexedDB checks. The message
+  event lifetime test also passed. These runs precede some final refinements;
+  detailed source checkpoints, test output and outstanding checks are retained
+  in target/servo-fourth/.
+
+Service-worker request interception, reserved navigation clients, client
+focus/navigation/openWindow, module service-worker
+validation and navigation preload remain unfinished. The isolated-engine
+module-inspection API proposal has not been applied; no active engine source
+has been changed.
+
+Messaging transport is implemented (2026-10-19). One natively-held
+structured-serialize packet is the only new transport: ServiceWorker
+postMessage serializes first, takes its source and origin from the
+incumbent global through the native callback boundary in Windows
+(a worker Realm is its own incumbent), applies Should Skip Event,
+then runs the destination worker under an event lease and lands as
+an ExtendableMessageEvent (messageerror if deserialization fails).
+Client postMessage serializes with the Client's relevant settings
+and enqueues on the target's native, initially disabled client
+message queue (256 packets, 32MiB); onmessage, startMessages,
+DOMContentLoaded and worker start enable it, and the container
+takes one packet per task, so a wake hint can never drop a message.
+Skipped events, failed startups, over-bound discards and client
+teardown release port/stream/OffscreenCanvas transfers natively,
+recursively for packets queued on discarded ports. Messages may
+run installing and waiting workers, including a bounded waiting-lease
+in begin_event. The worker/worklet incoming paths and the worker
+slot map now use bootstrap JSON.parse and Reflect/WeakMap/Object
+captures, and empty-host clientState traffic no longer fails.
+
+Touch input implementation
+--------------------------
+Native desktop touch contacts now reach the page as trusted PointerEvents with
+per-top-level pointer IDs, first-contact primary status, implicit/explicit
+capture, cancellation and tap activation. A contact is canceled when native
+scrolling takes over, the tab hides, focus is lost or browser UI interrupts it.
+Multiple contacts keep their own state; idle contacts schedule no timer work.
+
+CSS touch-action is parsed, validated and serialized in canonical order. Native
+panning snapshots the hit element's applicable ancestor policies and transformed
+coordinate systems, stops policy propagation at scroll/document boundaries, and
+keeps the initial direction and axis for the gesture. Nested scroll chaining
+uses containing-block scroll ancestry, available scroll ranges and overscroll
+policy. Rejected gestures continue to deliver pointer movement to the page.
+
+Compatibility mouse transitions track the effective position across pointer
+types and nested documents, while physical mouse hover/position remains separate.
+Touch taps use existing form, focus, link and browser UI activation paths. This
+work adds panning and Pointer Events; pinch zoom and native legacy TouchEvent
+streams are separate capabilities and are not implemented by this change.
+
+Standards consulted locally: Pointer Events 49c398264c8d (pointer event dispatch,
+capture, stream suppression, touch-action and compatibility mouse mapping),
+Compatibility Standard d2417c512256 (touch-action grammar), CSSWG 81c27f686901
+(Transforms, Overflow, CSSOM), and UI Events 8c1b809. These are local official
+snapshots, not a fresh upstream verification.
+
+The manual acceptance page is src/fixtures/touch_input.html. DIAGNOSTICS.md lists
+the release desktop invocation and the Wayland native-input regression. Detailed
+focused, broad and release-browser results are retained in target/servo-fourth/.
+Touch verification (final source)
+- Focused debug and release runs each passed 32 library checks. Four desktop
+  input checks passed in each profile, including the Wayland native-touch
+  regression. Tests cover transformed/directional pan policy, empty scrollports,
+  scroll ancestry, capture/removal, multi-contact identity, separate top-level
+  contexts, iframe boundaries/coordinates, cancellation and tap activation.
+- Full current release binary suites passed: 64 desktop tests (five ignored),
+  15 headless tests and one replay-example test.
+- cargo clippy --all-targets completed successfully; nine existing worker/body/
+  HostTask warnings remain. cargo fmt --check flags only the three handed-off
+  worker blocks in trust_js_backend.rs. JavaScript syntax and git diff --check
+  pass for the touch work.
+- cargo build --release --offline --locked succeeded with the isolated engine.
+  All three final artifacts are hashed in touch-release-sha256.txt. The release
+  headless browser rendered the manual fixture; both buttons activated, its
+  counter reached two, the pointer log updated and no script errors were
+  reported. Before/after PNGs were inspected. Native touch itself was exercised
+  through the release Wayland event regression and resident-page actor tests.
+- The earlier full debug library run had 3,841 passing, 14 failing and 43 ignored
+  checks. Those failures reproduce independently of touch and are documented
+  in the worker handoff. Later source refinements passed the final focused
+  debug tests and are included in the final release verification.
+- An unrestricted parallel release library run crashed in a render::headles
+  test thread. The truncated system core shows instruction address zero and
+  a return address in /usr/lib/libvulkan.so.1.4.365, offset 0x45c18. This is
+  diagnostic evidence, not a root-cause determination or proof that it is the
+  previously reported desktop crash. The core and stack/map records are saved
+  under target/servo-fourth/touch-unbounded-test*. A bounded rerun followed.
+- The final bounded release library run completed: 3,832 passed, 24 failed,
+  43 ignored (touch-full-release-final-bounded.log). Fourteen are the previously
+  demonstrated worker/lifecycle/inventory failures. Nine transport cases and
+  one regexp case also failed while the suite/build were active. Afterward,
+  serial isolated reruns passed the regexp check and all 23 HTTP/2 checks;
+  HTTP/3 passed 16 checks with one remaining failure in
+  http3_header_length_and_bodyless_validation ("length" at tests.rs:515).
+  The earlier HTTP/3 cookie failure passed this rerun. All failed runs are
+  retained; the repository-wide suite is not clean. No networking or regexp
+  implementation was changed during this touch increment.
+
+No installation, source commit, push, or change to the active trust-js checkout
+was performed. Pinch zoom, workers and the later follow-ups remain outside this
+completed touch increment.
+
+Touch verification is complete. Work stops here at the user's request. The user
+will arrange for the other developer to finish workers before any further
+feature work begins.
+The later authorized areas are LCP,
+nested orthogonal/logical-axis subgrid work, further compositor combinations,
+incremental A/AAAA resolution and NAT64, the remaining Servo regression audit,
+and the separate intermittent desktop startup crash investigation. Accessibility
+and persistent HTTP caching remain deferred.

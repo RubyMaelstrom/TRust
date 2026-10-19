@@ -31,6 +31,7 @@ use super::style::{Outline, OutlineStyle, outline_of};
 use super::value::{Len, Vp};
 
 mod paint_cache;
+mod touch;
 pub(crate) use paint_cache::PaintCache;
 #[cfg(test)]
 pub(crate) use paint_cache::audit::read as audit_read;
@@ -1939,6 +1940,9 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
     if fragment.flow.hidden || fragment.flow.elided {
         return;
     }
+    if let Some(PaintStyle::Element(node)) = PaintStyle::of(fragment) {
+        touch::record(builder, node, false);
+    }
     if let Some(collapsed) = &fragment.paint.collapsed_borders
         && collapsed.cell.is_none()
     {
@@ -2219,6 +2223,15 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
                 .then(|| builder.ancestor_clip(paint_node, fragment.clip))
                 .flatten()
                 .is_some_and(|clip| builder.push_hard_clip(clip));
+            // Writing-mode's internal paint rotation does not change the
+            // element's physical CSS axes for touch-action.
+            if piece.item.pseudo.is_none() {
+                touch::record(
+                    builder,
+                    style_node,
+                    piece.item.image.is_some() || matches!(piece.item.kind, super::ItemKind::Form),
+                );
+            }
             let writing_transform = line.sideways.then_some(Affine2d([
                 0.,
                 1.,

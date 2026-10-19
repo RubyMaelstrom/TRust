@@ -218,6 +218,10 @@ impl ScrollTree {
         }
     }
 
+    pub fn has_space(&self, node: NodeId) -> bool {
+        self.nodes.contains_key(&node)
+    }
+
     pub fn chain(&self, node: NodeId, content: bool) -> impl Iterator<Item = &ScrollLink> {
         let mut next = self.nodes.get(&node).and_then(|spaces| {
             if content {

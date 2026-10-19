@@ -65,7 +65,10 @@
     __trust.pointerButton(inner.__id, false, x, y, 500, 600);
     __trust.click(inner.__id);
     __trust.hover(null, x, y, 500, 600);
-    assert(pointerEvents.map(event => event.type).join() === 'pointerover,mouseover,pointerenter,mouseenter,pointermove,mousemove,pointerdown,mousedown,pointerup,mouseup,click,pointerout,mouseout,pointerleave,mouseleave', 'native pointer/mouse screen coordinate sequence');
+    // Pointer Events' compatibility mapping may group mouse transitions
+    // (their relative order stays consistent); TRust's shared legacy-mouse
+    // dispatcher fires each Document's mouse boundary with its over/out.
+    assert(pointerEvents.map(event => event.type).join() === 'pointerover,mouseover,mouseenter,pointerenter,pointermove,mousemove,pointerdown,mousedown,pointerup,mouseup,click,pointerout,mouseout,mouseleave,pointerleave', 'native pointer/mouse screen coordinate sequence: ' + pointerEvents.map(event => event.type).join());
     for (const event of pointerEvents) {
         assert(event.clientX === 12 && event.clientY === 16, event.type + ' nested client coordinates');
         assert(event.screenX === 500 && event.screenY === 600, event.type + ' screen coordinates cross frames unchanged');

@@ -253,6 +253,8 @@ pub fn view_action(
 pub(crate) fn image_response(response: Response) -> Result<crate::http::Response, String> {
     let mime = response.media_type()?.essence;
     let response = crate::http::Response {
+        internal: None,
+        service_client: None,
         url: ::url::Url::parse(&response.url.public_url().to_string())
             .map_err(|e| e.to_string())?,
         status: 200,

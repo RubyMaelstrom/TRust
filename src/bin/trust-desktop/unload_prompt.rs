@@ -254,6 +254,7 @@ impl DesktopWindow {
             self.close_context_menu();
             self.close_select_popup();
             self.release_native_pointer_lock(true);
+            self.cancel_touches();
             let bounds = self.content_bounds();
             self.unload_prompt = Some(UnloadPromptUi {
                 tab: id,

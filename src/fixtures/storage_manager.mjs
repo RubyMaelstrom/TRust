@@ -69,8 +69,10 @@
     await rejects('TypeError', container.register('/a%2Fb/sw.js'));
     await rejects('TypeError', container.register('/sw.js', {type: 'shared'}));
     await rejects('TypeError', container.register('/sw.js', {scope: 'data:text/plain,x'}));
-    await rejects('SecurityError', container.register('/sw.js'));
-    await rejects('SecurityError', container.register('sw.js', {scope: './', updateViaCache: 'none'}));
+    // This interface fixture has no network coordinator. A separate local
+    // HTTP integration test exercises successful registration and lifecycle.
+    await rejects('InvalidStateError', container.register('/sw.js'));
+    await rejects('InvalidStateError', container.register('sw.js', {scope: './', updateViaCache: 'none'}));
     await rejects('TypeError', ServiceWorkerContainer.prototype.register.call({}, '/sw.js'));
     check(container.startMessages() === undefined, 'startMessages');
     let messages = 0;

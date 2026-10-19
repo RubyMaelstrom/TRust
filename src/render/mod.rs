@@ -24,6 +24,7 @@ pub(crate) mod matrix3d;
 pub(crate) mod media_controls;
 pub mod selection;
 mod tab_strip;
+mod touch_input;
 mod unload_prompt;
 pub use command_panel::{CommandPanelGeometry, CommandResponse};
 pub use context_menu::{ContextMenuGeometry, ContextMenuIcon, ContextMenuItem, paint_context_menu};
@@ -35,6 +36,7 @@ pub use selection::{
 pub use tab_strip::{
     TAB_STRIP_HEIGHT, TabStripGeometry, TabStripPart, TabStripState, TabStripTab, paint_tab_strip,
 };
+pub use touch_input::TouchTarget;
 pub use unload_prompt::{
     UnloadPromptButton, UnloadPromptGeometry, UnloadPromptState, paint_unload_prompt,
 };
@@ -978,6 +980,7 @@ impl DisplayCommand {
                 }
             }
             DisplayCommand::PopClip
+            | DisplayCommand::TouchScope(_)
             | DisplayCommand::PushTransform(_)
             | DisplayCommand::PopTransform
             | DisplayCommand::PushLayer(_)
@@ -1324,6 +1327,21 @@ pub struct HitRegion {
     pub cursor: Option<String>,
 }
 
+/// Input policy at an element's painted coordinate space. This metadata is
+/// retained even when pointer-events or visibility suppress its own hit box:
+/// an eligible descendant still uses the ancestor's touch-action.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TouchScope {
+    pub node: usize,
+    pub action: crate::touch::TouchAction,
+    pub scroll_container: bool,
+    pub document_root: bool,
+    /// A known containing-block space may deliberately have no enclosing
+    /// scrollport (e.g. an absolutely positioned child outside an overflow).
+    pub scroll_space: bool,
+    pub scroll_target: Option<usize>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ScrollContainer {
     pub node: usize,
@@ -1505,6 +1523,8 @@ pub enum DisplayCommand {
         inset: bool,
     },
     HitRegion(HitRegion),
+    /// Non-raster input metadata, transformed alongside the element's paint.
+    TouchScope(TouchScope),
     // Compact chrome operations retained as sugar. Page paint uses `Fill` and
     // `Stroke`; backends treat these exactly like their general equivalents.
     FillRect {
@@ -2348,7 +2368,10 @@ fn raster_commands(commands: &[DisplayCommand]) -> Vec<&DisplayCommand> {
             index = end + 1;
             continue;
         }
-        if !matches!(command, DisplayCommand::HitRegion(_)) {
+        if !matches!(
+            command,
+            DisplayCommand::HitRegion(_) | DisplayCommand::TouchScope(_)
+        ) {
             paint.push(command);
         }
         index += 1;
@@ -2711,6 +2734,7 @@ fn leaf_command_bounds(command: &DisplayCommand) -> Option<CssRect> {
             .and_then(|clip| intersect_css_rect(*rect, clip))
             .or_else(|| clip.is_none().then_some(*rect)),
         DisplayCommand::HitRegion(_)
+        | DisplayCommand::TouchScope(_)
         | DisplayCommand::PushClip(_)
         | DisplayCommand::PopClip
         | DisplayCommand::PushTransform(_)

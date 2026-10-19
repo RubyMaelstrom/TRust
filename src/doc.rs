@@ -962,6 +962,8 @@ pub struct Doc {
     /// from it (a client-generated image — Steam's login QR); it rides the Doc
     /// into history so a frozen page's blob images still render on back.
     pub blobs: Option<BlobsHandle>,
+    /// The Document environment outlives an idle JavaScript actor.
+    pub service_client: Option<crate::js::DocumentClient>,
     /// The Document's policy container referrer policy (HTML #policy-containers,
     /// #meta-referrer), for the navigations the frontend starts from it. The
     /// default policy for documents of other protocols.
@@ -1133,6 +1135,7 @@ impl Doc {
             cookie_restricted_images: Default::default(),
             deferred_images: Vec::new(),
             blobs: None,
+            service_client: None,
             referrer_policy: Default::default(),
             carousels: Vec::new(),
             fixed: Vec::new(),

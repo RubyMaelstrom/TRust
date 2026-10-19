@@ -25,6 +25,8 @@ mod challenge_message_trace;
 use crate::compression_host;
 #[path = "audio_worklet_host.rs"]
 mod audio_worklet_host;
+#[path = "cookie_store_host.rs"]
+mod cookie_store_host;
 #[path = "font_loading_host.rs"]
 mod font_loading_host;
 #[path = "geometry_host.rs"]
@@ -43,6 +45,11 @@ mod media_host;
 mod message_port_host;
 #[path = "page_spare.rs"]
 mod page_spare;
+#[path = "private_response_host.rs"]
+mod private_response_host;
+#[path = "service_worker_host.rs"]
+mod service_worker_host;
+pub(crate) use service_worker_host::document as prepare_service_worker_document;
 #[path = "svg_geometry_host.rs"]
 mod svg_geometry_host;
 #[path = "text_decoder_host.rs"]
@@ -158,7 +165,23 @@ fn top_hit_key(ctx: &mut Ctx) -> TopHitKey {
 
 /// (status, Content-Type, body, header blob, final URL after redirects; empty when unknown).
 /// (status, Content-Type, body, header list, final URL, status message).
-type TrustJsFetchResult = Option<(u16, String, Vec<u8>, String, String, String)>;
+type TrustJsFetchResult = Option<TrustJsFetchData>;
+
+struct TrustJsFetchData {
+    status: u16,
+    content_type: String,
+    body: Vec<u8>,
+    headers: String,
+    url: String,
+    status_text: String,
+    /// Private filtered-view metadata. Native syscalls and platform records
+    /// are removed from author globals before any script runs.
+    filter: Option<String>,
+    private: Option<Box<crate::http::InternalResponse>>,
+    private_stream: Option<crate::http::BodyStream>,
+    private_timing: Option<TrustJsResourceTiming>,
+    private_keepalive: bool,
+}
 type TrustJsResourceResult = Option<(u16, String, Vec<u8>, Vec<(String, String)>)>;
 
 use crate::performance::ResourceTiming as TrustJsResourceTiming;
@@ -193,6 +216,28 @@ impl TrustJsResourceKind {
 /// selecting the corresponding HTML task.
 #[allow(dead_code)] // Some task variants are exercised only by particular web-platform features.
 enum TrustJsHostTask {
+    ServiceNotice {
+        context: u64,
+        notice: crate::service_worker::Notice,
+    },
+    ServiceResult {
+        context: u64,
+        id: u64,
+        result: Result<crate::service_worker::jobs::Output, crate::service_worker::Error>,
+    },
+    PrivateResponseEnd {
+        context: u64,
+        token: String,
+        timing: Option<TrustJsResourceTiming>,
+    },
+    PrivateResponseReady {
+        id: usize,
+        ok: bool,
+    },
+    CookieChanges {
+        context: u64,
+        changes: crate::http::cookie_store::Changes,
+    },
     PortReady,
     /// A media element's player reported (`media_host`).
     Media {
@@ -509,6 +554,11 @@ struct TrustJsWebSockets {
 }
 
 enum TrustJsWorkerCtl {
+    ServiceEvent {
+        id: u64,
+        kind: &'static str,
+        init: serde_json::Value,
+    },
     Message(String),
     HostTask(Box<TrustJsHostTask>),
     PortReady(Arc<std::sync::atomic::AtomicBool>),
@@ -666,6 +716,7 @@ struct TrustJsWorkerLaunch {
     secure_context: bool,
     /// A SharedWorkerGlobalScope rather than a DedicatedWorkerGlobalScope.
     shared: bool,
+    service: Option<Arc<service_worker_host::Scope>>,
     agent_cluster: u64,
     port_registry: Arc<std::sync::Mutex<message_port_host::Registry>>,
     port_wake: message_port_host::Wake,
@@ -816,6 +867,10 @@ struct ParserProgress {
 }
 
 struct HostState {
+    private_responses: private_response_host::Agent,
+    cookie_subscriptions: HashMap<u64, crate::http::cookie_store::Subscription>,
+    service_workers: service_worker_host::Agent,
+    service_scope: Option<Arc<service_worker_host::Scope>>,
     message_ports: message_port_host::Agent,
     /// This agent towards its storage shed's Indexed Database coordinator.
     indexed_db: indexed_db_host::Agent,
@@ -875,6 +930,9 @@ struct HostState {
     /// HTML #concept-settings-object-origin of each Window Realm, by host settings context.
     /// Opaque origins are created once, so identity (not serialization) decides equality.
     realm_origins: HashMap<u64, url::Origin>,
+    /// HTML active sandboxed-origin flags, snapshotted at Window creation.
+    /// Unlike an opaque data: origin, this flag propagates to descendants.
+    sandboxed_origins: std::collections::HashSet<u64>,
     /// HTML #policy-container-referrer-policy of each Window Realm's Document, by host
     /// settings context: from its navigation response's `Referrer-Policy` header, inherited
     /// for local URLs and srcdoc documents, and updated by `<meta name=referrer>`.
@@ -1147,9 +1205,13 @@ struct TestHooks {
     window_named_exports: usize,
 }
 
+fn next_agent_cluster_id() -> u64 {
+    static NEXT_CLUSTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT_CLUSTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 impl HostState {
     fn new(dom: Rc<RefCell<Dom>>, clock: Rc<RealmClock>) -> Self {
-        static NEXT_CLUSTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let (viewport, device_pixel_ratio) = {
             let mut dom = dom.borrow_mut();
             dom.enable_gc_allocation_leases();
@@ -1168,7 +1230,11 @@ impl HostState {
         };
         Self {
             message_ports: Default::default(),
+            private_responses: Default::default(),
             indexed_db: Default::default(),
+            cookie_subscriptions: HashMap::new(),
+            service_workers: Default::default(),
+            service_scope: None,
             dom,
             dom_gc: DomGcRegistry::default(),
             clock,
@@ -1211,6 +1277,7 @@ impl HostState {
             window_request_urls: HashMap::new(),
             window_cookie_contexts: HashMap::new(),
             realm_origins: HashMap::new(),
+            sandboxed_origins: Default::default(),
             referrer_policies: HashMap::new(),
             navigation_blob: None,
             frame_contexts: HashMap::new(),
@@ -1265,7 +1332,7 @@ impl HostState {
             image_element_slots: None,
             window_message_slots: None,
             wasm_module_slots: None,
-            agent_cluster: NEXT_CLUSTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            agent_cluster: next_agent_cluster_id(),
             top_context: 0,
             traversables: Traversables::default(),
             test_hooks: TestHooks::default(),
@@ -1323,6 +1390,9 @@ impl HostState {
             .remove_environment(self.blob_agent, Some(context));
         self.window_request_urls.remove(&context);
         self.window_cookie_contexts.remove(&context);
+        self.cookie_subscriptions.remove(&context);
+        self.service_workers.remove(context);
+        self.private_responses.abort(context);
         self.forget_realm_origin(context);
         if let Some(network) = self.network.as_mut() {
             network
@@ -1393,6 +1463,9 @@ impl HostState {
             self.pending_stylesheets.remove(&context);
             self.window_request_urls.remove(&context);
             self.window_cookie_contexts.remove(&context);
+            self.cookie_subscriptions.remove(&context);
+            self.service_workers.remove(context);
+            self.private_responses.abort(context);
             self.import_maps.remove(&context);
             self.forget_realm_origin(context);
         }
@@ -1470,6 +1543,7 @@ impl HostState {
 
     fn forget_realm_origin(&mut self, context: u64) {
         self.realm_origins.remove(&context);
+        self.sandboxed_origins.remove(&context);
         self.referrer_policies.remove(&context);
         self.frame_contexts.retain(|_, owner| *owner != context);
         self.window_parents.remove(&context);
@@ -1511,6 +1585,7 @@ impl HostState {
             pending_fetches: HashMap::new(),
             body_streams: HashMap::new(),
         });
+        service_worker_host::bind_profile(self);
     }
 
     /// Raster threads can discover a font after the page actor went idle.
@@ -1561,6 +1636,26 @@ impl HostState {
 
     fn configure_module_loading(&self, engine: &mut trust_js::Engine) {
         engine.set_import_base(self.base.as_str());
+        if self.service_scope.is_some() {
+            // HTML #hostloadimportedmodule (e5071a20, 122439–122455):
+            // dynamic import in ServiceWorkerGlobalScope finishes with a
+            // TypeError before fetching, including in a classic worker.
+            if let Some(events) = self.task_events.clone() {
+                let pending = self.pending_dynamic_modules.clone();
+                engine.set_async_dynamic_module_loader_with_context(
+                    move |request_id, context, _, _, _| {
+                        pending.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let _ = events.send(TrustJsHostTask::DynamicModule {
+                            context,
+                            request_id,
+                            result: None,
+                        });
+                        true
+                    },
+                );
+            }
+            return;
+        }
         if let Some(network) = self.network.as_ref() {
             let page = self
                 .window_request_urls
@@ -1734,7 +1829,11 @@ impl RetainedMemory for HostState {
         // the root realm and its ShadowRealms.
         let HostState {
             message_ports,
+            private_responses,
             indexed_db: _,
+            cookie_subscriptions: _,
+            service_workers: _,
+            service_scope: _,
             dom,
             dom_gc,
             clock,
@@ -1773,6 +1872,7 @@ impl RetainedMemory for HostState {
             window_request_urls,
             window_cookie_contexts,
             realm_origins,
+            sandboxed_origins,
             referrer_policies: _,
             navigation_blob: _,
             frame_contexts,
@@ -2167,6 +2267,7 @@ impl RetainedMemory for HostState {
         wasm.scan_retained_memory(visitor);
         // The broker owns bounded cross-agent queues; no JavaScript values cross it.
         message_ports.scan_retained_memory(visitor);
+        private_responses.scan(visitor);
 
         if window_realms.capacity() != 0 {
             visitor.opaque_storage();
@@ -2373,14 +2474,19 @@ impl RetainedMemory for HostState {
                         .sum::<usize>(),
             ));
         }
-        if !realm_origins.is_empty() || !frame_contexts.is_empty() || !window_parents.is_empty() {
+        if !realm_origins.is_empty()
+            || !frame_contexts.is_empty()
+            || !window_parents.is_empty()
+            || !sandboxed_origins.is_empty()
+        {
             visitor.opaque_storage(); // url::Origin hosts own unreported heap strings.
             visitor.allocation(RetainedManagedAllocation::new(
                 "trust.realm-origins",
                 realm_origins as *const _ as usize,
                 realm_origins.capacity() * std::mem::size_of::<(u64, url::Origin)>()
                     + frame_contexts.capacity() * std::mem::size_of::<(usize, u64)>()
-                    + window_parents.capacity() * std::mem::size_of::<(u64, u64)>(),
+                    + window_parents.capacity() * std::mem::size_of::<(u64, u64)>()
+                    + sandboxed_origins.capacity() * std::mem::size_of::<u64>(),
             ));
         }
         if !early_imports.borrow().is_empty() {
@@ -3115,6 +3221,7 @@ mod desktop {
             net: env.net.clone(),
             storage: env.storage.clone(),
             blobs: env.blobs.clone(),
+            service_client: env.service_client.clone(),
             scripted_frames: env.scripted_frames,
             last_modified: env.last_modified,
             document_encoding: env.document_encoding,
@@ -3966,6 +4073,14 @@ mod desktop {
                 .window_request_urls
                 .insert(context, response_url.clone());
             state.referrer_policies.insert(context, referrer_policy);
+            if let Some(client) = &env.service_client {
+                state.service_workers.document(
+                    context,
+                    client,
+                    state.blobs.clone(),
+                    state.blob_agent,
+                );
+            }
             context
         }) else {
             return;
@@ -5497,6 +5612,11 @@ mod desktop {
         state.referrer_policies.insert(0, referrer_policy);
         state.storage = env.storage.clone().unwrap_or_default();
         state.blobs = env.blobs.clone();
+        if let Some(client) = &env.service_client {
+            state
+                .service_workers
+                .document(0, client, state.blobs.clone(), state.blob_agent);
+        }
         state.viewport.set(viewport);
         state.device_pixel_ratio.set(env.device_pixel_ratio);
         state.screen_position.set(env.screen_position);
@@ -6465,7 +6585,8 @@ mod desktop {
             .ctx()
             .host_mut::<HostState>()
             .is_some_and(|state| {
-                state.pending_resources > 0
+                state.private_responses.transferring()
+                    || state.pending_resources > 0
                     || state.pending_preloads > 0
                     || state.pending_fonts > 0
                     || state.pending_document_images > 0
@@ -6501,6 +6622,7 @@ mod desktop {
             || trust_bool(page, "hasPlatformTask")
             || trust_bool(page, "hasIdleRequest")
             || trust_bool(page, "hasScrollWork")
+            || trust_bool(page, "hasTouchInput")
             || trust_bool(page, "hasResizeObserver")
             // Intersection Observer §3.3: observed targets can change at a
             // later viewport/scroll update even after initial timers end.
@@ -6508,6 +6630,11 @@ mod desktop {
             || trust_bool(page, "hasRenderingUpdate")
             || trust_bool(page, "hasInitialFramesPending")
             || trust_bool(page, "hasLifecycleListeners")
+            // Service registrations outlive page agents. Only actual jobs,
+            // pending ready callbacks or externally deliverable JS listeners
+            // require a resident VM. A registration's existence does not.
+            || trust_bool(page, "hasServiceWorkerWork")
+            || trust_bool(page, "hasCookieStoreWork")
     }
 
     /// HTML §8.1.7.3 runs an ordinary selected task to completion before the
@@ -8020,6 +8147,16 @@ mod desktop {
                 checkpoint(page, "history traversal");
                 finish_task(page, events)
             }
+            PageCmd::Touch(input) => {
+                prepare_interaction(page, interrupt);
+                run_touch_input(page, input);
+                checkpoint(page, "touch input");
+                if input.phase == crate::touch::TouchPhase::Up {
+                    finish_pointer_release(page, events)
+                } else {
+                    finish_task_with_ack(page, events, false)
+                }
+            }
             PageCmd::PointerButton {
                 node,
                 pressed,
@@ -8594,6 +8731,50 @@ mod desktop {
             "page focus",
         );
         checkpoint(page, "page focus");
+    }
+
+    /// Pointer Events: hit test before :active can change geometry, then set
+    /// implicit capture and dispatch in the target Document's realm.
+    fn run_touch_input(page: &mut TrustJsPage, input: crate::touch::TouchInput) {
+        use crate::touch::TouchPhase;
+        let x = finite_or_zero(f64::from(input.position.x));
+        let y = finite_or_zero(f64::from(input.position.y));
+        let text = serde_json::json!({
+            "id": input.id,
+            "phase": match input.phase {
+                TouchPhase::Down => "down", TouchPhase::Move => "move",
+                TouchPhase::Up => "up", TouchPhase::Cancel => "cancel",
+            },
+            "node": input.node, "x": x, "y": y,
+            "screenX": finite_or_zero(input.metadata.screen.map_or(x, |p| p.0)),
+            "screenY": finite_or_zero(input.metadata.screen.map_or(y, |p| p.1)),
+            "modifiers": input.metadata.modifier_bits(),
+            "pressure": finite_or_zero(input.pressure).clamp(0.0, 1.0),
+            "primary": input.primary, "mouse": input.mouse, "tap": input.tap,
+        })
+        .to_string();
+        let argument = Value::from_string(text);
+        if input.phase == TouchPhase::Down {
+            let node = call_trust(
+                page,
+                "touchPrepare",
+                std::slice::from_ref(&argument),
+                "touch target",
+            )
+            .and_then(|value| match value {
+                Value::Num(node) if node.is_finite() && node >= 0.0 => Some(node as usize),
+                _ => None,
+            });
+            let mut dom = page.dom.borrow_mut();
+            dom.set_input_modality(false);
+            if input.primary {
+                let node = node.filter(|&node| dom.is_valid(node));
+                dom.set_active_element(node);
+            }
+        } else if input.primary && matches!(input.phase, TouchPhase::Up | TouchPhase::Cancel) {
+            page.dom.borrow_mut().set_active_element(None);
+        }
+        let _ = call_trust(page, "touchInput", &[argument], "touch input");
     }
 
     /// UI Events #handle-native-mouse-down / #handle-native-mouse-up for the
@@ -10486,6 +10667,35 @@ mod desktop {
             })
             .await
             .expect("an idle page kept its actor");
+        }
+
+        #[tokio::test]
+        async fn cookie_and_service_worker_queries_do_not_pin_inert_documents() {
+            let html = r#"<body><p id=result>waiting</p><script>
+                (async()=>{
+                    await navigator.serviceWorker.getRegistrations();
+                    await cookieStore.get('query-without-listeners');
+                    document.getElementById('result').textContent='queries done';
+                })();
+            </script></body>"#;
+            let (_handle, mut events) = spawn_page(html.into(), PageEnv::bare(DEFAULT_URL));
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Static { html, outcome }) => {
+                            assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                            assert!(html.contains("queries done"), "{html}");
+                            break;
+                        }
+                        Some(PageEvt::Trouble(errors)) => panic!("{errors:?}"),
+                        Some(_) => {}
+                        None => panic!("document closed before the queries completed"),
+                    }
+                }
+                assert!(events.recv().await.is_none());
+            })
+            .await
+            .expect("query-only features kept the JavaScript actor alive");
         }
 
         #[tokio::test]
@@ -14610,6 +14820,9 @@ host_functions! {
     ("__css_style", 3, host_css_style, []),
     ("__css_sheet", 2, guarded_css_sheet, [0]),
     ("__css_supports_selector", 1, host_css_supports_selector, []),
+    ("__cookie_store", 5, cookie_store_host::operation, []),
+    ("__service_worker", 3, service_worker_host::operation, []),
+    ("__private_response", 2, private_response_host::operation, []),
     ("__font_query", 4, font_loading_host::query, []),
     ("__font_load", 4, font_loading_host::load, []),
     ("__font_install", 3, guarded_font_install, [0]),
@@ -16566,6 +16779,7 @@ fn prepare_uncounted_client_request(
             mode,
             credentials,
         }),
+        redirect: crate::http::RedirectMode::Follow,
     };
     let mode = fetch_policy.map_or(crate::http::RequestMode::NoCors, |(mode, _)| mode);
     crate::http::set_fetch_metadata(&mut request, origin, "empty", mode.as_str());
@@ -16627,14 +16841,34 @@ fn trust_js_fetch_result(response: crate::http::Response) -> TrustJsFetchResult 
             response.body.len()
         );
     }
-    Some((
-        response.status,
-        response.content_type,
-        response.body,
-        crate::js::headers_to_blob(&response.headers),
-        response.url.to_string(),
-        response.status_text,
-    ))
+    let filter = response.internal.as_ref().map(|inner| {
+        serde_json::json!({
+            "type": inner.kind, "headers": response.headers,
+            "urls": private_response_host::public_urls(&inner.url_list, inner.kind)
+        })
+        .to_string()
+    });
+    Some(TrustJsFetchData {
+        status: response.status,
+        content_type: response.content_type,
+        body: response.body,
+        headers: crate::js::headers_to_blob(&response.headers),
+        url: if response
+            .internal
+            .as_ref()
+            .is_some_and(|inner| inner.kind == "opaque")
+        {
+            String::new()
+        } else {
+            response.url.to_string()
+        },
+        status_text: response.status_text,
+        filter,
+        private: response.internal.filter(|inner| inner.kind != "basic"),
+        private_stream: None,
+        private_timing: None,
+        private_keepalive: false,
+    })
 }
 
 fn trust_js_cached_result(response: &crate::http::CachedResp) -> TrustJsFetchResult {
@@ -16646,22 +16880,60 @@ fn trust_js_cached_result(response: &crate::http::CachedResp) -> TrustJsFetchRes
             response.body.len()
         );
     }
-    Some((
-        response.status,
-        response.content_type.clone(),
-        response.body.clone(),
-        crate::js::headers_to_blob(&response.headers),
-        response
+    Some(TrustJsFetchData {
+        status: response.status,
+        content_type: response.content_type.clone(),
+        body: response.body.clone(),
+        headers: crate::js::headers_to_blob(&response.headers),
+        url: response
             .url_list
             .last()
             .map_or_else(String::new, |url| url.to_string()),
-        response.status_text.clone(),
-    ))
+        status_text: response.status_text.clone(),
+        private: None,
+        private_stream: None,
+        private_timing: None,
+        private_keepalive: false,
+        filter: Some(
+            serde_json::json!({"type":"basic", "headers": response.headers,
+            "urls": private_response_host::public_urls(&response.url_list, "basic")})
+            .to_string(),
+        ),
+    })
 }
 
 fn host_fetch_result_value(ctx: &mut Ctx, result: TrustJsFetchResult) -> Value {
-    let Some((status, content_type, body, headers, url, status_text)) = result else {
+    let Some(TrustJsFetchData {
+        status,
+        content_type,
+        body,
+        headers,
+        url,
+        status_text,
+        filter,
+        private,
+        private_stream,
+        private_timing,
+        private_keepalive,
+    }) = result
+    else {
         return Value::Null;
+    };
+    let private = if let Some(internal) = private {
+        let public_headers = crate::js::parse_header_blob(&headers);
+        let Some(metadata) = private_response_host::install(
+            ctx,
+            *internal,
+            public_headers,
+            private_stream,
+            private_timing,
+            private_keepalive,
+        ) else {
+            return Value::Null;
+        };
+        Value::from_string(metadata)
+    } else {
+        Value::Null
     };
     let text = if crate::js::response_body_is_binary(&content_type) {
         Value::Undefined
@@ -16690,6 +16962,9 @@ fn host_fetch_result_value(ctx: &mut Ctx, result: TrustJsFetchResult) -> Value {
         Value::from_string(url),
         Value::Undefined,
         Value::from_string(status_text),
+        Value::Undefined, // streaming body id, installed by FetchHead
+        filter.map_or(Value::Null, Value::from_string),
+        private,
     ])
 }
 
@@ -16799,12 +17074,18 @@ fn host_http_fetch(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
         );
     }
     let use_cors_preflight = host_fetch_use_cors_preflight(args);
+    let redirect = match host_arg_string(ctx, args, 14).as_str() {
+        "error" => crate::http::RedirectMode::Error,
+        "manual" => crate::http::RedirectMode::Manual,
+        _ => crate::http::RedirectMode::Follow,
+    };
     let work = ctx.host_mut::<HostState>().and_then(|state| {
         let prepared =
             prepare_client_request(state, &client, &target, method, body, headers, policy);
         prepared.map(|(handle, cache, mut request)| {
             request.cookie_context = Some(cookie_context);
             request.use_cors_preflight = use_cors_preflight;
+            request.redirect = redirect;
             apply_request_referrer(state, context, &referrer, referrer_policy, &mut request);
             (handle, cache, request)
         })
@@ -17144,6 +17425,11 @@ fn host_http_fetch_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
         "no-store" | "reload" | "no-cache"
     );
     let use_cors_preflight = host_fetch_use_cors_preflight(args);
+    let redirect = match host_arg_string(ctx, args, 14).as_str() {
+        "error" => crate::http::RedirectMode::Error,
+        "manual" => crate::http::RedirectMode::Manual,
+        _ => crate::http::RedirectMode::Follow,
+    };
     // Argument 11: the request's keepalive (Fetch #request-keepalive-flag).
     let keepalive = matches!(args.get(11), Some(Value::Bool(true)));
     // Arguments 12 and 13: the request's referrer and referrer policy.
@@ -17178,34 +17464,38 @@ fn host_http_fetch_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
                 .join(&target)
                 .ok()
                 .is_some_and(|url| crate::http::same_origin_for_host(&client, &url));
-        let cached =
-            if cache_safe_for_policy && !cookie_context.cross_site_ancestor && !bypass_cache {
-                state.network.as_ref().and_then(|network| {
-                    (method.eq_ignore_ascii_case("GET") && body.is_none())
-                        .then(|| client.join(&target).ok())
-                        .flatten()
-                        .and_then(|url| network.cache.peek(&url))
-                        .filter(|shared| {
-                            policy.is_none()
-                                || shared.peek().is_some_and(|result| {
-                                    result.as_ref().is_ok_and(|response| {
-                                        !response.url_list.is_empty()
-                                            && response.url_list.iter().all(|url| {
-                                                crate::http::same_origin_for_host(&client, url)
-                                            })
-                                    })
+        let cached = if redirect == crate::http::RedirectMode::Follow
+            && cache_safe_for_policy
+            && !cookie_context.cross_site_ancestor
+            && !bypass_cache
+        {
+            state.network.as_ref().and_then(|network| {
+                (method.eq_ignore_ascii_case("GET") && body.is_none())
+                    .then(|| client.join(&target).ok())
+                    .flatten()
+                    .and_then(|url| network.cache.peek(&url))
+                    .filter(|shared| {
+                        policy.is_none()
+                            || shared.peek().is_some_and(|result| {
+                                result.as_ref().is_ok_and(|response| {
+                                    !response.url_list.is_empty()
+                                        && response.url_list.iter().all(|url| {
+                                            crate::http::same_origin_for_host(&client, url)
+                                        })
                                 })
-                        })
-                })
-            } else {
-                None
-            };
+                            })
+                    })
+            })
+        } else {
+            None
+        };
         let source = match cached {
             Some(shared) => Some(AsyncFetchSource::Cached(shared)),
             None => prepare_client_request(state, &client, &target, method, body, headers, policy)
                 .map(|(_, _, mut request)| {
                     request.cookie_context = Some(cookie_context);
                     request.use_cors_preflight = use_cors_preflight;
+                    request.redirect = redirect;
                     apply_request_referrer(
                         state,
                         context,
@@ -17291,6 +17581,25 @@ fn host_http_fetch_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
             AsyncFetchSource::Request(request) if stream_body => {
                 let name = request.url.to_string();
                 match crate::http::fetch_script_streaming(&request).await {
+                    Ok((response, Some(body)))
+                        if response.internal.as_ref().is_some_and(|inner| {
+                            matches!(inner.kind, "opaque" | "opaqueredirect")
+                        }) =>
+                    {
+                        let (mut result, timing) =
+                            timed_fetch_result(Ok(response), name, initiator, started);
+                        if let Some(data) = result.as_mut() {
+                            data.private_stream = Some(body);
+                            data.private_timing = timing;
+                            data.private_keepalive = keepalive;
+                        }
+                        let _ = events.send(TrustJsHostTask::FetchDone {
+                            id,
+                            result,
+                            timing: None,
+                        });
+                        return;
+                    }
                     Ok((response, Some(body))) => {
                         let (result, timing) =
                             timed_fetch_result(Ok(response), name, initiator, started);
@@ -17628,7 +17937,10 @@ fn abort_document_fetches(ctx: &mut Ctx, context: u64) -> bool {
             .collect()
     };
     let resources = context == top_context && network.cache.stop_loading();
-    let canceled = resources || !pending.is_empty() || !streams.is_empty();
+    let canceled = state.private_responses.abort(context)
+        || resources
+        || !pending.is_empty()
+        || !streams.is_empty();
     for mut stream in streams {
         stream.flow.cancel();
         if let Some(pull) = stream.pull.take() {
@@ -18099,14 +18411,25 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
     } else {
         parsed_url.clone()
     };
-    let cookie_opaque = host_dom(ctx)
-        .borrow()
-        .attr(frame_id, "sandbox")
-        .is_some_and(|flags| {
-            !flags
-                .split_ascii_whitespace()
-                .any(|flag| flag.eq_ignore_ascii_case("allow-same-origin"))
-        });
+    // HTML “determine the creation sandboxing flags”: the embedding
+    // Document's active flags are unioned with the iframe's current flags.
+    // Changing its ancestor's sandbox attribute cannot unsandbox a live
+    // Document, nor does a non-sandboxed data: parent's opaque origin force
+    // every subsequent network child to be opaque.
+    let inherited_sandbox_origin = ctx
+        .host::<HostState>()
+        .is_some_and(|state| state.sandboxed_origins.contains(&creator_context));
+    let own_sandbox_origin = {
+        let dom = host_dom(ctx);
+        let dom = dom.borrow();
+        dom.tag_name(frame_id) == Some("iframe")
+            && dom.attr(frame_id, "sandbox").is_some_and(|flags| {
+                !flags
+                    .split_ascii_whitespace()
+                    .any(|flag| flag.eq_ignore_ascii_case("allow-same-origin"))
+            })
+    };
+    let cookie_opaque = inherited_sandbox_origin || own_sandbox_origin;
     let source_config = args.get(3).cloned().unwrap_or(Value::Undefined);
     let parent_window = args.get(4).cloned().unwrap_or(Value::Undefined);
     let top_window = args.get(5).cloned().unwrap_or(Value::Undefined);
@@ -18166,6 +18489,9 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
             parsed_url.origin()
         };
         state.realm_origins.insert(context, origin);
+        if cookie_opaque {
+            state.sandboxed_origins.insert(context);
+        }
         state.frame_contexts.insert(frame_id, context);
         state.window_parents.insert(context, creator_context);
         // A child navigable's Window belongs to its parent's top-level
@@ -18183,16 +18509,7 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
                 .client
                 .as_ref()
                 .is_none_or(|parent| !crate::site_storage::same_site(parent, &client_url));
-        if state
-            .dom
-            .borrow()
-            .attr(frame_id, "sandbox")
-            .is_some_and(|flags| {
-                !flags
-                    .split_ascii_whitespace()
-                    .any(|flag| flag.eq_ignore_ascii_case("allow-same-origin"))
-            })
-        {
+        if cookie_opaque {
             cookie_context.cross_site_ancestor = true;
         }
         state
@@ -18254,6 +18571,7 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
         if let Some(loader) = state.early_imports.borrow_mut().get_mut(&context) {
             loader.environment = environment;
         }
+        service_worker_host::child_document(state, context, creator_context, parsed_url.clone());
     }
     let installed = ctx.with_embed_realm(&realm, |realm_ctx| {
         realm_ctx.set_host_job_context(context);
@@ -18350,10 +18668,16 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
                 state.pending_stylesheets.remove(&context);
                 state.window_request_urls.remove(&context);
                 state.window_cookie_contexts.remove(&context);
+                state.cookie_subscriptions.remove(&context);
+                state.service_workers.remove(context);
+                state.private_responses.abort(context);
                 state.forget_realm_origin(context);
             }
             return Err(error);
         }
+    }
+    if let Some(state) = ctx.host_mut::<HostState>() {
+        state.service_workers.execution_ready(context);
     }
     Ok(realm)
 }
@@ -19896,6 +20220,7 @@ fn host_worker_spawn(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
         referrer_policy,
         secure_context,
         shared,
+        service: None,
         agent_cluster: state.agent_cluster,
         port_registry: state.message_ports.registry.clone(),
         port_wake: message_port_host::Wake::Worker(Arc::downgrade(&ctl)),
@@ -20062,6 +20387,9 @@ fn host_worker_self_close(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Resul
 }
 
 fn install_trust_js_worker_boundary(engine: &mut trust_js::Engine) {
+    engine.define_global("__cookie_store", 5, cookie_store_host::operation);
+    engine.define_global("__service_worker", 3, service_worker_host::operation);
+    engine.define_global("__private_response", 2, private_response_host::operation);
     engine.define_global("__font_query", 4, font_loading_host::query);
     engine.define_global("__font_load", 4, font_loading_host::load);
     engine.define_global("__font_install", 3, font_loading_host::install);
@@ -20772,6 +21100,7 @@ fn run_trust_js_worker(
     );
     state.agent_cluster = launch.agent_cluster;
     state.storage = launch.storage.clone();
+    state.service_scope = launch.service.clone();
     // File API #url-model: one blob URL store for the page and all of its agents; this
     // worker's entries leave it when the worker ends (#lifeTime).
     state.blobs = launch.blobs.clone();
@@ -20870,6 +21199,10 @@ fn run_trust_js_worker(
         serde_json::to_string(launch.cookie_context.storage_partition())
             .expect("storage partition serializes"),
     );
+    let config = format!(
+        "{config}globalThis.__worker_cfg.service = {};",
+        launch.service.is_some()
+    );
     #[cfg(test)]
     let config = format!(
         "{config}globalThis.__worker_cfg.crossOriginIsolated = {};",
@@ -20891,7 +21224,16 @@ fn run_trust_js_worker(
         }
     }
 
-    let Some(script) = fetch_trust_js_worker_script(&launch, &handle, &cache) else {
+    let script = launch
+        .service
+        .as_ref()
+        .map(|service| TrustJsWorkerScript {
+            url: service.worker.script.clone(),
+            source: service.version.root.source.to_string(),
+            referrer_policy: service.version.root.referrer_policy(),
+        })
+        .or_else(|| fetch_trust_js_worker_script(&launch, &handle, &cache));
+    let Some(script) = script else {
         send_trust_js_worker_error(
             &events,
             launch.id,
@@ -20911,36 +21253,73 @@ fn run_trust_js_worker(
     {
         worker.referrer_policy = policy;
     }
-    let continued = match launch.kind {
-        TrustJsWorkerKind::Classic => eval_trust_js_worker_classic(
-            &mut engine,
-            &script.source,
-            script.url.as_str(),
-            &events,
-            launch.id,
-        ),
-        TrustJsWorkerKind::Module => {
-            let fetched = engine
-                .ctx()
-                .host_mut::<HostState>()
-                .and_then(|state| state.network.as_ref())
-                .map(|network| network.fetched.clone())
-                .unwrap_or_default();
-            let environment = ModuleFetchEnvironment::of(engine.ctx(), 0);
-            eval_trust_js_worker_module(
+    let continued = if let Some(service) = &launch.service {
+        service.prepare_task();
+        let origin = trust_js::SourceOrigin::new(script.url.as_str());
+        let result = if launch.kind == TrustJsWorkerKind::Module {
+            Err(crate::service_worker::Error::type_error(
+                "Service-worker module inspection is unavailable",
+            ))
+        } else {
+            match engine.eval_value_interruptible_with_origin(&script.source, Some(&origin)) {
+                Ok(Ok(_)) => Ok(()),
+                Err(error) => Err(crate::service_worker::Error::type_error(format!(
+                    "Service-worker parse error: {}",
+                    error.message
+                ))),
+                Ok(Err(EvalError::Throw(error))) => Err(crate::service_worker::Error::type_error(
+                    describe_throw(&mut engine, error, "service worker"),
+                )),
+                Ok(Err(EvalError::Interrupted(_))) => {
+                    Err(crate::service_worker::Error::type_error(
+                        "Service-worker startup was interrupted",
+                    ))
+                }
+            }
+        };
+        let continued = result.is_ok();
+        if continued
+            && service.worker.event_types.get().is_none()
+            && let Ok(value) = trust_js_worker_internal_call(&mut engine, "serviceTypes", &[])
+            && let Ok(types) =
+                serde_json::from_str::<Vec<String>>(&value_string(&mut engine, &value))
+        {
+            let _ = service.worker.event_types.set(types);
+        }
+        service.started(result);
+        continued
+    } else {
+        match launch.kind {
+            TrustJsWorkerKind::Classic => eval_trust_js_worker_classic(
                 &mut engine,
-                &script,
-                TrustJsWorkerModuleFetch {
-                    page: launch.owner_page.clone(),
-                    cookie_context: launch.cookie_context.clone(),
-                    handle: handle.clone(),
-                    cache: cache.clone(),
-                    fetched,
-                    environment,
-                },
+                &script.source,
+                script.url.as_str(),
                 &events,
                 launch.id,
-            )
+            ),
+            TrustJsWorkerKind::Module => {
+                let fetched = engine
+                    .ctx()
+                    .host_mut::<HostState>()
+                    .and_then(|state| state.network.as_ref())
+                    .map(|network| network.fetched.clone())
+                    .unwrap_or_default();
+                let environment = ModuleFetchEnvironment::of(engine.ctx(), 0);
+                eval_trust_js_worker_module(
+                    &mut engine,
+                    &script,
+                    TrustJsWorkerModuleFetch {
+                        page: launch.owner_page.clone(),
+                        cookie_context: launch.cookie_context.clone(),
+                        handle: handle.clone(),
+                        cache: cache.clone(),
+                        fetched,
+                        environment,
+                    },
+                    &events,
+                    launch.id,
+                )
+            }
         }
     };
     if !continued
@@ -20972,6 +21351,17 @@ fn run_trust_js_worker(
     let mut queued_command = None;
     let mut source_cursor = 0;
     loop {
+        if launch
+            .service
+            .as_ref()
+            .and_then(|s| s.idle_remaining())
+            .is_some_and(|wait| wait.is_zero())
+        {
+            break;
+        }
+        if let Some(service) = &launch.service {
+            service.prepare_task();
+        }
         let now = virtual_origin + wall_origin.elapsed().as_secs_f64() * 1000.0;
         let deadline = trust_js_worker_deadline(&mut engine);
         let frame = trust_js_worker_frame_deadline(&mut engine);
@@ -21041,6 +21431,12 @@ fn run_trust_js_worker(
                         timeout_task = WorkerTask::Checkpoint;
                     }
                 }
+                if let Some(idle) = launch.service.as_ref().and_then(|s| s.idle_remaining())
+                    && wait.is_none_or(|wait| idle < wait)
+                {
+                    wait = Some(idle);
+                    timeout_task = WorkerTask::Checkpoint;
+                }
                 if wait.is_none() {
                     engine.collect_garbage_at_idle();
                 }
@@ -21058,9 +21454,32 @@ fn run_trust_js_worker(
             }
         };
         let now = virtual_origin + wall_origin.elapsed().as_secs_f64() * 1000.0;
+        if let Some(service) = &launch.service {
+            service.prepare_task();
+        }
         let _ = trust_js_worker_internal_call(&mut engine, "advanceClock", &[Value::Num(now)]);
         let task_result = match task {
             WorkerTask::Command(TrustJsWorkerCtl::Terminate) => break,
+            WorkerTask::Command(TrustJsWorkerCtl::ServiceEvent { id, kind, init }) => {
+                let result = trust_js_worker_internal_call(
+                    &mut engine,
+                    "serviceEvent",
+                    &[
+                        Value::Num(id as f64),
+                        Value::from_string(kind.to_string()),
+                        Value::from_string(init.to_string()),
+                    ],
+                );
+                if result.is_err()
+                    && let Some(runtime) = launch
+                        .service
+                        .as_ref()
+                        .and_then(|scope| scope.runtime.upgrade())
+                {
+                    runtime.complete(id, false);
+                }
+                result
+            }
             WorkerTask::Command(TrustJsWorkerCtl::PortReady(pending)) => {
                 pending.store(false, std::sync::atomic::Ordering::Release);
                 Ok(Value::Undefined)
@@ -22222,12 +22641,17 @@ fn host_task_traversable(state: &HostState, task: &TrustJsHostTask) -> Option<Tr
         TrustJsHostTask::Media { id, .. } => {
             return state.traversable_of_node(state.media.player_node(*id)?);
         }
-        TrustJsHostTask::DocumentImageDone { context, .. }
+        TrustJsHostTask::ServiceNotice { context, .. }
+        | TrustJsHostTask::ServiceResult { context, .. }
+        | TrustJsHostTask::PrivateResponseEnd { context, .. }
+        | TrustJsHostTask::CookieChanges { context, .. }
+        | TrustJsHostTask::DocumentImageDone { context, .. }
         | TrustJsHostTask::DynamicModuleStart { context, .. }
         | TrustJsHostTask::DynamicModule { context, .. }
         | TrustJsHostTask::AbortDocument { context } => *context,
         TrustJsHostTask::ImageDone { timing_context, .. } => *timing_context,
-        TrustJsHostTask::FetchDone { id, .. }
+        TrustJsHostTask::PrivateResponseReady { id, .. }
+        | TrustJsHostTask::FetchDone { id, .. }
         | TrustJsHostTask::FetchHead { id, .. }
         | TrustJsHostTask::FetchBodyChunk { id, .. }
         | TrustJsHostTask::FetchBodyEnd { id, .. }
@@ -22245,6 +22669,37 @@ fn host_task_traversable(state: &HostState, task: &TrustJsHostTask) -> Option<Tr
 
 fn dispatch_host_task(engine: &mut trust_js::Engine, task: TrustJsHostTask) -> Result<(), String> {
     match task {
+        TrustJsHostTask::ServiceNotice { context, notice } => {
+            service_worker_host::dispatch_notice(engine, context, notice)?
+        }
+        TrustJsHostTask::ServiceResult {
+            context,
+            id,
+            result,
+        } => service_worker_host::dispatch_result(engine, context, id, result)?,
+        TrustJsHostTask::PrivateResponseEnd {
+            context,
+            token,
+            timing,
+        } => {
+            record_resource_timing_in(engine, context, timing)?;
+            run_in_context_realm(engine, context, "private response end", |engine| {
+                host_call_trust(
+                    engine.ctx(),
+                    "privateResponseEnded",
+                    &[Value::from_string(token)],
+                )
+                .map(|_| ())
+                .map_err(|_| "private response end failed".to_string())
+            })?;
+        }
+        TrustJsHostTask::PrivateResponseReady { id, ok } => {
+            settle_network_task(engine, id, move |_| Value::Bool(ok))?;
+        }
+
+        TrustJsHostTask::CookieChanges { context, changes } => {
+            cookie_store_host::dispatch(engine, context, changes)?
+        }
         TrustJsHostTask::PortReady => {}
         TrustJsHostTask::Media { id, task } => media_host::dispatch(engine, id, task)?,
         TrustJsHostTask::WebAudio(task) => webaudio_host::dispatch(engine, task)?,
@@ -27040,10 +27495,24 @@ fn host_storage_cas(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
         // localStorage keeps its own quota and persistence path.
         return Ok(Value::Bool(false));
     }
+    let storage_owner = storage.clone();
     let mut storage = storage.lock().unwrap();
     let current = storage.get(&bucket).and_then(|entries| entries.get(&key));
     if current != expected.as_ref() {
         return Ok(Value::Bool(false));
+    }
+    let cache_bytes = storage
+        .get(&bucket)
+        .into_iter()
+        .flat_map(|entries| entries.iter())
+        .filter(|(entry, _)| **entry != key)
+        .map(|(_, value)| value.len())
+        .sum::<usize>()
+        .saturating_add(value.len());
+    if let Err(name) =
+        private_response_host::cache_commit(&storage_owner, &bucket, &key, &value, cache_bytes)
+    {
+        return Ok(Value::from_string(name.to_string()));
     }
     storage.entry(bucket).or_default().insert(key, value);
     Ok(Value::Bool(true))
@@ -27419,6 +27888,7 @@ fn host_storage_manager(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
             })
             .sum::<usize>()
     };
+    let usage = usage + private_response_host::cache_usage(&storage, &key);
     let quota = crate::site_storage::ORIGIN_QUOTA + INDEXED_DATABASE_QUOTA + CACHE_STORAGE_QUOTA;
     Ok(ctx.make_array(vec![Value::Num(usage as f64), Value::Num(quota as f64)]))
 }
@@ -30782,6 +31252,43 @@ mod tests {
         )
         .unwrap();
         engine
+    }
+
+    #[test]
+    fn native_touch_input_capture_cancellation_and_taps() {
+        let mut engine = platform_engine_with_body();
+        assert_eq!(
+            string_value(&mut engine, include_str!("fixtures/touch_input.mjs")),
+            "touch-input-ok"
+        );
+    }
+
+    #[test]
+    fn native_touch_input_routes_capture_and_click_to_the_child_realm() {
+        // Focus updates visit each Window's host environment. Give this
+        // iframe fixture the same initialized host as a resident page.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (events, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut state = HostState::new(
+            Rc::new(RefCell::new(Dom::parse_document(
+                "<!doctype html><html><head></head><body></body></html>",
+            ))),
+            Rc::new(RealmClock::new()),
+        );
+        state.enable_network(
+            url::Url::parse(DEFAULT_URL).unwrap(),
+            runtime.handle().clone(),
+            Default::default(),
+            events,
+        );
+        let mut engine = configured_engine(state, DEFAULT_URL);
+        assert_eq!(
+            string_value(&mut engine, include_str!("fixtures/touch_frame_input.mjs")),
+            "touch-frame-input-ok"
+        );
     }
 
     #[test]
@@ -36104,6 +36611,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_touch_actor_tap_uses_the_existing_hyperlink_activation() {
+        // Pointer Events #event-dispatch: cancellation of pointerdown does
+        // not suppress click. HTML hyperlink activation still follows it.
+        let html = "<style>body{margin:0}a{display:block;width:100px;height:100px}\
+            a:active{transform:translateX(200px)}</style><a id=a href='/touched'>tap</a>\
+            <script>a.addEventListener('pointerdown',e=>{\
+            if(e.pointerType!=='touch'||!a.hasPointerCapture(e.pointerId))throw Error('native touch');\
+            e.preventDefault();});</script>";
+        let node = Dom::parse_document(html).get_by_id("a").unwrap();
+        let mut env = crate::js::PageEnv::bare(DEFAULT_URL);
+        env.terminal_presentation = false;
+        let (handle, mut events) = spawn_page(html.into(), env);
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                match events.recv().await {
+                    Some(crate::js::PageEvt::Updated { .. }) => break,
+                    Some(crate::js::PageEvt::Trouble(errors)) => panic!("{errors:?}"),
+                    Some(_) => {}
+                    None => panic!("actor ended before touch"),
+                }
+            }
+            for phase in [crate::touch::TouchPhase::Down, crate::touch::TouchPhase::Up] {
+                handle
+                    .try_send_user(crate::js::PageCmd::Touch(crate::touch::TouchInput {
+                        id: 2,
+                        phase,
+                        node: Some(node),
+                        position: crate::core::CssPoint::new(20.0, 20.0),
+                        metadata: Default::default(),
+                        pressure: 0.5,
+                        primary: true,
+                        mouse: false,
+                        tap: phase == crate::touch::TouchPhase::Up,
+                    }))
+                    .unwrap();
+            }
+            loop {
+                match events.recv().await {
+                    Some(crate::js::PageEvt::Navigate(url, _)) => {
+                        assert_eq!(
+                            url,
+                            url::Url::parse(DEFAULT_URL)
+                                .unwrap()
+                                .join("/touched")
+                                .unwrap()
+                                .as_str()
+                        );
+                        break;
+                    }
+                    Some(crate::js::PageEvt::Trouble(errors)) => panic!("{errors:?}"),
+                    Some(_) => {}
+                    None => panic!("touch tap did not activate"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn actor_reports_input_focus_on_pointer_down_before_click() {
         // HTML focus follows the uncanceled pointer down. Desktop must learn
         // it even when the later click target changes during page rendering.
@@ -37920,7 +38487,7 @@ mod tests {
     #[test]
     fn trust_js_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 267, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 270, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -37931,7 +38498,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(trust_js_registry_matches_canonical_boundary());
-        assert_eq!(TRUST_JS_HOST_FUNCTIONS.len(), 267);
+        assert_eq!(TRUST_JS_HOST_FUNCTIONS.len(), 270);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(
@@ -40010,6 +40577,7 @@ mod tests {
         let probe = r#"
             (async () => {
                 const source = `
+                    JSON.parse = () => { throw new Error('author JSON.parse must not parse worklet packets'); };
                     class Gain extends AudioWorkletProcessor {
                         static get parameterDescriptors() {
                             return [{name: 'gain', defaultValue: 0.5, minValue: 0, maxValue: 1, automationRate: 'k-rate'}];
@@ -46701,6 +47269,101 @@ mod tests {
     }
 
     #[test]
+    fn worker_incoming_messages_survive_author_intrinsic_replacement() {
+        // HTML StructuredDeserializeWithTransfer: the worker's incoming
+        // packet parse uses the bootstrap JSON.parse, so delivery survives
+        // author replacement of JSON.parse. Slot-map intrinsics are covered
+        // by the structured-clone private-records worker check.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let page = url::Url::parse(DEFAULT_URL).unwrap();
+        let (task_tx, mut task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut state = HostState::new(
+            Rc::new(RefCell::new(Dom::new())),
+            Rc::new(RealmClock::new()),
+        );
+        state.enable_network(
+            page.clone(),
+            runtime.handle().clone(),
+            Arc::default(),
+            task_tx,
+        );
+        let mut engine = configured_engine(state, page.as_str());
+        eval(
+            &mut engine,
+            r#"
+            globalThis.incomingChecks = [];
+            globalThis.incomingFailures = [];
+            const incomingSource = `
+                const define = Object.defineProperty, getOwn = Object.getOwnPropertyDescriptor;
+                const targets = [[JSON,'parse']];
+                const saved = targets.map(([object,name]) => getOwn(object,name));
+                onmessage = event => {
+                    const value = event.data.value, port = event.ports[0];
+                    for (let i=0; i<targets.length; i++) define(targets[i][0], targets[i][1], saved[i]);
+                    postMessage('incoming:' + value + ':' + (port instanceof MessagePort));
+                };
+                for (let i=0; i<targets.length; i++)
+                    define(targets[i][0], targets[i][1], {...saved[i],
+                        value() { throw new Error('author intrinsic must not run'); }});
+                postMessage('ready');
+            `;
+            const incomingWorker = new Worker(URL.createObjectURL(
+                new Blob([incomingSource], {type:'text/javascript'})));
+            globalThis.incomingWorker = incomingWorker;
+            incomingWorker.onerror = event => incomingFailures.push('' + event.message);
+            incomingWorker.onmessage = event => {
+                if (event.data === 'ready') {
+                    const channel = new MessageChannel();
+                    incomingWorker.postMessage({value:41}, [channel.port2]);
+                } else incomingChecks.push(event.data);
+            };
+            "#,
+            "worker incoming intrinsics",
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            assert_eq!(string_value(&mut engine, "incomingFailures.join('|')"), "");
+            let log = string_value(&mut engine, "incomingChecks.join('|')");
+            if log == "incoming:41:true" {
+                break;
+            }
+            assert!(Instant::now() < deadline, "incoming message stalled: {log}");
+            if matches!(
+                engine_call_trust_method(&mut engine, "hasPlatformTask", &[]),
+                Ok(Value::Bool(true))
+            ) {
+                engine_call_trust_method(&mut engine, "runPlatformTask", &[]).unwrap_or_else(
+                    |error| {
+                        panic!(
+                            "{}",
+                            describe_eval_error(&mut engine, error, "platform task")
+                        )
+                    },
+                );
+            } else {
+                let task = runtime
+                    .block_on(async {
+                        tokio::time::timeout(
+                            deadline.saturating_duration_since(Instant::now()),
+                            task_rx.recv(),
+                        )
+                        .await
+                    })
+                    .unwrap_or_else(|_| panic!("worker timeout: {log}"))
+                    .unwrap();
+                dispatch_host_task(&mut engine, task).unwrap();
+            }
+            run_microtask_checkpoint(&mut engine);
+        }
+        eval(&mut engine, "incomingWorker.terminate()", "Worker cleanup").unwrap();
+    }
+
+    #[test]
     fn worker_inbox_preserves_bursts_and_coalesces_only_port_wakes() {
         let (inbox, receiver) = TrustJsWorkerInbox::new();
         for index in 0..1024 {
@@ -46723,7 +47386,9 @@ mod tests {
                     wakes += 1;
                 }
                 TrustJsWorkerCtl::Terminate => panic!("unexpected termination"),
-                TrustJsWorkerCtl::HostTask(_) => panic!("unexpected host task"),
+                TrustJsWorkerCtl::HostTask(_) | TrustJsWorkerCtl::ServiceEvent { .. } => {
+                    panic!("unexpected host task")
+                }
             }
         }
         assert_eq!(messages, 1024);
@@ -47428,7 +48093,15 @@ mod tests {
             catch (error) { check(error.name === 'SyntaxError', 'invalid URL: ' + error.name); }
             try { new SharedWorker(url, {type: 'shared'}); throw Error('invalid type accepted'); }
             catch (error) { check(error.name === 'TypeError', 'invalid type: ' + error.name); }
-            const first = new SharedWorker(url, 'counter');
+            let first, internalPortsSeen=0;
+            const arrayIterator=Array.prototype[Symbol.iterator], apply=Reflect.apply;
+            Array.prototype[Symbol.iterator]=function() {
+                for(let i=0;i<this.length;i++) if(this[i] instanceof MessagePort) internalPortsSeen++;
+                return apply(arrayIterator,this,[]);
+            };
+            try { first = new SharedWorker(url, 'counter'); }
+            finally { Array.prototype[Symbol.iterator]=arrayIterator; }
+            check(internalPortsSeen===0,'internal connection transfer list');
             const second = new SharedWorker(url, {name: 'counter'});
             const other = new SharedWorker(url, {name: 'other'});
             const mismatch = new SharedWorker(url, {name: 'counter', type: 'module'});
@@ -51238,6 +51911,57 @@ mod tests {
     }
 
     #[test]
+    fn descendant_origins_inherit_active_sandbox_flags_until_navigation() {
+        // HTML e5071a20: determine the creation sandboxing flags unions
+        // the container's flags with its node Document's ACTIVE flags.
+        let mut engine = platform_engine();
+        eval(&mut engine, r#"
+            const html=document.createElement('html');document.appendChild(html);
+            html.appendChild(document.createElement('body'));
+            const factory=`(url,sandbox)=>{
+                const frame=document.createElement('iframe');
+                if(sandbox!==undefined)frame.setAttribute('sandbox',sandbox);
+                document.body.appendChild(frame);
+                __dom_load_frame(frame.__id,'<body></body>',url);
+                frame.__contentDoc=undefined;
+                const child=__dom_create_window_realm(__dom_allocate_job_context(),frame.__id,url,
+                    __trust_cfg,window,window,frame,0,'');
+                frame.__frameUrl=url;frame.__contentRealmWindow=child;frame.__contentDoc=child.document;
+                return [frame,child];
+            }`;
+            const make=eval(factory);
+            const [container,sandboxed]=make('https://example.com/sandbox','allow-scripts');
+            container.removeAttribute('sandbox');
+            sandboxed.eval('globalThis.make='+factory);
+            sandboxed.eval(`
+                const [frame,nested]=make('https://example.com/nested','allow-scripts allow-same-origin');
+                globalThis.result=nested.origin;
+                nested.eval("try {localStorage;globalThis.storageResult='allowed';}catch(error){globalThis.storageResult=error.name;}");
+                result+=':'+nested.storageResult;
+            `);
+            const [,data]=make('data:text/html,<body></body>');
+            data.eval('globalThis.make='+factory);
+            data.eval(`
+                const [,nested]=make('https://example.com/from-data');
+                globalThis.result=nested.origin;
+                nested.eval("try {localStorage;globalThis.storageResult='allowed';}catch(error){globalThis.storageResult=error.name;}");
+                result+=':'+nested.storageResult;
+            `);
+            // A new navigation uses the container's now-unsandboxed flags.
+            __dom_load_frame(container.__id,'<body></body>','https://example.com/new-document');
+            container.__contentDoc=undefined;
+            const navigated=__dom_create_window_realm(__dom_allocate_job_context(),container.__id,
+                'https://example.com/new-document',__trust_cfg,window,window,container,0,'');
+            navigated.eval("try {localStorage;globalThis.storageResult='allowed';}catch(error){globalThis.storageResult=error.name;}");
+            globalThis.sandboxOriginResult=sandboxed.result+'|'+data.result+'|'+navigated.origin+':'+navigated.storageResult;
+        "#, "inherited active sandbox origins").unwrap();
+        assert_eq!(
+            string_value(&mut engine, "sandboxOriginResult"),
+            "null:SecurityError|https://example.com:allowed|https://example.com:allowed"
+        );
+    }
+
+    #[test]
     fn storage_maps_are_not_rekeyed_by_document_base_or_retired_host_context() {
         let mut engine = platform_engine();
         eval(&mut engine, r#"
@@ -51808,6 +52532,149 @@ mod tests {
         .unwrap();
         assert!(eval_trust_js_worker_platform_setup(&mut engine).unwrap());
         engine
+    }
+
+    #[test]
+    fn cookie_store_window_api_shares_cookies_and_preserves_creation_url() {
+        let _cookies = crate::http::COOKIE_TEST_LOCK.lock().unwrap();
+        for (index, tier) in [Tier::Interp, Tier::Bytecode, Tier::Jit]
+            .into_iter()
+            .enumerate()
+        {
+            let clock = Rc::new(RealmClock::new());
+            let mut state = HostState::new(
+                Rc::new(RefCell::new(Dom::parse_document("<!doctype html><body>"))),
+                clock,
+            );
+            let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+            state.task_events = Some(TrustJsTaskSender::Page(sender));
+            let mut engine = configured_engine(
+                state,
+                &format!("https://cookie-store-window-{index}.test/a/page"),
+            );
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            eval(
+                &mut engine,
+                include_str!("fixtures/cookie_store.mjs"),
+                "cookie store",
+            )
+            .unwrap();
+            assert_eq!(
+                settle_platform_result(&mut engine, "__trust", "cookieStoreResult"),
+                "cookie-store-ok",
+                "{tier:?}"
+            );
+            while let Ok(task) = receiver.try_recv() {
+                dispatch_host_task(&mut engine, task).unwrap();
+                run_microtask_checkpoint(&mut engine);
+            }
+            drain_platform_tasks(&mut engine, "__trust");
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    "cookieChanges.some(c=>c[0]==='changed'&&c[1]==='scoped'&&c[2]==='from-document')"
+                ),
+                "true"
+            );
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    "cookieChanges.some(c=>c[0]==='deleted'&&c[1]==='alpha'&&c[2]===undefined)"
+                ),
+                "true"
+            );
+            assert_eq!(string_value(&mut engine, "__trust.takeErrors()"), "");
+        }
+    }
+
+    #[test]
+    fn cookie_store_exposure_is_secure_window_and_service_worker_only() {
+        let state = HostState::new(
+            Rc::new(RefCell::new(Dom::new())),
+            Rc::new(RealmClock::new()),
+        );
+        let mut window = configured_engine(state, "http://cookie-store-insecure.test/");
+        assert_eq!(
+            string_value(
+                &mut window,
+                "[typeof CookieStore,typeof CookieChangeEvent,'cookieStore' in globalThis].join('|')"
+            ),
+            "undefined|undefined|false"
+        );
+        let mut worker = worker_engine_with_secure_context(true);
+        assert_eq!(
+            string_value(
+                &mut worker,
+                "[typeof CookieStore,typeof CookieChangeEvent,'cookieStore' in globalThis].join('|')"
+            ),
+            "undefined|undefined|false"
+        );
+    }
+
+    #[test]
+    fn cookie_store_borrowed_methods_use_the_receivers_settings_and_cookie_policy() {
+        let _cookies = crate::http::COOKIE_TEST_LOCK.lock().unwrap();
+        let state = HostState::new(
+            Rc::new(RefCell::new(Dom::parse_document("<!doctype html><body>"))),
+            Rc::new(RealmClock::new()),
+        );
+        let mut engine = configured_engine(state, "https://cookie-store-realm.test/parent/page");
+        eval(&mut engine, r#"
+            function cookieRealm(url) {
+                const frame = document.createElement('iframe'); document.body.appendChild(frame);
+                __dom_load_frame(frame.__id, '<body></body>', url); frame.__contentDoc = undefined;
+                return __dom_create_window_realm(__dom_allocate_job_context(), frame.__id, url,
+                    __trust_cfg, window, window, frame, 0, '');
+            }
+            document.cookie='owner=parent; Secure; Path=/parent';
+            const child=cookieRealm('https://cookie-store-realm.test/child/page');
+            child.eval("document.cookie='owner=child; Secure; Path=/child';globalThis.ownStore=cookieStore");
+            const foreign=cookieRealm('https://cookie-store-foreign.test/page');
+            foreign.eval("globalThis.ownStore=cookieStore");
+            Promise.all([
+                CookieStore.prototype.get.call(child.ownStore,'owner').then(c=>c.value),
+                child.CookieStore.prototype.get.call(cookieStore,'owner').then(c=>c.value),
+                CookieStore.prototype.set.call(foreign.ownStore,'blocked','value').then(()=> 'allowed',e=>e.name),
+                CookieStore.prototype.set.call(child.ownStore,{name:'written',value:'child',path:'/child'})
+                    .then(()=>child.document.cookie.includes('written=child'))
+            ]).then(values=>globalThis.cookieRealmResult=values.join('|'),error=>globalThis.cookieRealmResult=String(error));
+        "#, "cookie realms").unwrap();
+        for _ in 0..32 {
+            drain_platform_tasks(&mut engine, "__trust");
+            let contexts: Vec<_> = engine
+                .ctx()
+                .host::<HostState>()
+                .unwrap()
+                .window_realms
+                .keys()
+                .copied()
+                .collect();
+            for context in contexts {
+                run_in_context_realm(&mut engine, context, "cookie tasks", |engine| {
+                    for _ in 0..32 {
+                        let pending = host_call_trust(engine.ctx(), "hasPlatformTask", &[])
+                            .map_err(|_| String::from("cookie realm task query failed"))?;
+                        if !matches!(pending, Value::Bool(true)) {
+                            break;
+                        }
+                        host_call_trust(engine.ctx(), "runPlatformTask", &[])
+                            .map_err(|_| String::from("cookie realm task failed"))?;
+                        run_microtask_checkpoint(engine);
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            }
+            run_microtask_checkpoint(&mut engine);
+            if string_value(&mut engine, "typeof cookieRealmResult") != "undefined" {
+                break;
+            }
+        }
+        assert_eq!(
+            string_value(&mut engine, "String(cookieRealmResult)"),
+            "child|parent|SecurityError|true"
+        );
     }
 
     #[test]
@@ -52472,6 +53339,22 @@ mod tests {
         assert_eq!(
             (entry.read().unwrap(), entry.content_type.as_str()),
             (vec![0, 128, 255], "application/x-trust-js-port")
+        );
+    }
+
+    #[test]
+    fn indexed_db_private_records_keep_serialized_keys_away_from_author_hooks() {
+        platform_fixture_in_window_and_secure_worker(
+            "IndexedDB private records",
+            include_str!("fixtures/indexed_db_private_records.mjs"),
+        );
+    }
+
+    #[test]
+    fn structured_clone_private_records_ignore_author_hooks_in_windows_and_workers() {
+        platform_fixture_in_window_and_secure_worker(
+            "structured-clone private records",
+            include_str!("fixtures/structured_clone_private_records.mjs"),
         );
     }
 
@@ -53148,6 +54031,168 @@ mod tests {
         assert_eq!(
             string_value(&mut engine, "aesCtrResult"),
             "6bc1bee22e409f96e93d7e117393172a"
+        );
+    }
+
+    #[test]
+    fn service_worker_extendable_and_fetch_event_lifetimes_obey_dispatch_and_microtasks() {
+        let mut engine = configured_engine_before_prelude(
+            HostState::new(
+                Rc::new(RefCell::new(Dom::new())),
+                Rc::new(RealmClock::new()),
+            ),
+            DEFAULT_URL,
+        );
+        // Test-only adapter to the real trusted DOM dispatcher. Production
+        // exposes these interfaces only in a ServiceWorkerGlobalScope.
+        let adapter = r#"
+            g.swEventLog = [];
+            g.__service_event_adapter = {
+                Event, fetch:g.__fetch_api,
+                isMessagePort(value) { return portState(value)!==undefined; },
+                isMessageSource(value) { return portState(value)!==undefined; },
+                trusted(event) { return messageApply(trustedEventHas, trustedEvents, [event]); },
+                dispatching(event) { return eventRecord(event).eventDispatching; },
+                createTrusted:createTrustedEvent,
+                dispatch(event) { dispatch(g, event, false); },
+                complete(id,ok) { g.swEventLog.push('complete:' + id + ':' + ok); },
+                response(id,response) { g.swEventLog.push('response:' + id + ':' + (response ? response.status : 'error')); },
+                fallback(id) { g.swEventLog.push('fallback:' + id); },
+                bind(api) { g.swEventTest = api; }
+            };
+        "#;
+        let code = crate::js::PRELUDE.replacen(
+            "/*__FETCH_END__*/",
+            &format!(
+                "/*__FETCH_END__*/\n{adapter}\n{}",
+                include_str!("service_worker/events.js")
+            ),
+            1,
+        );
+        eval_test_bootstrap(&mut engine, &code, "service worker event prelude", false).unwrap();
+        eval(&mut engine, r#"
+            try { new ExtendableEvent('synthetic').waitUntil(1); } catch(e) { swEventLog.push(e.name); }
+            addEventListener('install', event => {
+                globalThis.lastInstall = event;
+                swEventLog.push('install');
+                event.waitUntil(Promise.resolve().then(() => {
+                    event.waitUntil(Promise.resolve().then(() => swEventLog.push('nested')));
+                    swEventLog.push('extended');
+                }));
+            });
+            swEventTest.dispatch(1,'install',{});
+            addEventListener('activate', event => {
+                Promise.resolve().then(() => {
+                    try { event.waitUntil(1); } catch(e) { swEventLog.push('late:' + e.name); }
+                });
+            });
+            swEventTest.dispatch(2,'activate',{});
+        "#, "service worker lifetimes").unwrap();
+        run_microtask_checkpoint(&mut engine);
+        assert_eq!(
+            string_value(&mut engine, "swEventLog.join('|')"),
+            "InvalidStateError|install|complete:2:true|extended|late:InvalidStateError|nested|complete:1:true"
+        );
+        eval(&mut engine, r#"
+            swEventLog.length=0;
+            const request = new Request('https://example.com/fetch');
+            const accesses = [];
+            const init = new Proxy({request}, {get(object,key) { accesses.push(key);return object[key]; }});
+            const synthetic = new FetchEvent('fetch',init);
+            swEventLog.push(accesses.join(','));
+            swEventLog.push([synthetic.request===request,synthetic.clientId,synthetic.resultingClientId,synthetic.replacesClientId].join(':'));
+            addEventListener('fetch',event => {
+                globalThis.lastFetch=event;
+                event.waitUntil(event.handled);
+                event.respondWith(Promise.resolve(new Response('answer')));
+                try { event.respondWith(new Response('twice')); } catch(e) { swEventLog.push('twice:' + e.name); }
+            });
+            addEventListener('fetch',()=>swEventLog.push('wrong-listener'));
+            swEventTest.dispatch(3,'fetch',{request});
+            try { lastFetch.respondWith(new Response('late')); } catch(e) { swEventLog.push('late:' + e.name); }
+        "#, "service worker fetch events").unwrap();
+        run_microtask_checkpoint(&mut engine);
+        assert_eq!(
+            string_value(&mut engine, "swEventLog.join('|')"),
+            "bubbles,cancelable,composed,clientId,handled,preloadResponse,replacesClientId,request,resultingClientId|true:::|twice:InvalidStateError|late:InvalidStateError|response:3:200"
+        );
+        eval(&mut engine, "swEventTest.handled(3,true);", "handled fetch").unwrap();
+        run_microtask_checkpoint(&mut engine);
+        assert_eq!(
+            string_value(&mut engine, "swEventLog[swEventLog.length-1]"),
+            "complete:3:true"
+        );
+        eval(&mut engine,r#"
+            swEventLog.length=0;
+            const channel=new MessageChannel(),access=[];
+            const messageInit=new Proxy({data:{hello:1},ports:[channel.port1],source:channel.port2,origin:'\ud800'},
+                {get(object,key){access.push(key);return object[key];}});
+            const message=new ExtendableMessageEvent('message',messageInit);
+            swEventLog.push(access.join(','));
+            swEventLog.push([message instanceof ExtendableEvent,message.data.hello,message.origin==='\ufffd',
+                message.source===channel.port2,message.ports[0]===channel.port1,Object.isFrozen(message.ports)].join(':'));
+            for(const options of [{source:{}},{ports:[{}]}]){
+                try{new ExtendableMessageEvent('message',options);swEventLog.push('invalid accepted');}
+                catch(error){swEventLog.push(error.name);}
+            }
+            addEventListener('message',event=>{
+                swEventLog.push('message:'+event.isTrusted+':'+event.data);
+                event.waitUntil(Promise.resolve().then(()=>swEventLog.push('message work')));
+            });
+            swEventTest.dispatch(4,'message',{data:'payload',source:channel.port1});
+        "#,"extendable messages").unwrap();
+        run_microtask_checkpoint(&mut engine);
+        assert_eq!(
+            string_value(&mut engine, "swEventLog.join('|')"),
+            "bubbles,cancelable,composed,data,lastEventId,origin,ports,source|true:1:true:true:true:true|TypeError|TypeError|message:true:payload|message work|complete:4:true"
+        );
+        eval(&mut engine,r#"
+            swEventLog.length=0;
+            const broadcast=new BroadcastChannel('brand-check');
+            Object.defineProperty(Object.prototype,'serviceWorker',{configurable:true,value:{kind:'ServiceWorker',state:'forged'}});
+            Object.defineProperty(Object.prototype,'serviceEvent',{configurable:true,value:{message:{data:'forged'}}});
+            try {
+                for(const run of [
+                    ()=>Object.getOwnPropertyDescriptor(ServiceWorker.prototype,'state').get.call(channel.port1),
+                    ()=>Object.getOwnPropertyDescriptor(ExtendableMessageEvent.prototype,'data').get.call(channel.port1),
+                    ()=>new MessageEvent('message',{source:broadcast})
+                ]) {
+                    try{run();swEventLog.push('forged');}catch(error){swEventLog.push(error.name);}
+                }
+            } finally {
+                delete Object.prototype.serviceWorker;delete Object.prototype.serviceEvent;
+                broadcast.close();channel.port1.close();channel.port2.close();
+            }
+        "#,"private service-worker interface brands").unwrap();
+        assert_eq!(
+            string_value(&mut engine, "swEventLog.join('|')"),
+            "TypeError|TypeError|TypeError"
+        );
+    }
+
+    #[test]
+    fn cache_storage_names_preserve_domstrings_and_use_string_conversion() {
+        let mut engine = platform_engine();
+        eval(&mut engine, r#"
+            globalThis.cacheNamesResult = 'pending';
+            (async () => {
+                const names = ['', '\ud800', '\udc00', '🎨', '!u16!0061', 'a\u0000b'];
+                for (const name of names) {
+                    await caches.open(name);
+                    if (!await caches.has(name)) throw new Error('missing name');
+                }
+                let calls = [];
+                await caches.open({toString(){calls.push('string');return 'converted';}, valueOf(){throw new Error('wrong hint');}});
+                const actual = await caches.keys();
+                if (actual.length !== names.length + 1 || !names.every((name,i)=>name===actual[i])) throw new Error('name mismatch');
+                for (const name of names) if (!await caches.delete(name)) throw new Error('failed delete');
+                cacheNamesResult = calls.join(',') + ':' + (await caches.keys()).join(',');
+            })().catch(e => { cacheNamesResult = e.name + ':' + e.message; });
+        "#, "CacheStorage DOMString names").unwrap();
+        run_microtask_checkpoint(&mut engine);
+        assert_eq!(
+            string_value(&mut engine, "cacheNamesResult"),
+            "string:converted"
         );
     }
 

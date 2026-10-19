@@ -11,6 +11,577 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 
+#[test]
+fn service_worker_registration_runs_install_and_activate_with_ram_cache() {
+    let runtime = runtime();
+    let (listener, base) = listen(&runtime);
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = requests.clone();
+    let server = runtime.spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let head = read_head(&mut socket).await;
+            seen.lock().unwrap().push(head.clone());
+            let source = if head.starts_with("get /import.js ") {
+                "self.importValue = 'imported';"
+            } else if head.starts_with("get /broken.js ") {
+                "throw new Error('startup rejected');"
+            } else {
+                r#"
+                importScripts('/import.js');
+                self.addEventListener('install', event => {
+                    event.waitUntil(caches.open('sw-lifecycle').then(cache => cache.put('/version',
+                        new Response(importValue + ':' + (self instanceof ServiceWorkerGlobalScope)))));
+                    event.waitUntil(self.skipWaiting());
+                });
+                self.addEventListener('activate', event => {
+                    event.waitUntil(cookieStore.set({name:'sw-activated',value:'yes',path:'/'}));
+                });
+                "#
+            };
+            let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{source}", source.len());
+            socket.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+    let (mut engine, mut tasks) = page(&runtime, &format!("{base}/page"));
+    eval(&mut engine, r#"
+        globalThis.swDone = false;
+        (async () => {
+            const registration = await navigator.serviceWorker.register('/sw.js');
+            log.push('registered:' + registration.installing.state);
+            registration.onupdatefound = () => log.push('updatefound');
+            const worker = registration.installing;
+            worker.onstatechange = () => log.push(worker.state);
+            const ready = await navigator.serviceWorker.ready;
+            log.push('same:' + (ready === registration));
+            if (worker.state !== 'activated') await new Promise(resolve => {
+                worker.addEventListener('statechange', () => {if (worker.state === 'activated') resolve();});
+            });
+            log.push('controller:' + navigator.serviceWorker.controller);
+            log.push('cache:' + await (await caches.match('/version')).text());
+            log.push('cookie:' + (await cookieStore.get('sw-activated')).value);
+            log.push('lookup:' + (await navigator.serviceWorker.getRegistration() === registration));
+            log.push('same-register:' + (await navigator.serviceWorker.register('/sw.js') === registration));
+            log.push('count:' + (await navigator.serviceWorker.getRegistrations()).length);
+            log.push('removed:' + await registration.unregister());
+            log.push('count-after:' + (await navigator.serviceWorker.getRegistrations()).length);
+            try {await navigator.serviceWorker.register('/broken.js');log.push('bad-startup-accepted');}
+            catch(error) {log.push('startup:' + error.name);}
+        })().catch(error => log.push('ERROR:' + error.name + ':' + error.message)).finally(() => swDone = true);
+    "#, "service worker lifecycle").unwrap();
+    run_until(&runtime, &mut engine, &mut tasks, "swDone");
+    let actual = log(&mut engine);
+    assert_eq!(
+        actual,
+        "registered:installing|updatefound|installed|activating|same:true|activated|controller:null|cache:imported:true|cookie:yes|lookup:true|same-register:true|count:1|removed:true|redundant|count-after:0|startup:TypeError"
+    );
+    let heads = requests.lock().unwrap();
+    assert_eq!(
+        heads
+            .iter()
+            .filter(|head| head.starts_with("get /sw.js "))
+            .count(),
+        1,
+        "same registration does not refetch"
+    );
+    assert!(
+        heads[0]
+            .to_ascii_lowercase()
+            .contains("service-worker: script")
+    );
+    server.abort();
+}
+
+#[test]
+fn service_worker_clients_query_claim_and_keep_document_snapshots() {
+    let runtime = runtime();
+    let (listener, base) = listen(&runtime);
+    let (mut engine, mut tasks) = page(&runtime, &format!("{base}/register"));
+    let storage = engine.ctx().host::<HostState>().unwrap().storage.clone();
+    let blobs = crate::js::BlobMap::default();
+    let static_client = prepare_service_worker_document(
+        &storage,
+        &blobs,
+        runtime.handle().clone(),
+        &url::Url::parse(&format!("{base}/static")).unwrap(),
+        crate::js::TraversableState::SHOWN,
+    )
+    .unwrap();
+    let insecure = prepare_service_worker_document(
+        &storage,
+        &blobs,
+        runtime.handle().clone(),
+        &url::Url::parse(&format!("{base}/insecure-ancestor")).unwrap(),
+        crate::js::TraversableState::SHOWN,
+    )
+    .unwrap();
+    insecure.client().set_secure_context(false);
+    let isolated_storage = crate::js::WebStorage::default();
+    let isolated_blobs = crate::js::BlobMap::default();
+    let isolated = prepare_service_worker_document(
+        &isolated_storage,
+        &isolated_blobs,
+        runtime.handle().clone(),
+        &url::Url::parse(&format!("{base}/other-profile")).unwrap(),
+        crate::js::TraversableState::SHOWN,
+    )
+    .unwrap();
+    let source = format!(
+        r#"
+        self.addEventListener('activate', event=>event.waitUntil((async()=>{{
+            const all=await clients.matchAll({{includeUncontrolled:true,type:'all'}});
+            const log=[clients===self.clients,all.length,Object.isFrozen(all),all.every(c=>c instanceof WindowClient&&c instanceof Client&&c.type==='window'&&c.frameType==='top-level')];
+            const again=await clients.get(all[0].id);
+            log.push(again!==all[0],again.id===all[0].id,again.ancestorOrigins===again.ancestorOrigins,Object.isFrozen(again.ancestorOrigins));
+            log.push((await clients.matchAll()).length,(await clients.matchAll({{includeUncontrolled:true,type:'worker'}})).length,await clients.get('absent')===undefined);
+            try{{await clients.get({insecure});log.push('insecure allowed');}}catch(error){{log.push(error.name);}}
+            await clients.claim();
+            log.push((await clients.matchAll()).length);
+            const cache=await caches.open('client-queries');await cache.put('/result',new Response(log.join('|')));
+        }})()));
+    "#,
+        insecure = serde_json::to_string(&insecure.client().id).unwrap()
+    );
+    let server = runtime.spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let _ = read_head(&mut socket).await;
+        let response=format!("HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{source}",source.len());
+        socket.write_all(response.as_bytes()).await.unwrap();
+    });
+    eval(&mut engine,r#"
+        globalThis.clientsDone=false;
+        (async()=>{
+            const registration=await navigator.serviceWorker.register('/clients.js');
+            await navigator.serviceWorker.ready;
+            const worker=registration.active;
+            if(worker.state!=='activated')await new Promise(resolve=>worker.addEventListener('statechange',()=>{if(worker.state==='activated')resolve();}));
+            log.push(await(await caches.match('/result')).text());
+            log.push(navigator.serviceWorker.controller===worker);
+            await registration.unregister();
+        })().catch(error=>log.push('ERROR:'+error.name+':'+error.message)).finally(()=>clientsDone=true);
+    "#,"service-worker Clients").unwrap();
+    run_until(&runtime, &mut engine, &mut tasks, "clientsDone");
+    assert_eq!(
+        log(&mut engine),
+        "true|2|true|true|true|true|true|true|0|0|true|SecurityError|2|true"
+    );
+    assert!(static_client.client().controller().is_some());
+    assert!(insecure.client().controller().is_none());
+    assert!(isolated.client().controller().is_none());
+    runtime.block_on(server).unwrap();
+}
+
+#[test]
+fn service_worker_messages_round_trip_through_clients_and_ports() {
+    // SW 92aba3be ServiceWorker/postMessage, Client/postMessage and the
+    // initially-disabled client message queue; HTML structured
+    // serialize/deserialize with transfer in both directions.
+    let runtime = runtime();
+    let (listener, base) = listen(&runtime);
+    let server = runtime.spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let head = read_head(&mut socket).await;
+            let source = if head.starts_with("get /nomsg/sw.js ") {
+                r#"
+                self.addEventListener('install', event => event.waitUntil(self.skipWaiting()));
+                self.addEventListener('activate', event => event.waitUntil(clients.claim()));
+                "#
+            } else {
+                r#"
+                self.addEventListener('install', event => event.waitUntil(self.skipWaiting()));
+                self.addEventListener('activate', event => event.waitUntil(clients.claim()));
+                self.addEventListener('message', event => {
+                    event.waitUntil((async () => {
+                        const cache = await caches.open('sw-messages');
+                        await cache.put('/seen', new Response([
+                            event.data.value, event.origin === self.location.origin,
+                            event.source && event.source.type, event.source && event.source.frameType,
+                            event instanceof ExtendableMessageEvent].join(':')));
+                        if (event.ports[0]) event.ports[0].postMessage('port:' + event.data.value);
+                        event.source.postMessage({reply: event.data.value + 1});
+                        await cache.put('/replied', new Response('yes'));
+                    })());
+                });
+                "#
+            };
+            let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{source}", source.len());
+            socket.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+    let (mut engine, mut tasks) = page(&runtime, &format!("{base}/page"));
+    eval(&mut engine, r#"
+        globalThis.msgDone = false;
+        (async () => {
+            const registration = await navigator.serviceWorker.register('/msg.js');
+            const installing = registration.installing;
+            installing.postMessage({value:1});
+            await navigator.serviceWorker.ready;
+            const worker = registration.active;
+            if (worker.state !== 'activated') await new Promise(resolve =>
+                worker.addEventListener('statechange', () => {if (worker.state === 'activated') resolve();}));
+            log.push('script:' + worker.scriptURL.endsWith('/msg.js'));
+            log.push('installing-same:' + (installing === worker));
+            let seen = '';
+            for (let i = 0; i < 200 && !seen.startsWith('1:'); i++) {
+                const hit = await caches.match('/seen'); if (hit) seen = await hit.text();
+            }
+            log.push('seen:' + seen);
+            const received = [];
+            let receivedWaiters = [];
+            navigator.serviceWorker.addEventListener('message', event => {
+                received.push([event.data.reply, event.source === worker,
+                    event.source instanceof ServiceWorker,
+                    event.origin === location.origin].join(':'));
+                const waiters = receivedWaiters; receivedWaiters = [];
+                waiters.forEach(resolve => resolve());
+            });
+            const untilReceived = async count => {
+                while (received.length < count)
+                    await new Promise(resolve => receivedWaiters.push(resolve));
+            };
+            let replied = '';
+            for (let i = 0; i < 200 && !replied; i++) {
+                const hit = await caches.match('/replied'); if (hit) replied = await hit.text();
+            }
+            log.push('held:' + received.length);
+            navigator.serviceWorker.startMessages();
+            await untilReceived(1);
+            log.push('received:' + received.join(','));
+            const channel = new MessageChannel();
+            const portReply = new Promise(resolve => channel.port1.onmessage = event => resolve(event.data));
+            worker.postMessage({value:10}, [channel.port2]);
+            log.push(await portReply);
+            await untilReceived(2);
+            log.push('received2:' + received.join(','));
+            let cloneError = '';
+            try { worker.postMessage(() => {}); } catch (error) { cloneError = error.name; }
+            log.push('clone:' + cloneError);
+            const quiet = await navigator.serviceWorker.register('/nomsg/sw.js');
+            const quietWorker = quiet.installing || quiet.waiting || quiet.active;
+            if (quietWorker.state !== 'activated') await new Promise(resolve =>
+                quietWorker.addEventListener('statechange', () => {if (quietWorker.state === 'activated') resolve();}));
+            const skipped = new MessageChannel();
+            quietWorker.postMessage({value:1}, [skipped.port1]);
+            let detached = false;
+            try { structuredClone(skipped.port1, {transfer:[skipped.port1]}); }
+            catch (error) { detached = error.name === 'DataCloneError'; }
+            log.push('skip-detached:' + detached);
+            await quiet.unregister();
+            await registration.unregister();
+        })().catch(error => log.push('ERROR:' + error.name + ':' + error.message)).finally(() => msgDone = true);
+    "#, "service worker messages").unwrap();
+    run_until(&runtime, &mut engine, &mut tasks, "msgDone");
+    assert_eq!(
+        log(&mut engine),
+        "script:true|installing-same:true|seen:1:true:window:top-level:true|held:0|received:2:true:true:true|port:10|received2:2:true:true:true,11:true:true:true|clone:DataCloneError|skip-detached:true"
+    );
+    server.abort();
+}
+
+#[test]
+fn service_worker_documents_keep_controllers_after_their_actors_retire() {
+    let runtime = runtime();
+    let (listener, base) = listen(&runtime);
+    let server = runtime.spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let head = read_head(&mut socket).await;
+            let (mime, source) = if head.starts_with("get /sw.js ") {
+                ("text/javascript", "// A saved classic worker with no event handlers.")
+            } else if head.starts_with("get /scripted ") {
+                ("text/html", r#"<p id=result>waiting</p><script>
+                    URL.createObjectURL(new Blob(['owned by the document']));
+                    const frame=document.createElement('iframe');document.body.appendChild(frame);
+                    frame.contentWindow.eval("URL.createObjectURL(new Blob(['owned by the child document']))");
+                    document.getElementById('result').textContent = navigator.serviceWorker.controller ? 'controlled document' : 'missing controller';
+                </script>"#)
+            } else {
+                ("text/html", "<p>Static document</p>")
+            };
+            let response = format!("HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{source}", source.len());
+            socket.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+    let (mut engine, mut tasks) = page(&runtime, &format!("{base}/register"));
+    let storage = engine.ctx().host::<HostState>().unwrap().storage.clone();
+    eval(
+        &mut engine,
+        r#"
+        globalThis.readyDone = false;
+        (async()=>{
+            globalThis.registration = await navigator.serviceWorker.register('/sw.js');
+            await navigator.serviceWorker.ready;
+            if(registration.active.state !== 'activated') await new Promise(resolve=>{
+                registration.active.addEventListener('statechange',()=>{
+                    if(registration.active.state === 'activated') resolve();
+                });
+            });
+            readyDone = true;
+        })();
+    "#,
+        "service-worker document ownership",
+    )
+    .unwrap();
+    run_until(&runtime, &mut engine, &mut tasks, "readyDone");
+    let mut documents = Vec::new();
+    for path in ["/plain", "/scripted"] {
+        let url = url::Url::parse(&format!("{base}{path}")).unwrap();
+        let mut response = runtime.block_on(async {
+            let response = crate::http::fetch(&crate::http::Request::get(url))
+                .await
+                .unwrap();
+            crate::http::execute_js(response, (80, 24), (8, 16), storage.clone()).await
+        });
+        if let Some(mut live) = response.live.take() {
+            // First paint may precede load/rendering tasks. Require the
+            // actor to retire once those finish, not before first paint.
+            runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    loop {
+                        match live.events.recv().await {
+                            Some(crate::js::PageEvt::Static { html, outcome }) => {
+                                assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                                response.body = html.into_bytes();
+                                break;
+                            }
+                            Some(crate::js::PageEvt::Trouble(errors)) => panic!("{errors:?}"),
+                            Some(_) => {}
+                            None => panic!("document closed without retiring"),
+                        }
+                    }
+                    assert!(live.events.recv().await.is_none());
+                })
+                .await
+                .expect("inert document retained an actor");
+            });
+        }
+        if path == "/scripted" {
+            assert!(
+                response
+                    .js
+                    .as_ref()
+                    .is_some_and(|outcome| outcome.errors.is_empty())
+            );
+            assert!(String::from_utf8_lossy(&response.body).contains(">controlled document<"));
+        }
+        assert!(
+            response
+                .service_client
+                .as_ref()
+                .unwrap()
+                .client()
+                .controller()
+                .is_some()
+        );
+        documents.push(response);
+    }
+    let client = documents[0].service_client.as_ref().unwrap().client();
+    let worker = client.controller().unwrap();
+    let retained_blob_store = documents[1].blobs.as_ref().unwrap().clone();
+    let entries = retained_blob_store.snapshot();
+    assert_eq!(entries.len(), 2);
+    for (blob_url, _) in &entries {
+        assert!(retained_blob_store.resolve(blob_url).is_some());
+    }
+    eval(
+        &mut engine,
+        "globalThis.removed=false;registration.unregister().then(()=>removed=true);",
+        "unregister",
+    )
+    .unwrap();
+    run_until(&runtime, &mut engine, &mut tasks, "removed");
+    assert_eq!(
+        worker.state(),
+        crate::service_worker::WorkerState::Activated
+    );
+    drop(documents.pop());
+    for (blob_url, started_request) in &entries {
+        assert!(
+            retained_blob_store.resolve(blob_url).is_none(),
+            "a retained history blob store kept an unloaded Document's URL published"
+        );
+        let bytes = started_request.read().unwrap();
+        assert!(bytes == b"owned by the document" || bytes == b"owned by the child document");
+    }
+    assert_eq!(
+        worker.state(),
+        crate::service_worker::WorkerState::Activated
+    );
+    drop(documents);
+    assert!(client.controller().is_none());
+    assert_eq!(
+        worker.state(),
+        crate::service_worker::WorkerState::Redundant
+    );
+    server.abort();
+}
+
+#[test]
+fn service_worker_cookie_subscriptions_wake_saved_scripts_and_extend_event_lifetime() {
+    let runtime = runtime();
+    let (listener, base) = listen(&runtime);
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = requests.clone();
+    let server=runtime.spawn(async move {
+        loop {
+            let (mut socket,_)=listener.accept().await.unwrap();
+            let head=read_head(&mut socket).await;
+            count.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
+            let source=if head.starts_with("get /import.js ") {"self.savedVersion='original';"} else {r#"
+                importScripts('/import.js');
+                self.oninstall = event => event.waitUntil(import('/forbidden-dynamic.js').then(
+                    () => {throw new Error('dynamic import was allowed');},
+                    error => {if(error.name!=='TypeError')throw error;}));
+                self.oncookiechange = event => {
+                    event.waitUntil((async () => {
+                        const cache=await caches.open('cookie-worker-events');
+                        const old=await cache.match('/count');
+                        const count=old?Number(await old.text()):0;
+                        const names=event.changed.map(x=>x.name+'='+x.value).join(',')+';'+event.deleted.map(x=>x.name+':'+('value' in x)).join(',');
+                        await cache.put('/last',new Response(savedVersion+':'+names+':'+event.isTrusted+':'+
+                            (event instanceof ExtendableCookieChangeEvent)+':'+Object.isFrozen(event.changed)+':'+(event.changed===event.changed)));
+                        await cache.put('/count',new Response(String(count+1)));
+                    })());
+                };
+            "#};
+            let response=format!("HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{source}",source.len());
+            socket.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+    let (mut engine, mut tasks) = page(&runtime, &format!("{base}/page"));
+    eval(&mut engine,r#"
+        globalThis.cookieWorkerPhase='starting';globalThis.cookieWorkerDone=false;
+        (async()=>{
+            const reg=await navigator.serviceWorker.register('/cookie-worker.js');
+            await navigator.serviceWorker.ready;
+            const worker=reg.active;
+            if(worker.state!=='activated')await new Promise(resolve=>worker.addEventListener('statechange',()=>{if(worker.state==='activated')resolve();}));
+            globalThis.cookieRegistration=reg;
+            const manager=reg.cookies;
+            log.push('manager:'+(manager===reg.cookies)+':'+(manager instanceof CookieStoreManager));
+            await manager.subscribe([{}]);
+            const all=await manager.getSubscriptions();
+            log.push('all:'+all.length+':'+('name' in all[0]));
+            await manager.unsubscribe(all);
+            try {await manager.subscribe([{name:' partial '},{url:'https://other.invalid/'}]);}
+            catch(error){log.push('partial:'+error.name);}
+            log.push('kept:'+(await manager.getSubscriptions())[0].name);
+            await manager.unsubscribe([{name:'partial'}]);
+            await manager.subscribe([{name:'sw-watched'},{name:'sw-watched',url:reg.scope+'nested'}]);
+            await manager.subscribe([{name:'sw-watched'}]);
+            log.push('subscriptions:'+(await manager.getSubscriptions()).length);
+            cookieWorkerPhase='activated';
+        })().catch(error=>{log.push('ERROR:'+error.name+':'+error.message);cookieWorkerPhase='failed';cookieWorkerDone=true;});
+    "#,"service cookie subscriptions").unwrap();
+    run_until(
+        &runtime,
+        &mut engine,
+        &mut tasks,
+        "cookieWorkerPhase!=='starting'",
+    );
+    assert_eq!(
+        string_value(&mut engine, "cookieWorkerPhase"),
+        "activated",
+        "{}",
+        log(&mut engine)
+    );
+    assert_eq!(
+        service_worker_host::stop_idle_agents_for_test(engine.ctx()),
+        1
+    );
+    eval(&mut engine,r#"
+        (async()=>{
+            await cookieStore.set({name:'sw-unrelated',value:'ignored',path:'/'});
+            await cookieStore.set({name:'sw-watched',value:'one',path:'/'});
+            const cache=await caches.open('cookie-worker-events');
+            async function waitCount(expected){for(;;){const response=await cache.match('/count');if(response&&Number(await response.text())>=expected)return;await new Promise(resolve=>setTimeout(resolve,5));}}
+            await waitCount(1);
+            log.push('changed:'+await(await cache.match('/last')).text());
+            await cookieStore.delete('sw-watched');
+            await waitCount(2);
+            log.push('deleted:'+await(await cache.match('/last')).text());
+            log.push('events:'+await(await cache.match('/count')).text());
+            await cookieRegistration.cookies.unsubscribe(await cookieRegistration.cookies.getSubscriptions());
+            log.push('empty:'+(await cookieRegistration.cookies.getSubscriptions()).length);
+            await cookieRegistration.unregister();
+        })().catch(error=>log.push('ERROR:'+error.name+':'+error.message)).finally(()=>cookieWorkerDone=true);
+    "#,"wake cookie worker").unwrap();
+    run_until(&runtime, &mut engine, &mut tasks, "cookieWorkerDone");
+    assert_eq!(
+        log(&mut engine),
+        "manager:true:true|all:1:false|partial:TypeError|kept:partial|subscriptions:2|changed:original:sw-watched=one;:true:true:true:true|deleted:original:;sw-watched:false:true:true:true:true|events:2|empty:0"
+    );
+    assert_eq!(
+        requests.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "restarting must reuse the root and imported script bytes"
+    );
+    server.abort();
+}
+
+#[test]
+fn service_worker_registration_uses_settings_origins_for_inherited_and_opaque_windows() {
+    let runtime = runtime();
+    let (listener, base) = listen(&runtime);
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = requests.clone();
+    let server=runtime.spawn(async move {
+        loop {
+            let (mut socket,_)=listener.accept().await.unwrap();
+            let _=read_head(&mut socket).await;
+            count.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+        }
+    });
+    let (mut engine, mut tasks) = page(&runtime, &format!("{base}/page"));
+    eval(&mut engine,&format!(r#"
+        globalThis.originWorkerDone=false;
+        const root=document.appendChild(document.createElement('html'));
+        // The normal browser bootstrap supplies this flag explicitly; the
+        // small test page uses the prelude's loopback-URL fallback.
+        const frameConfig={{...__trust_cfg,secureContext:isSecureContext}};
+        function realm(url,sandbox){{
+            const frame=document.createElement('iframe');
+            if(sandbox!==undefined)frame.setAttribute('sandbox',sandbox);
+            root.appendChild(frame);frame.__contentDoc=undefined;
+            __dom_load_frame(frame.__id,'<body></body>',url);
+            const child=__dom_create_window_realm(__dom_allocate_job_context(),frame.__id,url,frameConfig,window,window,frame,0,'');
+            frame.__frameUrl=url;frame.__contentRealmWindow=child;frame.__contentDoc=child.document;
+            return child;
+        }}
+        // Construct both realms before starting the asynchronous check: a
+        // fresh debug-build Window bootstrap is substantial synchronous work
+        // and must not consume the network task pump's deadline midway through.
+        const inherited=realm('about:blank');
+        const opaque=realm({opaque},'allow-scripts');
+        (async()=>{{
+            const registration=await inherited.navigator.serviceWorker.register({script},{{scope:{scope}}});
+            log.push('inherited:'+registration.scope);
+            opaque.eval(`globalThis.originResults=[];
+                globalThis.originChecks=(async()=>{{
+                    for(const op of [()=>navigator.serviceWorker.register({script}),()=>navigator.serviceWorker.getRegistrations(),()=>navigator.serviceWorker.getRegistration()]){{
+                        try{{await op();originResults.push('allowed');}}catch(error){{originResults.push(error.name);}}
+                    }}
+                }})();`);
+            await opaque.originChecks;
+            log.push('opaque:'+opaque.originResults.join(','));
+            log.push('removed:'+await registration.unregister());
+        }})().catch(error=>log.push('ERROR:'+error.name+':'+error.message)).finally(()=>originWorkerDone=true);
+    "#,script=serde_json::to_string(&format!("{base}/frame-sw.js")).unwrap(),scope=serde_json::to_string(&format!("{base}/")).unwrap(),opaque=serde_json::to_string(&format!("{base}/opaque")).unwrap()),"service-worker settings origins").unwrap();
+    run_until(&runtime, &mut engine, &mut tasks, "originWorkerDone");
+    assert_eq!(
+        log(&mut engine),
+        format!("inherited:{base}/|opaque:SecurityError,SecurityError,SecurityError|removed:true")
+    );
+    assert_eq!(
+        requests.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "opaque registration must not fetch a script"
+    );
+    server.abort();
+}
+
 fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -71,6 +642,34 @@ fn run_until(
         while string_value(engine, "__trust.hasPlatformTask()") == "true" {
             eval(engine, "__trust.runPlatformTask()", "platform task").unwrap();
             run_microtask_checkpoint(engine);
+        }
+        // A frame's DOM-manipulation tasks belong to its own realm. Tests
+        // with inherited/sandboxed settings must pump those queues as the
+        // resident page actor does, including promise-only native failures.
+        let contexts: Vec<_> = engine
+            .ctx()
+            .host::<HostState>()
+            .unwrap()
+            .window_realms
+            .keys()
+            .copied()
+            .collect();
+        for context in contexts {
+            run_in_context_realm(engine, context, "frame platform tasks", |engine| {
+                for _ in 0..32 {
+                    if !matches!(
+                        host_call_trust(engine.ctx(), "hasPlatformTask", &[]),
+                        Ok(Value::Bool(true))
+                    ) {
+                        break;
+                    }
+                    host_call_trust(engine.ctx(), "runPlatformTask", &[])
+                        .map_err(|_| String::from("frame platform task failed"))?;
+                    run_microtask_checkpoint(engine);
+                }
+                Ok(())
+            })
+            .unwrap();
         }
         if string_value(engine, condition) == "true" {
             return;
@@ -2071,5 +2670,225 @@ fn a_page_navigation_aborts_the_old_documents_fetches_first() {
     assert!(
         seen.contains(&(String::from("/slow closed"), true)),
         "{seen:?}"
+    );
+}
+
+#[test]
+fn fetch_redirect_modes_stop_before_the_next_request_and_cache_manual_responses() {
+    // Fetch #http-fetch / #concept-response-location-url: redirect mode is
+    // applied to the redirect status before Location is parsed/followed.
+    let rt = runtime();
+    let (listener, base) = listen(&rt);
+    let targets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = targets.clone();
+    let server = rt.spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let head = read_head(&mut socket).await;
+            let response = if head.starts_with("get /target ") {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                "HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\ntarget"
+            } else if head.starts_with("get /missing ") {
+                "HTTP/1.1 302 Found\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbody"
+            } else if head.starts_with("get /multi ") {
+                "HTTP/1.1 302 Found\r\nLocation: /target\r\nLocation: /other\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            } else {
+                "HTTP/1.1 302 Found\r\nLocation: /target\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbody"
+            };
+            socket.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+    let (mut engine, mut tasks) = page(&rt, &format!("{base}/page"));
+    eval(&mut engine, r#"
+        (async () => {
+            for (const path of ['/redirect', '/missing', '/multi']) {
+                try { await fetch(path, {redirect:'error'}); log.push('bad'); }
+                catch(e) { log.push('error:' + e.name); }
+                const r = await fetch(path, {redirect:'manual'});
+                log.push([r.type,r.status,r.body === null,r.redirected,r.headers.get('location'),
+                    r.url === new URL(path,location.href).href,await r.text()].join(':'));
+                const c = await caches.open('redirects');
+                await c.put(path, r.clone());
+                const copy = (await c.match(path)).clone();
+                log.push([copy.type,copy.status,copy.body===null,await copy.text()].join(':'));
+            }
+            log.push('follow:' + await (await fetch('/redirect')).text());
+            const missing = await fetch('/missing');
+            log.push('missing:' + missing.status + ':' + await missing.text());
+            try { await fetch('/multi'); log.push('bad'); } catch(e) { log.push('multi:' + e.name); }
+            log.push('done');
+        })().catch(e => log.push('FAILED:' + e.name + ':' + e.message));
+    "#, "redirect modes").unwrap();
+    run_until(
+        &rt,
+        &mut engine,
+        &mut tasks,
+        "log.includes('done') || log.some(x=>x.startsWith('FAILED'))",
+    );
+    let mut expected = Vec::new();
+    for _ in 0..3 {
+        expected.extend([
+            "error:TypeError",
+            "opaqueredirect:0:true:false::true:",
+            "opaqueredirect:0:true:",
+        ]);
+    }
+    expected.extend([
+        "follow:target",
+        "missing:302:body",
+        "multi:TypeError",
+        "done",
+    ]);
+    assert_eq!(log(&mut engine), expected.join("|"));
+    assert_eq!(targets.load(std::sync::atomic::Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[test]
+fn opaque_and_cors_cache_roundtrips_keep_private_bytes_without_exposing_them() {
+    // Fetch #concept-filtered-response / #concept-response-clone and SW
+    // #cache-put: an opaque cached image keeps real bytes behind a null Body.
+    let rt = runtime();
+    let (listener, base) = listen(&rt);
+    let server = rt.spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_head(&mut socket).await;
+            socket.write_all(b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Expose-Headers: X-Public\r\nContent-Type: application/octet-stream\r\nX-Public: yes\r\nX-Secret: private\r\nContent-Length: 6\r\nConnection: close\r\n\r\n").await.unwrap();
+            socket.write_all(&[0, 1, 127]).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            socket.write_all(&[128, 254, 255]).await.unwrap();
+        }
+    });
+    let (mut engine, mut tasks) = page(&rt, "http://127.0.0.1:1/page");
+    eval(&mut engine, &format!(r#"
+        const remote={base:?};
+        (async () => {{
+            const c = await caches.open('opaque');
+            let jsonHooks = 0;
+            Object.defineProperty(Object.prototype, 'toJSON', {{configurable:true, value() {{ jsonHooks++; return this; }} }});
+            const r = await fetch(remote + '/image', {{mode:'no-cors'}});
+            const clone = r.clone();
+            log.push([r.type,r.status,r.body===null,r.url,r.headers.get('x-secret'),await r.text(),r.bodyUsed].join(':'));
+            await c.put('/image', clone);
+            await c.put('/image2', (await c.match('/image')).clone());
+            const copy = (await c.match('/image2')).clone();
+            log.push([copy.type,copy.status,copy.body===null,copy.url,await copy.text(),copy.bodyUsed].join(':'));
+            delete Object.prototype.toJSON;
+            log.push('json-hooks:' + jsonHooks);
+            const cors = await fetch(remote + '/data');
+            log.push(cors.type + ':' + cors.headers.get('x-public') + ':' + cors.headers.get('x-secret'));
+            await c.put('/cors', cors.clone());
+            const cached = (await c.match('/cors')).clone();
+            log.push(cached.type + ':' + cached.headers.get('x-public') + ':' + cached.headers.get('x-secret') + ':' + [...await cached.bytes()].join(','));
+            log.push('original:' + [...await cors.bytes()].join(','));
+            log.push('done');
+        }})().catch(e => log.push('FAILED:' + e.name + ':' + e.message));
+    "#), "opaque cache").unwrap();
+    run_until(
+        &rt,
+        &mut engine,
+        &mut tasks,
+        "log.includes('done') || log.some(x=>x.startsWith('FAILED'))",
+    );
+    assert_eq!(
+        log(&mut engine),
+        "opaque:0:true::::false|opaque:0:true:::false|json-hooks:0|cors:yes:null|cors:yes:null:0,1,127,128,254,255|original:0,1,127,128,254,255|done"
+    );
+    // Native-only inspection: no opaque bytes or hidden headers are in the
+    // serialized JS cache records. The cache owns native capabilities.
+    let storage = engine.ctx().host::<HostState>().unwrap().storage.clone();
+    let payloads = private_response_host::cached_payloads(&storage);
+    assert_eq!(payloads.len(), 3);
+    for payload in payloads {
+        assert_eq!(payload.internal.status, 200);
+        assert!(
+            payload
+                .internal
+                .headers
+                .iter()
+                .any(|(name, value)| name == "x-secret" && value == "private")
+        );
+        if let Some(body) = &payload.body {
+            let mut cursor = body.cursor();
+            let mut bytes = Vec::new();
+            while let Some(piece) = rt
+                .block_on(crate::http::ExternalBody::next(&mut cursor))
+                .unwrap()
+            {
+                bytes.extend(piece);
+            }
+            assert_eq!(bytes, [0, 1, 127, 128, 254, 255]);
+        }
+    }
+    let storage = storage.lock().unwrap();
+    let encoded = storage
+        .iter()
+        .find(|(key, _)| key.starts_with("cache-storage-data:"))
+        .unwrap()
+        .1
+        .values()
+        .next()
+        .unwrap();
+    assert!(!encoded.contains("x-secret"));
+    let records: serde_json::Value = serde_json::from_str(encoded).unwrap();
+    for record in records.as_array().unwrap() {
+        assert!(record["response"]["privateToken"].as_str().is_some());
+        if record["response"]["type"] == "opaque" {
+            assert_eq!(record["response"]["body64"], "");
+        }
+    }
+    drop(storage);
+    server.abort();
+}
+
+#[test]
+fn opaque_streams_abort_on_the_signal_and_window_stop_after_the_head() {
+    let rt = runtime();
+    let (listener, base) = listen(&rt);
+    let server = rt.spawn(async move {
+        let mut clients = Vec::new();
+        for _ in 0..2 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            clients.push(tokio::spawn(async move {
+                read_head(&mut socket).await;
+                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n").await.unwrap();
+                let mut byte = [0];
+                matches!(tokio::time::timeout(Duration::from_secs(5), socket.read(&mut byte)).await, Ok(Ok(0) | Err(_)))
+            }));
+        }
+        for client in clients { assert!(client.await.unwrap(), "opaque body connection must be canceled"); }
+    });
+    let (mut engine, mut tasks) = page(&rt, "http://127.0.0.1:1/page");
+    eval(&mut engine, &format!(r#"
+        globalThis.opaqueReplies = [];
+        (async () => {{
+            const controller = new AbortController();
+            const first = await fetch({base:?} + '/signal', {{mode:'no-cors', signal:controller.signal}});
+            opaqueReplies.push(first);
+            log.push(first.type + ':' + first.body);
+            controller.abort();
+            const second = await fetch({base:?} + '/stop', {{mode:'no-cors'}});
+            opaqueReplies.push(second);
+            log.push(second.type + ':' + second.body);
+            window.stop();
+        }})().catch(e => log.push('FAILED:' + e.name + ':' + e.message));
+    "#), "opaque cancellation").unwrap();
+    run_until(
+        &rt,
+        &mut engine,
+        &mut tasks,
+        "log.length >= 2 || log.some(x=>x.startsWith('FAILED'))",
+    );
+    assert_eq!(log(&mut engine), "opaque:null|opaque:null");
+    rt.block_on(server).unwrap();
+    run_for(&rt, &mut engine, &mut tasks, Duration::from_millis(50));
+    assert!(
+        !engine
+            .ctx()
+            .host::<HostState>()
+            .unwrap()
+            .private_responses
+            .transferring()
     );
 }

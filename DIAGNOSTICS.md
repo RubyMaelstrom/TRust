@@ -527,6 +527,11 @@ engine to carry `href` into `SemanticNode`, not a driver-side guess from geometr
 
 `trust-desktop --help` accepts `[--renderer=auto|cpu|hybrid] [URL]`.
 `TRUST_DESKTOP_TRACE` and the desktop benchmark inputs are listed below.
+Open `src/fixtures/touch_input.html` with the release desktop browser to check
+touchscreen panning, directional starts, rotated axes, capture/cancellation,
+and button taps. Its event log shows each contact's pointer ID and primary
+status. The native input regression can also run without opening a window on
+Wayland: `cargo test --release --bin trust-desktop native_touch_panning -- --ignored --nocapture`.
 Escape, `stop` and `kill` behave as in the terminal browser; a page in
 fullscreen leaves it on Escape, and `kill` also restores the window.
 

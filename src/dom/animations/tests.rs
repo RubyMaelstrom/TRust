@@ -13,6 +13,22 @@ fn value(dom: &Dom, id: &str, property: &str) -> Option<String> {
 }
 
 #[test]
+fn touch_action_does_not_change_through_animation_sampling() {
+    let mut dom = setup(
+        "#target{touch-action:pan-y;animation:policy 2s linear both}\
+         @keyframes policy{from{touch-action:none}to{touch-action:pan-x}}",
+        "<div id=target></div>",
+    );
+    for time in [0.0, 1.0, 2.0] {
+        dom.update_css_animations(time);
+        assert_eq!(
+            value(&dom, "target", "touch-action").as_deref(),
+            Some("pan-y")
+        );
+    }
+}
+
+#[test]
 fn animation_composition_combines_in_list_order_before_interpolation() {
     let mut dom = setup(
         "div{width:10px;animation:a 2s linear,b 2s linear;animation-composition:replace,add}

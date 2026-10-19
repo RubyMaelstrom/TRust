@@ -78,6 +78,7 @@ fn sampled_property(property: &str, sample_compositor: bool) -> bool {
                 | "direction"
                 | "unicode-bidi"
                 | "will-change"
+                | "touch-action"
                 // A compatibility alias of the -x/-y longhands, which paint
                 // prefers once they are set.
                 | "background-position"

@@ -625,6 +625,8 @@ pub(crate) mod tests {
 
     pub(crate) fn response(value: Value) -> http::Response {
         http::Response {
+            internal: None,
+            service_client: None,
             url: Url::parse("https://rdap.example.test/domain/example.test").unwrap(),
             status: 200,
             status_text: String::new(),

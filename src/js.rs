@@ -109,6 +109,8 @@ pub enum WorkerOut {
 /// and by the frontend that presents the page's `blob:` images.
 pub type BlobMap = std::sync::Arc<crate::blob_url_store::BlobUrlStore>;
 
+pub use crate::service_worker::DocumentClient;
+
 /// After this many actual or speculative cache-miss fetches, stop issuing additional optional
 /// module prefetches. Required Fetch/HTML requests must never consult this optimization threshold:
 /// Fetch Standard §5.6 calls Fetch for every valid `fetch()` request and only a network error
@@ -211,6 +213,7 @@ pub struct PageEnv {
     pub net: Option<tokio::runtime::Handle>,
     pub storage: Option<WebStorage>,
     pub blobs: BlobMap,
+    pub(crate) service_client: Option<DocumentClient>,
     /// A frame document of this page has scripts. Nested documents run
     /// their own scripts (HTML #the-iframe-element), which only the live
     /// actor can do, so the page stays live even without scripts of its own.
@@ -302,6 +305,7 @@ impl PageEnv {
             net: None,
             storage: None,
             blobs: Default::default(),
+            service_client: None,
             scripted_frames: false,
             last_modified: None,
             document_encoding: encoding_rs::UTF_8,
@@ -525,6 +529,7 @@ pub enum PageCmd {
         dy: f64,
     },
     /// Actual pointer transitions, before the separate primary click action.
+    Touch(crate::touch::TouchInput),
     PointerButton {
         node: Option<usize>,
         pressed: bool,
@@ -655,6 +660,7 @@ impl PageCmd {
                 | Self::LockedPointerButton { .. }
                 | Self::LockedWheel { .. }
                 | Self::PointerButton { .. }
+                | Self::Touch(_)
                 | Self::Focus(_)
                 | Self::KeyboardFocus(_)
                 | Self::PickerOpen { .. }
@@ -1554,6 +1560,7 @@ pub(crate) fn worker_prelude() -> &'static str {
             let ports = platform_block("/*__PORTS_BEGIN__*/", "/*__PORTS_END__*/");
             let codec = platform_block("/*__SC_CODEC_BEGIN__*/", "/*__SC_CODEC_END__*/");
             let features = platform_block("/*__FEATURES_BEGIN__*/", "/*__FEATURES_END__*/");
+            let cookies = platform_block("/*__COOKIE_STORE_BEGIN__*/", "/*__COOKIE_STORE_END__*/");
             let bitmap = platform_block("/*__IMAGE_BITMAP_BEGIN__*/", "/*__IMAGE_BITMAP_END__*/");
             // HTML OffscreenCanvas, its 2D and bitmaprenderer contexts and
             // WebGL are [Exposed=(Window,Worker)].
@@ -1610,7 +1617,7 @@ pub(crate) fn worker_prelude() -> &'static str {
                     1,
                 );
             format!(
-                "{domexception}\n{worker_scope}\n{geometry}\n{string_list}\n{navigator}\n{permissions}\n{ports}\n{codec}\n{features}\n{abort}\n{streams}\n{file}\n{blob_url}\n{fetch}\n{cache_storage}\n{indexed_db}\n{xhr}\n{websocket}\n{eventsource}\n{dedicated_worker}\n{rejection}\n__rejection_bind(__rejection_api);\n{bitmap}\n{WEBGL}\n{canvas}\n{fonts}\n{crypto}\n{urlpattern}\n{wasm}\n\
+                "{domexception}\n{worker_scope}\n{geometry}\n{string_list}\n{navigator}\n{permissions}\n{ports}\n{codec}\n{features}\n{cookies}\n{abort}\n{streams}\n{file}\n{blob_url}\n{fetch}\n{cache_storage}\n{indexed_db}\n{xhr}\n{websocket}\n{eventsource}\n{dedicated_worker}\n{rejection}\n__rejection_bind(__rejection_api);\n{bitmap}\n{WEBGL}\n{canvas}\n{fonts}\n{crypto}\n{urlpattern}\n{wasm}\n\
                  __port_api.setCodec(__sc_serialize, __sc_deserialize);\n\
                  __port_api.setStreams(__streams_api);\n\
                  __port_api.setBitmaps(__bitmap_api); __sc_bitmap_codec(__bitmap_api);\n\
@@ -1622,10 +1629,13 @@ pub(crate) fn worker_prelude() -> &'static str {
                  delete globalThis.__crypto_key_api; delete globalThis.__sc_crypto_codec;\n\
                  (function (control) {{\n\
                  \x20   control.installPorts(__port_api);\n\
+                 \x20   control.privateResponseEnded = __fetch_api.privateResponseEnded;\n\
                  \x20   control.messageCodec = {{ serialize: __sc_serialize, deserialize: __sc_deserialize }};\n\
                  }})(Reflect.apply(WeakMap.prototype.get, __platform_slots(\"controls\", new WeakMap()), [globalThis]));\n\
-                 delete globalThis.__port_api;\n{performance}\n{class_strings}",
+                 delete globalThis.__port_api;\n{performance}\n{service_client}\n{service_events}\n{class_strings}",
                 WEBGL = include_str!("js_webgl.js"),
+                service_client = include_str!("service_worker/client.js"),
+                service_events = include_str!("service_worker/events.js"),
             )
         })
         .as_str()
@@ -1675,7 +1685,11 @@ const WORKER_SCOPE: &str = include_str!("js_worker.js");
 pub(crate) const PRELUDE: &str = concat!(
     include_str!("js_webgl.js"),
     "\n",
-    include_str!("js_platform.js")
+    include_str!("js_platform.js"),
+    "\n",
+    include_str!("service_worker/client.js"),
+    "\n",
+    include_str!("js_touch.js")
 );
 
 pub(crate) fn decode_history_updates(json: &str) -> Vec<(String, bool)> {

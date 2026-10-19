@@ -2,8 +2,8 @@
 //!
 //! The user agent's blob URL store maps blob URLs (keys without a fragment) to blob URL
 //! entries: a Blob's byte sequence and the environment settings object that created the URL.
-//! A page and all of its agents — its Windows and frames on the page actor, its dedicated,
-//! nested and shared workers — share one store, so a URL minted in any of them resolves in
+//! A page and all of its agents share one ownership shard. Shards in the same browser
+//! profile join one lookup domain, so a URL minted in any of them resolves in
 //! the others (#blob-url-resolve), subject to #partitioningOfBlobUrls: only environments
 //! whose storage key equals the creator's obtain the Blob (#blob-url-obtain-object), and only
 //! they may revoke it (#dfn-revokeObjectURL). A navigation obtains it without that check.
@@ -17,7 +17,7 @@
 
 use crate::file_select::{FileRange, ReadError};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 /// One leaf of a stored Blob's byte sequence.
 #[derive(Clone, Debug)]
@@ -106,11 +106,22 @@ impl BlobUrlEntry {
     }
 }
 
-/// One page's blob URL store, shared by every agent of the page.
+/// One page's ownership shard of the user agent's blob URL store.
 #[derive(Debug, Default)]
 pub struct BlobUrlStore {
     entries: Mutex<HashMap<String, Arc<BlobUrlEntry>>>,
+    domain: Mutex<Option<Arc<Domain>>>,
 }
+
+/// Weak members preserve document ownership: joining a profile must not keep
+/// a closed page's entries alive. Resolved entries independently retain their
+/// bytes for requests already in progress (File API #dfn-revokeObjectURL).
+#[derive(Debug)]
+struct Domain(Vec<Weak<BlobUrlStore>>);
+
+// Joins change the domain of every live member atomically with respect to
+// lookups and revocations. No file reads or author callbacks run under this lock.
+static DOMAINS: RwLock<()> = RwLock::new(());
 
 /// The store key of a URL string: its serialization without the fragment (#blob-url-resolve).
 pub fn key(url: &str) -> &str {
@@ -129,9 +140,55 @@ impl BlobUrlStore {
         self.lock().insert(url, Arc::new(entry));
     }
 
+    /// Join existing stores without copying entries or invalidating callers'
+    /// handles. The caller chooses the browser profile; partition authorization
+    /// remains per entry in obtain/revoke. File API #BlobURLStore, #lifeTime.
+    pub(crate) fn join(self: &Arc<Self>, other: &Arc<Self>) {
+        if Arc::ptr_eq(self, other) {
+            return;
+        }
+        let _joining = DOMAINS.write().unwrap();
+        let left = self.domain.lock().unwrap().clone();
+        let right = other.domain.lock().unwrap().clone();
+        if let (Some(left), Some(right)) = (&left, &right)
+            && Arc::ptr_eq(left, right)
+        {
+            return;
+        }
+        let mut members = vec![self.clone(), other.clone()];
+        for group in [left, right].into_iter().flatten() {
+            for member in group.0.iter().filter_map(Weak::upgrade) {
+                if !members.iter().any(|old| Arc::ptr_eq(old, &member)) {
+                    members.push(member);
+                }
+            }
+        }
+        let group = Arc::new(Domain(members.iter().map(Arc::downgrade).collect()));
+        for member in &members {
+            *member.domain.lock().unwrap() = Some(group.clone());
+        }
+    }
+
+    // The caller holds DOMAINS for reading. Keep the local shard first, and
+    // avoid retaining other pages after this operation completes.
+    fn peers(&self) -> Vec<Arc<Self>> {
+        let group = self.domain.lock().unwrap().clone();
+        group
+            .into_iter()
+            .flat_map(|group| group.0.iter().filter_map(Weak::upgrade).collect::<Vec<_>>())
+            .filter(|store| !std::ptr::eq(self, &**store))
+            .collect()
+    }
+
     /// #blob-url-resolve: the entry of `url`, ignoring its fragment.
     pub fn resolve(&self, url: &str) -> Option<Arc<BlobUrlEntry>> {
-        self.lock().get(key(url)).cloned()
+        let _lookup = DOMAINS.read().unwrap();
+        if let Some(entry) = self.lock().get(key(url)).cloned() {
+            return Some(entry);
+        }
+        self.peers()
+            .iter()
+            .find_map(|store| store.lock().get(key(url)).cloned())
     }
 
     /// #blob-url-resolve followed by #blob-url-obtain-object for an environment with
@@ -146,13 +203,26 @@ impl BlobUrlStore {
     /// URL's blob URL entry (resolved without the fragment); it is removed by `url`'s whole
     /// serialization (#removeTheEntry), as the store's keys never have a fragment.
     pub fn revoke(&self, url: &str, storage_key: &str) {
+        let _lookup = DOMAINS.read().unwrap();
+        if self.revoke_local(url, storage_key) {
+            return;
+        }
+        for store in self.peers() {
+            if store.revoke_local(url, storage_key) {
+                return;
+            }
+        }
+    }
+
+    fn revoke_local(&self, url: &str, storage_key: &str) -> bool {
         let mut entries = self.lock();
-        let authorized = entries
-            .get(key(url))
-            .is_some_and(|entry| entry.storage_key == storage_key);
-        if authorized {
+        let Some(entry) = entries.get(key(url)) else {
+            return false;
+        };
+        if entry.storage_key == storage_key {
             entries.remove(url);
         }
+        true
     }
 
     /// #lifeTime: the entries an environment created go away with it. `realm` None removes
@@ -172,7 +242,7 @@ impl BlobUrlStore {
         self.lock().is_empty()
     }
 
-    /// Approximate heap bytes the entries hold.
+    /// Approximate heap bytes owned by this shard, not every page in its profile.
     pub fn retained_bytes(&self) -> usize {
         let entries = self.lock();
         entries
@@ -225,6 +295,65 @@ impl Drop for EnvironmentRelease {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn joined_pages_share_resolution_and_revocation_without_pinning_owners() {
+        let profile = Arc::new(BlobUrlStore::default());
+        let page = Arc::new(BlobUrlStore::default());
+        let sibling = Arc::new(BlobUrlStore::default());
+        let isolated = Arc::new(BlobUrlStore::default());
+        let url = "blob:https://a.test/00000000-0000-4000-8000-000000000001";
+        page.add(url.into(), entry(b"first", "https://a.test", 1, 0));
+        profile.join(&page);
+        sibling.join(&profile);
+        assert!(isolated.resolve(url).is_none());
+        assert!(sibling.obtain(url, Some("https://b.test")).is_none());
+        let started = sibling.obtain(url, Some("https://a.test")).unwrap();
+        sibling.revoke(url, "https://b.test");
+        assert!(profile.resolve(url).is_some());
+        sibling.revoke(&format!("{url}#fragment"), "https://a.test");
+        assert!(page.resolve(url).is_some());
+        sibling.revoke(url, "https://a.test");
+        assert!(page.resolve(url).is_none());
+        assert!(profile.resolve(url).is_none());
+        assert_eq!(started.read().unwrap(), b"first");
+
+        page.add(url.into(), entry(b"second", "https://a.test", 1, 0));
+        assert_eq!(profile.retained_bytes(), 0);
+        assert_eq!(sibling.retained_bytes(), 0);
+        assert!(page.retained_bytes() > 0);
+        let owner = Arc::downgrade(&page);
+        drop(page);
+        assert!(owner.upgrade().is_none());
+        assert!(profile.resolve(url).is_none());
+        assert!(sibling.resolve(url).is_none());
+    }
+
+    #[test]
+    fn joining_domains_preserves_existing_entries_and_environment_cleanup() {
+        let a = Arc::new(BlobUrlStore::default());
+        let b = Arc::new(BlobUrlStore::default());
+        let c = Arc::new(BlobUrlStore::default());
+        let d = Arc::new(BlobUrlStore::default());
+        let first = "blob:https://a.test/00000000-0000-4000-8000-000000000002";
+        let second = "blob:https://a.test/00000000-0000-4000-8000-000000000003";
+        a.add(first.into(), entry(b"first", "https://a.test", 1, 0));
+        d.add(second.into(), entry(b"second", "https://a.test", 2, 1));
+        a.join(&b);
+        c.join(&d);
+        assert!(a.resolve(second).is_none());
+        b.join(&c);
+        a.join(&d); // Rejoining is idempotent.
+        for store in [&a, &b, &c, &d] {
+            assert!(store.resolve(first).is_some());
+            assert!(store.resolve(second).is_some());
+        }
+        d.remove_environment(2, Some(1));
+        for store in [&a, &b, &c, &d] {
+            assert!(store.resolve(first).is_some());
+            assert!(store.resolve(second).is_none());
+        }
+    }
 
     fn entry(bytes: &[u8], key: &str, agent: u64, realm: u64) -> BlobUrlEntry {
         BlobUrlEntry {

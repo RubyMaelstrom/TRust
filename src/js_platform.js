@@ -1971,6 +1971,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     function updateVisibilityState(state) {
         if (documentVisibility === state) return;
         documentVisibility = state;
+        if (trust.serviceClientChanged) trust.serviceClientChanged();
         if (trust.queueVisibilityStateEntry) trust.queueVisibilityStateEntry(state);
         dispatch(g.document, createTrustedEvent(Event, "visibilitychange",
             { bubbles: true, cancelable: false }), false);
@@ -2223,6 +2224,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         trust.collectFocusChain(chain);
         systemFocused = !!focused;
         __dom_system_focus(systemFocused);
+        if (trust.serviceClientChanged) trust.serviceClientChanged();
         if (!systemFocused) {
             for (const [entryTrust, element] of chain) entryTrust.fireFocusChainEntry(element, "blur");
         } else {
@@ -2436,6 +2438,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // object; a navigable container is not itself an entry, so the iframe
     // element becomes this Document's focused area without events.
     function chainFocusWindow(type) {
+        if (trust.serviceClientChanged) trust.serviceClientChanged();
         dispatch(g, createTrustedEvent(FocusEvent, type, {
             bubbles: false, cancelable: false, composed: true, view: g, detail: 0, relatedTarget: null,
         }), false);
@@ -4046,13 +4049,14 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     const PageTransitionEvent = simpleEvent("PageTransitionEvent", Event, [["persisted", idlBoolean, false]]);
     // HTML #the-messageevent-interface, #the-errorevent-interface and
     // WebSockets #the-closeevent-interface: the shared HTML_EVENTS block.
+    const htmlEventOwn=Object.getOwnPropertyDescriptor;
     g.__html_events_adapter = {
         Event,
         // HTML #messageeventsource: a WindowProxy (a Window or another
         // Realm's cross-origin view of one) or a MessagePort.
         isMessageEventSource(value) {
             return windowMessageState(value) !== null || portState(value) !== undefined ||
-                messageApply(weakSetHas, crossOriginViewBrands, [value]);
+                messageApply(weakSetHas, crossOriginViewBrands, [value]) || htmlEventOwn(internalsOf(value),"serviceWorker")?.value?.kind === "ServiceWorker";
         },
         isMessagePort(value) { return portState(value) !== undefined; },
         dispatching(event) { return eventRecord(event).eventDispatching; },
@@ -4424,9 +4428,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         "webkittransitionend", "wheel",
     ];
     // Touch Events #conditionally-exposing-legacy-touch-event-apis: TRust
-    // reports maxTouchPoints 0, so it does not expose the legacy ontouch*
-    // handlers that pages read as a touch-device signal; TouchEvent and
-    // addEventListener("touchstart", ...) remain available.
+    // delivers native touchscreen input through Pointer Events. Keep the
+    // legacy ontouch* handlers absent until native Touch Events are supported;
+    // the TouchEvent constructor remains available for script-created events.
     const EXTENDED_EVENT_HANDLER_TYPES = [
         "focusin", "focusout", "selectionchange", "loadend",
         "pointerdown", "pointerup", "pointermove", "pointerover", "pointerout",
@@ -6446,6 +6450,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // on the object, so reuse across a chain would corrupt the sequence.
     let hoverTarget = null;
     let hoveredChildFrame = null;
+    // A shared effective legacy mouse target also accounts for touch input.
+    // Actual mouse PointerEvent hover/capture state remains independent.
+    let legacyMouseDispatcher = null;
     let nativePointerPosition = null, suppressCompatibilityMouse = false;
     // The click coordinates above are consumed by activateClick. Retain the
     // actual cursor position independently for an asynchronous lock result,
@@ -6637,6 +6644,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         lockedButtons = pointerInput.buttons;
         pointerInput.pending = null;
         processPointerCapture();
+        if(trust.touchReleaseCaptures)trust.touchReleaseCaptures(record.document);
         state.position = lastPointerPosition || {clientX:0, clientY:0, screenX:0, screenY:0, pageX:0, pageY:0};
         __queue_dom_task(() => {
             pointerLockEvent(record.document, "pointerlockchange");
@@ -6789,6 +6797,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         trust.hover(id,x,y,screenX,screenY,modifiers,true,false);
         const init = Object.assign({bubbles:true, cancelable:true, composed:true, view:g,
             pointerId:1, pointerType:"mouse", isPrimary:true, width:1, height:1, pressure:buttons ? 0.5 : 0}, nativePointerPosition);
+        if (legacyMouseDispatcher) legacyMouseDispatcher("position", target, null, init, false);
         const type = !pointerInput.beforeButtons && pressed ? "pointerdown" : !buttons && !pressed ? "pointerup" : "pointermove";
         const captured = !!pointerInput.capture;
         const pointer = createTrustedEvent(PointerEvent, type, {...init, detail:0});
@@ -6878,9 +6887,55 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             ...pinit, bubbles:false, cancelable:false, composed:false
         })];
         dispatch(target, createTrustedEvent(PointerEvent, "pointer" + name, pinit), false);
-        if (name !== "move" || !(pointerLockState.target ? suppressCompatibilityMouse : pointerInput.suppress))
+        const mouseAllowed = name !== "move" || !(pointerLockState.target ? suppressCompatibilityMouse : pointerInput.suppress);
+        if (legacyMouseDispatcher) legacyMouseDispatcher(name, target, related, init, mouseAllowed);
+        else if (mouseAllowed)
             dispatch(target, createTrustedEvent(MouseEvent, "mouse" + name, init), false);
     }
+    // Input-only adapter for the separate native-touch module. Its bootstrap
+    // captures this object after the complete Window platform is initialized.
+    function touchTopControl() {
+        let state=messageWindowState;
+        for(let parent=state.parent();parent;parent=parent.parent())state=parent;
+        return trustOf(state.window)||trust;
+    }
+    g.__touch_adapter = {
+        control:trust, topControl:touchTopControl, capabilities:pointerLockState, elementId:elementIdentity, path:hoverPath,
+        controlFor:trustOf,
+        controlForNode(node) {
+            const frame=frameOwnerForNode(node);
+            const window=frame&&internalsOf(frame).contentRealmWindow;
+            return window ? trustOf(window) : touchTopControl();
+        },
+        frame() { return realmRootFrame; },
+        origin() { return messageWindowState.pointerOrigin(); },
+        scroll() { return {x:windowAttributes.scrollX,y:windowAttributes.scrollY}; },
+        lockedElement() { return pointerLockState.target; },
+        resolve(id,x,y) {
+            id=pointerHitTest(x,y,id);
+            id=nativeFrameContentHit(id,x,y);
+            const frame=nativeInputChildFrame(id);
+            if(frame) {
+                const rect=frameContentClientRect(frame);
+                return {child:trustOf(internalsOf(frame).contentRealmWindow),node:id,x:x-rect.left,y:y-rect.top};
+            }
+            const target=nonInertPointerTarget(id==null ? g.document.documentElement : wrap(id));
+            return target ? {target} : null;
+        },
+        pointer(type,target,init) {
+            const event=createTrustedEvent(PointerEvent,type,init); dispatch(target,event,false);return event;
+        },
+        sample(init) { return createTrustedEvent(PointerEvent,"pointermove",init); },
+        mouse(type,target,init) {
+            const event=createTrustedEvent(MouseEvent,type,init);dispatch(target,event,false);return event;
+        },
+        focus(target) { trust.focusPage(elementIdentity(target)); },
+        activate:notifyPointerActivation,
+        lightDismiss:runLightDismissActivities,
+        commonTarget:pointerClickTarget,
+        click(target,init) { pointerInput.click={target,owner:trust,init}; },
+        installLegacy(handler) { legacyMouseDispatcher=handler; },
+    };
     // CSSOM View's MouseEvent extensions distinguish screen coordinates from
     // viewport-relative client coordinates. Keep the frontend's screen space unchanged across
     // nested browsing contexts; only the client pair crosses content-box origins.
@@ -15340,7 +15395,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (!state.port) {
                 const channel = new pristineMessageChannel();
                 state.port = channel.port1;
-                const packet = JSON.stringify(portAPI.serialize(undefined, [channel.port2]));
+                const packet = portAPI.stringify(portAPI.serializeList(undefined, [channel.port2]));
                 if (state.started) host("globalPort", get(state.context).id, packet);
                 else state.portPacket = packet;
             }
@@ -15442,7 +15497,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 if (parameterData) optionsObject.parameterData = parameterData;
                 if (processorOptions !== undefined) optionsObject.processorOptions = processorOptions;
                 const channel = new pristineMessageChannel();
-                const packet = JSON.stringify(portAPI.serialize(optionsObject, [channel.port2]));
+                const packet = portAPI.stringify(portAPI.serializeList(optionsObject, [channel.port2]));
                 state.port = channel.port1;
                 const map = new MapCtor();
                 for (const descriptor of descriptors)
@@ -29351,13 +29406,13 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // constants every conformant browser returns verbatim regardless of
         // engine. platform, vendor, productSub and appVersion depend on the
         // navigator compatibility mode and are set by the shared Navigator
-        // block below. hardwareConcurrency is the real host core count; we are
-        // not a touch device so maxTouchPoints is 0.
+        // block below. hardwareConcurrency is the real host core count;
+        // maxTouchPoints starts at the host's known digitizer minimum.
         appCodeName: "Mozilla", appName: "Netscape", product: "Gecko",
         productSub: "20100101", vendor: "", vendorSub: "",
         appVersion: "",
         doNotTrack: null,
-        hardwareConcurrency: cfg.hardwareConcurrency || 8, maxTouchPoints: 0,
+        hardwareConcurrency: cfg.hardwareConcurrency || 8, maxTouchPoints: cfg.maxTouchPoints || 0,
         // Beacon API §sendBeacon: a fire-and-forget POST. We really send it
         // (there is no unload window to defer past, so queue-and-send
         // collapses to send-now); `true` is the spec's accepted-for-
@@ -29408,6 +29463,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const ordinaryDefine=Reflect.defineProperty, TypeErrorCtor=TypeError, StringCtor=String;
         const worker=typeof document==='undefined', interfaceName=worker?'WorkerNavigator':'Navigator';
         const nav=g.navigator, values=Object.create(null);
+        const touchCapability=!worker && g.__touch_adapter?.capabilities;
         // HTML #concept-navigator-compatibility-mode follows the engine tokens
         // of the User-Agent (crate::http::navigator_compatibility_mode):
         // Gecko for TRust's own and Firefox's, Chrome only for a User-Agent
@@ -29448,7 +29504,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if(!worker)names.push('vendor','vendorSub','productSub','cookieEnabled','maxTouchPoints','webdriver','doNotTrack');
         for(const name of names) {
             values[name]=nav[name];delete nav[name];
-            readonly(Constructor.prototype,name,interfaceName,state=>state.values[name]);
+            readonly(Constructor.prototype,name,interfaceName,state=>name==='maxTouchPoints' && touchCapability?.touchKnownMinimum
+                ? state.values[name] || touchCapability.touchKnownMinimum : state.values[name]);
         }
         values.userAgent=values.userAgent===undefined?'TRust/0.1':values.userAgent;
         // HTML #dom-navigator-appVersion: the User-Agent after "Mozilla/" in
@@ -29571,10 +29628,33 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // bootstrap-only adapter supplies the environment's EventTarget, task
     // queue and settings object; the shared feature block deletes it.
     g.__feature_adapter = {
-        EventTarget, window: true,
+        EventTarget, window: true, service: false,
+        kind: "window",
+        creationURL: String(cfg.url),
+        native(op, input) { return __service_worker(op, storageContextId, input); },
+        bind(control) { trust.serviceResult = control.result; trust.serviceNotice = control.notice; trust.serviceWorkerWork = control.resident; trust.serviceClientInfo = control.clientInfo; trust.serviceClientChanged = control.clientChanged; },
+        clientInfo() {
+            const value=featureCreate(null), origins=[];
+            featureSetPrototype(origins,null);
+            const ancestors=ancestorOriginObjects();
+            for(let i=0;i<ancestors.length;i++)origins[i]=ancestors[i].serialized;
+            value.frameType=cfg.parentWindow?"nested":traversableRecord&&traversableRecord.opener?"auxiliary":"top-level";
+            value.visibilityState=documentVisibility;value.focused=trust.documentFocused();value.focusWithin=inFocusChain;value.ancestorOrigins=origins;
+            return value;
+        },
+        listens(target,type) { return lsFor(target,type).length !== 0; },
         add(target, type, fn) { addL(target, type, fn, false); },
         remove(target, type, fn) { removeL(target, type, fn, false); },
         fire(target, type) { dispatch(target, createTrustedEvent(Event, type, {}), false); },
+        // Service-worker messaging: pristine serialize/deserialize, trusted
+        // MessageEvent delivery, incumbent identification (through the
+        // native callback boundary) and the DOMContentLoaded queue enable.
+        callback: makeCallbackAPI,
+        serializeMessage(message, options) { return portAPI.stringify(portAPI.serialize(message, portAPI.optionsTransfer(options))); },
+        deserializeMessage(packet) { return portAPI.deserialize(messageWireParse(packet)); },
+        fireMessage(target, type, init) { runInFrame(realmRootFrame, () => dispatch(target, createTrustedEvent(MessageEvent, type, init), false)); },
+        incumbentContext(global) { const s = windowMessageState(global); return s ? s.settingsContext : storageContextId; },
+        documentLoaded(fn) { addL(g.document, "DOMContentLoaded", fn, false); },
         queue(fn) { __queue_dom_task(fn); },
         report(error) { reportException(error, "callback"); },
         origin() { return messageWindowState.origin; },
@@ -29582,6 +29662,19 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         baseURL() { return messageWindowState.apiBaseURL(); },
         secure: secureContext,
         context: storageContextId,
+    };
+    const featureSetEach=Set.prototype.forEach, featureApply=Reflect.apply, featureCreate=Object.create, featureSetPrototype=Object.setPrototypeOf;
+    trust.hasServiceWorkerWork = function () {
+        if (trust.serviceWorkerWork && trust.serviceWorkerWork()) return true;
+        let work=false;
+        featureApply(featureSetEach,childWindowTrusts,[child=>{if(child.hasServiceWorkerWork&&child.hasServiceWorkerWork())work=true;}]);
+        return work;
+    };
+    trust.hasCookieStoreWork = function () {
+        if (trust.cookieStoreWork && trust.cookieStoreWork()) return true;
+        let work=false;
+        featureApply(featureSetEach,childWindowTrusts,[child=>{if(child.hasCookieStoreWork&&child.hasCookieStoreWork())work=true;}]);
+        return work;
     };
     /*__PERMISSIONS_BEGIN__*/
     (function () {
@@ -34000,7 +34093,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     const rejected = reason => new PromiseCtor((_, reject) => reject(reason));
     // CreateDataProperty: never consults setters on Object.prototype.
     const put = (object, key, value) =>
-        define(object, key, {value, writable: true, enumerable: true, configurable: true});
+        define(object, key, {__proto__: null, value, writable: true, enumerable: true, configurable: true});
     const dictionary = () => objectCreate(null);
 
     // --- Web IDL conversions ------------------------------------------------
@@ -34107,7 +34200,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // --- CryptoKey ----------------------------------------------------------
     function keyState(value) {
         const record = isObject(value) ? apply(weakGet, internals, [value]) : undefined;
-        const state = record && record.cryptoKey;
+        const state = record && apply(hasOwn, record, ["cryptoKey"]) && record.cryptoKey;
         if (!state) throw new TypeErrorCtor("Value is not a CryptoKey");
         return state;
     }
@@ -34145,8 +34238,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             record = objectCreate(null);
             apply(weakSet, internals, [key, record]);
         }
-        record.cryptoKey = {type, extractable, algorithm, usages, handle,
-            algorithmCached: undefined, usagesCached: undefined};
+        put(record, "cryptoKey", {__proto__: null, type, extractable, algorithm, usages, handle,
+            algorithmCached: undefined, usagesCached: undefined});
         return key;
     }
     // The KeyAlgorithm dictionaries converted to ECMAScript objects: members
@@ -35200,9 +35293,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     g.__crypto_key_api = {
         serialize(value) {
             const record = isObject(value) ? apply(weakGet, internals, [value]) : undefined;
-            const state = record && record.cryptoKey;
+            const state = record && apply(hasOwn, record, ["cryptoKey"]) && record.cryptoKey;
             if (!state) return null;
-            const algorithm = state.algorithm, fields = {name: algorithm.name};
+            const algorithm = state.algorithm, fields = dictionary();
+            fields.name = algorithm.name;
             if (algorithm.length !== undefined) fields.length = algorithm.length;
             if (algorithm.namedCurve !== undefined) fields.namedCurve = algorithm.namedCurve;
             if (algorithm.modulusLength !== undefined) {
@@ -35211,7 +35305,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             }
             if (algorithm.hash !== undefined) fields.hash = algorithm.hash.name;
             const usages = [];
-            for (let i = 0; i < state.usages.length; i++) usages[i] = state.usages[i];
+            for (let i = 0; i < state.usages.length; i++) put(usages, i, state.usages[i]);
             return [state.type, state.extractable, fields, usages, base64urlEncode(state.handle)];
         },
         deserialize(serialized) {
@@ -35250,6 +35344,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // then deserialize in the receiving Realm. The shared private slots are
     // also the cross-Realm Window brand; page properties cannot forge an origin.
     let messageSerialize, messageDeserialize;
+    const messageWireParse = JSON.parse;
     const messaging = makeWindowMessageBinding(new WeakMap(), function (target, source, args) {
         const receiver = windowMessageState(target), sender = windowMessageState(source);
         if (!receiver || !sender) throw new TypeError("Illegal Window invocation");
@@ -35279,7 +35374,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         let messageKind = "";
         if (cfg.frameTrace) {
             try {
-                const record = JSON.parse(wire), root = record[0];
+                const record = messageWireParse(wire), root = record[0];
                 if (root[0] === "r" && record[1][root[1]][0] === "O") {
                     const entry = record[1][root[1]][1].find(entry => entry[0] === "event");
                     if (entry && entry[1][0] === "s") messageKind = entry[1][1].slice(0, 64);
@@ -45560,14 +45655,37 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (record === undefined || record.fetchResponse === undefined) throw new TypeErrorCtor("Illegal invocation");
         return record.fetchResponse;
     }
+    const privateResponseNative = __private_response;
+    const privateResponseFinishes = objectCreate(null);
+    const privateResponseRelease = new FinalizationRegistryCtor(function (lease) { privateResponseNative("release", lease); });
+    function privateResponseMetadata(token) {
+        const text = privateResponseNative("retain", token);
+        if (typeof text !== "string") throw new TypeErrorCtor("Filtered response is unavailable");
+        return jsonParse(text);
+    }
+    function adoptPrivateResponse(response, metadata) {
+        response.privateResponse = {token: metadata.token, lease: metadata.lease, pending: !!metadata.pending};
+        apply(registryRegister, privateResponseRelease, [response, metadata.lease]);
+    }
     function newResponseRecord(fields) {
         const response = {type: "default", aborted: false, urlList: [], status: 200, statusMessage: "",
-            headerList: [], body: null, rangeRequested: false, internal: null};
+            headerList: [], body: null, rangeRequested: false, privateResponse: null};
         for (const key in fields) response[key] = fields[key];
         response.headersList = function () { return response.headerList; };
         return response;
     }
     function networkError() { return newResponseRecord({type: "error", status: 0}); }
+    // Only the filtered view enters JS. Native capabilities retain opaque
+    // bodies and CORS-hidden headers across clone(), CacheStorage and workers.
+    function filteredResponse(response, type, headerList) {
+        const opaque = type === "opaque" || type === "opaqueredirect";
+        return newResponseRecord({type,
+            status: opaque ? 0 : response.status,
+            statusMessage: opaque ? "" : response.statusMessage,
+            urlList: type === "opaque" ? [] : response.urlList.slice(),
+            headerList: opaque ? [] : headerList.map(pair => pair.slice()),
+            body: opaque ? null : response.body});
+    }
     // #concept-response-clone
     function cloneResponse(response) {
         const clone = newResponseRecord({});
@@ -45576,6 +45694,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         for (let i = 0; i < response.headerList.length; i++) clone.headerList.push([response.headerList[i][0], response.headerList[i][1]]);
         clone.urlList = response.urlList.slice();
         if (response.body !== null) clone.body = cloneBody(response.body);
+        if (response.privateResponse !== null) adoptPrivateResponse(clone, privateResponseMetadata(response.privateResponse.token));
         return clone;
     }
     // #response-create
@@ -45870,7 +45989,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (sync) {
             return hostResponse(request, httpFetchSync(request.url, request.method, bodyBytes, contentType, headerWire,
                 request.mode, request.credentials, initiator, undefined, undefined, useCORSPreflight, false,
-                referrer, referrerPolicy));
+                referrer, referrerPolicy, request.redirect));
         }
         let resolveFetch = null, settled = false;
         const promise = new PromiseCtor(function (resolve) { resolveFetch = resolve; });
@@ -45887,7 +46006,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // stopping the document cancels.
         react(httpFetchAsync(request.url, request.method, bodyBytes, contentType, headerWire,
             request.mode, request.credentials, initiator, !!stream, request.cache, useCORSPreflight,
-            !!request.keepalive, referrer, referrerPolicy), function (result) {
+            !!request.keepalive, referrer, referrerPolicy, request.redirect), function (result) {
             if (settled) {
                 // Aborted meanwhile: release a transfer that already began.
                 if (result && typeof result[8] === "number") httpFetchCancel(result[8]);
@@ -45911,10 +46030,6 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     function hostResponse(request, result) {
         if (!result) return networkError();
         const status = result[0];
-        if (status === 0) {
-            // An opaque filtered response (#concept-filtered-response-opaque).
-            return newResponseRecord({type: "opaque", status: 0, urlList: []});
-        }
         const headerList = [];
         const lines = `${result[4] || ""}`.split("\n");
         for (let i = 0; i + 1 < lines.length; i += 2) if (lines[i]) headerList.push([lines[i], lines[i + 1]]);
@@ -45923,16 +46038,26 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // answered when the host followed redirects.
         const finalURL = typeof result[5] === "string" && result[5] !== "" ? result[5] : request.url;
         const withoutFragment = url => { const hash = url.indexOf("#"); return hash < 0 ? url : apply(stringSlice, url, [0, hash]); };
-        const urlList = withoutFragment(finalURL) !== withoutFragment(request.url) ? [request.url, finalURL] : [request.url];
-        const type = request.mode === "cors" && !sameOrigin(finalURL, adapter.origin()) ? "cors" : "basic";
+        const filter = typeof result[9] === "string" ? jsonParse(result[9]) : null;
+        const urlList = filter !== null ? filter.urls
+            : withoutFragment(finalURL) !== withoutFragment(request.url) ? [request.url, finalURL] : [request.url];
+        const type = filter !== null ? filter.type
+            : request.mode === "cors" && !sameOrigin(finalURL, adapter.origin()) ? "cors" : "basic";
         let body;
         if (typeof result[8] === "number") body = bodyFromHost(result[8], request.keepalive);
         else {
             const bytes = isArrayBuffer(result[3]) ? new Uint8ArrayCtor(result[3]) : utf8(`${result[2] || ""}`);
             body = bodyFromBytes(bytes, null, bytes.length);
         }
-        return newResponseRecord({type, status, statusMessage: typeof result[7] === "string" ? result[7] : "",
+        if (request.method === "HEAD" || NULL_BODY_STATUSES.indexOf(status) >= 0) {
+            terminateBody(body);
+            body = null;
+        }
+        const internal = newResponseRecord({status, statusMessage: typeof result[7] === "string" ? result[7] : "",
             headerList, urlList, body});
+        const response = filteredResponse(internal, type, filter !== null ? filter.headers : headerList);
+        if (typeof result[10] === "string") adoptPrivateResponse(response, jsonParse(result[10]));
+        return response;
     }
     // XHR #the-send()-method fetch: a "cors" request with credentials per
     // withCredentials and the "xmlhttprequest" initiator type, through
@@ -46091,6 +46216,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             react(streamsAPI.cancel(request.body.stream, error), undefined, function () {});
         if (responseObject === null) return;
         const response = slotsOf(responseObject).fetchResponse;
+        if (response.privateResponse !== null) privateResponseNative("abort", response.privateResponse.token);
         if (response.body !== null) {
             if (response.body.stream === null) response.body.streamError = error;
             else if (streamsAPI.readable(response.body.stream)) streamsAPI.error(response.body.stream, error);
@@ -46141,6 +46267,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             // The fetch stays abortable until its response body has been read
             // to the end; aborting meanwhile errors the body (#abort-fetch).
             if (response.body !== null) response.body.onDone = function () { abortAPI.remove(request.signal, abortSteps); };
+            else if (response.privateResponse !== null && response.privateResponse.pending)
+                privateResponseFinishes[response.privateResponse.token] = {
+                    signal: new WeakRefCtor(request.signal), steps: new WeakRefCtor(abortSteps)
+                };
             else abortAPI.remove(request.signal, abortSteps);
             responseObject = createResponseObject(response, "immutable");
             resolveFn(responseObject);
@@ -46167,7 +46297,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             // A local scheme answers from a networking task.
             const local = schemeFetch(request);
             const filtered = local === null || local.type === "error" ? networkError()
-                : tainting === "opaque" ? newResponseRecord({type: "opaque", status: 0, urlList: []}) : local;
+                : tainting === "opaque" ? filteredResponse(local, "opaque", []) : local;
             if (filtered !== local || tainting === "basic") filtered.type = filtered.type === "error" ? "error" : tainting;
             adapter.queue(function () { processResponse(filtered); });
             return promise;
@@ -46243,6 +46373,22 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         isFormData,
         request: requestState,
         response: responseState,
+        cloneResponse,
+        filteredResponse,
+        privateResponseEnded(token) {
+            const finish = privateResponseFinishes[token];
+            delete privateResponseFinishes[token];
+            if (finish) {
+                const signal = apply(weakRefDeref, finish.signal, []), steps = apply(weakRefDeref, finish.steps, []);
+                if (signal !== undefined && steps !== undefined) abortAPI.remove(signal, steps);
+            }
+        },
+        prepareCacheResponse(response) {
+            if (response.privateResponse === null) return __promise_resolved_with(undefined);
+            return react(privateResponseNative("prepare", response.privateResponse.token), function (ok) {
+                if (!ok) throw new TypeErrorCtor("The filtered response body could not be read");
+            });
+        },
         headerList(headers) { return headersState(headers).list; },
         extract(value, keepalive) { return extractBody(convertBodyInit(value), !!keepalive); },
         multipartBoundary,
@@ -46255,8 +46401,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 abortAPI.any([]));
         },
         createResponse(fields, bytes) {
-            const response = newResponseRecord(fields);
-            if (bytes !== null) response.body = bodyFromBytes(bytes, null, bytes.length);
+            const privateMetadata = fields.privateToken ? privateResponseMetadata(fields.privateToken) : null;
+            const response = newResponseRecord(privateMetadata || fields);
+            if (bytes !== null && response.type !== "opaque" && response.type !== "opaqueredirect")
+                response.body = bodyFromBytes(bytes, null, bytes.length);
+            if (privateMetadata !== null) adoptPrivateResponse(response, privateMetadata);
             return createResponseObject(response, fields.guard || "immutable");
         },
         bodyUnusable,
@@ -46306,6 +46455,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     })(globalThis);
     /*__FETCH_END__*/
     const fetchAPI = g.__fetch_api, fileAPI = g.__file_api, platformFetch = g.fetch;
+    trust.privateResponseEnded = fetchAPI.privateResponseEnded;
     // HTML #nav-stop step 2 for this Window's navigable: set its ongoing
     // navigation to null, discarding the navigation this task requested.
     // Returns whether there was one.
@@ -46473,8 +46623,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // and workers can all be associated with the same name to cache map"). It
     // is session-lifetime RAM. Cache ids are separate from names so
     // `caches.delete(name)` does not invalidate an already-referenced Cache
-    // (§5.5.4). Each change of the map and each Batch Cache Operations run is
-    // one compare-and-set of the serialized list, retried if another agent
+    // (§5.5.4). Native name-map transactions retain Cache references before
+    // another agent can delete a name. Each Batch Cache Operations run uses
+    // compare-and-set of the serialized list, retried if another agent
     // changed it meanwhile, so the operations stay atomic across agents.
     (function (g) {
     "use strict";
@@ -46484,7 +46635,27 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     const Request = g.Request, URLCtor = g.URL, DOMExceptionCtor = g.DOMException;
     const QuotaExceededErrorCtor = g.QuotaExceededError;
     const apply = Reflect.apply, define = Object.defineProperty, freeze = Object.freeze;
-    const parse = JSON.parse, stringify = JSON.stringify, isArray = Array.isArray;
+    const parse = JSON.parse, jsonStringify = JSON.stringify, isArray = Array.isArray;
+    const getOwn = Object.getOwnPropertyDescriptor, ownKeys = Reflect.ownKeys;
+    const create = Object.create, setPrototypeOf = Object.setPrototypeOf, ArrayCtor = Array;
+    // Serialize platform records without invoking author Object/Array
+    // prototype toJSON hooks (ECMAScript SerializeJSONProperty). Those hooks
+    // are not part of any CacheStorage algorithm.
+    function jsonData(value) {
+        if (value === null || typeof value !== "object") return value;
+        const out = isArray(value) ? new ArrayCtor(value.length) : create(null);
+        setPrototypeOf(out, null);
+        const keys = ownKeys(value);
+        for (let i = 0; i < keys.length; i++) {
+            const key = keys[i];
+            if (typeof key !== "string" || key === "length" && isArray(value)) continue;
+            const descriptor = getOwn(value, key);
+            if (descriptor && "value" in descriptor)
+                define(out, key, {value: jsonData(descriptor.value), writable:true, enumerable:true, configurable:true});
+        }
+        return out;
+    }
+    function stringify(value) { return jsonStringify(jsonData(value)); }
     const weakGet = WeakMap.prototype.get, weakSet = WeakMap.prototype.set;
     const PromiseCtor = Promise, promiseResolve = Promise.resolve.bind(Promise);
     const promiseReject = Promise.reject.bind(Promise), promiseAll = Promise.all.bind(Promise);
@@ -46493,13 +46664,31 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     const cacheDataKind = "cache-storage-data:" + storageOrigin;
     const cacheNamesKey = "map";
     const cacheQuota = 64 * 1024 * 1024;
-    const cacheNameLimit = 1024;
     const cacheToken = {};
+    const charCode = String.prototype.charCodeAt, stringSlice = String.prototype.slice;
+    const fromCharCode = String.fromCharCode, parseIntNative = Number.parseInt;
+    // Cache names are DOMString, including lone surrogates. Encode UTF-16
+    // units for the native map; JSON's Rust strings cannot hold surrogates.
+    function nameKey(name) {
+        const hex = "0123456789abcdef";
+        let key = "!u16!";
+        for (let i = 0; i < name.length; i++) {
+            const c = apply(charCode, name, [i]);
+            key += hex[(c >>> 12) & 15] + hex[(c >>> 8) & 15] + hex[(c >>> 4) & 15] + hex[c & 15];
+        }
+        return key;
+    }
+    function nameValue(key) {
+        if (apply(stringSlice, key, [0,5]) !== "!u16!") return key;
+        let name = "";
+        for (let i = 5; i < key.length; i += 4) name += fromCharCode(parseIntNative(apply(stringSlice,key,[i,i+4]),16));
+        return name;
+    }
 
     function cacheDOMString(value) {
         // Web IDL DOMString conversion is ECMAScript ToString. Concatenation,
         // unlike String(Symbol), retains ToString's required Symbol exception.
-        return "" + value;
+        return `${value}`;
     }
     function parseNames(encoded) {
         if (encoded === null) return { next: 1, entries: [] };
@@ -46510,18 +46699,19 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         return { next: 1, entries: [] };
     }
     function cacheNames() { return parseNames(__storage_get(cacheNamesKind, cacheNamesKey)); }
-    // Change the name to cache map atomically: `change` edits a fresh copy and
-    // returns {changed, value}, or throws without writing anything.
-    function updateNames(change) {
-        for (;;) {
-            const encoded = __storage_get(cacheNamesKind, cacheNamesKey);
-            const names = parseNames(encoded);
-            const result = change(names);
-            if (!result.changed) return result.value;
-            if (names.entries.length > cacheNameLimit)
-                throw new QuotaExceededErrorCtor("The CacheStorage quota was exceeded.");
-            if (__storage_cas(cacheNamesKind, cacheNamesKey, encoded, stringify(names))) return result.value;
+    const nativeCache = __private_response;
+    const cacheRelease = new FinalizationRegistry(lease => nativeCache("cache-release", lease));
+    const registerCacheRelease = FinalizationRegistry.prototype.register;
+    function cacheMapOperation(op, name) {
+        const input = {origin: storageOrigin};
+        if (name !== undefined) input.name = nameKey(name);
+        const result = parse(nativeCache(op, stringify(input)));
+        if (result && result.error) {
+            if (result.error === "QuotaExceededError") throw new QuotaExceededErrorCtor("The CacheStorage quota was exceeded.");
+            if (result.error === "SecurityError") throw new DOMExceptionCtor("Cache storage is unavailable", "SecurityError");
+            throw new TypeError("Invalid CacheStorage operation");
         }
+        return result;
     }
     function parseRecords(encoded) {
         if (encoded === null) return [];
@@ -46554,7 +46744,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (!result.changed) return result.value;
             const next = stringify(records);
             checkQuota(id, next.length);
-            if (__storage_cas(cacheDataKind, id, encoded, next)) return result.value;
+            const committed = __storage_cas(cacheDataKind, id, encoded, next);
+            if (typeof committed === "string") {
+                if (committed === "QuotaExceededError") throw new QuotaExceededErrorCtor("The CacheStorage quota was exceeded.");
+                throw new TypeError("Invalid cached response");
+            }
+            if (committed) return result.value;
         }
     }
     // Copies of internal header lists (Fetch #concept-header-list).
@@ -46622,7 +46817,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         return fetchAPI.createResponse({
             type: record.type, status: record.status, statusMessage: record.statusText,
             headerList: cacheHeaders(record.headers), urlList, guard: "immutable",
-        }, record.type === "opaque" ? null : bytes);
+            privateToken: record.privateToken || null,
+        }, record.nullBody || record.type === "opaque" || record.type === "opaqueredirect" ? null : bytes);
     }
     // Service Workers #cache-put steps over the associated request and response.
     function cacheResponseRecord(request, response) {
@@ -46640,7 +46836,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             return promiseReject(new TypeError("A response with Vary: * cannot be stored in a Cache"));
         if (fetchAPI.bodyUnusable(inner))
             return promiseReject(new TypeError("The response body is disturbed or locked"));
-        return fetchAPI.readBody(inner).then((bytes) => ({
+        return fetchAPI.prepareCacheResponse(inner).then(() => fetchAPI.readBody(inner)).then((bytes) => ({
             request: cacheRequestRecord(request),
             response: {
                 status: inner.status,
@@ -46649,6 +46845,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 urlList: inner.urlList.slice(),
                 type: inner.type,
                 body64: cacheBytesToBase64(bytes),
+                nullBody: inner.body === null,
+                privateToken: inner.privateResponse === null ? null : inner.privateResponse.token,
             },
         }));
     }
@@ -46677,9 +46875,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         return id;
     }
     class Cache {
-        constructor(token, id) {
+        constructor(token, id, lease) {
             if (token !== cacheToken) throw new TypeError("Illegal constructor");
             apply(weakSet, cacheIds, [this, id]);
+            apply(registerCacheRelease, cacheRelease, [this, lease]);
         }
         match(request, options) {
             if (arguments.length === 0) return promiseReject(new TypeError("Cache.match requires a request"));
@@ -46727,7 +46926,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 }
                 return promiseAll(responses.map((response, index) =>
                     cacheResponseRecord(list[index], response)));
-            }).then((records) => { cacheCommit(id, records); return undefined; });
+            }).then((records) => { cacheId(this); cacheCommit(id, records); return undefined; });
         }
         put(request, response) {
             if (arguments.length < 2) return promiseReject(new TypeError("Cache.put requires a request and response"));
@@ -46737,6 +46936,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 normalized = cacheRequest(request);
             } catch (error) { return promiseReject(error); }
             return cacheResponseRecord(normalized, response).then((record) => {
+                cacheId(this); // The pending operation retains its request/response list.
                 cacheCommit(id, [record]);
                 return undefined;
             });
@@ -46786,17 +46986,13 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         match(request, options) {
             if (arguments.length === 0) return promiseReject(new TypeError("CacheStorage.match requires a request"));
             try {
-                const names = cacheNames();
-                if (options && Object.prototype.hasOwnProperty.call(options, "cacheName")) {
-                    const name = cacheDOMString(options.cacheName);
-                    const entry = names.entries.find((item) => item[0] === name);
-                    return entry ? new Cache(cacheToken, entry[1]).match(request, options)
-                        : promiseResolve(undefined);
-                }
+                const name = options && options.cacheName !== undefined ? cacheDOMString(options.cacheName) : undefined;
+                const entries = cacheMapOperation("cache-list", name);
                 let promise = promiseResolve(undefined);
-                for (let index = 0; index < names.entries.length; index++) {
-                    const cache = new Cache(cacheToken, names.entries[index][1]);
-                    promise = promise.then((response) => response === undefined ? cache.match(request, options) : response);
+                for (let index = 0; index < entries.length; index++) {
+                    const entry = entries[index];
+                    const cache = new Cache(cacheToken, entry.id, entry.lease);
+                    promise = promise.then(response => response === undefined ? cache.match(request, options) : response);
                 }
                 return promise;
             } catch (error) { return promiseReject(error); }
@@ -46804,7 +47000,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         has(cacheName) {
             if (arguments.length === 0) return promiseReject(new TypeError("CacheStorage.has requires a cache name"));
             try {
-                const name = cacheDOMString(cacheName);
+                const name = nameKey(cacheDOMString(cacheName));
                 return promiseResolve(cacheNames().entries.some((entry) => entry[0] === name));
             } catch (error) { return promiseReject(error); }
         }
@@ -46812,34 +47008,18 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (arguments.length === 0) return promiseReject(new TypeError("CacheStorage.open requires a cache name"));
             try {
                 const name = cacheDOMString(cacheName);
-                // #cache-storage-open: an existing entry, or a new request
-                // response list set into the map. The empty list's quota is
-                // checked before its name becomes visible, so a rejected open
-                // never leaves a half-created entry.
-                const id = updateNames((names) => {
-                    const existing = names.entries.find((entry) => entry[0] === name);
-                    if (existing) return { changed: false, value: existing[1] };
-                    const created = String(names.next++);
-                    names.entries.push([name, created]);
-                    checkQuota(created, 2);
-                    return { changed: true, value: created };
-                });
-                return promiseResolve(new Cache(cacheToken, id));
+                const entry = cacheMapOperation("cache-open", name);
+                return promiseResolve(new Cache(cacheToken, entry.id, entry.lease));
             } catch (error) { return promiseReject(error); }
         }
         delete(cacheName) {
             if (arguments.length === 0) return promiseReject(new TypeError("CacheStorage.delete requires a cache name"));
             try {
                 const name = cacheDOMString(cacheName);
-                return promiseResolve(updateNames((names) => {
-                    const index = names.entries.findIndex((entry) => entry[0] === name);
-                    if (index < 0) return { changed: false, value: false };
-                    names.entries.splice(index, 1);
-                    return { changed: true, value: true };
-                }));
+                return promiseResolve(cacheMapOperation("cache-delete", name));
             } catch (error) { return promiseReject(error); }
         }
-        keys() { return promiseResolve(cacheNames().entries.map((entry) => entry[0])); }
+        keys() { return promiseResolve(cacheNames().entries.map((entry) => nameValue(entry[0]))); }
         get [Symbol.toStringTag]() { return "CacheStorage"; }
     }
 
@@ -46913,7 +47093,76 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     const internalSlots = __platform_slots("internals", new WeakMap());
     const apply = Reflect.apply, define = Object.defineProperty, getOwn = Object.getOwnPropertyDescriptor;
     const weakGet = WeakMap.prototype.get, weakSet = WeakMap.prototype.set, objectCreate = Object.create;
-    const parse = JSON.parse, stringify = JSON.stringify, isArray = Array.isArray;
+    const parse = JSON.parse, jsonStringify = JSON.stringify, isArray = Array.isArray;
+    const keysOf = Object.keys, hasOwn = Object.prototype.hasOwnProperty, setPrototypeOf = Object.setPrototypeOf;
+    const ArrayCtor = Array, StringCtor = String, arraySort = Array.prototype.sort;
+    const min = Math.min, max = Math.max;
+    // IndexedDB #clone-value / #object-store-storage-operation keep serialized
+    // Records private, including WebCrypto [[Handle]]. A database envelope
+    // must not re-expose a safely serialized value through JSON/prototype hooks.
+    const put = (object, key, value) => define(object, key,
+        {__proto__:null, value, writable:true, enumerable:true, configurable:true});
+    function jsonData(value) {
+        if (value === null || typeof value !== "object") return value;
+        const array = isArray(value), out = array ? new ArrayCtor(value.length) : objectCreate(null);
+        if (array) setPrototypeOf(out, null);
+        const keys = keysOf(value);
+        for (let i=0; i<keys.length; i++) {
+            const field = getOwn(value,keys[i]);
+            if (field && apply(hasOwn,field,["value"])) put(out,keys[i],jsonData(field.value));
+        }
+        return out;
+    }
+    function stringify(value) { return jsonStringify(jsonData(value)); }
+    // These Lists are not ECMAScript Array operations: no author methods,
+    // iterators, indexed setters or @@species constructors participate.
+    function listPush(list, value) { put(list,list.length,value); }
+    function listMap(list, convert) {
+        const out = [];
+        for (let i=0; i<list.length; i++) listPush(out,convert(list[i],i));
+        return out;
+    }
+    function listFilter(list, matches) {
+        const out = [];
+        for (let i=0; i<list.length; i++) if (matches(list[i],i)) listPush(out,list[i]);
+        return out;
+    }
+    function listFindIndex(list, matches) {
+        for (let i=0; i<list.length; i++) if (matches(list[i],i)) return i;
+        return -1;
+    }
+    function listFind(list, matches) {
+        const index=listFindIndex(list,matches); return index<0 ? undefined : list[index];
+    }
+    function listSome(list, matches) { return listFindIndex(list,matches)>=0; }
+    function listSlice(list, start=0, end=list.length) {
+        const out=[];
+        start=start<0 ? max(list.length+start,0) : min(start,list.length);
+        end=end<0 ? max(list.length+end,0) : min(end,list.length);
+        for (let i=start; i<end; i++) listPush(out,list[i]);
+        return out;
+    }
+    function listSplice(list, start, count=list.length-start) {
+        const removed=listSlice(list,start,start+count), end=min(start+count,list.length);
+        for (let i=end; i<list.length; i++) put(list,i-end+start,list[i]);
+        list.length-=end-start;
+        return removed;
+    }
+    function listShift(list) {
+        if (!list.length) return undefined;
+        const first=list[0]; listSplice(list,0,1); return first;
+    }
+    function listReverse(list) {
+        for (let i=0,j=list.length-1; i<j; i++,j--) {
+            const value=list[i]; put(list,i,list[j]); put(list,j,value);
+        }
+        return list;
+    }
+    function listSort(list, compare) { return apply(arraySort,list,[compare]); }
+    function assignRecord(target, source) {
+        const keys=keysOf(source);
+        for (let i=0; i<keys.length; i++) put(target,keys[i],source[keys[i]]);
+    }
     const isView = ArrayBuffer.isView, DateCtor = Date;
     const dateGetTime = Date.prototype.getTime;
     const bufferByteLength = getOwn(ArrayBuffer.prototype, "byteLength").get;
@@ -46939,12 +47188,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // task this realm caused is preserved; tasks caused by other agents join
     // when this realm observes them.
     const databaseQueue = [];
-    function queueDatabaseTask(fn) { databaseQueue.push({ fn, frame: adapter.frame(), task: null }); }
+    function queueDatabaseTask(fn) { listPush(databaseQueue,{ fn, frame: adapter.frame(), task: null }); }
     function takeCoordinatorTasks() {
         for (;;) {
             const task = __indexed_db("take", []);
             if (task === null) return;
-            databaseQueue.push({ fn: null, frame: null, task });
+            listPush(databaseQueue,{ fn: null, frame: null, task });
         }
     }
     function coordinator(op, argument) {
@@ -46959,7 +47208,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     function registered() { return requestsById.size + connectionsById.size + transactionsById.size; }
     function runDatabaseTask() {
         if (registered() > 0) takeCoordinatorTasks();
-        const entry = databaseQueue.shift();
+        const entry = listShift(databaseQueue);
         if (entry === undefined) return false;
         if (entry.fn !== null) {
             adapter.runIn(entry.frame, entry.fn);
@@ -47046,9 +47295,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (transaction.mode === "versionchange") data = record.data;
             else {
                 data = idbParseData(encoded) || idbDefaultData();
-                for (const storeName of record.scope) {
+                for (let scopeIndex=0; scopeIndex<record.scope.length; scopeIndex++) {
+                    const storeName=record.scope[scopeIndex];
                     const changed = idbStore(record.data, storeName);
-                    const index = data.stores.findIndex((store) => store.name === storeName);
+                    const index = listFindIndex(data.stores,(store) => store.name === storeName);
                     if (changed && index >= 0) data.stores[index] = changed;
                 }
             }
@@ -47062,17 +47312,17 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     function idbSchema(data) {
         return {
             version: data.version,
-            stores: data.stores.map((store) => ({
+            stores: listMap(data.stores,(store) => ({
                 name: store.name, keyPath: store.keyPath, autoIncrement: store.autoIncrement,
                 nextKey: store.nextKey, indexes: idbCloneData(store.indexes), records: [],
             })),
         };
     }
     function idbStore(data, name) {
-        return data.stores.find((store) => store.name === name) || null;
+        return listFind(data.stores,(store) => store.name === name) || null;
     }
     function idbSortedNames(values) {
-        return createDOMStringList(values.map(String).sort());
+        return createDOMStringList(listSort(listMap(values,StringCtor)));
     }
     function idbEncodeNumber(value) {
         if (value === Infinity) return "+i";
@@ -47120,7 +47370,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             for (let index = 0; index < value.length; index++) {
                 if (!Object.prototype.hasOwnProperty.call(value, index))
                     throw idbException("DataError", "A sparse array is not an IndexedDB key.");
-                keys.push(idbKey(value[index], seen));
+                listPush(keys,idbKey(value[index], seen));
             }
             seen.delete(value);
             return { t: "a", v: keys };
@@ -47134,7 +47384,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             let key;
             try { key = idbKey(value[index]); }
             catch (_) { continue; }
-            if (!keys.some((item) => idbCompare(item, key) === 0)) keys.push(key);
+            if (!listSome(keys,(item) => idbCompare(item, key) === 0)) listPush(keys,key);
         }
         return { t: "a", v: keys };
     }
@@ -47143,7 +47393,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (key.t === "d") return new DateCtor(key.v);
         if (key.t === "s") return key.v;
         if (key.t === "b") return new Uint8Array(key.v).buffer;
-        return key.v.map(idbKeyValue);
+        return listMap(key.v,idbKeyValue);
     }
     function idbCompare(a, b) {
         const order = { n: 0, d: 1, s: 2, b: 3, a: 4 };
@@ -47179,7 +47429,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             for (const part of path) {
                 const extracted = idbExtractPath(value, part);
                 if (extracted === undefined) return undefined;
-                keys.push(extracted);
+                listPush(keys,extracted);
             }
             return keys;
         }
@@ -47353,7 +47603,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     function idbFinishConnectionClose(connection) {
         const record = internalsFor(connection);
         if (!record.closePending || record.closed) return;
-        if (record.transactions.some((transaction) => internalsFor(transaction).state !== "finished")) return;
+        if (listSome(record.transactions,(transaction) => internalsFor(transaction).state !== "finished")) return;
         record.closed = true;
         connectionsById.delete(record.id);
         // §§5.1–5.3 wait on actual closure, not merely close-pending.
@@ -47376,8 +47626,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             coordinator("finished", [record.id]);
         }
         const connection = record.connection, list = internalsFor(connection).transactions;
-        const index = list.indexOf(transaction);
-        if (index >= 0) list.splice(index, 1);
+        const index = listFindIndex(list,item=>item===transaction);
+        if (index >= 0) listSplice(list,index,1);
     }
     // #transaction-lifecycle step 2: the coordinator found the scheduling
     // constraints satisfied. The transaction sees the latest committed data.
@@ -47430,8 +47680,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         record.state = "finished";
         record.error = error || null;
         idbTransactionFinished(transaction);
-        const pending = record.requests.splice(0);
-        for (const request of pending) {
+        const pending = listSplice(record.requests,0);
+        for (let pendingIndex=0; pendingIndex<pending.length; pendingIndex++) {
+            const request=pending[pendingIndex];
             const requestRecord = internalsFor(request);
             requestRecord.done = true; requestRecord.result = undefined;
             requestRecord.error = idbException("AbortError", "The transaction was aborted.");
@@ -47465,7 +47716,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         record.processing = true;
         queueDatabaseTask(() => {
             if (record.state === "finished") { record.processing = false; return; }
-            const request = record.requests.shift(), requestRecord = internalsFor(request);
+            const request = listShift(record.requests), requestRecord = internalsFor(request);
             let result, error = null;
             try { result = requestRecord.operation(); }
             catch (caught) {
@@ -47508,7 +47759,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // from EventTarget's get-the-parent algorithm. Open requests are never
         // queued here and therefore retain their required null parent.
         adapter.setParent(request, transaction);
-        internalsFor(transaction).requests.push(request);
+        listPush(internalsFor(transaction).requests,request);
         idbProcess(transaction);
         return request;
     }
@@ -47525,7 +47776,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             record.transactionRecord = true;
             record.id = id;
             record.connection = connection;
-            record.scope = scope.slice(); record.mode = mode; record.durability = durability;
+            record.scope = listSlice(scope); record.mode = mode; record.durability = durability;
             record.state = "active"; record.started = mode === "versionchange";
             record.processing = false; record.requests = []; record.error = null;
             record.data = upgradeData || null; record.openRequest = openRequest || null;
@@ -47534,7 +47785,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             // Indexed Database 3 §2.7.1: a transaction's event parent is its
             // database connection, whose own event parent is null.
             adapter.setParent(this, connection);
-            internalsFor(connection).transactions.push(this);
+            listPush(internalsFor(connection).transactions,this);
             if (id) transactionsById.set(id, this);
         }
         get objectStoreNames() { return idbSortedNames(idbTransactionRecord(this).scope); }
@@ -47582,9 +47833,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         return store;
     }
     function idbRecordList(store, range, direction) {
-        const records = store.records.filter((record) => idbRangeIncludes(range, record.key));
-        records.sort((left, right) => idbCompare(left.key, right.key));
-        if (direction === "prev" || direction === "prevunique") records.reverse();
+        const records = listFilter(store.records,(record) => idbRangeIncludes(range, record.key));
+        listSort(records,(left, right) => idbCompare(left.key, right.key));
+        if (direction === "prev" || direction === "prevunique") listReverse(records);
         return records;
     }
     function idbIndexKeys(index, serialized) {
@@ -47604,22 +47855,24 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     function idbIndexRecordList(handle, range, direction) {
         const index = indexRecord.call(handle), store = idbStoreForHandle(handle.objectStore);
         let records = [];
-        for (const record of store.records) {
-            for (const key of idbIndexKeys(index, record.value)) {
-                if (idbRangeIncludes(range, key)) records.push({
+        for (let recordIndex=0; recordIndex<store.records.length; recordIndex++) {
+            const record=store.records[recordIndex], keys=idbIndexKeys(index,record.value);
+            for (let keyIndex=0; keyIndex<keys.length; keyIndex++) {
+                const key=keys[keyIndex];
+                if (idbRangeIncludes(range, key)) listPush(records,{
                     key: key, primaryKey: record.key, value: record.value,
                 });
             }
         }
-        records.sort((left, right) => {
+        listSort(records,(left, right) => {
             const keyOrder = idbCompare(left.key, right.key);
             return keyOrder || idbCompare(left.primaryKey, right.primaryKey);
         });
         if (direction === "nextunique" || direction === "prevunique") {
-            records = records.filter((record, index) =>
+            records = listFilter(records,(record, index) =>
                 index === 0 || idbCompare(record.key, records[index - 1].key) !== 0);
         }
-        if (direction === "prev" || direction === "prevunique") records.reverse();
+        if (direction === "prev" || direction === "prevunique") listReverse(records);
         return records;
     }
     function idbSourceRecordList(source, range, direction) {
@@ -47628,13 +47881,16 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             : idbRecordList(idbStoreForHandle(source), range, direction);
     }
     function idbValidateUniqueIndexes(store, candidate, replacedKey) {
-        for (const index of store.indexes) {
+        for (let indexIndex=0; indexIndex<store.indexes.length; indexIndex++) {
+            const index=store.indexes[indexIndex];
             if (!index.unique) continue;
             const keys = idbIndexKeys(index, candidate.value);
-            for (const record of store.records) {
+            for (let recordIndex=0; recordIndex<store.records.length; recordIndex++) {
+                const record=store.records[recordIndex];
                 if (replacedKey && idbCompare(record.key, replacedKey) === 0) continue;
                 const existing = idbIndexKeys(index, record.value);
-                for (const key of keys) for (const other of existing) {
+                for (let keyIndex=0; keyIndex<keys.length; keyIndex++) for (let otherIndex=0; otherIndex<existing.length; otherIndex++) {
+                    const key=keys[keyIndex], other=existing[otherIndex];
                     if (idbCompare(key, other) === 0)
                         throw idbException("ConstraintError", "A unique index key already exists.");
                 }
@@ -47681,11 +47937,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             // private store copy and publish only after all constraints pass.
             const staged = idbCloneData(store);
             const record = idbStoreKey(staged, serialized, keyGiven, key);
-            const index = staged.records.findIndex((item) => idbCompare(item.key, record.key) === 0);
+            const index = listFindIndex(staged.records,(item) => idbCompare(item.key, record.key) === 0);
             if (index >= 0 && noOverwrite) throw idbException("ConstraintError", "The key already exists.");
             idbValidateUniqueIndexes(staged, record, index >= 0 ? record.key : null);
-            if (index >= 0) staged.records[index] = record; else staged.records.push(record);
-            Object.assign(store, staged);
+            if (index >= 0) staged.records[index] = record; else listPush(staged.records,record);
+            assignRecord(store,staged);
             return idbKeyValue(record.key);
         };
     }
@@ -47716,8 +47972,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const range = idbRange(queryGiven ? query : null, true), limit = idbCount(count);
         return idbQueueRequest(this, () => {
             let records = idbRecordList(idbStoreForHandle(this), range, "next");
-            if (limit !== undefined && limit !== 0) records = records.slice(0, limit);
-            return records.map((record) => keyOnly ? idbKeyValue(record.key) : adapter.deserialize(record.value));
+            if (limit !== undefined && limit !== 0) records = listSlice(records,0,limit);
+            return listMap(records,(record) => keyOnly ? idbKeyValue(record.key) : adapter.deserialize(record.value));
         });
     }
     function objectStoreOpenCursor(query, direction, keyOnly, queryGiven) {
@@ -47757,10 +48013,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             const record = idbStoreHandleRecord(this);
             const path = idbStoreForHandle(this).keyPath;
             if (!isArray(path)) return path;
-            if (record.keyPathValue === undefined) record.keyPathValue = path.slice();
+            if (record.keyPathValue === undefined) record.keyPathValue = listSlice(path);
             return record.keyPathValue;
         }
-        get indexNames() { idbStoreHandleRecord(this); return idbSortedNames(idbStoreForHandle(this).indexes.map((index) => index.name)); }
+        get indexNames() { idbStoreHandleRecord(this); return idbSortedNames(listMap(idbStoreForHandle(this).indexes,(index) => index.name)); }
         get autoIncrement() { idbStoreHandleRecord(this); return !!idbStoreForHandle(this).autoIncrement; }
         put(value, key = undefined) { idbStoreHandleRecord(this); return objectStoreAddOrPut.call(this, value, key, arguments.length > 1 && key !== undefined, false); }
         add(value, key = undefined) { idbStoreHandleRecord(this); return objectStoreAddOrPut.call(this, value, key, arguments.length > 1 && key !== undefined, true); }
@@ -47772,7 +48028,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             const range = idbRange(query, false);
             return idbQueueRequest(this, () => {
                 const store = idbStoreForHandle(this);
-                store.records = store.records.filter((record) => !idbRangeIncludes(range, record.key));
+                store.records = listFilter(store.records,(record) => !idbRangeIncludes(range, record.key));
                 return undefined;
             });
         }
@@ -47812,8 +48068,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (!idbKeyPathValid(keyPath)) throw idbException("SyntaxError", "The index key path is invalid.");
             if (isArray(keyPath) && options.multiEntry) throw idbException("InvalidAccessError", "A sequence key path cannot be multiEntry.");
             const store = idbStoreForHandle(this);
-            if (store.indexes.some((index) => index.name === name)) throw idbException("ConstraintError", "The index already exists.");
-            store.indexes.push({ name: name, keyPath: isArray(keyPath) ? keyPath.slice() : String(keyPath), unique: !!options.unique, multiEntry: !!options.multiEntry });
+            if (listSome(store.indexes,(index) => index.name === name)) throw idbException("ConstraintError", "The index already exists.");
+            listPush(store.indexes,{ name: name, keyPath: isArray(keyPath) ? listSlice(keyPath) : String(keyPath), unique: !!options.unique, multiEntry: !!options.multiEntry });
             const handle = new IDBIndex(idbToken, this, name);
             // Index population is an asynchronous request in the upgrade
             // transaction. createIndex() still returns synchronously; an
@@ -47835,7 +48091,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             name = idbDOMString(name);
             if (internalsFor(this.transaction).state === "finished")
                 throw idbException("InvalidStateError", "The transaction has finished.");
-            if (!idbStoreForHandle(this).indexes.some((index) => index.name === name))
+            if (!listSome(idbStoreForHandle(this).indexes,(index) => index.name === name))
                 throw idbException("NotFoundError", "The index does not exist.");
             return new IDBIndex(idbToken, this, name);
         }
@@ -47845,9 +48101,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             const transaction = this.transaction;
             if (transaction.mode !== "versionchange") throw idbException("InvalidStateError", "Index deletion requires a versionchange transaction.");
             idbRequireActive(transaction); name = idbDOMString(name);
-            const store = idbStoreForHandle(this), index = store.indexes.findIndex((item) => item.name === name);
+            const store = idbStoreForHandle(this), index = listFindIndex(store.indexes,(item) => item.name === name);
             if (index < 0) throw idbException("NotFoundError", "The index does not exist.");
-            store.indexes.splice(index, 1);
+            listSplice(store.indexes,index,1);
         }
     }
     function idbStoreHandleRecord(handle) {
@@ -47857,7 +48113,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
 
     function indexRecord() {
-        const index = idbStoreForHandle(this.objectStore).indexes.find((item) => item.name === internalsFor(this).name);
+        const index = listFind(idbStoreForHandle(this.objectStore).indexes,(item) => item.name === internalsFor(this).name);
         if (!index) throw idbException("InvalidStateError", "The index was deleted.");
         return index;
     }
@@ -47885,8 +48141,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const range = idbRange(rangeQuery, true), bounded = idbCount(limit);
         return idbQueueRequest(this, () => {
             let records = idbIndexRecordList(this, range, direction);
-            if (bounded !== undefined && bounded !== 0) records = records.slice(0, bounded);
-            return records.map((record) => keyOnly
+            if (bounded !== undefined && bounded !== 0) records = listSlice(records,0,bounded);
+            return listMap(records,(record) => keyOnly
                 ? idbKeyValue(record.primaryKey) : adapter.deserialize(record.value));
         });
     }
@@ -47921,7 +48177,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             const index = indexRecord.call(this);
             if (name === record.name) return;
             const store = idbStoreForHandle(record.objectStore);
-            if (store.indexes.some((item) => item.name === name))
+            if (listSome(store.indexes,(item) => item.name === name))
                 throw idbException("ConstraintError", "An index already has that name.");
             index.name = name; record.name = name;
         }
@@ -47929,7 +48185,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             const record = idbIndexHandleRecord(this);
             const path = indexRecord.call(this).keyPath;
             if (!isArray(path)) return path;
-            if (record.keyPathValue === undefined) record.keyPathValue = path.slice();
+            if (record.keyPathValue === undefined) record.keyPathValue = listSlice(path);
             return record.keyPathValue;
         }
         get multiEntry() { idbIndexHandleRecord(this); return indexRecord.call(this).multiEntry; }
@@ -48040,7 +48296,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             return idbQueueRequest(this, () => {
                 const store = idbStoreForHandle(internalsFor(record.source).index
                     ? record.source.objectStore : record.source);
-                store.records = store.records.filter((item) => idbCompare(item.key, key) !== 0);
+                store.records = listFilter(store.records,(item) => idbCompare(item.key, key) !== 0);
                 return undefined;
             });
         }
@@ -48110,7 +48366,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         get objectStoreNames() {
             const record = idbConnectionRecord(this);
             const data = record.upgrade ? internalsFor(record.upgrade).data : record.schema;
-            return idbSortedNames(data.stores.map((store) => store.name));
+            return idbSortedNames(listMap(data.stores,(store) => store.name));
         }
         transaction(storeNames, mode = undefined, options = undefined) {
             const record = idbConnectionRecord(this);
@@ -48159,14 +48415,14 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             let keyPath = options.keyPath === undefined ? null : options.keyPath;
             if (keyPath !== null) {
                 if (!idbKeyPathValid(keyPath)) throw idbException("SyntaxError", "The object store key path is invalid.");
-                keyPath = isArray(keyPath) ? keyPath.slice() : String(keyPath);
+                keyPath = isArray(keyPath) ? listSlice(keyPath) : String(keyPath);
             }
             const transactionRecord = internalsFor(transaction);
             if (idbStore(transactionRecord.data, name)) throw idbException("ConstraintError", "The object store already exists.");
             if (options.autoIncrement && (keyPath === "" || isArray(keyPath)))
                 throw idbException("InvalidAccessError", "This key path cannot use autoIncrement.");
-            transactionRecord.data.stores.push({ name: name, keyPath: keyPath, autoIncrement: !!options.autoIncrement, nextKey: 1, indexes: [], records: [] });
-            if (!transactionRecord.scope.includes(name)) transactionRecord.scope.push(name);
+            listPush(transactionRecord.data.stores,{ name: name, keyPath: keyPath, autoIncrement: !!options.autoIncrement, nextKey: 1, indexes: [], records: [] });
+            if (!transactionRecord.scope.includes(name)) listPush(transactionRecord.scope,name);
             return transaction.objectStore(name);
         }
         deleteObjectStore(name) {
@@ -48176,10 +48432,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (!transaction) throw idbException("InvalidStateError", "Object stores can only be deleted during an upgrade.");
             idbRequireActive(transaction); name = idbDOMString(name);
             const transactionRecord = internalsFor(transaction);
-            const index = transactionRecord.data.stores.findIndex((store) => store.name === name);
+            const index = listFindIndex(transactionRecord.data.stores,(store) => store.name === name);
             if (index < 0) throw idbException("NotFoundError", "The object store does not exist.");
-            transactionRecord.data.stores.splice(index, 1);
-            transactionRecord.scope = transactionRecord.scope.filter((item) => item !== name);
+            listSplice(transactionRecord.data.stores,index,1);
+            transactionRecord.scope = listFilter(transactionRecord.scope,(item) => item !== name);
         }
         close() { idbConnectionRecord(this); idbCloseConnection(this); }
     }
@@ -48249,7 +48505,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const data = idbLoadData(name) || idbDefaultData();
         data.version = version;
         const transaction = new IDBTransaction(idbToken, connection,
-            data.stores.map((store) => store.name), "versionchange", "default", 0, data, request);
+            listMap(data.stores,(store) => store.name), "versionchange", "default", 0, data, request);
         connectionRecord.upgrade = transaction;
         const transactionRecord = internalsFor(transaction);
         transactionRecord.state = "inactive";
@@ -48327,7 +48583,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 const name = __storage_key(idbDataKind, index);
                 if (name === null) continue;
                 const data = idbLoadData(name);
-                if (data && data.version) result.push({ name: name, version: data.version });
+                if (data && data.version) listPush(result,{ name: name, version: data.version });
             }
             return Promise.resolve(result);
         }
@@ -48385,8 +48641,37 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const binding = g.__message_port_binding;
         delete g.__message_port_binding;
         const apply = Reflect.apply, weakGet = WeakMap.prototype.get, weakSet = WeakMap.prototype.set;
-        const parse = JSON.parse, stringify = JSON.stringify, define = Object.defineProperty;
+        const parse = JSON.parse, jsonStringify = JSON.stringify, define = Object.defineProperty;
+        const own = Object.prototype.hasOwnProperty, keys = Object.keys, getOwn = Object.getOwnPropertyDescriptor;
+        const setPrototypeOf = Object.setPrototypeOf, ArrayCtor = Array, isArray = Array.isArray;
+        // HTML StructuredSerialize{WithTransfer,Internal} uses private Records
+        // and Lists, not author JSON serialization hooks. In particular Web
+        // Crypto #cryptokey-interface-serializable keeps [[Handle]] private.
+        // Copy only own data fields; never let toJSON or a prototype setter
+        // observe either a transfer capability or the serialized graph.
+        const put = (object, key, value) => define(object, key,
+            {__proto__:null, value, writable:true, enumerable:true, configurable:true});
+        const append = (array, value) => put(array, array.length, value);
+        function wireData(value) {
+            if (value === null || typeof value !== "object") return value;
+            const array = isArray(value), out = array ? new ArrayCtor(value.length) : objectCreate(null);
+            if (array) setPrototypeOf(out, null);
+            const names = keys(value);
+            for (let i = 0; i < names.length; i++) {
+                const field = getOwn(value, names[i]);
+                if (field && apply(own, field, ["value"])) put(out, names[i], wireData(field.value));
+            }
+            return out;
+        }
+        function stringify(value) { return jsonStringify(wireData(value)); }
+        function parseWire(value) { return wireData(parse(value)); }
+        g.__message_wire_codec = {stringify, parse:parseWire};
         const token = {}, portsById = new Map();
+        const MapCtor = Map, SetCtor = Set;
+        const mapGet = Map.prototype.get, mapSet = Map.prototype.set, mapDelete = Map.prototype.delete;
+        const mapSize = getOwn(Map.prototype, "size").get;
+        const setHas = Set.prototype.has, setAdd = Set.prototype.add;
+        const weakHas = WeakSet.prototype.has, weakAdd = WeakSet.prototype.add, convertedLists = new WeakSet();
         const transferBuffer = ArrayBuffer.prototype.transfer;
         const bufferByteLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength").get;
         const promiseThen = Promise.prototype.then, objectCreate = Object.create;
@@ -48398,7 +48683,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         function native(op, id, payload) { return parse(binding(op, id, payload)); }
         function state(value) {
             const slot = apply(weakGet, adapter.slots, [value]);
-            return slot && slot.messagePort;
+            return slot && apply(own, slot, ["messagePort"]) ? slot.messagePort : undefined;
         }
         function requirePort(value) {
             const slot = state(value);
@@ -48439,23 +48724,32 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 const step = apply(next, iterator, []);
                 if (!step || (typeof step !== "object" && typeof step !== "function"))
                     throw new TypeError("Invalid transfer iterator result");
-                if (step.done) return result;
+                if (step.done) { apply(weakAdd, convertedLists, [result]); return result; }
                 const item = step.value;
                 if (!item || (typeof item !== "object" && typeof item !== "function"))
                     throw new TypeError("Transfer list entries must be objects");
-                result.push(item);
+                append(result, item);
             }
         }
         // Web IDL overload resolution reads @@iterator once, then converts either
         // sequence<object> or StructuredSerializeOptions. Never use array-like fallback.
+        function emptyTransferList() {
+            const list = []; apply(weakAdd, convertedLists, [list]); return list;
+        }
+        // A transfer List created by another platform algorithm has already
+        // bypassed Web IDL argument conversion; it is not an author sequence.
+        function serializeList(value, list) {
+            apply(weakAdd, convertedLists, [list]);
+            return serialize(value, list);
+        }
         function optionsTransfer(options) {
-            if (options == null) return [];
+            if (options == null) return emptyTransferList();
             if (typeof options !== "object" && typeof options !== "function")
                 throw new TypeError("PostMessage options must be an object");
             const method = options[Symbol.iterator];
             if (method != null) return sequence(options, method);
             const transfer = options.transfer;
-            return transfer === undefined ? [] : sequence(transfer);
+            return transfer === undefined ? emptyTransferList() : sequence(transfer);
         }
         // Streams #transferrable-streams: the port behaviors the cross-realm
         // transforms use. post is PackAndPostMessage (the message port post
@@ -48474,7 +48768,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 native("send", peer, stringify(packet));
             },
             listen(port, message, messageerror) {
-                streamPortHandlers.set(requirePort(port).id, { message, messageerror });
+                apply(mapSet, streamPortHandlers, [requirePort(port).id, {message, messageerror}]);
             },
             enable(port) {
                 const slot = requirePort(port);
@@ -48484,8 +48778,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 const slot = requirePort(port);
                 if (slot.detached) return;
                 slot.detached = true;
-                streamPortHandlers.delete(slot.id);
-                portsById.delete(slot.id);
+                apply(mapDelete, streamPortHandlers, [slot.id]);
+                apply(mapDelete, portsById, [slot.id]);
                 native("dispose", slot.id);
             },
         };
@@ -48496,7 +48790,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             const slot = requirePort(port);
             const key = native("transfer", slot.id);
             if (!key) throw cloneError("MessagePort transfer allocation failed");
-            portsById.delete(slot.id);
+            apply(mapDelete, portsById, [slot.id]);
             slot.id = 0;
             slot.detached = true;
             return key;
@@ -48578,34 +48872,37 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             return value;
         }
         function serialize(value, transfer, sourcePort, targetPort) {
-            const list = transfer === undefined ? [] : sequence(transfer);
-            const seen = new Set(), records = [], indices = new Map(), bufferIndices = new Map(), bitmapIndices = new Map();
-            const streamIndices = new Map(), canvasIndices = new Map();
-            for (const item of list) {
-                if (seen.has(item) || item === sourcePort) throw cloneError("Duplicate or source port in transfer list");
-                seen.add(item);
+            // optionsTransfer already performed Web IDL sequence conversion.
+            // Its private List must not invoke an author iterator a second time.
+            const list = transfer === undefined ? [] : apply(weakHas, convertedLists, [transfer]) ? transfer : sequence(transfer);
+            const seen = new SetCtor(), records = [], indices = new MapCtor(), bufferIndices = new MapCtor(), bitmapIndices = new MapCtor();
+            const streamIndices = new MapCtor(), canvasIndices = new MapCtor();
+            for (let i = 0; i < list.length; i++) {
+                const item = list[i];
+                if (apply(setHas, seen, [item]) || item === sourcePort) throw cloneError("Duplicate or source port in transfer list");
+                apply(setAdd, seen, [item]);
                 const slot = state(item), bitmap = bitmapCodec && bitmapCodec.state(item);
                 const canvas = canvasCodec && canvasCodec.state(item);
                 const type = slot || bitmap || canvas ? null : streamType(item);
                 if (bitmap) {
-                    bitmapIndices.set(item, bitmapIndices.size);
-                    records.push({ item, bitmap });
+                    apply(mapSet, bitmapIndices, [item, apply(mapSize, bitmapIndices, [])]);
+                    append(records, {__proto__:null, item, bitmap});
                 } else if (canvas) {
                     // HTML #structuredserializewithtransfer step 5.4.
                     canvasCodec.check(canvas);
-                    canvasIndices.set(item, canvasIndices.size);
-                    records.push({ item, canvas });
+                    apply(mapSet, canvasIndices, [item, apply(mapSize, canvasIndices, [])]);
+                    append(records, {__proto__:null, item, canvas});
                 } else if (slot) {
-                    indices.set(item, indices.size);
-                    records.push({ item, slot });
+                    apply(mapSet, indices, [item, apply(mapSize, indices, [])]);
+                    append(records, {__proto__:null, item, slot});
                 } else if (type) {
-                    streamIndices.set(item, streamIndices.size);
-                    records.push({ item, stream: type });
+                    apply(mapSet, streamIndices, [item, apply(mapSize, streamIndices, [])]);
+                    append(records, {__proto__:null, item, stream:type});
                 } else {
                     try { apply(bufferByteLength, item, []); }
                     catch (_) { throw cloneError("Object is not transferable"); }
-                    bufferIndices.set(item, bufferIndices.size);
-                    records.push({ item });
+                    apply(mapSet, bufferIndices, [item, apply(mapSize, bufferIndices, [])]);
+                    append(records, {__proto__:null, item});
                 }
             }
             // HTML #structuredserializewithtransfer: visit the graph before detaching
@@ -48614,42 +48911,48 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 ports = [], buffers = [], bitmaps = [];
             const streams = [], canvases = [];
             let doomed = false;
-            for (const record of records) {
+            for (let i = 0; i < records.length; i++) {
+                const record = records[i];
                 if (record.stream) {
-                    streams.push(transferStreamWithTransfer(record.item, record.stream));
+                    append(streams, transferStreamWithTransfer(record.item, record.stream));
                 } else if (record.bitmap) {
-                    bitmaps.push(encode(bitmapCodec.transfer(record.item)));
+                    append(bitmaps, encode(bitmapCodec.transfer(record.item)));
                 } else if (record.canvas) {
-                    canvases.push(canvasCodec.transfer(record.item));
+                    append(canvases, canvasCodec.transfer(record.item));
                 } else if (record.slot) {
                     const slot = record.slot;
                     if (slot.detached) throw cloneError("MessagePort is detached");
                     const key = native("transfer", slot.id);
                     if (!key) throw cloneError("MessagePort is detached");
                     if (slot.id === targetPort) doomed = true;
-                    ports.push(key);
-                    portsById.delete(slot.id);
+                    append(ports, key);
+                    apply(mapDelete, portsById, [slot.id]);
                     slot.id = 0;
                     slot.detached = true;
                 } else {
-                    try { buffers.push(encode(apply(transferBuffer, record.item, []))); }
+                    try { append(buffers, encode(apply(transferBuffer, record.item, []))); }
                     catch (_) { throw cloneError("ArrayBuffer cannot be transferred"); }
                 }
             }
-            return { wire, ports, buffers, bitmaps, streams, canvases, doomed };
+            return {__proto__:null, wire, ports, buffers, bitmaps, streams, canvases, doomed};
+        }
+        function mapList(list, convert) {
+            const result = [];
+            if (list) for (let i = 0; i < list.length; i++) append(result, convert(list[i]));
+            return result;
         }
         function deserialize(packet) {
-            const ports = packet.ports.map(key => {
+            const ports = mapList(packet.ports, key => {
                 const id = native("receive", key);
                 if (!id) throw cloneError("MessagePort transfer is no longer available");
                 return new MessagePort(token, id);
             });
-            const buffers = (packet.buffers || []).map(wire => decode(wire));
-            const bitmaps = (packet.bitmaps || []).map(wire => bitmapCodec.receive(decode(wire)));
+            const buffers = mapList(packet.buffers, wire => decode(wire));
+            const bitmaps = mapList(packet.bitmaps, wire => bitmapCodec.receive(decode(wire)));
             // HTML #structureddeserializewithtransfer: every transferred value,
             // a stream included, is created before the serialized graph.
-            const streams = (packet.streams || []).map(receiveStream);
-            const canvases = (packet.canvases || []).map(key => canvasCodec.receive(key));
+            const streams = mapList(packet.streams, receiveStream);
+            const canvases = mapList(packet.canvases, key => canvasCodec.receive(key));
             return { data: decode(packet.wire, ports, buffers, bitmaps, streams, canvases), ports };
         }
         class MessagePort extends adapter.EventTarget {
@@ -48659,7 +48962,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 apply(weakSet, adapter.slots, [this, { messagePort: {
                     id, detached: false, onmessage: null, onmessageerror: null
                 } }]);
-                portsById.set(id, this);
+                apply(mapSet, portsById, [id, this]);
             }
             // HTML #event-handler-attributes: [LegacyTreatNonObjectAsNull]
             // EventHandlers whose activated listener keeps its position while
@@ -48707,7 +49010,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // other; each destination's agent delivers in posting order.
         function channelState(value) {
             const slot = apply(weakGet, adapter.slots, [value]);
-            return slot && slot.broadcastChannel;
+            return slot && apply(own, slot, ["broadcastChannel"]) ? slot.broadcastChannel : undefined;
         }
         function requireChannel(value) {
             const slot = channelState(value);
@@ -48740,7 +49043,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                     id, name, closed: false, handlers: {message: null, messageerror: null},
                     listeners: {message: null, messageerror: null},
                 } }]);
-                portsById.set(id, this);
+                apply(mapSet, portsById, [id, this]);
             }
             get name() { return requireChannel(this).name; }
             postMessage(message) {
@@ -48756,7 +49059,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 if (slot.closed) return;
                 slot.closed = true;
                 native("broadcast-close", slot.id);
-                portsById.delete(slot.id);
+                apply(mapDelete, portsById, [slot.id]);
             }
             get [Symbol.toStringTag]() { return "BroadcastChannel"; }
         }
@@ -48792,12 +49095,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             setBitmaps(api) { bitmapCodec = api; },
             setStreams(api) { streamsAPI = api; },
             setCanvases(api) { canvasCodec = api; },
-            serialize, deserialize, optionsTransfer,
+            serialize, serializeList, deserialize, optionsTransfer, stringify,
             hasTask() { return native("has"); },
             runTask() {
                 const task = native("take");
                 if (!task) return false;
-                const port = portsById.get(task[0]);
+                const port = apply(mapGet, portsById, [task[0]]);
                 if (!port) return true;
                 const channel = channelState(port);
                 if (channel) {
@@ -48813,7 +49116,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 // A transferred stream's port runs its cross-realm transform's
                 // handlers (Streams #set-up-cross-realm-transform-readable and
                 // -writable); no author listener can observe that port.
-                const streamHandlers = streamPortHandlers.get(task[0]);
+                const streamHandlers = apply(mapGet, streamPortHandlers, [task[0]]);
                 let packet;
                 try { packet = deserialize(parse(task[1])); }
                 catch (_) {
@@ -49628,15 +49931,28 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // in the page realm and a worker realm.)
     /*__SC_CODEC_BEGIN__*/
     (function (G) {
+    const wireCodec = G.__message_wire_codec;
+    delete G.__message_wire_codec;
+    const create = Object.create, define = Object.defineProperty, keysOf = Object.keys;
+    const own = Object.prototype.hasOwnProperty, isArray = Array.isArray;
+    const ArrayCtor = Array, MapCtor = Map, SetCtor = Set, DateCtor = Date, RegExpCtor = RegExp;
+    const DataViewCtor = DataView, BigIntCtor = BigInt, ErrorCtor = Error;
+    const mapGet = Map.prototype.get, mapSet = Map.prototype.set, mapHas = Map.prototype.has;
+    const mapEach = Map.prototype.forEach, setEach = Set.prototype.forEach, setAdd = Set.prototype.add;
+    const dateTime = Date.prototype.getTime, bigintString = BigInt.prototype.toString;
+    const put = (object, key, value) => define(object, key,
+        {__proto__:null, value, writable:true, enumerable:true, configurable:true});
+    const append = (array, value) => put(array, array.length, value);
+    const ownSlot = (record, name) => record && apply(own, record, [name]) ? record[name] : undefined;
     const codecSlotsMap = __platform_slots("internals", new WeakMap());
     function codecSlots(object) {
         // Internal slots shared with the platform, in Window and Worker realms.
         const map = codecSlotsMap;
-        let record = Reflect.apply(WeakMap.prototype.get, map, [object]);
+        let record = apply(weakGet, map, [object]);
         if (record === undefined) {
-            record = Object.create(null);
+            record = create(null);
             if ((typeof object === "object" && object !== null) || typeof object === "function")
-                Reflect.apply(WeakMap.prototype.set, map, [object, record]);
+                apply(weakSet, map, [object, record]);
         }
         return record;
     }
@@ -49645,6 +49961,16 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // The shared codec block installs the same interface in Window and Worker realms.
         const apply = Reflect.apply;
         const descriptor = Object.getOwnPropertyDescriptor;
+        const mapSize = descriptor(MapCtor.prototype, "size").get;
+        const setSize = descriptor(SetCtor.prototype, "size").get;
+        const regexpSource = descriptor(RegExpCtor.prototype, "source").get;
+        const regexpFlags = [];
+        for (const pair of [["hasIndices","d"],["global","g"],["ignoreCase","i"],["multiline","m"],
+                ["dotAll","s"],["unicode","u"],["unicodeSets","v"],["sticky","y"]])
+            append(regexpFlags, [descriptor(RegExpCtor.prototype, pair[0]).get, pair[1]]);
+        const viewBuffer = descriptor(DataViewCtor.prototype, "buffer").get;
+        const viewOffset = descriptor(DataViewCtor.prototype, "byteOffset").get;
+        const viewBytes = descriptor(DataViewCtor.prototype, "byteLength").get;
         const typedProto = Object.getPrototypeOf(Uint8ClampedArray.prototype);
         const typedName = descriptor(typedProto, Symbol.toStringTag).get;
         const typedBuffer = descriptor(typedProto, "buffer").get;
@@ -49767,7 +50093,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             Object.defineProperty(ImageData.prototype, key, { ...descriptor(ImageData.prototype, key), enumerable: true });
         Object.defineProperty(ImageData.prototype, Symbol.toStringTag, { value: "ImageData", configurable: true });
         Object.defineProperty(G, "ImageData", { value: ImageData, writable: true, configurable: true });
-        var TYPED = { Int8Array: 1, Uint8Array: 1, Uint8ClampedArray: 1, Int16Array: 1, Uint16Array: 1, Int32Array: 1, Uint32Array: 1, Float16Array: 1, Float32Array: 1, Float64Array: 1, BigInt64Array: 1, BigUint64Array: 1 };
+        const TYPED = {__proto__:null, Int8Array, Uint8Array, Uint8ClampedArray, Int16Array, Uint16Array,
+            Int32Array, Uint32Array, Float16Array, Float32Array, Float64Array, BigInt64Array, BigUint64Array};
         function dce(what) {
             try { return new (G.DOMException || Error)(what + " could not be cloned.", "DataCloneError"); }
             catch (e) { var er = new Error(what + " could not be cloned."); er.name = "DataCloneError"; return er; }
@@ -49811,14 +50138,14 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 if (value === 0 && 1 / value === -Infinity) return ["fs", "z"];
                 return ["d", value];
             }
-            if (t === "bigint") return ["bi", value.toString()];
+            if (t === "bigint") return ["bi", apply(bigintString, value, [])];
             if (t === "symbol") throw dce("A Symbol");
             if (t === "function") throw dce("A function");
-            if (seen.has(value)) return ["r", seen.get(value)];
+            if (apply(mapHas, seen, [value])) return ["r", apply(mapGet, seen, [value])];
             var idx = heap.length;
-            heap.push(0);
-            seen.set(value, idx);
-            heap[idx] = encObj(value, heap, seen, forStorage);
+            append(heap, 0);
+            apply(mapSet, seen, [value, idx]);
+            put(heap, idx, encObj(value, heap, seen, forStorage));
             return ["r", idx];
         }
         function encObj(v, heap, seen, forStorage) {
@@ -49833,7 +50160,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (geometry) {
                 const node = [geometry[0]];
                 for (let i = 1; i < geometry.length; i++)
-                    node.push(typeof geometry[i] === "boolean" ? geometry[i] : enc(geometry[i], heap, seen, forStorage));
+                    append(node, typeof geometry[i] === "boolean" ? geometry[i] : enc(geometry[i], heap, seen, forStorage));
                 return node;
             }
             if (messagePortBrand && messagePortBrand(v)) throw dce("An untransferred MessagePort");
@@ -49843,42 +50170,42 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             const platformSlots = apply(weakGet, codecSlotsMap, [v]);
             // File API #filelist-section: a FileList is serializable; its
             // serialization steps serialize each of its File objects.
-            if (platformSlots && platformSlots.fileListFiles) {
+            if (platformSlots && ownSlot(platformSlots, "fileListFiles")) {
                 const files = [];
-                for (let i = 0; i < platformSlots.fileListFiles.length; i++)
-                    files.push(enc(platformSlots.fileListFiles[i], heap, seen, forStorage));
+                for (let i = 0; i < ownSlot(platformSlots, "fileListFiles").length; i++)
+                    append(files, enc(ownSlot(platformSlots, "fileListFiles")[i], heap, seen, forStorage));
                 return ["FL", files];
             }
-            if (platformSlots && (platformSlots.rectListItems || platformSlots.domStringList ||
-                    platformSlots.timeRanges || platformSlots.mediaQueryList ||
-                    platformSlots.mediaQueryListEvent || platformSlots.locationObject))
+            if (platformSlots && (ownSlot(platformSlots, "rectListItems") || ownSlot(platformSlots, "domStringList") ||
+                    ownSlot(platformSlots, "timeRanges") || ownSlot(platformSlots, "mediaQueryList") ||
+                    ownSlot(platformSlots, "mediaQueryListEvent") || ownSlot(platformSlots, "locationObject")))
                 throw dce("A platform object");
             // Of the WebAssembly interfaces only Module is [Serializable]
             // (Web API #serialization); Instance, Memory, Table, Global, Tag
             // and Exception are not (JS API), so HTML
             // #structuredserializeinternal throws a DataCloneError. Their
             // store addresses may be 0.
-            if (platformSlots && (platformSlots.wasmTag !== undefined ||
-                    platformSlots.wasmExn !== undefined || platformSlots.wasmGlobal !== undefined ||
-                    platformSlots.wasmMemory !== undefined || platformSlots.wasmTable !== undefined ||
-                    platformSlots.wasmInstanceExports !== undefined))
-                throw dce("A WebAssembly." + (platformSlots.wasmTag !== undefined ? "Tag"
-                    : platformSlots.wasmExn !== undefined ? "Exception"
-                    : platformSlots.wasmGlobal !== undefined ? "Global"
-                    : platformSlots.wasmMemory !== undefined ? "Memory"
-                    : platformSlots.wasmTable !== undefined ? "Table" : "Instance"));
+            if (platformSlots && (ownSlot(platformSlots, "wasmTag") !== undefined ||
+                    ownSlot(platformSlots, "wasmExn") !== undefined || ownSlot(platformSlots, "wasmGlobal") !== undefined ||
+                    ownSlot(platformSlots, "wasmMemory") !== undefined || ownSlot(platformSlots, "wasmTable") !== undefined ||
+                    ownSlot(platformSlots, "wasmInstanceExports") !== undefined))
+                throw dce("A WebAssembly." + (ownSlot(platformSlots, "wasmTag") !== undefined ? "Tag"
+                    : ownSlot(platformSlots, "wasmExn") !== undefined ? "Exception"
+                    : ownSlot(platformSlots, "wasmGlobal") !== undefined ? "Global"
+                    : ownSlot(platformSlots, "wasmMemory") !== undefined ? "Memory"
+                    : ownSlot(platformSlots, "wasmTable") !== undefined ? "Table" : "Instance"));
             // Streams #rs-transfer, #ws-transfer and #ts-transfer: streams are
             // transferable, not serializable. Outside the transfer list they,
             // like their readers, writers, controllers and strategies, are
             // platform objects that cannot be cloned.
-            if (platformSlots && (platformSlots.readableStream || platformSlots.writableStream ||
-                    platformSlots.transformStream || platformSlots.streamReader ||
-                    platformSlots.streamWriter || platformSlots.readableStreamController ||
-                    platformSlots.writableStreamController || platformSlots.transformStreamController ||
-                    platformSlots.byobRequest || platformSlots.byteLengthStrategy ||
-                    platformSlots.countStrategy || platformSlots.textDecoderStream ||
-                    platformSlots.textEncoderStream || platformSlots.compressionStream ||
-                    platformSlots.decompressionStream))
+            if (platformSlots && (ownSlot(platformSlots, "readableStream") || ownSlot(platformSlots, "writableStream") ||
+                    ownSlot(platformSlots, "transformStream") || ownSlot(platformSlots, "streamReader") ||
+                    ownSlot(platformSlots, "streamWriter") || ownSlot(platformSlots, "readableStreamController") ||
+                    ownSlot(platformSlots, "writableStreamController") || ownSlot(platformSlots, "transformStreamController") ||
+                    ownSlot(platformSlots, "byobRequest") || ownSlot(platformSlots, "byteLengthStrategy") ||
+                    ownSlot(platformSlots, "countStrategy") || ownSlot(platformSlots, "textDecoderStream") ||
+                    ownSlot(platformSlots, "textEncoderStream") || ownSlot(platformSlots, "compressionStream") ||
+                    ownSlot(platformSlots, "decompressionStream")))
                 throw dce("A stream platform object");
             if (wasmClone) {
                 const module = wasmClone.serialize(v, forStorage);
@@ -49895,15 +50222,37 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             const image = imageState(v);
             if (image) return ["ID", enc(image.data, heap, seen, forStorage), image.width, image.height, image.colorSpace, image.pixelFormat];
             if (G.Node && v instanceof G.Node) throw dce("A DOM node");
-            if (v instanceof Date) return ["D", v.getTime()];
-            if (v instanceof RegExp) return ["R", v.source, v.flags];
-            if (typeof Map !== "undefined" && v instanceof Map) {
-                var m = []; v.forEach(function (val, key) { m.push([enc(key, heap, seen, forStorage), enc(val, heap, seen, forStorage)]); });
-                return ["M", m];
+            let date = false, time;
+            try { time = apply(dateTime, v, []); date = true; } catch (_) {}
+            if (date) return ["D", enc(time, heap, seen, forStorage)];
+            let regexp = false, source;
+            // ECMA-262 #sec-get-regexp.prototype.source also accepts the
+            // intrinsic prototype, which does not have [[RegExpMatcher]].
+            if (v !== RegExpCtor.prototype)
+                try { source = apply(regexpSource, v, []); regexp = true; } catch (_) {}
+            if (regexp) {
+                let flags = "";
+                for (let i = 0; i < regexpFlags.length; i++)
+                    if (apply(regexpFlags[i][0], v, [])) flags += regexpFlags[i][1];
+                return ["R", source, flags];
             }
-            if (typeof Set !== "undefined" && v instanceof Set) {
-                var s = []; v.forEach(function (val) { s.push(enc(val, heap, seen, forStorage)); });
-                return ["S", s];
+            let map = false, set = false;
+            try { apply(mapSize, v, []); map = true; } catch (_) {}
+            if (map) {
+                // HTML #structuredserializeinternal snapshots [[MapData]]
+                // before visiting entries, whose getters may mutate the Map.
+                const entries = [], serialized = [];
+                apply(mapEach, v, [(value, key) => append(entries, [key, value])]);
+                for (let i = 0; i < entries.length; i++)
+                    append(serialized, [enc(entries[i][0], heap, seen, forStorage), enc(entries[i][1], heap, seen, forStorage)]);
+                return ["M", serialized];
+            }
+            try { apply(setSize, v, []); set = true; } catch (_) {}
+            if (set) {
+                const entries = [], serialized = [];
+                apply(setEach, v, [value => append(entries, value)]);
+                for (let i = 0; i < entries.length; i++) append(serialized, enc(entries[i], heap, seen, forStorage));
+                return ["S", serialized];
             }
             // ArrayBuffer branding is realm-independent, including an ImageData view
             // obtained from a same-origin frame. Do not consult constructor expandos.
@@ -49917,12 +50266,14 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 return ["AB64", apply(bytesToBase64, bytes, []),
                     apply(bufferResizable, v, []) ? apply(bufferMaxBytes, v, []) : null];
             }
-            var cn = apply(typedName, v, []) || (v.constructor && v.constructor.name);
-            if (cn === "DataView" && v.buffer instanceof ArrayBuffer) return ["DV", enc(v.buffer, heap, seen, forStorage), v.byteOffset, v.byteLength];
+            let dataView = false, dataBuffer;
+            try { dataBuffer = apply(viewBuffer, v, []); dataView = true; } catch (_) {}
+            if (dataView) return ["DV", enc(dataBuffer, heap, seen, forStorage), apply(viewOffset, v, []), apply(viewBytes, v, [])];
+            var cn = apply(typedName, v, []);
             if (cn && TYPED[cn] && apply(typedName, v, [])) {
                 const buffer = apply(typedBuffer, v, []);
                 // A detached view cannot be serialized; a zero-length attached view can.
-                try { new Uint8Array(buffer, 0, 0); } catch (_) { throw dce("A detached typed array"); }
+                try { new RawBytes(buffer, 0, 0); } catch (_) { throw dce("A detached typed array"); }
                 return ["TA", cn, enc(buffer, heap, seen, forStorage), apply(typedOffset, v, []), apply(typedLength, v, [])];
             }
             if (G.File && v instanceof G.File) return ["F", blobBytes(v), v.type || "", v.name || "", v.lastModified || 0];
@@ -49930,39 +50281,28 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (v instanceof Error) {
                 const node = ["E", v.name || "Error", v.message || "", v.stack || "", (G.DOMException && v instanceof G.DOMException) ? 1 : 0];
                 // Web IDL #quotaexceedederror serialization steps: [[Quota]], [[Requested]].
-                const quota = platformSlots && platformSlots.quotaExceeded;
-                if (quota) node.push([quota.quota, quota.requested]);
+                const quota = platformSlots && ownSlot(platformSlots, "quotaExceeded");
+                if (quota) append(node, [quota.quota, quota.requested]);
                 return node;
             }
-            if (Array.isArray(v)) {
-                var ap = [];
-                for (var k in v) if (Object.prototype.hasOwnProperty.call(v, k)) ap.push([k, enc(v[k], heap, seen, forStorage)]);
-                return ["A", v.length, ap];
-            }
-            var op = [], keys = Object.keys(v);
-            for (var i = 0; i < keys.length; i++) op.push([keys[i], enc(v[keys[i]], heap, seen, forStorage)]);
-            return ["O", op];
+            const array = isArray(v), length = array ? v.length : 0;
+            var properties = [], keys = keysOf(v);
+            for (var i = 0; i < keys.length; i++)
+                if (apply(own, v, [keys[i]])) append(properties, [keys[i], enc(v[keys[i]], heap, seen, forStorage)]);
+            return array ? ["A", length, properties] : ["O", properties];
         }
         G.__sc_serialize = function (value, forStorage = false, ports, buffers, bitmaps, streams, canvases) {
-            var heap = [], seen = new Map();
+            var heap = [], seen = new MapCtor();
             // Transferred streams (HTML #structuredserializewithtransfer memory).
-            if (streams && !forStorage) streams.forEach(function (index, stream) {
-                seen.set(stream, heap.length); heap.push(["STT", index]);
-            });
-            if (ports && !forStorage) ports.forEach(function (index, port) {
-                seen.set(port, heap.length); heap.push(["PT", index]);
-            });
-            if (buffers && !forStorage) buffers.forEach(function (index, buffer) {
-                seen.set(buffer, heap.length); heap.push(["BT", index]);
-            });
-            if (bitmaps && !forStorage) bitmaps.forEach(function (index, bitmap) {
-                seen.set(bitmap, heap.length); heap.push(["IBT", index]);
-            });
-            if (canvases && !forStorage) canvases.forEach(function (index, canvas) {
-                seen.set(canvas, heap.length); heap.push(["OCT", index]);
-            });
+            function transfers(entries, tag) {
+                if (entries && !forStorage) apply(mapEach, entries, [(index, item) => {
+                    apply(mapSet, seen, [item, heap.length]); append(heap, [tag, index]);
+                }]);
+            }
+            transfers(streams, "STT"); transfers(ports, "PT"); transfers(buffers, "BT");
+            transfers(bitmaps, "IBT"); transfers(canvases, "OCT");
             var root = enc(value, heap, seen, forStorage);
-            return JSON.stringify([root, heap]);
+            return wireCodec.stringify([root, heap]);
         };
         // Pass 1: build leaves fully + empty containers (so refs/cycles resolve).
         function shell(node, ports, buffers, bitmaps, streams, canvases) {
@@ -49988,7 +50328,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 case "CK":
                     if (!cryptoKeyCodec) throw dce("A CryptoKey");
                     return cryptoKeyCodec.deserialize(node[1]);
-                case "D": return new Date(node[1]);
+                case "D": return new DateCtor(isArray(node[1]) ? decRef(node[1]) : node[1]);
                 case "DR": case "DRO":
                     return (node[0] === "DR" ? cloneMutableRect : cloneReadonlyRect)(
                         decRef(node[1]), decRef(node[2]), decRef(node[3]), decRef(node[4]));
@@ -49997,13 +50337,17 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                         decRef(node[4]), node[0] === "DP");
                 case "DM": case "DMO": {
                     const values = [];
-                    for (let i = 2; i < node.length; i++) values.push(decRef(node[i]));
+                    for (let i = 2; i < node.length; i++) append(values, decRef(node[i]));
                     return geometryCodec.matrix(values, node[1], node[0] === "DM");
                 }
-                case "R": return new RegExp(node[1], node[2]);
-                case "M": return new Map();
-                case "S": return new Set();
-                case "AB": return new Uint8Array(node[1]).buffer;
+                case "R": return new RegExpCtor(node[1], node[2]);
+                case "M": return new MapCtor();
+                case "S": return new SetCtor();
+                case "AB": {
+                    const bytes = new RawBytes(node[1].length);
+                    for (let i = 0; i < node[1].length; i++) bytes[i] = node[1][i];
+                    return apply(typedBuffer, bytes, []);
+                }
                 case "AB64": {
                     const bytes = apply(bytesFromBase64, RawBytes, [node[1]]);
                     if (node[2] === null) return apply(typedBuffer, bytes, []);
@@ -50031,7 +50375,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                     if (node[3]) try { e.stack = node[3]; } catch (x) {}
                     return e;
                 }
-                case "A": return new Array(node[1]);
+                case "A": return new ArrayCtor(node[1]);
                 case "O": return {};
             }
             return null; // TA / DV / FL: built in pass 2 (need their referents resolved)
@@ -50042,23 +50386,24 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 case "z": return null;
                 case "b": case "s": case "d": return val[1];
                 case "fs": return val[1] === "n" ? NaN : val[1] === "i" ? Infinity : val[1] === "g" ? -Infinity : -0;
-                case "bi": return BigInt(val[1]);
+                case "bi": return BigIntCtor(val[1]);
                 case "r": return built[val[1]];
             }
             return undefined;
         }
         G.__sc_deserialize = function (str, ports, buffers, bitmaps, streams, canvases) {
-            var parsed = JSON.parse(str), root = parsed[0], heap = parsed[1];
-            var built = new Array(heap.length), i;
-            for (i = 0; i < heap.length; i++) built[i] = shell(heap[i], ports, buffers, bitmaps, streams, canvases);
+            var parsed = wireCodec.parse(str), root = parsed[0], heap = parsed[1];
+            var built = new ArrayCtor(heap.length), i;
+            for (i = 0; i < heap.length; i++) put(built, i, shell(heap[i], ports, buffers, bitmaps, streams, canvases));
             // Pass 2: typed arrays / DataView (their buffer is an AB leaf, now built).
             for (i = 0; i < heap.length; i++) {
                 var n = heap[i];
-                if (n[0] === "TA") built[i] = new G[n[1]](decRef(n[2], built), n[3], n[4]);
-                else if (n[0] === "DV") built[i] = new DataView(decRef(n[1], built), n[2], n[3]);
+                if (n[0] === "TA") built[i] = new TYPED[n[1]](decRef(n[2], built), n[3], n[4]);
+                else if (n[0] === "DV") built[i] = new DataViewCtor(decRef(n[1], built), n[2], n[3]);
                 else if (n[0] === "FL") {
                     // A Realm without FileList (this worker realm) gets its Files.
-                    const files = n[1].map((file) => decRef(file, built));
+                    const files = [];
+                    for (let j = 0; j < n[1].length; j++) append(files, decRef(n[1][j], built));
                     const make = G.FileList && apply(weakGet, codecSlotsMap, [G.FileList]);
                     built[i] = make && make.createFileList ? make.createFileList(files) : files;
                 }
@@ -50071,7 +50416,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                     decRef(n[3], built), decRef(n[4], built));
                 else if (n[0] === "ID") built[i] = new ImageData(decRef(n[1], built), n[2], n[3], { colorSpace: n[4], pixelFormat: n[5] });
                 else if (n[0] === "IB") {
-                    const record = Object.create(null);
+                    const record = create(null);
                     record[0] = n[2]; record[1] = n[3]; record[2] = decRef(n[1], built);
                     record[3] = true; record[4] = 1; record[5] = n[4];
                     built[i] = bitmapCodec.make(record);
@@ -50080,10 +50425,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             // Pass 3: fill containers (all referents now exist → cycles close).
             for (i = 0; i < heap.length; i++) {
                 var node = heap[i], obj = built[i], j;
-                if (node[0] === "M") { for (j = 0; j < node[1].length; j++) obj.set(decRef(node[1][j][0], built), decRef(node[1][j][1], built)); }
-                else if (node[0] === "S") { for (j = 0; j < node[1].length; j++) obj.add(decRef(node[1][j], built)); }
-                else if (node[0] === "A") { for (j = 0; j < node[2].length; j++) obj[node[2][j][0]] = decRef(node[2][j][1], built); }
-                else if (node[0] === "O") { for (j = 0; j < node[1].length; j++) obj[node[1][j][0]] = decRef(node[1][j][1], built); }
+                if (node[0] === "M") { for (j = 0; j < node[1].length; j++) apply(mapSet, obj, [decRef(node[1][j][0], built), decRef(node[1][j][1], built)]); }
+                else if (node[0] === "S") { for (j = 0; j < node[1].length; j++) apply(setAdd, obj, [decRef(node[1][j], built)]); }
+                else if (node[0] === "A") { for (j = 0; j < node[2].length; j++) put(obj, node[2][j][0], decRef(node[2][j][1], built)); }
+                else if (node[0] === "O") { for (j = 0; j < node[1].length; j++) put(obj, node[1][j][0], decRef(node[1][j][1], built)); }
             }
             return decRef(root, built);
         };
@@ -50648,96 +50993,267 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         }
         finishInterface(StorageManager, "StorageManager", secure);
 
-        // --- Service Workers (W3C, local w3c/ServiceWorker@92aba3b) ----------
-        // #serviceworkercontainer-interface. TRust runs no service workers:
-        // there is no registration, no controller and no ready registration.
-        // Registration behaves as for a user agent whose policy disables
-        // service-worker storage, after the Start Register checks.
-        const WORKER_TYPES = freeze(["classic", "module"]);
-        const UPDATE_VIA_CACHE = freeze(["imports", "all", "none"]);
-        function stripFragment(url) {
-            const hash = url.indexOf("#");
-            return hash < 0 ? url : url.slice(0, hash);
-        }
-        function hasEncodedSeparator(url) {
-            const path = (__url_parse(url, null) || [])[5] || "";
-            return /%2f|%5c/i.test(path);
-        }
-        class ServiceWorkerContainer extends EventTargetCtor {
-            constructor() { throw new TypeErrorCtor("Illegal constructor"); }
-            get controller() { brand(this, "service-worker-container", "ServiceWorkerContainer"); return null; }
-            get ready() {
-                const state = brand(this, "service-worker-container", "ServiceWorkerContainer");
-                // #navigator-service-worker-ready: no registration can ever
-                // match, so the promise stays pending (and never rejects).
-                if (!state.ready) state.ready = new PromiseCtor(() => {});
-                return state.ready;
-            }
-            register(scriptURL, options = undefined) {
-                try {
-                    brand(this, "service-worker-container", "ServiceWorkerContainer");
-                    if (arguments.length < 1) throw new TypeErrorCtor("register requires a script URL");
-                    scriptURL = usvString(scriptURL);
-                    const dict = dictionary(options, "RegistrationOptions");
-                    const scopeValue = dict === null ? undefined : dict.scope;
-                    const scope = scopeValue === undefined ? null : usvString(scopeValue);
-                    const typeValue = dict === null ? undefined : dict.type;
-                    if (typeValue !== undefined) enumeration(typeValue, WORKER_TYPES, "WorkerType");
-                    const cacheValue = dict === null ? undefined : dict.updateViaCache;
-                    if (cacheValue !== undefined) enumeration(cacheValue, UPDATE_VIA_CACHE, "ServiceWorkerUpdateViaCache");
-                    // #start-register-algorithm.
-                    let script = parseURL(scriptURL);
-                    if (script === null) throw new TypeErrorCtor("Invalid service worker script URL");
-                    script = stripFragment(script);
-                    if (!/^https?:/i.test(script) || hasEncodedSeparator(script))
-                        throw new TypeErrorCtor("Unsupported service worker script URL");
-                    let scopeURL = scope === null ? (__url_parse("./", script) || [null])[0] : parseURL(scope);
-                    if (scopeURL === null) throw new TypeErrorCtor("Invalid service worker scope URL");
-                    scopeURL = stripFragment(scopeURL);
-                    if (!/^https?:/i.test(scopeURL) || hasEncodedSeparator(scopeURL))
-                        throw new TypeErrorCtor("Unsupported service worker scope URL");
-                } catch (error) { return rejected(error); }
-                // #register-algorithm rejects through #reject-job-promise on a
-                // DOM manipulation task. Without service-worker support no job
-                // can create a registration: "SecurityError".
-                return new PromiseCtor((resolve, reject) => adapter.queue(() => reject(
-                    exception("Service worker registration is disabled", "SecurityError"))));
-            }
-            getRegistration(clientURL = "") {
-                try {
-                    brand(this, "service-worker-container", "ServiceWorkerContainer");
-                    clientURL = usvString(clientURL);
-                    // #navigator-service-worker-getRegistration.
-                    const parsed = __url_parse(clientURL, adapter.baseURL());
-                    if (!parsed) throw new TypeErrorCtor("Invalid client URL");
-                    if (parsed[8] !== adapter.origin() || parsed[8] === "null")
-                        throw exception("Client URL is not same origin", "SecurityError");
-                } catch (error) { return rejected(error); }
-                return new PromiseCtor(resolve => adapter.queue(() => resolve(undefined)));
-            }
-            getRegistrations() {
-                try { brand(this, "service-worker-container", "ServiceWorkerContainer"); }
-                catch (error) { return rejected(error); }
-                return new PromiseCtor(resolve => adapter.queue(() => resolve(freeze([]))));
-            }
-            // #navigator-service-worker-startMessages: enabling the client
-            // message queue delivers nothing because no service worker exists.
-            startMessages() { brand(this, "service-worker-container", "ServiceWorkerContainer"); }
-        }
-        eventHandlers(ServiceWorkerContainer.prototype, "service-worker-container", "ServiceWorkerContainer",
-            ["controllerchange", "message", "messageerror"]);
-        finishInterface(ServiceWorkerContainer, "ServiceWorkerContainer", secure);
-
         if (secure) {
             const manager = create(StorageManager.prototype);
             remember(manager, {kind: "storage-manager"});
             navigatorAttribute("storage", manager);
-            const container = Reflect.construct(EventTargetCtor, [], ServiceWorkerContainer);
-            remember(container, {kind: "service-worker-container", handlers: create(null), ready: null});
-            navigatorAttribute("serviceWorker", container);
         }
+        // Client interfaces finish after the common bootstrap; the adapter
+        // retains this environment's settings and pristine event operations.
+        g.__service_worker_adapter = adapter;
+        adapter.navigatorAttribute = navigatorAttribute;
     })();
     /*__FEATURES_END__*/
+    const cookieCreationURL = String(cfg.url);
+    g.__cookie_store_adapter = {
+        EventTarget, Event, window: true, service: false, secure: secureContext,
+        creationURL: cookieCreationURL, origin: messageWindowState.origin,
+        baseURL() { return messageWindowState.apiBaseURL(); },
+        native(op, input) {
+            return __cookie_store(op, storageContextId,
+                realmRootFrame ? nodeIds.get(realmRootFrame) : topDocumentId,
+                cookieCreationURL, input);
+        },
+        queue(fn) { __queue_dom_task(fn); },
+        fire(target, C, type, init) { dispatch(target, createTrustedEvent(C, type, init), false); },
+        add(target, type, fn) { addL(target, type, fn, false); },
+        remove(target, type, fn) { removeL(target, type, fn, false); },
+        expose(read) { defineWindowAttribute("cookieStore", "readonly", read); },
+        listens(target) { return lsFor(target,"change").length !== 0; },
+        bind(deliver, resident) { trust.cookieStoreChange = deliver; trust.cookieStoreWork = resident; },
+    };
+    /*__COOKIE_STORE_BEGIN__*/
+    // Cookie Store 54559c0c: operations use their creation URL, even after
+    // history changes. Web IDL 8f182624: overloads, dictionary order, finite
+    // doubles, USVString and FrozenArray. Shared with ServiceWorker globals.
+    (function (g) {
+        "use strict";
+        const adapter = g.__cookie_store_adapter;
+        delete g.__cookie_store_adapter;
+        if (!adapter || !adapter.secure || !(adapter.window || adapter.service)) return;
+        const apply = Reflect.apply, define = Object.defineProperty, own = Object.getOwnPropertyDescriptor;
+        const freeze = Object.freeze, create = Object.create, keys = Object.keys;
+        const getSlot = WeakMap.prototype.get, setSlot = WeakMap.prototype.set, hasOwn=Object.prototype.hasOwnProperty;
+        const slots = __platform_slots("internals", new WeakMap());
+        const PromiseCtor = Promise, react=__promise_react, reject = Promise.reject.bind(Promise);
+        const construct=Reflect.construct, split=String.prototype.split, trim=String.prototype.trim, iterator=Symbol.iterator;
+        const parse = JSON.parse, stringify = JSON.stringify, TypeErrorCtor = TypeError;
+        const DOMExceptionCtor = g.DOMException, finite = Number.isFinite, trunc = Math.trunc;
+        const toWellFormed = String.prototype.toWellFormed;
+        const EventCtor = adapter.Event, EventTargetCtor = adapter.EventTarget;
+        const creation = __url_parse(adapter.creationURL, null);
+        const stripFragment = value => apply(split,value,["#",1])[0];
+        const string = value => apply(toWellFormed, `${value}`, []);
+        const object = value => value !== null && (typeof value === "object" || typeof value === "function");
+        const dictionary = value => {
+            if (value == null) return create(null);
+            if (!object(value)) throw new TypeErrorCtor("Expected a dictionary");
+            return value;
+        };
+        function brand(value, kind) {
+            const shared = object(value) && apply(getSlot, slots, [value]);
+            const record = shared && apply(hasOwn,shared,["cookieStore"]) && shared.cookieStore;
+            if (!record || record.kind !== kind) throw new TypeErrorCtor("Illegal " + kind + " invocation");
+            return record;
+        }
+        function remember(value, record) {
+            let shared = apply(getSlot, slots, [value]);
+            if (!shared) { shared = create(null); apply(setSlot, slots, [value, shared]); }
+            define(shared,"cookieStore",{value:record,writable:true,enumerable:true,configurable:true});
+        }
+        function finish(C, name) {
+            for (const name of Object.getOwnPropertyNames(C.prototype)) {
+                if (name !== "constructor") define(C.prototype, name, {enumerable: true});
+            }
+            define(C.prototype, Symbol.toStringTag, {value: name, configurable: true});
+            define(g, name, {value: C, writable: true, configurable: true});
+        }
+        function number(value) {
+            const result = +value;
+            if (!finite(result)) throw new TypeErrorCtor("Expected a finite number");
+            return result;
+        }
+        function integer(value) {
+            let result = +value;
+            if (!finite(result) || result === 0) return 0;
+            result = trunc(result) % 18446744073709551616;
+            if (result < 0) result += 18446744073709551616;
+            return result >= 9223372036854775808 ? result - 18446744073709551616 : result;
+        }
+        function queryOptions(value) {
+            const result=create(null);
+            if (value != null && !object(value)) {result.name=string(value);return result;}
+            const dict = dictionary(value);
+            const name = dict.name;
+            if (name !== undefined) result.name = string(name);
+            const url = dict.url;
+            if (url !== undefined) result.url = string(url);
+            return result;
+        }
+        function writeOptions(value, deleting) {
+            const dict = dictionary(value), result = create(null);
+            const domain = dict.domain;
+            result.domain = domain == null ? null : string(domain);
+            if (!deleting) {
+                const expires = dict.expires;
+                result.expires = expires == null ? null : number(expires);
+                const maxAge = dict.maxAge;
+                result.maxAge = maxAge == null ? null : integer(maxAge);
+            }
+            const name = dict.name;
+            if (name === undefined) throw new TypeErrorCtor("Cookie name is required");
+            result.name = string(name);
+            const partitioned = dict.partitioned;
+            result.partitioned = !!partitioned;
+            const path = dict.path;
+            result.path = path === undefined ? "/" : string(path);
+            if (!deleting) {
+                const sameSite = dict.sameSite;
+                result.sameSite = sameSite === undefined ? "strict" : string(sameSite);
+                if (result.sameSite!=="strict"&&result.sameSite!=="lax"&&result.sameSite!=="none") throw new TypeErrorCtor("Invalid SameSite");
+                const value = dict.value;
+                if (value === undefined) throw new TypeErrorCtor("Cookie value is required");
+                result.value = string(value);
+            }
+            return result;
+        }
+        function simpleOptions(name,value,writing) {
+            const result=create(null);result.name=string(name);
+            if(writing)result.value=string(value);
+            result.domain=null;result.path="/";result.partitioned=false;
+            if(writing){result.sameSite="strict";result.expires=null;result.maxAge=null;}
+            return result;
+        }
+        function allowed(state) {
+            if (state.adapter.origin === "null") throw new DOMExceptionCtor("Opaque cookie origin", "SecurityError");
+        }
+        function call(state, op, input) {
+            allowed(state);
+            return new PromiseCtor((resolve, reject) => state.adapter.queue(() => {
+                try {
+                    const result = parse(state.adapter.native(op, stringify(input)));
+                    if (result && result.error) {
+                        throw result.error === "TypeError" ? new TypeErrorCtor(result.message)
+                            : new DOMExceptionCtor(result.message, result.error);
+                    }
+                    resolve(result);
+                } catch (error) { reject(error); }
+            }));
+        }
+        function getCookies(target, value, single) {
+            const state = brand(target, "CookieStore");
+            const options = queryOptions(value);
+            allowed(state);
+            if (single && keys(options).length === 0) throw new TypeErrorCtor("Cookie name or URL is required");
+            if (options.url !== undefined) {
+                const parsed = __url_parse(options.url, state.adapter.baseURL());
+                // #CookieStore-get/getAll normative algorithms compare the
+                // creation URL, excluding only its fragment.
+                if (!parsed || !state.creation || parsed[8] !== state.creation[8]
+                    || stripFragment(parsed[0]) !== stripFragment(state.creation[0])) {
+                    throw new TypeErrorCtor("Cookie URL differs from the environment creation URL");
+                }
+            }
+            return react(call(state,"get",options),list=>single?(list.length?list[0]:null):list);
+        }
+        class CookieStore extends EventTargetCtor {
+            constructor() { throw new TypeErrorCtor("Illegal constructor"); }
+            get(value = undefined) { try { return getCookies(this, value, true); } catch (error) { return reject(error); } }
+            getAll(value = undefined) { try { return getCookies(this, value, false); } catch (error) { return reject(error); } }
+            set(name, value = undefined) {
+                try {
+                    const state = brand(this, "CookieStore");
+                    if (arguments.length === 0) throw new TypeErrorCtor("CookieStore.set requires an argument");
+                    const options = arguments.length >= 2
+                        ? simpleOptions(name,value,true)
+                        : writeOptions(name, false);
+                    return react(call(state,"set",options),()=>undefined);
+                } catch (error) { return reject(error); }
+            }
+            delete(name) {
+                try {
+                    const state = brand(this, "CookieStore");
+                    if (arguments.length === 0) throw new TypeErrorCtor("CookieStore.delete requires an argument");
+                    // CookieStoreDeleteOptions defaults partitioned to false,
+                    // as does the specification's explainer's string form.
+                    // The prose overload's literal `true` conflicts with both.
+                    const options = name != null && !object(name)
+                        ? simpleOptions(name,undefined,false)
+                        : writeOptions(name, true);
+                    options.value = apply(trim,options.name,[]) === "" ? "deleted" : "";
+                    options.expires = null; options.maxAge = 0; options.sameSite = "strict";
+                    return react(call(state,"set",options),()=>undefined);
+                } catch (error) { return reject(error); }
+            }
+        }
+        function list(value) {
+            if(value===undefined)return freeze([]);
+            if(!object(value))throw new TypeErrorCtor("CookieList must be a sequence");
+            const method=value[iterator];
+            if(typeof method!=="function")throw new TypeErrorCtor("CookieList must be iterable");
+            const iter=apply(method,value,[]);
+            if(!object(iter))throw new TypeErrorCtor("Invalid iterator");
+            const next=iter.next,result=[];
+            for(;;){
+                const step=apply(next,iter,[]);
+                if(!object(step))throw new TypeErrorCtor("Invalid iterator result");
+                if(step.done)return freeze(result);
+                const dict=dictionary(step.value),item={};
+                const name=dict.name;if(name!==undefined)define(item,"name",{value:string(name),writable:true,enumerable:true,configurable:true});
+                const value=dict.value;if(value!==undefined)define(item,"value",{value:string(value),writable:true,enumerable:true,configurable:true});
+                define(result,result.length,{value:item,writable:true,enumerable:true,configurable:true});
+            }
+        }
+        class CookieChangeEvent extends EventCtor {
+            constructor(type, init = undefined) {
+                if(arguments.length===0)throw new TypeErrorCtor("Event type is required");
+                type=`${type}`;
+                const dict=dictionary(init),base=create(null);
+                base.bubbles=!!dict.bubbles;base.cancelable=!!dict.cancelable;base.composed=!!dict.composed;
+                const changed=list(dict.changed),deleted=list(dict.deleted);
+                super(type,base);
+                remember(this,{kind:"CookieChangeEvent",changed,deleted});
+            }
+            get changed() { return brand(this, "CookieChangeEvent").changed; }
+            get deleted() { return brand(this, "CookieChangeEvent").deleted; }
+        }
+        finish(CookieStore, "CookieStore");
+        if (adapter.window) finish(CookieChangeEvent, "CookieChangeEvent");
+        if (adapter.window) {
+            const accessors = {
+                get onchange() { return brand(this, "CookieStore").handler?.value || null; },
+                set onchange(value) {
+                    const state = brand(this, "CookieStore");
+                    value = object(value) ? value : null;
+                    if (value === null) {
+                        if (state.handler) state.adapter.remove(this, "change", state.handler.listener);
+                        state.handler = null;
+                    } else if (state.handler) state.handler.value = value;
+                    else {
+                        const target = this, handler = state.handler = {value, listener: null};
+                        handler.listener = event => {
+                            if (typeof handler.value === "function" && apply(handler.value, target, [event]) === false) event.preventDefault();
+                        };
+                        state.adapter.add(this, "change", handler.listener);
+                    }
+                },
+            };
+            define(CookieStore.prototype, "onchange", {...own(accessors, "onchange"), enumerable: true, configurable: true});
+        }
+        let store;
+        adapter.expose(() => {
+            if (!store) {
+                store = construct(EventTargetCtor, [], CookieStore);
+                remember(store, {kind: "CookieStore", handler: null, adapter, creation});
+                if (adapter.window) adapter.native("watch", "{}");
+            }
+            return store;
+        });
+        adapter.bind(json => {
+            if (store && adapter.window) adapter.fire(store, CookieChangeEvent, "change", parse(json));
+        }, () => !!(store && adapter.window && adapter.listens(store)));
+    })(globalThis);
+    /*__COOKIE_STORE_END__*/
     // --- Window-only capability APIs ---------------------------------------
     // Credential Management, Clipboard, Media Capture and Web Speech Synthesis.
     // Each reports what TRust can actually provide: no credential types, no
@@ -51368,6 +51884,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         serialize(message, transfer) { return serializeMessage(message, transfer); },
         deserialize(packet) { return deserializeMessage(packet); },
         optionsTransfer(options) { return portAPI.optionsTransfer(options); },
+        stringify(packet) { return portAPI.stringify(packet); },
         reportUnhandled(info) {
             // HTML #report-an-exception with omitError set to true.
             let notHandled = true;
@@ -51403,7 +51920,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         delete g.__worker_adapter;
         const control = adapter.control;
         const apply = Reflect.apply, define = Object.defineProperty, freeze = Object.freeze;
-        const stringify = JSON.stringify, parse = JSON.parse, objectCreate = Object.create;
+        const stringify = adapter.stringify, parse = JSON.parse, objectCreate = Object.create;
         const wellFormed = String.prototype.toWellFormed, startsWith = String.prototype.startsWith;
         const stringSlice = String.prototype.slice, split = String.prototype.split;
         const slotGet = WeakMap.prototype.get, slotSet = WeakMap.prototype.set;
@@ -51577,7 +52094,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 return;
             }
             (trust.sharedWorkers[id] || (trust.sharedWorkers[id] = new Set())).add(this);
-            __worker_post(id, JSON.stringify(serializeMessage("", [channel.port2])));
+            __worker_post(id, portAPI.stringify(portAPI.serializeList("", [channel.port2])));
         }
         get port() { return sharedWorkerState(this).port; }
         // AbstractWorker's onerror (HTML #event-handler-attributes keeps a

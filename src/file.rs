@@ -191,6 +191,8 @@ pub(crate) async fn fetch(request: &crate::http::Request) -> Result<crate::http:
     timing.decoded_body_size = body.len();
 
     Ok(crate::http::Response {
+        internal: None,
+        service_client: None,
         url: request.url.clone(),
         status: 200,
         status_text: String::new(),

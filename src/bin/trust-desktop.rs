@@ -231,6 +231,8 @@ mod single_instance;
 mod tabs;
 #[path = "trust-desktop/text_selection.rs"]
 mod text_selection;
+#[path = "trust-desktop/touch.rs"]
+mod touch;
 #[path = "trust-desktop/unload_prompt.rs"]
 mod unload_prompt;
 #[path = "trust-desktop/window_chrome.rs"]
@@ -1933,6 +1935,7 @@ struct DesktopWindow {
     modifiers: ModifiersState,
     screen_origin: (i32, i32),
     page_pointer_buttons: u16,
+    touches: touch::TouchState,
     command_history: trust::command::History,
     downloads_in_flight: usize,
     composing: bool,
@@ -2319,6 +2322,7 @@ impl DesktopWindow {
             modifiers: ModifiersState::empty(),
             screen_origin: (0, 0),
             page_pointer_buttons: 0,
+            touches: Default::default(),
             command_history: trust::command::History::default(),
             downloads_in_flight: 0,
             composing: false,
@@ -2818,6 +2822,7 @@ impl DesktopWindow {
                 .try_send(trust::telnet::Command::Close);
         }
         if leaves_keyboard_target {
+            self.cancel_touches();
             self.tab.keyboard_target = None;
             self.tab.pending_page_keys.clear();
             self.tab.queued_form_keys.clear();
@@ -3366,12 +3371,16 @@ impl DesktopWindow {
     }
 
     fn pointer_metadata(&self) -> trust::js::PointerMetadata {
+        self.pointer_metadata_at(self.pointer)
+    }
+
+    fn pointer_metadata_at(&self, point: CssPoint) -> trust::js::PointerMetadata {
         // CursorMoved and the cached client-window origin are already in CSS
         // pixels. Keep chrome in screen coordinates, but not page client ones.
         trust::js::PointerMetadata {
             screen: Some((
-                f64::from(self.screen_origin.0) + f64::from(self.pointer.x),
-                f64::from(self.screen_origin.1) + f64::from(self.pointer.y),
+                f64::from(self.screen_origin.0) + f64::from(point.x),
+                f64::from(self.screen_origin.1) + f64::from(point.y),
             )),
             modifiers: translate_modifiers(self.modifiers),
             ..Default::default()
@@ -6940,6 +6949,7 @@ impl DesktopWindow {
         };
         self.close_select_popup();
         self.tab.select_popup = Some(SelectPopup::new(form, field, node, control, anchor));
+        self.cancel_touches();
         // HTML #selector-open: the select's picker is showing.
         if self.tab.browser.page_is_live()
             && let Some(node) = node
@@ -9748,6 +9758,7 @@ impl DesktopWindow {
             WindowEvent::Focused(focused) => {
                 self.window_focused = focused;
                 if !focused {
+                    self.cancel_touches();
                     self.close_select_popup();
                     self.close_context_menu();
                     self.release_native_pointer_lock(true);
@@ -9828,21 +9839,7 @@ impl DesktopWindow {
                 native_pointer::release();
             }
             WindowEvent::MouseWheel { delta, .. } => self.handle_scroll(delta),
-            WindowEvent::Touch(touch) => {
-                let point = self
-                    .metrics
-                    .physical_to_css(touch.location.x, touch.location.y);
-                self.pointer_moved(Some(event_loop), point);
-                match touch.phase {
-                    TouchPhase::Started => {
-                        self.handle_pointer_button(ElementState::Pressed, MouseButton::Left)
-                    }
-                    TouchPhase::Ended | TouchPhase::Cancelled => {
-                        self.handle_pointer_button(ElementState::Released, MouseButton::Left)
-                    }
-                    TouchPhase::Moved => {}
-                }
-            }
+            WindowEvent::Touch(touch) => self.handle_touch(touch),
             _ => {}
         }
     }
@@ -10914,6 +10911,8 @@ mod tests {
         app.metrics =
             ViewportMetrics::from_physical(PhysicalSize::new(640, 480), ScaleFactor::new(1.0));
         let response = trust::http::Response {
+            internal: None,
+            service_client: None,
             url: url::Url::parse("https://example.test/page").unwrap(),
             status: 200,
             status_text: String::new(),
@@ -11003,6 +11002,81 @@ mod tests {
                 _ => None,
             })
             .unwrap_or_else(|| panic!("no run {text:?}"))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires Wayland for the native event-loop proxy; creates no window"]
+    async fn native_touch_panning_latches_policy_and_preserves_mouse_position() {
+        use winit::platform::wayland::EventLoopBuilderExtWayland;
+        let mut builder = EventLoop::<AppEvent>::with_user_event();
+        builder.with_any_thread(true).with_wayland();
+        let event_loop = builder.build().unwrap();
+        for (action, expected) in [
+            ("none", 0.0),
+            ("pan-x", 0.0),
+            ("pan-y", 50.0),
+            ("pan-down", 50.0),
+            ("pan-up", 0.0),
+        ] {
+            let mut app = static_page_app(
+                &event_loop,
+                &format!(
+                    "<style>body{{margin:0}}#sc{{width:180px;height:140px;overflow:auto}}\
+                 #target{{height:600px;touch-action:{action}}}</style><div id=sc><div id=target></div></div>"
+                ),
+            );
+            let content = app.scene.as_ref().unwrap().content_viewport;
+            let node = app.scene.as_ref().unwrap().page_scroll_containers[0].node;
+            let original_mouse = CssPoint::new(500.0, 400.0);
+            app.pointer = original_mouse;
+            let send = |app: &mut DesktopWindow, phase, x, y| {
+                app.handle_touch(winit::event::Touch {
+                    device_id: DeviceId::dummy(),
+                    phase,
+                    location: winit::dpi::PhysicalPosition::new(
+                        f64::from(content.x + x),
+                        f64::from(content.y + y),
+                    ),
+                    force: None,
+                    id: 123,
+                })
+            };
+            send(&mut app, TouchPhase::Started, 40.0, 100.0);
+            send(&mut app, TouchPhase::Moved, 42.0, 60.0);
+            send(&mut app, TouchPhase::Moved, 60.0, 50.0);
+            send(&mut app, TouchPhase::Ended, 60.0, 50.0);
+            let offset = app
+                .tab
+                .page_layout
+                .as_ref()
+                .unwrap()
+                .scroll_offsets
+                .get(&node)
+                .copied()
+                .unwrap_or_default();
+            assert_eq!(offset, CssPoint::new(0.0, expected), "{action}");
+            assert_eq!(
+                app.pointer, original_mouse,
+                "touch keeps the physical mouse position"
+            );
+            // A canceled contact cannot resume on a later movement sample.
+            send(&mut app, TouchPhase::Started, 40.0, 100.0);
+            app.cancel_touches();
+            send(&mut app, TouchPhase::Moved, 40.0, 50.0);
+            send(&mut app, TouchPhase::Ended, 40.0, 50.0);
+            assert_eq!(
+                app.tab
+                    .page_layout
+                    .as_ref()
+                    .unwrap()
+                    .scroll_offsets
+                    .get(&node)
+                    .copied()
+                    .unwrap_or_default(),
+                offset
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -12101,6 +12175,8 @@ mod tests {
         app.metrics =
             ViewportMetrics::from_physical(PhysicalSize::new(558, 625), ScaleFactor::new(1.0));
         let response = trust::http::Response {
+            internal: None,
+            service_client: None,
             url: url::Url::parse("https://example.test/email-verification").unwrap(),
             status: 200,
             status_text: String::new(),

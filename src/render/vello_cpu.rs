@@ -734,7 +734,7 @@ impl VelloCpuRenderer {
                     }
                     self.context.pop_clip();
                 }
-                DisplayCommand::HitRegion(_) => {}
+                DisplayCommand::HitRegion(_) | DisplayCommand::TouchScope(_) => {}
                 Primitive::FillRect { rect, color } => {
                     if !rect_is_visible(*rect, *logical_transforms.last().unwrap(), clips.bounds())
                     {

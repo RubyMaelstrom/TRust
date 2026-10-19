@@ -9,6 +9,9 @@
     if (!cfg || !cfg.worklet) return;
     const control = Reflect.apply(WeakMap.prototype.get, __platform_slots("controls", new WeakMap()), [g]);
     const apply = Reflect.apply, construct = Reflect.construct, define = Object.defineProperty;
+    // Incoming processor/global-port packets arrive after author code runs;
+    // parse them (and encode native results) with bootstrap intrinsics.
+    const parse = JSON.parse, stringify = JSON.stringify;
     const freeze = Object.freeze, isArray = Array.isArray, NumberCtor = Number, F32 = Float32Array;
     const fround = Math.fround, finite = Number.isFinite;
     const Exception = g.DOMException;
@@ -115,7 +118,7 @@
             const match = /\((.*):(\d+):(\d+)\)/.exec(stack) || /at (.*):(\d+):(\d+)/.exec(stack);
             if (match) { filename = match[1]; line = +match[2]; column = +match[3]; }
         } catch (_) {}
-        return JSON.stringify({message, filename, line, column});
+        return stringify({message, filename, line, column});
     }
     function shapeOf(text) {
         return text === "" ? [] : text.split(",").map(NumberCtor);
@@ -129,11 +132,11 @@
     // Methods the rendering thread calls (`audio_worklet_host`).
     control.workletTake = function () {
         const list = registered.splice(0);
-        return JSON.stringify(list.map(([name, descriptors]) => ({name, descriptors})));
+        return stringify(list.map(([name, descriptors]) => ({name, descriptors})));
     };
     control.workletTime = function (value) { frame = value; };
     control.workletGlobalPort = function (packet) {
-        try { globalPort = portAPI.deserialize(JSON.parse(packet)).ports[0] || null; }
+        try { globalPort = portAPI.deserialize(parse(packet)).ports[0] || null; }
         catch (_) { globalPort = null; }
     };
     // #invoking-processor-constructor
@@ -141,7 +144,7 @@
         const entry = processors.get(name);
         try {
             if (!entry) throw new Exception("No processor named " + name, "InvalidStateError");
-            const {data, ports} = portAPI.deserialize(JSON.parse(packet));
+            const {data, ports} = portAPI.deserialize(parse(packet));
             pending = {node, port: ports[0] || null};
             const processor = construct(entry.ctor, [data]);
             if (processor === null || (typeof processor !== "object" && typeof processor !== "function"))

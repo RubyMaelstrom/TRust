@@ -3,16 +3,23 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
 (function () {
     var g = globalThis;
     var portAPI;
+    const workerSlotOwn=Object.getOwnPropertyDescriptor;
+    // Captured before author execution: incoming packets and platform-object
+    // slots must survive author replacement of these intrinsics (HTML
+    // StructuredDeserializeWithTransfer; private serialization records).
+    const internalsApply=Reflect.apply, internalsWeakGet=WeakMap.prototype.get,
+        internalsWeakSet=WeakMap.prototype.set, internalsCreate=Object.create;
+    const workerJsonParse=JSON.parse;
     const bitmapTasks = [];
     // Internal slots of worker platform objects (shared with the platform
     // blocks): never author-visible properties of the objects themselves.
     const internalSlotMap = __platform_slots("internals", new WeakMap());
     function internalsFor(object) {
-        let record = Reflect.apply(WeakMap.prototype.get, internalSlotMap, [object]);
+        let record = internalsApply(internalsWeakGet, internalSlotMap, [object]);
         if (record === undefined) {
-            record = Object.create(null);
+            record = internalsCreate(null);
             if ((typeof object === "object" && object !== null) || typeof object === "function")
-                Reflect.apply(WeakMap.prototype.set, internalSlotMap, [object, record]);
+                internalsApply(internalsWeakSet, internalSlotMap, [object, record]);
         }
         return record;
     }
@@ -65,7 +72,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         },
         message: function (s) {
             var packet;
-            try { packet = portAPI.deserialize(JSON.parse(s)); }
+            try { packet = portAPI.deserialize(workerJsonParse(s)); }
             catch (e) {
                 if (!cfg.shared) fireScope("messageerror", trustedScopeEvent(MessageEvent, "messageerror", {}));
                 return;
@@ -123,7 +130,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // The worker loop's control object stays private: the native host and the
     // shared platform blocks reach it through the host-rooted WeakMap keyed by
     // this WorkerGlobalScope, never through a global property.
-    Reflect.apply(WeakMap.prototype.set, __platform_slots("controls", new WeakMap()), [g, WK]);
+    internalsApply(internalsWeakSet, __platform_slots("controls", new WeakMap()), [g, WK]);
     // WorkerGlobalScope has no print(); remove the engine's Test262 hook.
     delete g.print;
     // HTML Timers "timer initialization steps" apply to both Window and
@@ -348,7 +355,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     g.__html_events_ports = function (brand) { messagePortBrand = brand; };
     g.__html_events_adapter = {
         Event,
-        isMessageEventSource(value) { return !!(messagePortBrand && messagePortBrand(value)); },
+        isMessageEventSource(value) { return !!(messagePortBrand && messagePortBrand(value)) || workerSlotOwn(internalsFor(value),"serviceWorker")?.value?.kind === "ServiceWorker"; },
         isMessagePort(value) { return !!(messagePortBrand && messagePortBrand(value)); },
         dispatching(event) { return scopeEventState(event).dispatching; },
     };
@@ -376,7 +383,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // onmessage/onmessageerror (HTML #shared-workers-and-the-sharedworkerglobalscope-interface).
     // WorkerGlobalScope adds onerror, onlanguagechange, onoffline, ononline,
     // onrejectionhandled and onunhandledrejection (HTML #the-workerglobalscope-common-interface).
-    (cfg.shared ? ["connect"] : ["message", "messageerror"]).concat(["error", "languagechange", "offline", "online",
+    (cfg.service ? ["install", "activate", "fetch", "message", "messageerror", "cookiechange"] : cfg.shared ? ["connect"] : ["message", "messageerror"]).concat(["error", "languagechange", "offline", "online",
         "rejectionhandled", "unhandledrejection"]).forEach(function (type) {
         // HTML #event-handler-attributes: [LegacyTreatNonObjectAsNull]
         // EventHandler; activation appends one listener that keeps its place.
@@ -529,7 +536,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // its blob serialization tasks and, in a dedicated worker, the
     // AnimationFrameProvider whose rendering updates the Rust loop drives.
     g.__canvas_adapter = {
-        EventTarget: g.EventTarget, control: WK, shared: !!cfg.shared,
+        EventTarget: g.EventTarget, control: WK, shared: !!cfg.shared || !!cfg.service,
         add(target, type, callback) { addListener.call(target, type, callback); },
         remove(target, type, callback) { removeListener.call(target, type, callback); },
         fire(target, type, cancelable, C, init) {
@@ -566,6 +573,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         serialize(message, transfer) { return portAPI.serialize(message, transfer); },
         deserialize(packet) { return portAPI.deserialize(packet); },
         optionsTransfer(options) { return portAPI.optionsTransfer(options); },
+        stringify(packet) { return portAPI.stringify(packet); },
         // #report-an-exception for this global with omitError set.
         reportUnhandled(info) {
             reportErrorInformation({message: info.message, filename: info.filename, lineno: info.lineno,
@@ -604,12 +612,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // globalscope-name / #dom-sharedworkerglobalscope-name ([Replaceable]).
     defineScopeAttribute("self", "readonly", function () { return g; });
     var workerName = cfg.name || "";
-    defineScopeAttribute("name", "replaceable", function () { return workerName; });
-    if (!cfg.shared) g.postMessage = {postMessage(message) {
+    if (!cfg.service) defineScopeAttribute("name", "replaceable", function () { return workerName; });
+    if (!cfg.shared && !cfg.service) g.postMessage = {postMessage(message) {
         if (arguments.length === 0) throw new TypeError("postMessage requires a message");
-        __worker_self_post(JSON.stringify(portAPI.serialize(message, portAPI.optionsTransfer(arguments[1]))));
+        __worker_self_post(portAPI.stringify(portAPI.serialize(message, portAPI.optionsTransfer(arguments[1]))));
     }}.postMessage;
-    g.close = {close() { workerClosing = true; __worker_self_close(); }}.close;
+    if (!cfg.service) g.close = {close() { workerClosing = true; __worker_self_close(); }}.close;
     {
         // HTML #the-workerglobalscope-common-interface, #dedicated-workers-and-the-
         // dedicatedworkerglobalscope-interface and #shared-workers-and-the-
@@ -620,7 +628,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // properties of the global; only the interface chain is installed.
         const illegal = function () { throw new TypeError("Illegal constructor"); };
         const WorkerGlobalScope = function WorkerGlobalScope() { illegal(); };
-        const kind = cfg.shared ? "SharedWorkerGlobalScope" : "DedicatedWorkerGlobalScope";
+        const kind = cfg.service ? "ServiceWorkerGlobalScope" : cfg.shared ? "SharedWorkerGlobalScope" : "DedicatedWorkerGlobalScope";
         const KindGlobalScope = { [kind]: function () { illegal(); } }[kind];
         Object.setPrototypeOf(WorkerGlobalScope, g.EventTarget);
         Object.setPrototypeOf(WorkerGlobalScope.prototype, g.EventTarget.prototype);
@@ -773,10 +781,17 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // The shared Permissions block and the features built on it run in this
     // WorkerGlobalScope through this bootstrap-only adapter (see the Window's).
     g.__feature_adapter = {
-        EventTarget: g.EventTarget, window: false,
+        EventTarget: g.EventTarget, window: false, service: !!cfg.service,
+        kind: cfg.shared ? "sharedworker" : "worker",
+        creationURL: cfg.url,
+        native(op, input) { return __service_worker(op, 0, input); },
+        bind(control) { WK.serviceResult = control.result; WK.serviceNotice = control.notice; WK.serviceSource = control.source; },
         add(target, type, fn) { addListener.call(target, type, fn); },
         remove(target, type, fn) { removeListener.call(target, type, fn); },
         fire(target, type) { dispatchScopeEvent(trustedScopeEvent(Event, type, {}), true, target); },
+        serializeMessage(message, options) { return portAPI.stringify(portAPI.serialize(message, portAPI.optionsTransfer(options))); },
+        deserializeMessage(packet) { return portAPI.deserialize(workerJsonParse(packet)); },
+        fireMessage(target, type, init) { dispatchScopeEvent(trustedScopeEvent(MessageEvent, type, init), true, target); },
         queue(fn) { platformTasks.push(fn); },
         report(error) { reportException(error); },
         origin() { return lp[8] || "null"; },
@@ -784,6 +799,67 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         baseURL() { return lp[0]; },
         secure: !!cfg.secureContext,
         context: 0,
+    };
+
+    if (cfg.service) {
+        const encode = JSON.stringify, parse = workerJsonParse, create = Object.create, each = Map.prototype.forEach, setPrototype=Object.setPrototypeOf;
+        const apply = Reflect.apply;
+        WK.serviceTypes = () => {
+            const types=[]; setPrototype(types,null);
+            apply(each,LS,[(listeners,type)=>{if(listeners.length)types[types.length]=type;}]);
+            return encode(types);
+        };
+        g.__service_event_adapter = {
+            Event, get fetch() { return g.__fetch_api; },
+            isMessagePort(value) { return !!portAPI.state(value); },
+            isMessageSource(value) {
+                const kind=workerSlotOwn(internalsFor(value),"serviceWorker")?.value?.kind;
+                return kind==="Client"||kind==="WindowClient"||kind==="ServiceWorker"||!!portAPI.state(value);
+            },
+            trusted(event) { return scopeEventState(event).isTrusted; },
+            dispatching(event) { return scopeEventState(event).dispatching; },
+            createTrusted(C, type, init) { return trustedScopeEvent(C, type, init); },
+            dispatch(event) { dispatchScopeEvent(event, true, g); },
+            complete(id, ok) { const input=create(null);input.id=id;input.ok=ok;__service_worker("complete", 0, encode(input)); },
+            bind(control) { WK.serviceEvent = (id, type, init) => {
+                const data = parse(init) || {};
+                if (type === "message" && typeof data.packet === "string") {
+                    // ServiceWorker/postMessage: deserialize in this Realm;
+                    // failure dispatches ExtendableMessageEvent messageerror.
+                    const source = WK.serviceSource ? WK.serviceSource(data.source) : null;
+                    try {
+                        const packet = portAPI.deserialize(parse(data.packet));
+                        control.dispatch(id, "message", {data: packet.data, origin: data.origin || "", ports: packet.ports, source});
+                    } catch (_) {
+                        control.dispatch(id, "messageerror", {origin: data.origin || "", source});
+                    }
+                    return;
+                }
+                control.dispatch(id, type, data);
+            }; },
+        };
+    }
+
+    const cookieScopeTypeError=TypeError;
+    g.__cookie_store_adapter = {
+        EventTarget: g.EventTarget, Event, window: false, service: !!cfg.service,
+        secure: !!cfg.secureContext, creationURL: cfg.url, origin: lp[8] || "null",
+        baseURL() { return lp[0]; },
+        native(op, input) { return __cookie_store(op, 0, 0, cfg.url, input); },
+        queue(fn) { platformTasks.push(fn); },
+        fire(target, C, type, init) { dispatchScopeEvent(trustedScopeEvent(C, type, init), true, target); },
+        add(target, type, fn) { addListener.call(target, type, fn); },
+        remove(target, type, fn) { removeListener.call(target, type, fn); },
+        expose(read) {
+            const descriptor={get cookieStore(){
+                if(this!=null&&this!==g)throw new cookieScopeTypeError("Illegal WorkerGlobalScope invocation");
+                return read();
+            }};
+            Object.defineProperty(Object.getPrototypeOf(g),"cookieStore",{
+                configurable:true,enumerable:true,get:workerSlotOwn(descriptor,"cookieStore").get
+            });
+        },
+        bind(deliver) { WK.cookieStoreChange = deliver; },
     };
 
     // CSS Font Loading's shared implementation uses this worker's slots,
@@ -875,6 +951,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // Parse every URL first, then fetch each classic worker-imported script
     // synchronously and run it as a classic script with rethrow errors set:
     // its declarations join the global scope and an exception propagates.
+    const importException = g.DOMException, importParse = JSON.parse, importEncode = JSON.stringify;
+    const importCreate = Object.create;
     g.importScripts = function () {
         if (cfg.type === "module") throw new TypeError("importScripts() is unavailable in a module worker");
         var urls = [], i;
@@ -886,8 +964,17 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             records.push(parsed[0]);
         }
         for (i = 0; i < records.length; i++) {
-            var url = records[i], source;
-            if (url.slice(0, 5) === "blob:") {
+            var url = records[i], source, muted = false;
+            if (cfg.service) {
+                const input=importCreate(null);input.url=url;
+                const imported = importParse(__service_worker("import", 0, importEncode(input)));
+                if (imported.error) throw new importException(imported.error.message, imported.error.name);
+                source = imported.value.source;
+                muted = imported.value.muted;
+                // HTML classic worker-imported scripts use the final
+                // response URL as their script base/source origin.
+                url = imported.value.url;
+            } else if (url.slice(0, 5) === "blob:") {
                 // Fetch #scheme-fetch "blob" for this worker's environment.
                 var entry = blobURLAPI.read(url);
                 if (!entry) throw new g.DOMException("importScripts failed to load " + url, "NetworkError");
@@ -898,7 +985,14 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 // #fetch-a-classic-worker-imported-script: UTF-8 decode the body.
                 source = r[3] instanceof ArrayBuffer ? new g.TextDecoder().decode(new Uint8Array(r[3])) : String(r[2] || "");
             }
-            __classic_script_run(source, url);
+            try { __classic_script_run(source, url); }
+            catch(error) {
+                // HTML #run-a-classic-script, rethrow-errors + muted-errors:
+                // opaque imported scripts replace abrupt completion with a
+                // NetworkError, including a parse error.
+                if(muted)throw new importException("Imported script failed", "NetworkError");
+                throw error;
+            }
         }
     };
 

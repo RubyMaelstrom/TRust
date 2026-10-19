@@ -1,0 +1,47 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>TRust touchscreen input checks</title>
+<style>
+  body { margin: 24px; font: 16px sans-serif; color: #182536; background: #f4f7fb; }
+  h1 { font-size: 24px; }
+  .examples { display: flex; flex-wrap: wrap; gap: 24px; }
+  section { width: 280px; }
+  h2 { font-size: 18px; }
+  .scroll { width: 260px; height: 180px; overflow: auto; border: 2px solid #537697; background: white; }
+  .content { width: 520px; height: 480px; background: repeating-linear-gradient(0deg,#e7edf5 0 40px,#fff 40px 80px); }
+  .content p { margin: 0; padding: 12px; }
+  #vertical { touch-action: pan-y; }
+  #horizontal { touch-action: pan-x; }
+  #custom { touch-action: none; }
+  #direction { touch-action: pan-down; }
+  #rotated { transform: rotate(90deg); transform-origin: center; touch-action: pan-x; width: 180px; height: 240px; margin: 40px; }
+  button { padding: 12px; margin: 12px; }
+  #log { white-space: pre-wrap; font: 13px monospace; height: 200px; overflow: auto; background: #fff; padding: 12px; }
+</style>
+<h1>Touch input</h1>
+<p>Drag inside each panel. Once a pan begins, its axis stays fixed until the finger lifts.
+  A rejected direction stays with the page, even if the finger turns. Mouse wheel scrolling remains independent.</p>
+<div class="examples">
+  <section><h2>Vertical</h2><div class="scroll" id="vertical"><div class="content"><p>Pan up or down.</p><button>Tap me</button></div></div></section>
+  <section><h2>Horizontal</h2><div class="scroll" id="horizontal"><div class="content"><p>Pan left or right.</p></div></div></section>
+  <section><h2>Page handles movement</h2><div class="scroll" id="custom"><div class="content"><p>No native panning. Watch pointermove below.</p><button>Tap still works</button></div></div></section>
+  <section><h2>Start scrolling down</h2><div class="scroll" id="direction"><div class="content"><p>Start by moving the finger upward. Reverse after scrolling starts.</p></div></div></section>
+  <section><h2>Rotated horizontal axis</h2><div class="scroll" id="rotated"><div class="content"><p>Its local X axis is vertical on screen.</p></div></div></section>
+</div>
+<p id="clicks">Button taps: 0</p>
+<pre id="log">Pointer events will appear here.</pre>
+<script>
+  const log = document.getElementById('log'), lines = [];
+  for (const type of ['pointerdown','pointermove','pointerup','pointercancel','gotpointercapture','lostpointercapture']) {
+    document.querySelector('.examples').addEventListener(type, event => {
+      lines.push(`${type} #${event.pointerId} ${event.pointerType} ${event.isPrimary ? 'primary' : 'secondary'} (${event.clientX}, ${event.clientY})`);
+      if (lines.length > 40) lines.shift();
+      log.textContent = lines.join('\n');
+      log.scrollTop = log.scrollHeight;
+    });
+  }
+  let taps = 0;
+  for (const button of document.querySelectorAll('button')) button.addEventListener('click', event => {
+    document.getElementById('clicks').textContent = `Button taps: ${++taps}; last pointer: ${event.pointerType}`;
+  });
+</script>

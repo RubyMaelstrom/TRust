@@ -326,6 +326,7 @@ pub enum UserAction {
         position: CssPoint,
         metadata: crate::js::PointerMetadata,
     },
+    PageTouch(crate::touch::TouchInput),
     PagePointerButton {
         actor: Option<usize>,
         position: CssPoint,
@@ -1435,6 +1436,12 @@ impl BrowserController {
     /// command channel leaves it unsent, so a later round retries.
     fn sync_traversable(&mut self) {
         let state = self.traversable_state();
+        if let Some(page) = &self.current
+            && let FetchedDocument::Http(response) = &page.document
+            && let Some(client) = &response.service_client
+        {
+            client.presentation(state.hidden, state.focused);
+        }
         self.window_environment.send_if_modified(|env| {
             let changed = env.traversable.hidden != state.hidden
                 || env.traversable.focused != state.focused
@@ -2221,6 +2228,10 @@ impl BrowserController {
                 // invalidation. Frontends separately send `PageHover` when
                 // hit testing crosses a semantic target; that transition (or
                 // the resulting live-DOM wake) is what can change pixels.
+                false
+            }
+            UserAction::PageTouch(input) => {
+                self.send_user(crate::js::PageCmd::Touch(input));
                 false
             }
             UserAction::PagePointerButton {
@@ -3799,6 +3810,9 @@ impl BrowserController {
         // CSSOM View scroll notifications coalesce per box. A full actor
         // channel must retain the latest position, not a history of touchpad
         // samples. Keys, buttons and different scroll boxes are FIFO barriers.
+        // Pointer Events #coalesced-events requires every merged touch sample
+        // in getCoalescedEvents(). Keep native touch samples as separate FIFO
+        // entries; each dispatched move then carries its one observed sample.
         if let Some((previous, _)) = self.pending_user_input.back_mut() {
             use crate::js::PageCmd;
             let same_scroll = match (&*previous, &command) {
@@ -4564,6 +4578,8 @@ impl BrowserController {
                 Some(crate::js::PageEvt::Updated { html, mut outcome }) => {
                     let rendered = outcome.rendered.take();
                     Ok(FetchedDocument::Http(Box::new(http::Response {
+                        internal: None,
+                        service_client: None,
                         url,
                         status: 200,
                         status_text: String::new(),
@@ -5941,6 +5957,8 @@ mod tests {
         assert!(browser.finish_fetch(
             1,
             Ok(FetchedDocument::Http(Box::new(crate::http::Response {
+                internal: None,
+                service_client: None,
                 url: source,
                 status: 200,
                 status_text: String::new(),
@@ -5986,6 +6004,8 @@ mod tests {
             target: Link::Http(target.clone()),
             fallback_http: false,
             document: FetchedDocument::Http(Box::new(crate::http::Response {
+                internal: None,
+                service_client: None,
                 url: target.clone(),
                 status: 200,
                 status_text: String::new(),
@@ -6212,6 +6232,8 @@ mod tests {
         assert!(browser.finish_download(
             7,
             crate::http::Response {
+                internal: None,
+                service_client: None,
                 url: url::Url::parse("https://example.test/report.pdf").unwrap(),
                 status: 200,
                 status_text: String::new(),
@@ -6991,6 +7013,8 @@ mod tests {
             target: Link::Http(url::Url::parse("https://example.com/").unwrap()),
             fallback_http: false,
             document: FetchedDocument::Http(Box::new(crate::http::Response {
+                internal: None,
+                service_client: None,
                 url: url::Url::parse("https://example.com/").unwrap(),
                 status: 200,
                 status_text: String::new(),
@@ -7381,6 +7405,52 @@ mod tests {
         let target = url::Url::parse("https://cdn.example.test/video.mp4").unwrap();
         browser.handle_action(UserAction::Activate(Link::Media(target.clone())));
         assert_eq!(browser.take_external_media(), Some((target, None)));
+    }
+
+    #[tokio::test]
+    async fn native_touch_backlog_keeps_samples_and_release_barriers() {
+        use crate::touch::{TouchInput, TouchPhase};
+        let mut browser =
+            BrowserController::new(Handle::current(), || {}, CssSize::new(640., 480.));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        browser.live_page = Some(crate::js::PageHandle::from_test_sender(tx));
+        let samples = [
+            (2, TouchPhase::Down, 0.),
+            (2, TouchPhase::Move, 1.),
+            (2, TouchPhase::Move, 2.),
+            (3, TouchPhase::Down, 0.),
+            (2, TouchPhase::Move, 3.),
+            (2, TouchPhase::Move, 4.),
+            (3, TouchPhase::Move, 5.),
+            (2, TouchPhase::Up, 4.),
+            (3, TouchPhase::Cancel, 5.),
+        ];
+        for (id, phase, x) in samples {
+            browser.handle_action(UserAction::PageTouch(TouchInput {
+                id,
+                phase,
+                node: Some(42),
+                position: CssPoint::new(x, 20.),
+                metadata: Default::default(),
+                pressure: 0.5,
+                primary: id == 2,
+                mouse: false,
+                tap: false,
+            }));
+        }
+        let mut delivered = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while delivered.len() < samples.len() {
+                browser.process_async_events();
+                if let Ok(crate::js::PageCmd::Touch(input)) = rx.try_recv() {
+                    delivered.push((input.id, input.phase, input.position.x));
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(delivered, samples);
     }
 
     #[tokio::test]

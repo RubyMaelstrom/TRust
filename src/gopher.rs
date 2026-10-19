@@ -1208,6 +1208,8 @@ pub fn representation(url: &GopherUrl, page: Page) -> Result<crate::http::Respon
 
 fn response(url: &GopherUrl, body: Vec<u8>, mime: &str) -> Result<crate::http::Response, String> {
     Ok(crate::http::Response {
+        internal: None,
+        service_client: None,
         url: url::Url::parse(&url.to_string()).map_err(|e| e.to_string())?,
         status: 200,
         status_text: String::new(),
