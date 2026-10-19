@@ -235,7 +235,7 @@ struct Catalog {
 /// One already-fetched `@font-face` resource. The CSS descriptor's family
 /// name intentionally overrides the font file's internal name (CSS Fonts 4
 /// §4.1 permits authors to assign an arbitrary family to a face).
-#[derive(Default)]
+#[derive(Clone, Default, PartialEq)]
 pub(crate) struct PageFont {
     pub family: String,
     pub bytes: Vec<u8>,

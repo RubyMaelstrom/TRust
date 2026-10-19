@@ -157,6 +157,23 @@ Cargo uses the sibling TRust JS checkout (`../trust-js/crates/trust-js`) directl
 TRust and TRust JS are developed together on their `main` branches while
 host-boundary work is upstreamed. TRust supplies networking and TLS.
 
+When the sibling engine is on an incompatible work branch, build against a
+separate clone of its local `main` without changing that checkout or this
+repository's dependency path. Keep the TRust manifest path through the symlink
+so Cargo resolves `../trust-js` in the isolated directory:
+
+```sh
+trust_build_root=$(mktemp -d /tmp/trust-main-build-XXXXXX)
+git clone --no-hardlinks --single-branch --branch main /big/Code/trust-js "$trust_build_root/trust-js"
+ln -s /big/Code/TRust "$trust_build_root/TRust"
+cargo build --release --locked --manifest-path "$trust_build_root/TRust/Cargo.toml"
+```
+
+Use that same `--manifest-path` for debug/release tests and Clippy. The normal
+`target/release` artifacts remain in this repository through the symlink.
+Record the cloned engine revision with validation results. Do not switch,
+reset, patch, or build in the active engine checkout to make this work.
+
 Build and test from the repository root:
 
 ```sh

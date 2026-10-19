@@ -696,6 +696,8 @@ pub struct Dom {
     /// CSS Fonts 4 #font-fetching-requirements: `@font-face` network sources
     /// the host fetched for this arena, by absolute URL (`None` = failed).
     downloaded_fonts: FxHashMap<String, Option<std::sync::Arc<[u8]>>>,
+    /// CSS Font Loading: loaded, manually-added faces of each Document.
+    script_fonts: FxHashMap<NodeId, Vec<crate::font_system::PageFont>>,
     /// Network font sources a font set is waiting for, for the host to fetch,
     /// and every source ever requested with the end of its face's swap
     /// period (CSS Fonts 4 #font-display-timeline; `None`: infinite).
@@ -1296,6 +1298,7 @@ impl Dom {
             document_modes,
             document_encodings,
             downloaded_fonts,
+            script_fonts,
             font_requests,
             import_requests,
             svg_resource_requests,
@@ -1481,6 +1484,22 @@ impl Dom {
             bytes = bytes
                 .saturating_add(url.capacity())
                 .saturating_add(font.as_ref().map_or(0, |font| font.len()));
+        }
+        fixed_map!(script_fonts, (NodeId, Vec<crate::font_system::PageFont>));
+        for fonts in script_fonts.values() {
+            bytes += fonts.capacity() * std::mem::size_of::<crate::font_system::PageFont>();
+            for font in fonts {
+                bytes += font.family.capacity()
+                    + font.bytes.capacity()
+                    + font.descriptors.features.capacity() * std::mem::size_of::<([u8; 4], u32)>()
+                    + font.descriptors.variations.capacity()
+                        * std::mem::size_of::<([u8; 4], f32)>()
+                    + font
+                        .descriptors
+                        .named_instance
+                        .as_ref()
+                        .map_or(0, String::capacity);
+            }
         }
         {
             let (pending, requested) = &*import_requests.borrow();
@@ -1923,6 +1942,7 @@ impl Dom {
             document_modes: FxHashMap::default(),
             document_encodings: FxHashMap::default(),
             downloaded_fonts: FxHashMap::default(),
+            script_fonts: FxHashMap::default(),
             font_requests: RefCell::default(),
             import_requests: RefCell::default(),
             svg_resource_requests: RefCell::default(),
@@ -2991,6 +3011,21 @@ impl Dom {
     /// Style/flow work inside that transaction can reuse independent inputs.
     pub fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    pub(crate) fn font_source_epoch(&self) -> u64 {
+        self.style_epoch
+    }
+
+    pub(crate) fn font_source_scopes(&self, document: NodeId) -> Vec<NodeId> {
+        self.shadow_including_subtree(document)
+            .into_iter()
+            .filter(|&node| {
+                node == document
+                    || (self.shadow_hosts.contains_key(&node)
+                        && self.owner_document(node) == Some(document))
+            })
+            .collect()
     }
 
     pub(crate) fn window_names_epoch(&self) -> u64 {
@@ -10121,6 +10156,9 @@ impl Dom {
         mut faces: FxHashMap<NodeId, Vec<crate::http::CssFontFace>>,
         sets: &mut FxHashMap<NodeId, std::sync::Arc<crate::text::FontSet>>,
     ) {
+        for &document in self.script_fonts.keys() {
+            faces.entry(document).or_default();
+        }
         // CSS Fonts 4 #font-face-rule / #font-fetching-requirements. Data
         // sources can be activated immediately when an applicable sheet is
         // attached, including dynamic sheets and child navigables. Network
@@ -10145,12 +10183,13 @@ impl Dom {
                     && matches!(self.nodes[scope].data, NodeData::Document);
                 let foreground =
                     !child_document && self.registration_document(scope) == self.document();
-                let fonts = faces
+                let mut fonts = faces
                     .remove(&scope)
                     .unwrap_or_default()
                     .into_iter()
                     .filter_map(|face| self.face_font(face, foreground))
                     .collect::<Vec<_>>();
+                fonts.extend(self.script_fonts.get(&scope).into_iter().flatten().cloned());
                 let parent = self
                     .shadow_hosts
                     .get(&scope)
@@ -10206,7 +10245,7 @@ impl Dom {
             }
             let Some(url) = url::Url::parse(source)
                 .ok()
-                .filter(|url| matches!(url.scheme(), "http" | "https" | "file"))
+                .filter(|url| matches!(url.scheme(), "http" | "https" | "file" | "blob"))
             else {
                 continue;
             };
@@ -10256,6 +10295,30 @@ impl Dom {
         let bytes = bytes.filter(|_| failure.is_none_or(|end| std::time::Instant::now() <= end));
         self.downloaded_fonts
             .insert(url.to_string(), bytes.map(Into::into));
+        self.touch_style();
+    }
+
+    pub(crate) fn set_script_fonts(
+        &mut self,
+        document: NodeId,
+        fonts: Vec<crate::font_system::PageFont>,
+    ) {
+        if !self.is_valid(document)
+            || !matches!(self.nodes[document].data, NodeData::Document)
+            || self
+                .script_fonts
+                .get(&document)
+                .map(Vec::as_slice)
+                .unwrap_or(&[])
+                == fonts.as_slice()
+        {
+            return;
+        }
+        if fonts.is_empty() {
+            self.script_fonts.remove(&document);
+        } else {
+            self.script_fonts.insert(document, fonts);
+        }
         self.touch_style();
     }
 

@@ -1919,6 +1919,20 @@ impl PageCache {
             .map(|entry| entry.future.clone())
     }
 
+    /// HTML #fetch-a-single-module-script removes a failed module fetch before
+    /// notifying its waiters, so a later import can try again. Forget only the
+    /// response those waiters consumed: another request may already have
+    /// replaced this URL's entry with a different authorization context or retry.
+    pub(crate) fn forget_fetch(&self, url: &Url, fetch: &SharedFetch) {
+        let mut map = self.map.lock().unwrap();
+        if map
+            .get(url.as_str())
+            .is_some_and(|entry| entry.future.ptr_eq(fetch))
+        {
+            map.remove(url.as_str());
+        }
+    }
+
     /// A no-CORS preload must not satisfy an element's CORS load, nor may an
     /// authorization for one document origin or credentials mode authorize a
     /// different one. Retain in-flight sharing only within the same context.
@@ -2785,6 +2799,17 @@ fn validate_cors_preflight(
             .map(|value| value.trim().to_ascii_lowercase())
             .collect::<Vec<_>>();
         let wildcard = allowed.iter().any(|value| value == "*");
+        // Fetch #cors-preflight-fetch-0 step 7.6, before the wildcard rule:
+        // Authorization is a CORS non-wildcard request-header name, including
+        // when credentials mode is "omit". Match the actual header list.
+        if request
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+            && !allowed.iter().any(|name| name == "authorization")
+        {
+            return Err(String::from("CORS preflight authorization not allowed"));
+        }
         if (!wildcard || credentials)
             && requested_headers
                 .iter()
@@ -6940,7 +6965,15 @@ async fn execute_js_with_presentation(
                 .await;
         push_imported_sheets(&mut sheets, inline);
     }
-    install_stylesheet_fonts(&html, &sheets, &response.url, true, referrer_policy).await;
+    install_stylesheet_fonts(
+        &html,
+        &sheets,
+        &response.url,
+        true,
+        referrer_policy,
+        Some(cache.clone()),
+    )
+    .await;
     // Created HERE so it outlives the engine: the app hangs it on the Doc
     // and decodes blob: image srcs from it even after the page froze.
     let blobs = group
@@ -8488,6 +8521,9 @@ fn document_font_faces(
 async fn load_document_face(
     face: &DocumentFontFace,
     page_url: &Url,
+    cache: Option<&PageCache>,
+    cookies: Option<&CookieContext>,
+    blobs: Option<(&crate::js::BlobMap, &str)>,
     report: impl Fn(&Url, bool),
 ) -> Option<crate::font_system::PageFont> {
     let family = &face.family;
@@ -8524,6 +8560,28 @@ async fn load_document_face(
             }
             continue;
         }
+        if url.scheme() == "blob" {
+            let entry = blobs.and_then(|(store, key)| store.obtain(url.as_str(), Some(key)));
+            let bytes = if let Some(entry) = entry {
+                tokio::task::spawn_blocking(move || entry.read().ok())
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+            let font = bytes
+                .and_then(|bytes| {
+                    crate::font_system::PageFont::from_web_resource(family.clone(), bytes)
+                })
+                .and_then(|font| font.select_face(url.fragment()))
+                .filter(|font| ttf_parser::Face::parse(&font.bytes, 0).is_ok());
+            report(url, font.is_some());
+            if let Some(font) = font {
+                return Some(finish(font));
+            }
+            continue;
+        }
         let mut request = Request::subresource(
             url.clone(),
             page_url,
@@ -8531,13 +8589,33 @@ async fn load_document_face(
             Some(CredentialsMode::SameOrigin),
         );
         face.referrer.apply(&mut request);
-        let response = fetch(&request)
-            .await
-            .ok()
-            .filter(|response| (200..300).contains(&response.status));
-        let font = response.and_then(|response| {
-            crate::font_system::PageFont::from_web_resource(family.clone(), response.body)
+        if let Some(cookies) = cookies {
+            request.cookie_context = Some(cookies.clone());
+        }
+        let bytes = if let Some(cache) = cache {
+            cache
+                .fetch_prepared_resource(
+                    &tokio::runtime::Handle::current(),
+                    request,
+                    page_url,
+                    "font",
+                    Some(CredentialsMode::SameOrigin),
+                )
+                .await
+                .ok()
+                .filter(|response| (200..300).contains(&response.status))
+                .map(|response| response.body.clone())
+        } else {
+            fetch(&request)
+                .await
+                .ok()
+                .filter(|response| (200..300).contains(&response.status))
+                .map(|response| response.body)
+        };
+        let font = bytes.and_then(|bytes| {
+            crate::font_system::PageFont::from_web_resource(family.clone(), bytes)
                 .and_then(|font| font.select_face(url.fragment()))
+                .filter(|font| ttf_parser::Face::parse(&font.bytes, 0).is_ok())
         });
         report(url, font.is_some());
         if let Some(font) = font {
@@ -8545,6 +8623,59 @@ async fn load_document_face(
         }
     }
     None
+}
+
+/// CSS Font Loading #font-face-load shares the renderer's src-list loader
+/// and the document's response cache. Return unmodified font data so changing
+/// a FontFace's unicode-range or metric descriptors can be applied afresh.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn load_font_face(
+    face: CssFontFace,
+    base: &Url,
+    client: &Url,
+    referrer: SheetReferrer,
+    cache: Option<&PageCache>,
+    cookies: &CookieContext,
+    blobs: &crate::js::BlobMap,
+    storage_key: &str,
+) -> Option<(Option<String>, crate::font_system::PageFont)> {
+    let sources = face
+        .sources
+        .into_iter()
+        .filter_map(|source| match source {
+            CssFontSource::Local(name) => Some(DocumentFontSource::Local(name)),
+            CssFontSource::Url(source) => base
+                .join(&source)
+                .ok()
+                .filter(|url| {
+                    matches!(url.scheme(), "data" | "blob") || subresource_allowed(client, url)
+                })
+                .map(DocumentFontSource::Url),
+        })
+        .collect();
+    let face = DocumentFontFace {
+        family: face.family,
+        sources,
+        unicode_range: Vec::new(),
+        descriptors: Default::default(),
+        referrer,
+    };
+    let winner = std::sync::Mutex::new(None);
+    let font = load_document_face(
+        &face,
+        client,
+        cache,
+        Some(cookies),
+        Some((blobs, storage_key)),
+        |url, loaded| {
+            if loaded {
+                *winner.lock().unwrap() = Some(url.to_string());
+            }
+        },
+    )
+    .await?;
+    ttf_parser::Face::parse(&font.bytes, 0).ok()?;
+    Some((winner.into_inner().unwrap(), font))
 }
 
 /// Load the document's downloadable faces before its first rendering.
@@ -8562,6 +8693,7 @@ async fn install_stylesheet_fonts(
     page_url: &Url,
     live: bool,
     referrer_policy: crate::referrer_policy::ReferrerPolicy,
+    cache: Option<std::sync::Arc<PageCache>>,
 ) {
     let started = tokio::time::Instant::now();
     let faces = document_font_faces(html, sheets, page_url, referrer_policy);
@@ -8575,6 +8707,7 @@ async fn install_stylesheet_fonts(
         };
         let failure = swap.map(|swap| std::time::Instant::now() + block + swap);
         let page_url = page_url.clone();
+        let cache = cache.clone();
         async move {
             let (sender, receiver) = tokio::sync::watch::channel(None);
             let urls: Vec<String> = face
@@ -8587,14 +8720,21 @@ async fn install_stylesheet_fonts(
                 .collect();
             let mut task = tokio::spawn(async move {
                 let winner = std::sync::Mutex::new(None);
-                let font = load_document_face(&face, &page_url, |url, loaded| {
-                    if loaded {
-                        *winner
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                            Some(url.to_string());
-                    }
-                })
+                let font = load_document_face(
+                    &face,
+                    &page_url,
+                    cache.as_deref(),
+                    None,
+                    None,
+                    |url, loaded| {
+                        if loaded {
+                            *winner
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                Some(url.to_string());
+                        }
+                    },
+                )
                 .await;
                 let winner = winner
                     .into_inner()
@@ -8710,7 +8850,7 @@ async fn css_only_with_sheets(
     // document leaves for its requests and the frontend's navigations.
     let referrer_policy = document_referrer_policy(&html, response_referrer_policy(&response));
     response.referrer_policy = Some(referrer_policy);
-    install_stylesheet_fonts(&html, &sheets, &response.url, false, referrer_policy).await;
+    install_stylesheet_fonts(&html, &sheets, &response.url, false, referrer_policy, None).await;
     let base = base_with_doc_base(&html, &response.url);
     fetch_svg_sprite_sheets(&html, &base, &response.url, referrer_policy).await;
     // The frame documents are fetched up front into a url→content map (Dom is
@@ -12425,6 +12565,101 @@ mod tests {
             &names,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn cors_preflight_authorization_requires_an_explicit_header() {
+        // Fetch #cors-preflight-fetch-0 steps 7.6/7.7: wildcard coverage of
+        // ordinary headers is separate from Authorization and credentials.
+        for credentials in [
+            CredentialsMode::Omit,
+            CredentialsMode::SameOrigin,
+            CredentialsMode::Include,
+        ] {
+            for (names, allowed, expected) in [
+                (vec!["authorization"], "*", false),
+                (vec!["authorization"], "AuThOrIzAtIoN", true),
+                (
+                    vec!["authorization", "x-extra"],
+                    "*, Authorization",
+                    credentials != CredentialsMode::Include,
+                ),
+                (
+                    vec!["authorization", "x-extra"],
+                    "Authorization, X-Extra",
+                    true,
+                ),
+                (
+                    vec!["x-extra"],
+                    "*",
+                    credentials != CredentialsMode::Include,
+                ),
+            ] {
+                let mut request =
+                    scripted_request("https://api.example/data", RequestMode::Cors, credentials);
+                request.headers = names
+                    .iter()
+                    .map(|name| (name.to_string(), String::from("value")))
+                    .collect();
+                let response = policy_response(
+                    "https://api.example/data",
+                    204,
+                    &[
+                        ("access-control-allow-origin", "https://app.example"),
+                        ("access-control-allow-credentials", "true"),
+                        ("access-control-allow-headers", allowed),
+                    ],
+                );
+                let names = cors_non_safelisted_header_names(&request);
+                assert_eq!(
+                    validate_cors_preflight(&response, &request, &names).is_ok(),
+                    expected,
+                    "{credentials:?}, {names:?}, {allowed}"
+                );
+                if expected {
+                    let mut cache = PreflightCache::default();
+                    cache.store(&request, &response, Instant::now());
+                    for name in &names {
+                        assert!(
+                            cache.header_match(&request, name),
+                            "validated headers remain valid in the cache"
+                        );
+                    }
+                    if allowed == "*" {
+                        assert!(!cache.header_match(&request, "Authorization"));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn forgetting_a_module_response_does_not_remove_its_replacement() {
+        let cache = PageCache::default();
+        let url = Url::parse("https://example.test/module.js").unwrap();
+        cache.seed(url.to_string(), 404, "text/javascript".into(), Vec::new());
+        let failed = cache.peek(&url).unwrap();
+        assert_eq!(
+            PageCache::block_on_fetch(None, failed.clone())
+                .unwrap()
+                .status,
+            404
+        );
+        cache.forget_fetch(&url, &failed);
+        assert!(cache.peek(&url).is_none());
+        cache.seed(
+            url.to_string(),
+            200,
+            "text/javascript".into(),
+            b"export {}".to_vec(),
+        );
+        cache.forget_fetch(&url, &failed);
+        assert_eq!(
+            PageCache::block_on_fetch(None, cache.peek(&url).unwrap())
+                .unwrap()
+                .status,
+            200
+        );
     }
 
     #[test]

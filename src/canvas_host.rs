@@ -128,6 +128,12 @@ impl<'a> Environment<'a> {
             None => (self.inherited.1, self.inherited.0.clone()),
         };
         crate::canvas_text::TextEnvironment {
+            // HTML #canvastextdrawingstyles resolves fonts against the
+            // canvas's Document, including manually added FontFace objects.
+            font_set: self.document.and_then(|node| {
+                self.dom
+                    .scope_font_set(self.dom.owner_document(node).unwrap_or(node))
+            }),
             rtl,
             language,
             root_font_size: self.dom.root_font_px(),

@@ -66,6 +66,7 @@ pub use font::{
     AxisInfo, Descriptor, FaceDescriptors, FontInfo, FontInfoOverride, StyleRange, Synthesis,
 };
 pub use impl_fontconfig::FromFontconfig;
+pub use matching::match_face_descriptors;
 pub use parlance::{FontStyle, FontWeight, FontWidth, GenericFamily, Language, Script};
 pub use source::{SourceId, SourceInfo, SourceKind};
 

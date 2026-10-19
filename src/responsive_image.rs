@@ -1,5 +1,5 @@
 //! HTML responsive-image source selection (`<picture>`, `srcset`, and
-//! `sizes`).
+//! `sizes`), including `<link rel=preload as=image>` source sets.
 //!
 //! This follows WHATWG HTML §4.8.4.3.7–§4.8.4.3.12: build the source set in
 //! picture-child order, parse candidates with the specified tokenizer,
@@ -14,7 +14,7 @@ use url::Url;
 use crate::dom::{Dom, NodeId};
 use crate::layout2::Viewport;
 
-/// One source selected for an `img` element.
+/// One source selected for an `img` or image-preloading `link` element.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SelectedImage {
     /// Absolute URL serialization, as exposed by `HTMLImageElement.currentSrc`.
@@ -53,7 +53,7 @@ pub fn select(
     viewport: Viewport,
     device_pixel_ratio: f32,
 ) -> Option<SelectedImage> {
-    if dom.tag_name(img) != Some("img") {
+    if !matches!(dom.tag_name(img), Some("img" | "link")) {
         return None;
     }
     let base = dom.resource_base_url(img, page_url);
@@ -125,7 +125,8 @@ fn update_source_set(
     viewport: Viewport,
     device_pixel_ratio: f32,
 ) -> (Vec<Candidate>, NodeId) {
-    if let Some(parent) = dom.node(img).parent
+    if dom.tag_name(img) == Some("img")
+        && let Some(parent) = dom.node(img).parent
         && dom.tag_name(parent) == Some("picture")
     {
         // Only preceding siblings of this particular img participate. Invalid
@@ -176,14 +177,27 @@ fn update_source_set(
         }
     }
 
-    let default_source = dom.attr(img, "src").unwrap_or("");
-    let srcset = dom.attr(img, "srcset").unwrap_or("");
+    // HTML #update-the-source-set / #create-a-source-set: link elements use
+    // href/imagesrcset/imagesizes and a null img (so auto sizes cannot apply).
+    let is_link = dom.tag_name(img) == Some("link");
+    let default_source = dom
+        .attr(img, if is_link { "href" } else { "src" })
+        .unwrap_or("");
+    let srcset = dom
+        .attr(img, if is_link { "imagesrcset" } else { "srcset" })
+        .unwrap_or("");
     let mut candidates = if srcset.is_empty() {
         Vec::new()
     } else {
         parse_srcset(srcset)
     };
-    let source_size = parse_sizes(dom, img, Some(img), viewport, device_pixel_ratio);
+    let source_size = parse_sizes(
+        dom,
+        img,
+        (!is_link).then_some(img),
+        viewport,
+        device_pixel_ratio,
+    );
     // The default source is appended only when there is no 1x candidate and
     // no width descriptor. This is why a width-descriptor srcset must not
     // download a giant `src` fallback.
@@ -404,7 +418,12 @@ fn parse_sizes(
     // If the following img allows auto-sizes, an omitted `sizes` on a picture
     // source is equivalent to `auto` (HTML §4.8.2). This differs from an
     // explicitly empty attribute, which falls through to 100vw.
-    let raw_sizes = match dom.attr(element, "sizes") {
+    let sizes_attribute = if dom.tag_name(element) == Some("link") {
+        "imagesizes"
+    } else {
+        "sizes"
+    };
+    let raw_sizes = match dom.attr(element, sizes_attribute) {
         Some(value) => value,
         None if dom.tag_name(element) == Some("source")
             && img.is_some_and(|img| allows_auto_sizes(dom, img)) =>
@@ -651,6 +670,83 @@ fn resolve_url(base: &Url, raw: &str, encoding: &'static encoding_rs::Encoding) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preloads_select_the_same_sources_as_images() {
+        // HTML #create-a-source-set: default source, duplicate densities,
+        // width descriptors, sizes fallback and null-img auto handling.
+        let base = Url::parse("https://example.test/path/page").unwrap();
+        let viewport = Viewport {
+            width: 800.,
+            height: 600.,
+        };
+        for (href, srcset, sizes, density, expected) in [
+            (
+                "fallback.png",
+                "selected.png 1x, large.png 2x",
+                "",
+                1.,
+                "selected.png",
+            ),
+            ("fallback.png", "large.png 2x", "", 1., "fallback.png"),
+            (
+                "fallback.png",
+                "small.png 400w, large.png 800w",
+                "50vw",
+                1.,
+                "small.png",
+            ),
+            (
+                "fallback.png",
+                "small.png 400w, large.png 800w",
+                "50vw",
+                2.,
+                "large.png",
+            ),
+            (
+                "",
+                "small.png 400w, large.png 800w",
+                "auto, (min-width: 600px) 50vw, 100vw",
+                1.,
+                "small.png",
+            ),
+            (
+                "",
+                "small.png 400w, large.png 800w",
+                "auto",
+                1.,
+                "large.png",
+            ),
+            ("", "first.png 1x, second.png 1x", "", 1., "first.png"),
+            ("fallback.png", "invalid.png -1x", "", 1., "fallback.png"),
+        ] {
+            let dom = Dom::parse_document(&format!(
+                "<base href='/assets/'><link id=link rel=preload as=image href='{href}' imagesrcset='{srcset}' imagesizes='{sizes}'>\
+                 <img id=img src='{href}' srcset='{srcset}' sizes='{sizes}'>"
+            ));
+            let link = select(
+                &dom,
+                dom.get_by_id("link").unwrap(),
+                &base,
+                viewport,
+                density,
+            )
+            .unwrap();
+            let img = select(
+                &dom,
+                dom.get_by_id("img").unwrap(),
+                &base,
+                viewport,
+                density,
+            )
+            .unwrap();
+            assert_eq!(
+                link.source,
+                format!("https://example.test/assets/{expected}")
+            );
+            assert_eq!((link.source, link.density), (img.source, img.density));
+        }
+    }
 
     #[test]
     fn resource_base_selection_tracks_tree_order_mutations_and_fallbacks() {

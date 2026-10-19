@@ -25,6 +25,8 @@ mod challenge_message_trace;
 use crate::compression_host;
 #[path = "audio_worklet_host.rs"]
 mod audio_worklet_host;
+#[path = "font_loading_host.rs"]
+mod font_loading_host;
 #[path = "geometry_host.rs"]
 mod geometry_host;
 #[path = "image_bitmap_host.rs"]
@@ -176,6 +178,9 @@ enum TrustJsResourceKind {
 }
 
 impl TrustJsResourceKind {
+    fn is_stylesheet(self) -> bool {
+        matches!(self, Self::Stylesheet | Self::ParsedStylesheet { .. })
+    }
     /// HTML #delay-the-load-event: script and style sheet loads delay their
     /// document's load event; #link-type-preload must not.
     fn delays_load(self) -> bool {
@@ -201,8 +206,14 @@ enum TrustJsHostTask {
     CanvasFrame {
         node: usize,
     },
-    /// A network `@font-face` source the page's font sets awaited (`None`
-    /// when it could not be fetched).
+    /// CSS Font Loading completion for a FontFace object in one realm.
+    FontFaceDone {
+        traversable: TraversableId,
+        context: u64,
+        request: u64,
+        source: Option<String>,
+        bytes: Option<Vec<u8>>,
+    },
     FontDone {
         traversable: TraversableId,
         url: String,
@@ -305,6 +316,9 @@ enum TrustJsHostTask {
         referrer: String,
         /// The import's `type` attribute (None for a JavaScript module).
         module_type: Option<String>,
+        /// The fetch joined when import() ran, before a response task can
+        /// retire a failed cache entry. Existing waiters share that outcome.
+        fetch: Option<(url::Url, crate::http::SharedFetch)>,
     },
     DynamicModule {
         context: u64,
@@ -835,9 +849,12 @@ struct HostState {
     /// HTML #link-type-preload fetches in flight. They never delay the load
     /// event, but the document is not quiescent until they settle.
     pending_preloads: usize,
+    pending_fonts: usize,
     pending_module_evaluations: usize,
     modules_skipped: usize,
     pending_dynamic_modules: Arc<std::sync::atomic::AtomicUsize>,
+    /// CSS Font Loading's pending stylesheet requests, by settings context.
+    pending_stylesheets: HashMap<u64, usize>,
     network: Option<TrustJsNetwork>,
     websockets: Option<TrustJsWebSockets>,
     workers: Option<TrustJsPageWorkers>,
@@ -1029,6 +1046,7 @@ struct TraversableHost {
     top_context: u64,
     pending_resources: usize,
     pending_preloads: usize,
+    pending_fonts: usize,
     pending_module_evaluations: usize,
     modules_skipped: usize,
 }
@@ -1066,6 +1084,7 @@ impl TraversableHost {
             top_context,
             pending_resources: 0,
             pending_preloads: 0,
+            pending_fonts: 0,
             pending_module_evaluations: 0,
             modules_skipped: 0,
         }
@@ -1101,6 +1120,7 @@ impl TraversableHost {
             top_context,
             pending_resources,
             pending_preloads,
+            pending_fonts,
             pending_module_evaluations,
             modules_skipped,
         );
@@ -1170,9 +1190,11 @@ impl HostState {
             muted_traversables: std::collections::HashSet::new(),
             pending_resources: 0,
             pending_preloads: 0,
+            pending_fonts: 0,
             pending_module_evaluations: 0,
             modules_skipped: 0,
             pending_dynamic_modules: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            pending_stylesheets: HashMap::new(),
             network: None,
             websockets: None,
             workers: None,
@@ -1282,6 +1304,7 @@ impl HostState {
     fn release_window_settings(&mut self, context: u64) {
         self.import_maps.remove(&context);
         self.window_realms.remove(&context);
+        self.pending_stylesheets.remove(&context);
         if context == 0 {
             self.traversables.default_realm = None;
         }
@@ -1361,6 +1384,7 @@ impl HostState {
         for context in contexts {
             self.traversables.contexts.remove(&context);
             self.window_realms.remove(&context);
+            self.pending_stylesheets.remove(&context);
             self.window_request_urls.remove(&context);
             self.window_cookie_contexts.remove(&context);
             self.import_maps.remove(&context);
@@ -1628,15 +1652,17 @@ impl HostState {
         engine.set_async_dynamic_module_loader_with_context(
             move |request_id, context, specifier, referrer, module_type| {
                 pending_dynamic_modules.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if let Some(loader) = early_imports.borrow().get(&context) {
-                    begin_dynamic_module_fetch(loader, specifier, referrer);
-                }
+                let fetch = early_imports
+                    .borrow()
+                    .get(&context)
+                    .and_then(|loader| begin_dynamic_module_fetch(loader, specifier, referrer));
                 let _ = events.send(TrustJsHostTask::DynamicModuleStart {
                     request_id,
                     context,
                     specifier: specifier.into(),
                     referrer: referrer.into(),
                     module_type: module_type.map(str::to_owned),
+                    fetch,
                 });
                 true
             },
@@ -1711,9 +1737,11 @@ impl RetainedMemory for HostState {
             muted_traversables: _,
             pending_resources,
             pending_preloads: _,
+            pending_fonts: _,
             pending_module_evaluations: _,
             modules_skipped: _,
             pending_dynamic_modules,
+            pending_stylesheets,
             network,
             websockets,
             workers,
@@ -2207,6 +2235,13 @@ impl RetainedMemory for HostState {
                 "trust.in-flight-imports",
                 in_flight_imports as *const _ as usize,
                 in_flight_imports.iter().map(String::capacity).sum(),
+            ));
+        }
+        if !pending_stylesheets.is_empty() {
+            visitor.allocation(RetainedManagedAllocation::new(
+                "trust.pending-stylesheets",
+                pending_stylesheets as *const _ as usize,
+                pending_stylesheets.capacity() * std::mem::size_of::<(u64, usize)>(),
             ));
         }
         let clipboard_bytes: usize = clipboard_requests
@@ -4156,6 +4191,7 @@ mod desktop {
             && let Some(state) = engine.ctx().host_mut::<HostState>()
         {
             state.window_realms.remove(&context);
+            state.pending_stylesheets.remove(&context);
             state.window_request_urls.remove(&context);
             state.forget_realm_origin(context);
         }
@@ -6348,6 +6384,7 @@ mod desktop {
             .is_some_and(|state| {
                 state.pending_resources > state.pending_module_evaluations
                     || state.pending_preloads > 0
+                    || state.pending_fonts > 0
                     || state.pending_document_images > 0
                     || state
                         .pending_dynamic_modules
@@ -6408,6 +6445,7 @@ mod desktop {
             .is_some_and(|state| {
                 state.pending_resources > 0
                     || state.pending_preloads > 0
+                    || state.pending_fonts > 0
                     || state.pending_document_images > 0
                     || state
                         .pending_dynamic_modules
@@ -14534,6 +14572,9 @@ host_functions! {
     ("__css_style", 3, host_css_style, []),
     ("__css_sheet", 2, guarded_css_sheet, [0]),
     ("__css_supports_selector", 1, host_css_supports_selector, []),
+    ("__font_query", 4, font_loading_host::query, []),
+    ("__font_load", 4, font_loading_host::load, []),
+    ("__font_install", 3, guarded_font_install, [0]),
     ("__css_supports_color", 1, host_css_supports_color, []),
     ("__dom_template_content", 1, guarded_template_content, [0]),
     ("__http_fetch", 5, host_http_fetch, []),
@@ -15362,6 +15403,7 @@ macro_rules! node_access_guards {
 }
 
 node_access_guards! {
+    guarded_font_install = font_loading_host::install, [0], Invalidate;
     guarded_create_element = host_create_element, [1], Throw;
     guarded_create_element_ns = host_create_element_ns, [3], Throw;
     guarded_create_text = host_create_text, [1], Throw;
@@ -17467,6 +17509,9 @@ fn call_trust_in_context(ctx: &mut Ctx, context: u64, name: &str) -> Option<Valu
 /// HTML #abort-a-document for Window `context`'s Document, in a task of its
 /// event loop. Returns whether this canceled anything.
 fn abort_document(ctx: &mut Ctx, context: u64) -> bool {
+    if let Some(state) = ctx.host_mut::<HostState>() {
+        state.pending_stylesheets.remove(&context);
+    }
     // Step 2: cancel the fetches in the context of the document. Its Realm
     // aborts its fetch group first, producing the script-visible results
     // (fetch() rejects with an "AbortError" DOMException, XMLHttpRequest
@@ -18251,6 +18296,7 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
             if let Some(state) = ctx.host_mut::<HostState>() {
                 state.import_maps.remove(&context);
                 state.window_realms.remove(&context);
+                state.pending_stylesheets.remove(&context);
                 state.window_request_urls.remove(&context);
                 state.window_cookie_contexts.remove(&context);
                 state.forget_realm_origin(context);
@@ -18459,6 +18505,7 @@ fn host_create_auxiliary_traversable(
                     .created
                     .retain(|created| created.id != id);
                 state.window_realms.remove(&context);
+                state.pending_stylesheets.remove(&context);
                 state.window_request_urls.remove(&context);
                 state.forget_realm_origin(context);
                 state.traversables.contexts.remove(&context);
@@ -18743,6 +18790,15 @@ fn blob_resource_result(ctx: &mut Ctx, node_id: usize, url: &str) -> TrustJsReso
     ))
 }
 
+fn finish_stylesheet_load(state: &mut HostState, context: u64) {
+    if let Some(count) = state.pending_stylesheets.get_mut(&context) {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            state.pending_stylesheets.remove(&context);
+        }
+    }
+}
+
 fn send_resource_completion(
     ctx: &mut Ctx,
     node_id: usize,
@@ -18770,6 +18826,9 @@ fn send_resource_completion(
         } else {
             state.pending_preloads += 1;
         }
+        if kind.is_stylesheet() {
+            *state.pending_stylesheets.entry(context).or_default() += 1;
+        }
         state.dom_gc.start_resource(node_id);
         Some((events, state.traversables.selected))
     }) else {
@@ -18791,6 +18850,9 @@ fn send_resource_completion(
         .is_err()
     {
         if let Some(state) = ctx.host_mut::<HostState>() {
+            if kind.is_stylesheet() {
+                finish_stylesheet_load(state, context);
+            }
             if kind.delays_load() {
                 state.pending_resources = state.pending_resources.saturating_sub(1);
             } else {
@@ -18812,6 +18874,8 @@ fn send_resource_completion(
 /// element for a network error and `load` for any other response. Unlike
 /// style sheets and scripts, a preload does not delay the load event.
 fn host_preload_link(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let (_, viewport, density) = host_layout_environment(ctx);
+    let base = request_client_url(ctx);
     let (node_id, href, destination, type_matches) = {
         let dom = host_dom(ctx);
         let dom = dom.borrow();
@@ -18829,7 +18893,14 @@ fn host_preload_link(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
         };
         (
             node_id,
-            dom.attr(node_id, "href").map(str::to_string),
+            if destination == "image" {
+                // HTML #preload chooses from the link's source set before
+                // creating its request, using the same selection as <img>.
+                crate::responsive_image::select(&dom, node_id, &base, viewport, density)
+                    .map(|selected| selected.source)
+            } else {
+                dom.attr(node_id, "href").map(str::to_string)
+            },
             destination,
             preload_type_matches(dom.attr(node_id, "type").unwrap_or(""), destination),
         )
@@ -18837,7 +18908,11 @@ fn host_preload_link(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
     if !type_matches {
         return Ok(Value::Undefined);
     }
-    let Some(href) = host_resource_url(ctx, node_id, href) else {
+    let Some(href) = (if destination == "image" {
+        href
+    } else {
+        host_resource_url(ctx, node_id, href)
+    }) else {
         return Ok(Value::Undefined);
     };
     let local = href.trim_start();
@@ -19042,6 +19117,9 @@ fn spawn_resource_fetch(
             let events = state.task_events.clone()?;
             let network = state.network.as_ref()?;
             state.pending_resources += 1;
+            if kind.is_stylesheet() {
+                *state.pending_stylesheets.entry(context).or_default() += 1;
+            }
             state.dom_gc.start_resource(node_id);
             Some((
                 network.handle.clone(),
@@ -21069,7 +21147,7 @@ fn module_dependency_loader(
     {
         return None;
     }
-    let response = if let Some(shared) = (!cookie_context.cross_site_ancestor)
+    let shared = if let Some(shared) = (!cookie_context.cross_site_ancestor)
         .then(|| {
             cache.peek_resource(
                 &resolved,
@@ -21080,24 +21158,33 @@ fn module_dependency_loader(
         })
         .flatten()
     {
-        crate::http::PageCache::block_on_fetch(Some(handle), shared)?
+        shared
     } else {
         // HTML's fetch-a-module-script graph algorithm requires this dependency. Keep the count
         // as diagnostics, but never turn historical activity into a synthetic load failure.
         fetched.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let request = environment.module_request(resolved.clone(), page, referrer, cookie_context);
-        let shared = cache.fetch_prepared_resource(
+        cache.fetch_prepared_resource(
             handle,
             request,
             page,
             "script",
             Some(crate::http::CredentialsMode::SameOrigin),
-        );
-        crate::http::PageCache::block_on_fetch(Some(handle), shared)?
+        )
     };
-    (crate::http::module_response_allowed(response.status, &response.content_type, module_type)
-        && crate::import_maps::integrity_matches(&integrity, &response.body))
-    .then(|| {
+    let response =
+        crate::http::PageCache::block_on_fetch(Some(handle), shared.clone()).filter(|response| {
+            crate::http::module_response_allowed(
+                response.status,
+                &response.content_type,
+                module_type,
+            ) && crate::import_maps::integrity_matches(&integrity, &response.body)
+        });
+    let Some(response) = response else {
+        cache.forget_fetch(&resolved, &shared);
+        return None;
+    };
+    Some({
         // A JSON module imports nothing.
         if module_type.is_none()
             && !cookie_context.cross_site_ancestor
@@ -21152,6 +21239,7 @@ fn queue_dynamic_module_load(
     specifier: &str,
     referrer: &str,
     module_type: Option<&str>,
+    fetch: Option<(url::Url, crate::http::SharedFetch)>,
 ) {
     let base = url::Url::parse(referrer).unwrap_or_else(|_| loader.page.clone());
     let Some(resolved) = loader
@@ -21216,7 +21304,9 @@ fn queue_dynamic_module_load(
         return;
     }
 
-    let shared = if let Some(shared) = (!loader.cookie_context.cross_site_ancestor)
+    let shared = if let Some((_, shared)) = fetch.filter(|(url, _)| *url == resolved) {
+        shared
+    } else if let Some(shared) = (!loader.cookie_context.cross_site_ancestor)
         .then(|| {
             network.cache.peek_resource(
                 &resolved,
@@ -21251,8 +21341,9 @@ fn queue_dynamic_module_load(
     let events = loader.events.clone();
     let context = loader.context;
     let module_type = module_type.map(str::to_owned);
+    let cache = network.cache.clone();
     network.cache.spawn(&network.handle, async move {
-        let result = shared.await.ok().and_then(|response| {
+        let result = shared.clone().await.ok().and_then(|response| {
             (crate::http::module_response_allowed(
                 response.status,
                 &response.content_type,
@@ -21265,6 +21356,12 @@ fn queue_dynamic_module_load(
                 )
             })
         });
+        // HTML #fetch-a-single-module-script: a failed fetch or unsupported
+        // module response is retryable. Keep parse/evaluation errors in the
+        // engine's module map; this only retires the failed network response.
+        if result.is_none() {
+            cache.forget_fetch(&resolved, &shared);
+        }
         let _ = events.send(TrustJsHostTask::DynamicModule {
             context,
             request_id,
@@ -21285,36 +21382,28 @@ fn begin_dynamic_module_fetch(
     loader: &TrustJsDynamicModuleLoader,
     specifier: &str,
     referrer: &str,
-) {
-    let Some(network) = loader.network.as_ref() else {
-        return;
-    };
-    if loader.cookie_context.cross_site_ancestor {
-        // `queue_dynamic_module_load` does not share these requests.
-        return;
-    }
+) -> Option<(url::Url, crate::http::SharedFetch)> {
+    let network = loader.network.as_ref()?;
     let base = url::Url::parse(referrer).unwrap_or_else(|_| loader.page.clone());
-    let Some(resolved) = loader
+    let resolved = loader
         .import_map
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .resolve(specifier, &base)
-    else {
-        return;
-    };
+        .resolve(specifier, &base)?;
     if !matches!(resolved.scheme(), "http" | "https")
         || !crate::http::subresource_allowed(&loader.page, &resolved)
-        || network
-            .cache
-            .peek_resource(
-                &resolved,
-                &loader.page,
-                "script",
-                Some(crate::http::CredentialsMode::SameOrigin),
-            )
-            .is_some()
     {
-        return;
+        return None;
+    }
+    if !loader.cookie_context.cross_site_ancestor
+        && let Some(shared) = network.cache.peek_resource(
+            &resolved,
+            &loader.page,
+            "script",
+            Some(crate::http::CredentialsMode::SameOrigin),
+        )
+    {
+        return Some((resolved, shared));
     }
     if std::env::var_os("TRUST_NET_TRACE").is_some() {
         eprintln!(
@@ -21344,6 +21433,7 @@ fn begin_dynamic_module_fetch(
         network.cache.clone(),
         network.fetched.clone(),
     );
+    let joined = (resolved.clone(), shared.clone());
     network.cache.spawn(&network.handle, async move {
         let Ok(response) = shared.await else {
             return;
@@ -21354,6 +21444,7 @@ fn begin_dynamic_module_fetch(
             speculate_module_graph(page, handle, cache, fetched, resolved, &response.body);
         }
     });
+    Some(joined)
 }
 
 fn speculate_engine_imports(engine: &mut trust_js::Engine, base: &url::Url, body: &[u8]) {
@@ -22066,7 +22157,8 @@ fn host_task_traversable(state: &HostState, task: &TrustJsHostTask) -> Option<Tr
     let context = match task {
         // The traversable whose count the fetch joined, also when its element
         // has moved to another traversable since.
-        TrustJsHostTask::FontDone { traversable, .. }
+        TrustJsHostTask::FontFaceDone { traversable, .. }
+        | TrustJsHostTask::FontDone { traversable, .. }
         | TrustJsHostTask::StyleImportsDone { traversable, .. }
         | TrustJsHostTask::ParserResourceTiming { traversable, .. }
         | TrustJsHostTask::ResourceDone { traversable, .. } => return Some(*traversable),
@@ -22117,6 +22209,39 @@ fn dispatch_host_task(engine: &mut trust_js::Engine, task: TrustJsHostTask) -> R
                     dom.borrow_mut().resource_changed();
                 }
             }
+        }
+        TrustJsHostTask::FontFaceDone {
+            context,
+            request,
+            source,
+            bytes,
+            ..
+        } => {
+            if let Some(state) = engine.ctx().host_mut::<HostState>() {
+                state.pending_fonts = state.pending_fonts.saturating_sub(1);
+                if let (Some(source), Some(bytes)) = (&source, &bytes) {
+                    state
+                        .dom
+                        .borrow_mut()
+                        .install_downloaded_font(source, Some(bytes.clone()));
+                }
+            }
+            run_in_context_realm(engine, context, "font loading", |engine| {
+                let value = match bytes {
+                    Some(bytes) => engine
+                        .ctx()
+                        .make_array_buffer(&bytes)
+                        .map_err(|_| String::from("font buffer allocation failed"))?,
+                    None => Value::Bool(false),
+                };
+                host_call_trust(
+                    engine.ctx(),
+                    "fontFaceLoaded",
+                    &[Value::Num(request as f64), value],
+                )
+                .map(|_| ())
+                .map_err(|_| String::from("font loading completion failed"))
+            })?;
         }
         TrustJsHostTask::FontDone { url, bytes, .. } => {
             let dom = engine
@@ -22359,6 +22484,9 @@ fn dispatch_host_task(engine: &mut trust_js::Engine, task: TrustJsHostTask) -> R
                 .host_mut::<HostState>()
                 .map(|state| state.dom_gc.resource_lease(node_id));
             if let Some(state) = engine.ctx().host_mut::<HostState>() {
+                if kind.is_stylesheet() {
+                    finish_stylesheet_load(state, context);
+                }
                 if kind.delays_load() {
                     state.pending_resources = state.pending_resources.saturating_sub(1);
                 } else {
@@ -22410,6 +22538,7 @@ fn dispatch_host_task(engine: &mut trust_js::Engine, task: TrustJsHostTask) -> R
             specifier,
             referrer,
             module_type,
+            fetch,
         } => {
             if std::env::var_os("TRUST_NET_TRACE").is_some() {
                 eprintln!(
@@ -22447,6 +22576,7 @@ fn dispatch_host_task(engine: &mut trust_js::Engine, task: TrustJsHostTask) -> R
                     &specifier,
                     &referrer,
                     module_type.as_deref(),
+                    fetch,
                 );
             }
         }
@@ -37534,7 +37664,7 @@ mod tests {
     #[test]
     fn trust_js_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 263, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 266, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -37545,7 +37675,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(trust_js_registry_matches_canonical_boundary());
-        assert_eq!(TRUST_JS_HOST_FUNCTIONS.len(), 263);
+        assert_eq!(TRUST_JS_HOST_FUNCTIONS.len(), 266);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(
@@ -45918,8 +46048,11 @@ mod tests {
                             key.startsWith('__')) continue;
                         const d = own(object, key), first = key.charCodeAt(0);
                         if ('value' in d) {
+                            // Web IDL #js-set-keys shares the values function.
+                            const values = key === 'keys' && own(object, 'values');
+                            const expected = values && values.value === d.value ? 'values' : key;
                             if (typeof d.value === 'function' && !(first >= 65 && first <= 90) &&
-                                !(global && /^[A-Z]/.test(d.value.name)) && d.value.name !== key)
+                                !(global && /^[A-Z]/.test(d.value.name)) && d.value.name !== expected)
                                 bad.push(label + '.' + key + '=' + d.value.name);
                         } else {
                             if (d.get && d.get.name !== 'get ' + key) bad.push(label + '.get ' + key + '=' + d.get.name);

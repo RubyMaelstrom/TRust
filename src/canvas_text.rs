@@ -61,6 +61,8 @@ pub(crate) const LANG: u8 = 10;
 /// "inherit" direction and language, and the environment of relative units.
 #[derive(Clone, Debug)]
 pub(crate) struct TextEnvironment {
+    /// CSS Font Loading #font-face-source of the canvas's owning context.
+    pub font_set: Option<Arc<crate::text::FontSet>>,
     /// The canvas element's directionality, or the OffscreenCanvas's
     /// inherited direction.
     pub rtl: bool,
@@ -74,6 +76,7 @@ pub(crate) struct TextEnvironment {
 impl Default for TextEnvironment {
     fn default() -> Self {
         Self {
+            font_set: None,
             rtl: false,
             language: None,
             root_font_size: 16.,
@@ -439,6 +442,7 @@ impl TextState {
             _ => environment.rtl,
         };
         let mut style = self.style.clone();
+        style.font_set = environment.font_set.clone();
         style.language = language.clone();
         let width = STRETCH
             .iter()

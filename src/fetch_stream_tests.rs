@@ -1277,6 +1277,365 @@ fn import_starts_its_fetch_before_the_page_thread_takes_its_task() {
 }
 
 #[test]
+fn failed_module_fetches_retry_without_repeating_successful_evaluation() {
+    // HTML #fetch-a-single-module-script: network/HTTP/MIME failures remove
+    // the map entry before rejecting; successful modules remain singletons.
+    let runtime = runtime();
+    let (listener, base) = listen(&runtime);
+    let server = runtime.spawn(async move {
+        let mut counts = std::collections::HashMap::<String, usize>::new();
+        let mut heads = Vec::new();
+        for _ in 0..4 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let head = read_head(&mut socket).await;
+            let path = head.split_whitespace().nth(1).unwrap().to_owned();
+            let count = counts.entry(path.clone()).or_default();
+            *count += 1;
+            let failed = *count == 1;
+            let status = if failed && path == "/http.js" { "404 Not Found" } else { "200 OK" };
+            let mime = if failed && path == "/mime.js" { "text/plain" } else { "text/javascript" };
+            let body = "export const value = {}; globalThis.evaluations = (globalThis.evaluations || 0) + 1;";
+            let response = format!("HTTP/1.1 {status}\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}", body.len());
+            socket.write_all(response.as_bytes()).await.unwrap();
+            heads.push(head);
+        }
+        heads
+    });
+    let (mut engine, mut tasks) = page(&runtime, &format!("{base}/page"));
+    eval(
+        &mut engine,
+        r#"
+        (async () => {
+            for (const path of ['/http.js', '/mime.js']) {
+                const failures = await Promise.allSettled([import(path), import(path)]);
+                log.push(failures.map(result => result.status).join(','));
+                const first = await import(path), again = await import(path);
+                log.push(String(first === again && first.value === again.value));
+            }
+            log.push('evaluations:' + evaluations);
+        })().catch(error => log.push('failed:' + error));
+    "#,
+        "module retry",
+    )
+    .unwrap();
+    run_until(
+        &runtime,
+        &mut engine,
+        &mut tasks,
+        "log.length >= 5 || log.some(x => x.startsWith('failed:'))",
+    );
+    assert_eq!(
+        log(&mut engine),
+        "rejected,rejected|true|rejected,rejected|true|evaluations:2"
+    );
+    let heads = runtime.block_on(server).unwrap();
+    assert_eq!(
+        heads
+            .iter()
+            .filter(|head| head.starts_with("get /http.js "))
+            .count(),
+        2
+    );
+    assert_eq!(
+        heads
+            .iter()
+            .filter(|head| head.starts_with("get /mime.js "))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn image_preloads_follow_source_set_changes_and_removals() {
+    // HTML #link-type-preload / #update-the-source-set, including a link
+    // without href and a media query becoming applicable after insertion.
+    let runtime = runtime();
+    let (listener, base) = listen(&runtime);
+    let server = serve_each(&runtime, listener, 5, |_| {
+        b"HTTP/1.1 200 OK\r\nContent-Type: image/svg+xml\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+    });
+    let (mut engine, mut tasks) = page(&runtime, &format!("{base}/page"));
+    eval(
+        &mut engine,
+        r#"
+        const root = document.createElement('html'); document.appendChild(root);
+        const link = document.createElement('link');
+        link.rel = 'preload'; link.as = 'image'; link.href = '/fallback.svg';
+        link.imageSrcset = '/small.svg 10w, /medium.svg 20w, /large.svg 30w';
+        link.imageSizes = '10px';
+        link.onload = () => {
+            log.push('load');
+            if (log.length === 1) link.imageSizes = '20px';
+            else if (log.length === 2) link.removeAttribute('imagesizes');
+            else if (log.length === 3) link.removeAttribute('imagesrcset');
+            else if (log.length === 4) {
+                const only = document.createElement('link');
+                only.rel = 'preload'; only.as = 'image'; only.imageSrcset = '/only.svg 1x';
+                only.media = 'not all'; only.onload = () => log.push('only');
+                root.appendChild(only); only.media = 'all';
+            }
+        };
+        root.appendChild(link);
+    "#,
+        "responsive preloads",
+    )
+    .unwrap();
+    run_until(&runtime, &mut engine, &mut tasks, "log.length === 5");
+    assert_eq!(log(&mut engine), "load|load|load|load|only");
+    let heads = runtime.block_on(server).unwrap();
+    let paths: Vec<_> = heads
+        .iter()
+        .map(|head| head.split_whitespace().nth(1).unwrap())
+        .collect();
+    assert_eq!(
+        paths,
+        [
+            "/small.svg",
+            "/medium.svg",
+            "/large.svg",
+            "/fallback.svg",
+            "/only.svg"
+        ]
+    );
+}
+
+#[test]
+fn font_face_sets_load_matching_css_faces_and_keep_live_connections() {
+    // CSS Font Loading 3 #document-font-face-set, #font-face-css-connection,
+    // #font-face-set-load and #font-face-set-check. The third family must
+    // remain unrequested when only the first family's two ranges are loaded.
+    let runtime = runtime();
+    let (listener, base) = listen(&runtime);
+    let server = serve_each(&runtime, listener, 2, |_| {
+        let bytes = include_bytes!("../assets/fonts/dejavu/DejaVuSans.ttf");
+        let mut response = format!("HTTP/1.1 200 OK\r\nContent-Type: font/ttf\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len()).into_bytes();
+        response.extend_from_slice(bytes);
+        response
+    });
+    let (mut engine, mut tasks) = page(&runtime, &format!("{base}/page"));
+    eval(&mut engine, r#"
+        const root = document.createElement('html'); document.appendChild(root);
+        const style = document.createElement('style');
+        style.textContent = `
+            @font-face {font-family: Review;src:url(/latin.ttf);unicode-range:U+0-7F}
+            @font-face {font-family: Review;src:url(/cyrillic.ttf);unicode-range:U+400-4FF}
+            @font-face {font-family: Other;src:url(/unused.ttf)}
+        `;
+        root.appendChild(style);
+        const fonts = document.fonts, before = Array.from(fonts);
+        log.push('size:' + fonts.size);
+        log.push('iterator:' + (fonts.keys === fonts.values) + ':' + (fonts[Symbol.iterator] === fonts.values) + ':' + fonts.keys.name);
+        log.push('check:' + fonts.check('12px Review','a') + ':' + fonts.check('12px Review','') + ':' + fonts.check('12px Missing'));
+        let syntax = ''; try { fonts.check('inherit'); } catch(e) {syntax = e.name;}
+        log.push('syntax:' + syntax);
+        (async () => {
+            const loaded = await fonts.load('12px Review','aЖ');
+            log.push('loaded:' + loaded.length + ':' + (loaded[0] === before[0]) + ':' + (loaded[1] === before[1]));
+            log.push('status:' + loaded.map(f => f.status).join(',') + ':' + fonts.check('12px Review','aЖ'));
+            log.push('empty:' + (await fonts.load('12px Other','')).length);
+            log.push('delete:' + fonts.delete(before[0])); fonts.clear(); log.push('clear:' + fonts.size);
+            before[0].weight = '700';
+            log.push('to-css:' + style.sheet.cssRules[0].style.fontWeight);
+            style.sheet.cssRules[0].style.fontWeight = '500'; log.push('from-css:' + before[0].weight);
+            style.sheet.cssRules[0].style.setProperty('src','url(/replacement.ttf)');
+            log.push('replace:' + (Array.from(fonts)[0] !== before[0]));
+            style.sheet.deleteRule(0); log.push('remove:' + fonts.size);
+            // Removed objects retain their former descriptors and can be
+            // manually added; their old CSS connection never comes back.
+            fonts.add(before[0]); log.push('manual:' + fonts.has(before[0]) + ':' + fonts.delete(before[0]));
+            log.push('done');
+        })().catch(error => log.push('failed:' + error));
+    "#, "font loading CSS connection").unwrap();
+    run_until(
+        &runtime,
+        &mut engine,
+        &mut tasks,
+        "log.includes('done') || log.some(x => x.startsWith('failed:'))",
+    );
+    assert_eq!(
+        log(&mut engine),
+        "size:3|iterator:true:true:values|check:false:true:true|syntax:SyntaxError|loaded:2:true:true|status:loaded,loaded:true|empty:0|delete:false|clear:3|to-css:700|from-css:500|replace:true|remove:2|manual:true:true|done"
+    );
+    let heads = runtime.block_on(server).unwrap();
+    assert!(heads.iter().any(|head| head.starts_with("get /latin.ttf ")));
+    assert!(
+        heads
+            .iter()
+            .any(|head| head.starts_with("get /cyrillic.ttf "))
+    );
+}
+
+#[test]
+fn font_descriptor_dictionaries_read_and_convert_each_member_once() {
+    let runtime = runtime();
+    let (mut engine, _tasks) = page(&runtime, "https://example.test/page");
+    eval(&mut engine, r#"
+        const reads=[];
+        const face=new FontFace('Converted','local("DejaVu Sans")',{
+            get width(){reads.push('width');return '125%'},
+            get weight(){reads.push('weight');return {toString(){reads.push('convert');return '700'}}}
+        });
+        log.push(reads.join(','),face.weight,face.stretch,face.status);
+    "#, "FontFace dictionary conversion").unwrap();
+    assert_eq!(log(&mut engine), "weight,convert,width|700|125%|unloaded");
+}
+
+#[test]
+fn font_sources_include_shadow_and_adopted_rules_and_disconnect_removed_faces() {
+    let runtime = runtime();
+    let (mut engine, _tasks) = page(&runtime, "https://example.test/page");
+    eval(&mut engine, r#"
+        const root=document.createElement('html'); document.appendChild(root);
+        const host=document.createElement('div'); root.appendChild(host);
+        const shadow=host.attachShadow({mode:'closed'}), style=document.createElement('style');
+        style.textContent='@font-face{font-family:Shadow;src:local("DejaVu Sans")}'; shadow.appendChild(style);
+        const sheet=new CSSStyleSheet(); sheet.replaceSync('@font-face{font-family:Adopted;src:local("DejaVu Sans")}');
+        document.adoptedStyleSheets=[sheet];
+        const fonts=document.fonts, old=Array.from(fonts).find(f=>f.family==='Shadow');
+        log.push(Array.from(fonts,f=>f.family).sort().join(','));
+        log.push(String(fonts.delete(old))); style.remove(); log.push(String(fonts.has(old)));
+        shadow.appendChild(style);
+        log.push(String(Array.from(fonts).find(f=>f.family==='Shadow')!==old));
+        old.family='Detached'; log.push(style.sheet.cssRules[0].style.fontFamily);
+        document.adoptedStyleSheets=[]; log.push('remaining:'+fonts.size);
+    "#, "shadow font source").unwrap();
+    assert_eq!(
+        log(&mut engine),
+        "Adopted,Shadow|false|false|true|Shadow|remaining:1"
+    );
+}
+
+#[test]
+fn font_loading_uses_source_fallbacks_and_rejects_failed_decoding() {
+    let runtime = runtime();
+    let (listener, base) = listen(&runtime);
+    let server = serve_each(&runtime, listener, 2, |head| {
+        let status = if head.starts_with("get /missing.ttf ") {
+            "404 Not Found"
+        } else {
+            "200 OK"
+        };
+        format!("HTTP/1.1 {status}\r\nContent-Type: font/ttf\r\nContent-Length: 4\r\nConnection: close\r\n\r\noops").into_bytes()
+    });
+    let (mut engine, mut tasks) = page(&runtime, &format!("{base}/page"));
+    eval(&mut engine, r#"
+        (async()=>{
+            const fallback=new FontFace('Fallback','url(/bad.ttf),url(/missing.ttf),local("DejaVu Sans")');
+            await fallback.load(); log.push('fallback:'+fallback.status);
+            const failed=new FontFace('Failed','url(/bad.ttf)');
+            try {await failed.load();} catch(e) {log.push(e.name+':'+failed.status);}
+            log.push('done');
+        })().catch(e=>log.push('failed:'+e));
+    "#, "font source fallbacks").unwrap();
+    run_until(
+        &runtime,
+        &mut engine,
+        &mut tasks,
+        "log.includes('done') || log.some(x=>x.startsWith('failed:'))",
+    );
+    assert_eq!(log(&mut engine), "fallback:loaded|NetworkError:error|done");
+    assert_eq!(runtime.block_on(server).unwrap().len(), 2);
+}
+
+#[test]
+fn font_ready_waits_for_stylesheets_and_fonts_after_document_load() {
+    // CSS Font Loading #font-face-set-ready: a newly observed font source
+    // waits for pending stylesheets and the font loads they discover.
+    let runtime = runtime();
+    let (listener, base) = listen(&runtime);
+    let server = serve_each(&runtime, listener, 2, |head| {
+        let (kind, bytes): (&str, &[u8]) = if head.starts_with("get /late.css ") {
+            (
+                "text/css",
+                b"@font-face{font-family:Late;src:url(/late.ttf)}",
+            )
+        } else {
+            (
+                "font/ttf",
+                include_bytes!("../assets/fonts/dejavu/DejaVuSans.ttf"),
+            )
+        };
+        let mut response = format!("HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len()).into_bytes();
+        response.extend_from_slice(bytes);
+        response
+    });
+    let (mut engine, mut tasks) = page(&runtime, &format!("{base}/page"));
+    eval(&mut engine, r#"
+        const root=document.createElement('html'); document.appendChild(root);
+        __trust.setDocumentReadiness('complete');
+        const text=document.createElement('span'); text.style.fontFamily='Late'; text.textContent='Font readiness'; root.appendChild(text);
+        const link=document.createElement('link'); link.rel='stylesheet'; link.href='/late.css';
+        link.onload=()=>log.push('sheet'); root.appendChild(link);
+        document.fonts.ready.then(()=>log.push('ready:'+document.fonts.size+':'+Array.from(document.fonts)[0].status));
+        log.push('initial');
+    "#, "font ready environment").unwrap();
+    run_until(
+        &runtime,
+        &mut engine,
+        &mut tasks,
+        "log.some(x=>x.startsWith('ready:'))",
+    );
+    assert_eq!(log(&mut engine), "initial|sheet|ready:1:loaded");
+    assert_eq!(runtime.block_on(server).unwrap().len(), 2);
+}
+
+#[test]
+fn font_face_loading_decodes_binary_data_and_updates_layout() {
+    // CSS Font Loading #font-face-constructor / #font-face-set-css: bytes
+    // must decode, and adding/removing a loaded face changes real layout.
+    let runtime = runtime();
+    let (mut engine, mut tasks) = page(&runtime, "https://example.test/page");
+    let bytes = include_bytes!("../assets/fonts/dejavu/DejaVuSans.ttf");
+    let buffer = engine
+        .ctx()
+        .make_array_buffer(bytes)
+        .unwrap_or_else(|_| panic!("font buffer"));
+    let global = engine.global_this();
+    engine
+        .ctx()
+        .member_set(&global, "fontBytes", buffer)
+        .unwrap_or_else(|_| panic!("font global"));
+    eval(&mut engine, r#"
+        const root = document.createElement('html'); document.appendChild(root);
+        const body = document.createElement('body'); root.appendChild(body);
+        const span = document.createElement('span'); span.style.cssText='font:30px LoadedFont,monospace';
+        span.textContent='iiiiWWWW'; body.appendChild(span);
+        const before = span.getBoundingClientRect().width;
+        const canvas = document.createElement('canvas'); body.appendChild(canvas);
+        const context = canvas.getContext('2d'); context.font = '30px LoadedFont, monospace';
+        const canvasBefore = context.measureText('iiiiWWWW').width;
+        const fonts = document.fonts;
+        const face = new FontFace('LoadedFont',new Uint8Array(fontBytes));
+        const promise = face.loaded; log.push('initial:' + face.status + ':' + (face.load() === promise));
+        fonts.add(face);
+        const events=[]; for(const name of ['loading','loadingdone','loadingerror']) fonts.addEventListener(name,e=>events.push(e.type));
+        (async()=>{
+            await face.loaded;
+            log.push('decoded:' + face.status + ':' + (Math.abs(span.getBoundingClientRect().width-before)>1));
+            log.push('canvas:' + (Math.abs(context.measureText('iiiiWWWW').width-canvasBefore)>1));
+            fonts.delete(face); log.push('removed:' + (Math.abs(span.getBoundingClientRect().width-before)<0.01));
+            const url=URL.createObjectURL(new Blob([fontBytes],{type:'font/ttf'}));
+            const blobFace=new FontFace('BlobFont','url("'+url+'")');
+            await blobFace.load(); log.push('blob:'+blobFace.status); URL.revokeObjectURL(url);
+            const bad = new FontFace('Broken',new Uint8Array([0,1,0,0]));
+            try {await bad.loaded;} catch(e) {log.push('bad:' + e.name + ':' + bad.status);}
+            __trust.setDocumentReadiness('complete');
+            await fonts.ready; log.push('ready:' + fonts.status); log.push('done');
+        })().catch(e=>log.push('failed:'+e));
+    "#, "binary FontFace").unwrap();
+    run_until(
+        &runtime,
+        &mut engine,
+        &mut tasks,
+        "log.includes('done') || log.some(x=>x.startsWith('failed:'))",
+    );
+    assert_eq!(
+        log(&mut engine),
+        "initial:unloaded:true|decoded:loaded:true|canvas:true|removed:true|blob:loaded|bad:SyntaxError:error|ready:loaded|done"
+    );
+}
+
+#[test]
 fn script_sees_header_values_as_byte_strings() {
     // Fetch #header-value: byte sequences, which Headers, getResponseHeader
     // and getAllResponseHeaders expose isomorphic decoded (Web IDL

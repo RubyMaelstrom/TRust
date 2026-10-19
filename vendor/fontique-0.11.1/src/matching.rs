@@ -12,7 +12,7 @@
 //! specified search order among those the remaining faces support, then
 //! removes the faces that do not support it.
 
-use super::font::{FontInfo, StyleRange};
+use super::font::{Descriptor, FaceDescriptors, FontInfo, StyleRange};
 use crate::{FontStyle, FontWeight, FontWidth};
 use smallvec::SmallVec;
 
@@ -44,7 +44,7 @@ pub fn match_font(
         1 => return Some(0),
         _ => {}
     }
-    let mut set: SmallVec<[Candidate; 16]> = set
+    let set: SmallVec<[Candidate; 16]> = set
         .iter()
         .enumerate()
         .map(|(index, font)| Candidate {
@@ -54,6 +54,67 @@ pub fn match_font(
             style: font.style_range(),
         })
         .collect();
+    match_candidates(set, width, style, weight, synthesize_style)
+        .first()
+        .map(|candidate| candidate.index)
+}
+
+/// CSS Font Loading's matching operation also runs before the font files
+/// have loaded. Apply the same CSS Fonts 4 algorithm to their descriptors,
+/// retaining all matching members of a composite unicode-range face.
+pub fn match_face_descriptors(
+    descriptors: &[FaceDescriptors],
+    width: FontWidth,
+    style: FontStyle,
+    weight: FontWeight,
+) -> alloc::vec::Vec<usize> {
+    let set = descriptors
+        .iter()
+        .enumerate()
+        .map(|(index, face)| Candidate {
+            index,
+            width: match face.width {
+                Descriptor::Value(value) => value,
+                _ => [1.; 2],
+            },
+            weight: match face.weight {
+                Descriptor::Value(value) => value,
+                _ => [400.; 2],
+            },
+            style: match face.style {
+                Descriptor::Value(value) => value,
+                _ => StyleRange {
+                    italic: None,
+                    oblique: Some([0.; 2]),
+                },
+            },
+        })
+        .collect();
+    let matching = match_candidates(set, width, style, weight, true);
+    let Some(first) = matching.first().copied() else {
+        return alloc::vec::Vec::new();
+    };
+    // CSS Fonts 4 #font-style-matching chooses one of any remaining tied
+    // faces. Identical descriptors form a composite face (unicode-range is
+    // applied by the caller), so retain that chosen face's whole group.
+    matching
+        .into_iter()
+        .filter(|candidate| {
+            candidate.width == first.width
+                && candidate.weight == first.weight
+                && candidate.style == first.style
+        })
+        .map(|candidate| candidate.index)
+        .collect()
+}
+
+fn match_candidates(
+    mut set: SmallVec<[Candidate; 16]>,
+    width: FontWidth,
+    style: FontStyle,
+    weight: FontWeight,
+    synthesize_style: bool,
+) -> SmallVec<[Candidate; 16]> {
     // Step 4.1: 'font-width' is tried first.
     let desired = width.ratio();
     let widths: SmallVec<[[f32; 2]; 16]> = set.iter().map(|f| f.width).collect();
@@ -100,7 +161,7 @@ pub fn match_font(
     }
     // "more than one font might be remaining ... it must not differ between
     // two elements in the same document": the first in registration order.
-    set.first().map(|f| f.index)
+    set
 }
 
 /// The value the style search settled on: the faces kept are those whose
