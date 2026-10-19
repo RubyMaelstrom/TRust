@@ -86,6 +86,8 @@ struct FrameDocument {
     committed: Mutex<Option<DocumentClient>>,
     sheets: Mutex<Vec<PageSheet>>,
     created: f64,
+    navigation_start: Option<f64>,
+    initial_blank: bool,
     // A failed prefetch is a completed navigation attempt as well. The
     // separate flag distinguishes it from a local srcdoc/data navigation.
     network: bool,
@@ -167,6 +169,7 @@ impl FrameDocuments {
                 .into_iter()
                 .map(|(path, (url, markup, encoding, policy))| {
                     let base = base_with_doc_base(&markup, &url);
+                    let initial_blank = url.as_str() == "about:blank";
                     (
                         path,
                         Arc::new(FrameDocument {
@@ -183,6 +186,8 @@ impl FrameDocuments {
                             sheets: Mutex::default(),
                             network: false,
                             created: crate::performance::now_ms(),
+                            navigation_start: None,
+                            initial_blank,
                             response: Mutex::default(),
                             sandboxed: false,
                             restricted: false,
@@ -415,6 +420,9 @@ pub(super) async fn prefetch_frame_documents(
 }
 
 async fn fetch_frame(source: Source, parent: &Pending) -> (usize, FrameDocument) {
+    // HTML #creating-a-new-browsing-context captures the initial
+    // blank's navigation start at context creation, before its first response.
+    let context_created = crate::performance::now_ms();
     let Source {
         ordinal,
         attributes,
@@ -470,13 +478,18 @@ async fn fetch_frame(source: Source, parent: &Pending) -> (usize, FrameDocument)
         navigation_client: None,
         committed: Mutex::default(),
         sheets: Mutex::default(),
-        created: crate::performance::now_ms(),
+        created: context_created,
+        navigation_start: Some(context_created),
+        initial_blank: true,
         network: false,
         response: Mutex::default(),
         sandboxed,
         restricted: cookies.cross_site_ancestor,
     };
+    let navigation_start = crate::performance::now_ms();
     if let Some(srcdoc) = attributes.srcdoc {
+        record.navigation_start = Some(navigation_start);
+        record.initial_blank = false;
         record.created = crate::performance::now_ms();
         record.url = Url::parse("about:srcdoc").unwrap();
         record.policy = document_referrer_policy(&srcdoc, parent.policy);
@@ -485,6 +498,8 @@ async fn fetch_frame(source: Source, parent: &Pending) -> (usize, FrameDocument)
     } else if let Some(url) = requested {
         if url.scheme() == "data" {
             if let Some(markup) = data_frame_document(&url) {
+                record.navigation_start = Some(navigation_start);
+                record.initial_blank = false;
                 record.created = crate::performance::now_ms();
                 record.fallback_base = url.clone();
                 record.base = base_with_doc_base(&markup, &url);
@@ -533,6 +548,8 @@ async fn fetch_frame(source: Source, parent: &Pending) -> (usize, FrameDocument)
                     // HTML #initialise-the-document-object creates the
                     // response Document after fetching. The initial blank
                     // above has a separate, earlier creation transition.
+                    record.navigation_start = Some(navigation_start);
+                    record.initial_blank = false;
                     record.created = crate::performance::now_ms();
                     let response_origin = response
                         .service_client
@@ -806,6 +823,8 @@ pub(crate) struct ResumedDocument {
     pub referrer: String,
     pub timing: Option<Box<FetchTiming>>,
     pub created: f64,
+    pub navigation_start: Option<f64>,
+    pub initial_blank: bool,
 }
 
 #[derive(Default)]
@@ -835,8 +854,13 @@ impl ActorFrames {
                         .map_or_else(String::new, |response| response.referrer.clone()),
                     timing: response
                         .as_ref()
+                        // A no-Document response leaves the initial blank
+                        // active, without the aborted attempt's fetch timing.
+                        .filter(|_| !record.initial_blank)
                         .and_then(|response| response.response.timing.clone()),
                     created: record.created,
+                    navigation_start: record.navigation_start,
+                    initial_blank: record.initial_blank,
                 });
                 (
                     path.clone(),

@@ -5336,6 +5336,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // HTML §7.3.2.1 creates and completely loads a populated initial
         // about:blank Document, with its own Window Realm, as part of creating
         // the iframe's child navigable. It exists before attribute navigation.
+        const initialCreation = navigationFloorTime(__clockNow() * 10) / 10;
         navigableName(frame); // Snapshot the name at child-navigable creation, not at every navigation.
         internalsFor(frame).frameUrl = "about:blank";
         frameAboutBaseURLs.set(frame, nodeBaseHref(frame));
@@ -5350,7 +5351,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         for (let i = 0; i < replacedRoots.length; i++)
             syncWrapperSubtreeRetention(nodeIds.get(replacedRoots[i]));
 
-        const childWindow = createFrameWindowRealm(frame, "about:blank");
+        const childWindow = createFrameWindowRealm(frame, "about:blank", "text/html", {
+            timeOrigin: initialCreation,
+            'legacy:navigationStart': navigationFloorTime(initialCreation),
+            'legacy:domLoading': 0,
+        });
         if (childWindow) internalsFor(frame).trustInitialAboutBlank = true;
         else internalsFor(frame).contentDoc = frameDocument(frame);
 
@@ -5363,7 +5368,20 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         return childWindow;
     }
     function loadFrameMarkup(frame, markup, base, frameUrl, generation, referrer = "", contentType = "text/html", navigationTiming = null, encoding = "UTF-8", resuming = false) {
-        if (navigationTiming && !resuming) navigationTiming['legacy:domLoading'] = navigationFloorTime(__clockNow());
+        if (!resuming) {
+            const loading = __clockNow();
+            if (!navigationTiming) {
+                const pending = frameResourceTimings.get(frame);
+                const origin = pending && pending.generation === generation
+                    ? pending.start : navigationFloorTime(loading * 10) / 10;
+                // A local replacement still creates a new Document, including
+                // when it reuses the initial blank's Window and Performance.
+                // Its original navigation/loading moments need no fake fetch.
+                navigationTiming = {timeOrigin: origin,
+                    'legacy:navigationStart': navigationFloorTime(origin)};
+            }
+            navigationTiming['legacy:domLoading'] = navigationFloorTime(loading);
+        }
         if (frameBlobOrigins.get(frame)?.url !== frameUrl) frameBlobOrigins.delete(frame);
         if (frameResponseOrigins.get(frame)?.url !== frameUrl) frameResponseOrigins.delete(frame);
         frameReferrers.set(frame, referrer);
@@ -54875,13 +54893,26 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         recordResourceTimingPacked(values);
     };
     function installNavigation(data) {
-        if (!data || typeof data.name !== 'string') return;
+        if (!data) return;
         // HTML's Window settings-object time origin is a getter on its
         // associated Document's navigation start. It changes even for the
         // initial-about:blank exception that reuses the Window and Realm.
         if (typeof data.timeOrigin === 'number' && finite(data.timeOrigin) && data.timeOrigin > 0) {
             owner.timeOrigin = data.timeOrigin;
         }
+        // Native Document clocks also exist without FetchTiming (initial
+        // blank, srcdoc, data, or a retained creation-time fallback). Restore
+        // those moments without inventing a network/navigation entry. Zero
+        // remains unavailable, including an initial blank's loading phase.
+        if (!worker) {
+            for (const name of timingNames) owner.legacyTiming[name] = 0;
+            owner.legacyTiming.navigationStart = floor(owner.timeOrigin);
+            owner.legacyTiming.domLoading = typeof data.name === 'string'
+                ? floor(owner.timeOrigin + owner.now()) : 0;
+            for (const name of timingNames) if (typeof data['legacy:' + name] === 'number')
+                owner.legacyTiming[name] = data['legacy:' + name];
+        }
+        if (typeof data.name !== 'string') return;
         const entry = create(PerformanceNavigationTiming.prototype);
         const state = {kind:'navigation',name:data.name,startTime:0,duration:0,type:data.type || 'navigate'};
         for (const name of resourceNumbers) state[name] = data[name] || 0;
@@ -54892,11 +54923,6 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // the Document and its initial visibility state entry: first in
         // the timeline among entries at time zero.
         write(entry,state); owner.navigation = entry; apply(splice,owner.entries,[0,0,entry]);
-        for (const name of timingNames) owner.legacyTiming[name] = 0;
-        owner.legacyTiming.navigationStart = floor(owner.timeOrigin);
-        owner.legacyTiming.domLoading = floor(owner.timeOrigin + owner.now());
-        for (const name of timingNames) if (typeof data['legacy:' + name] === 'number')
-            owner.legacyTiming[name] = data['legacy:' + name];
         owner.legacyRedirectCount = data.legacyRedirectCount || 0;
     }
     // Lifecycle hooks are host-side, not author Event listeners. Synthetic
@@ -54906,7 +54932,14 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             phase !== 'domContentLoadedEventStart' && phase !== 'domContentLoadedEventEnd' &&
             phase !== 'loadEventStart' && phase !== 'loadEventEnd') return;
         const entry = owner.navigation;
-        if (!entry) return;
+        if (!entry) {
+            // A real parser transition still updates the legacy interface
+            // when there is no fetch-backed navigation entry. Restoring an
+            // already-complete Document does not call these lifecycle hooks.
+            if (owner.legacyTiming[phase] === 0)
+                owner.legacyTiming[phase] = floor(owner.timeOrigin + owner.now());
+            return;
+        }
         const state = read(entry);
         if (phase === 'loadEventEnd' && state.loadEventEnd !== 0) return;
         const time = owner.now();

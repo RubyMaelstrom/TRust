@@ -4145,14 +4145,13 @@ mod desktop {
                 &env.referrer,
                 viewport,
                 env.device_pixel_ratio,
-                env.navigation_timing
-                    .as_ref()
-                    .map_or(serde_json::Value::Null, |timing| {
-                        let mut data = timing.navigation_data(response_url.as_str());
-                        data["legacy:domLoading"] =
-                            serde_json::json!(document_creation_time.floor());
-                        data
-                    }),
+                crate::performance::document_timing_data(
+                    env.navigation_timing.as_deref(),
+                    response_url.as_str(),
+                    None,
+                    document_creation_time,
+                    false,
+                ),
                 env.last_modified,
                 env.fullscreen_supported,
                 !env.terminal_presentation,
@@ -5749,13 +5748,13 @@ mod desktop {
             &env.referrer,
             viewport,
             env.device_pixel_ratio,
-            env.navigation_timing
-                .as_ref()
-                .map_or(serde_json::Value::Null, |timing| {
-                    let mut data = timing.navigation_data(response_url.as_str());
-                    data["legacy:domLoading"] = serde_json::json!(document_creation_time.floor());
-                    data
-                }),
+            crate::performance::document_timing_data(
+                env.navigation_timing.as_deref(),
+                response_url.as_str(),
+                None,
+                document_creation_time,
+                false,
+            ),
             env.last_modified,
             env.fullscreen_supported,
             !env.terminal_presentation,
@@ -10218,6 +10217,69 @@ mod desktop {
             let before = crate::performance::now_ms();
             let fresh = parse_navigation_document("<body>new", &env, None).document_creation_time;
             assert!(fresh >= before && fresh <= crate::performance::now_ms());
+        }
+
+        #[test]
+        fn document_clock_roots_keep_native_creation_without_fetch_metadata() {
+            // Navigation Timing #domloading / HTML #concept-settings-object-time-origin:
+            // original native creation is the fallback when an earlier browser
+            // navigation start was not measured. Fetch metadata stays absent.
+            for resumed in [true, false] {
+                for measured_start in [false, true] {
+                    let html = "<body><p>existing</p><script>globalThis.promotionRan=true</script>";
+                    let start = crate::performance::now_ms();
+                    std::thread::sleep(Duration::from_millis(10));
+                    let mut env = PageEnv::bare(DEFAULT_URL);
+                    let created =
+                        parse_navigation_document(html, &env, None).document_creation_time;
+                    env.document_creation_time = Some(created);
+                    env.resume_static = resumed;
+                    if measured_start {
+                        env.navigation_timing = Some(Box::new(crate::performance::FetchTiming {
+                            start_time: start,
+                            ..Default::default()
+                        }));
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                    let materialized = crate::performance::now_ms();
+                    let (host_tx, mut host_rx) = tokio::sync::mpsc::unbounded_channel();
+                    let mut page = load_page(
+                        html,
+                        env,
+                        host_tx,
+                        &mut host_rx,
+                        None,
+                        Arc::new(trust_js::RuntimeInterrupt::default()),
+                        None,
+                    )
+                    .unwrap_or_else(|outcome| panic!("Document clock fixture: {outcome:?}"));
+                    if !resumed {
+                        let _ = call_trust(&mut page, "completeDocumentLoad", &[], "load");
+                        checkpoint(&mut page, "load");
+                    }
+                    let value = evaluate_task(
+                        &mut page,
+                        "JSON.stringify([performance.timeOrigin,performance.timing.navigationStart,performance.timing.domLoading,performance.timing.fetchStart,performance.timing.domInteractive,performance.timing.domComplete,performance.timing.loadEventEnd,performance.getEntriesByType('navigation').length])",
+                        "original Document clock",
+                    )
+                    .unwrap();
+                    let stamps: Vec<f64> =
+                        serde_json::from_str(&value_string(&mut page.engine, &value)).unwrap();
+                    let origin = if measured_start { start } else { created };
+                    assert_eq!(stamps[0], (origin * 10.).floor() / 10.);
+                    assert_eq!(stamps[1], origin.floor());
+                    assert_eq!(stamps[2], created.floor());
+                    assert!(stamps[1] <= stamps[2] && stamps[2] < materialized.floor());
+                    assert_eq!(stamps[3], 0., "missing fetch metadata was fabricated");
+                    assert_eq!(stamps[7], if measured_start { 1. } else { 0. });
+                    if resumed {
+                        assert_eq!(&stamps[4..7], &[0., 0., 0.]);
+                    } else {
+                        assert!(stamps[4..7].iter().all(|stamp| *stamp >= stamps[2]));
+                    }
+                    assert!(page.outcome.errors.is_empty(), "{:?}", page.outcome.errors);
+                }
+            }
         }
 
         #[tokio::test]
@@ -19120,6 +19182,14 @@ fn host_create_auxiliary_traversable(
     _this: Value,
     args: &[Value],
 ) -> Result<Value, Value> {
+    let context_created = crate::performance::now_ms();
+    let document_clock = crate::performance::document_timing_data(
+        None,
+        "about:blank",
+        Some(context_created),
+        context_created,
+        true,
+    );
     let source_config = args.first().cloned().unwrap_or(Value::Undefined);
     let opener = args.get(1).cloned().unwrap_or(Value::Undefined);
     let name = host_arg_string(ctx, args, 2);
@@ -19246,7 +19316,8 @@ fn host_create_auxiliary_traversable(
             "referrer",
             Value::from_string(creator_url.to_string()),
         )?;
-        realm_ctx.member_set(&config, "navigationTiming", Value::Null)?;
+        let timing = host_timing_data_value(realm_ctx, &document_clock)?;
+        realm_ctx.member_set(&config, "navigationTiming", timing)?;
         realm_ctx.member_set(
             &config,
             "aboutBaseURL",
@@ -27951,18 +28022,14 @@ fn host_resume_frame(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
         (resumed, origin)
     };
     let (resumed, origin) = resumed;
-    let timing = match resumed.timing.as_ref() {
-        Some(timing) => {
-            let value = host_navigation_timing_value(ctx, timing, resumed.url.as_str())?;
-            ctx.member_set(
-                &value,
-                "legacy:domLoading",
-                Value::Num(resumed.created.floor()),
-            )?;
-            value
-        }
-        None => Value::Null,
-    };
+    let data = crate::performance::document_timing_data(
+        resumed.timing.as_deref(),
+        resumed.url.as_str(),
+        resumed.navigation_start,
+        resumed.created,
+        resumed.initial_blank,
+    );
+    let timing = host_timing_data_value(ctx, &data)?;
     Ok(ctx.make_array(vec![
         Value::from_string(resumed.url.to_string()),
         Value::from_string(resumed.markup),

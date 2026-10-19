@@ -20,6 +20,37 @@ pub(crate) fn now_ms() -> f64 {
     epoch + instant.elapsed().as_secs_f64() * 1000.0
 }
 
+/// HTML e5071a20 #concept-settings-object-time-origin / #initialise-the-document-object
+/// and Navigation Timing 245fee24 #domloading. An existing Document's clock
+/// does not restart when its JavaScript Realm is materialized later.
+///
+/// Keep this independent of FetchTiming: local/initial Documents can have a
+/// native clock without network metadata or a navigation performance entry.
+/// With no captured navigation start, the original native creation moment is
+/// a fallback origin, not a measurement of an earlier browser navigation.
+pub(crate) fn document_timing_data(
+    fetched: Option<&FetchTiming>,
+    url: &str,
+    navigation_start: Option<f64>,
+    created: f64,
+    initial_blank: bool,
+) -> serde_json::Value {
+    let mut data = fetched.map_or_else(
+        || serde_json::json!({}),
+        |timing| timing.navigation_data(url),
+    );
+    let origin = fetched
+        .map(|timing| timing.start_time)
+        .or(navigation_start)
+        .unwrap_or(created);
+    data["timeOrigin"] = serde_json::json!((origin * 10.).floor() / 10.);
+    data["legacy:navigationStart"] = serde_json::json!(origin.floor());
+    // HTML's initial about:blank is complete from creation; it never enters
+    // loading. Other accepted Documents record their first loading moment.
+    data["legacy:domLoading"] = serde_json::json!(if initial_blank { 0. } else { created.floor() });
+    data
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct FetchTiming {
     pub navigation_type: NavigationType,

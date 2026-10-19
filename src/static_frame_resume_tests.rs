@@ -130,6 +130,176 @@ async fn static_frames_resume_native_binding_preserves_opaque_identity_readiness
     server.await.unwrap();
 }
 
+#[tokio::test]
+async fn document_clock_restored_srcdoc_data_and_initial_blank_precede_materialization() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let data = crate::img::base64_encode(b"<!doctype html><body>data child");
+    let markup = format!(
+        "<!doctype html><body><iframe id=blank></iframe><iframe id=srcdoc srcdoc='<p>inline child'></iframe><iframe id=data src='data:text/html;base64,{data}'></iframe><iframe id=no-content src='/no-document'></iframe>"
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url =
+        url::Url::parse(&format!("http://{}/parent", listener.local_addr().unwrap())).unwrap();
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = requests.clone();
+    let server = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                head.push(socket.read_u8().await.unwrap());
+                assert!(head.len() < 16384);
+            }
+            let head = String::from_utf8(head).unwrap();
+            let no_document = head.starts_with("GET /no-document ");
+            recorded.lock().unwrap().push(head);
+            let (status, body) = if no_document {
+                (204, "")
+            } else {
+                (200, markup.as_str())
+            };
+            socket.write_all(format!("HTTP/1.1 {status} OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+        }
+    });
+    let storage = crate::js::WebStorage::default();
+    let mut response = crate::http::fetch(&crate::http::Request::get(url.clone()))
+        .await
+        .unwrap();
+    // Optional FetchTiming is not a prerequisite for retaining a Document's
+    // own clock; exercise the genuinely absent-metadata root path as well.
+    response.timing = None;
+    let response = crate::http::execute_js(response, (80, 24), (8, 16), storage.clone()).await;
+    assert!(response.live.is_none());
+    let owner = response.service_client.as_ref().unwrap();
+    let crate::http::frames::DeferredPage { html, env } = owner.take_deferred_page().unwrap();
+    let completed = crate::performance::now_ms();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let dom = Rc::new(RefCell::new(Dom::parse_document(&html)));
+    dom.borrow_mut().set_doc_url(Some(url.clone()));
+    let mut state = HostState::new(dom.clone(), Rc::new(RealmClock::new()));
+    state.storage = storage;
+    state.blobs = env.blobs;
+    state.service_workers.prefetched_frames =
+        crate::http::frames::ActorFrames::new(env.prefetched_frames, &dom.borrow(), true);
+    state.realm_origins.insert(0, owner.client().origin());
+    state
+        .service_workers
+        .document(0, owner, state.blobs.clone(), state.blob_agent);
+    let (events, _tasks) = tokio::sync::mpsc::unbounded_channel();
+    state.enable_network(
+        url.clone(),
+        tokio::runtime::Handle::current(),
+        env.cache,
+        events,
+    );
+    let mut engine = configured_engine_before_prelude(state, url.as_str());
+    eval(
+        &mut engine,
+        "__trust_cfg.resumedDocument=true;",
+        "existing root",
+    )
+    .unwrap();
+    eval_platform_prelude(&mut engine).unwrap();
+    eval(&mut engine, r#"
+        globalThis.replayed=0;
+        for(const frame of document.querySelectorAll('iframe'))frame.onload=()=>++replayed;
+        __trust.hydrateFrames();__trust.parserFinished();__trust.fireDOMContentLoaded();__trust.completeDocumentLoad();
+    "#, "materialize local frame Documents").unwrap();
+    for name in ["blank", "srcdoc", "data", "no-content"] {
+        let context = {
+            let state = engine.ctx().host::<HostState>().unwrap();
+            let node = dom.borrow().get_by_id(name).unwrap();
+            state.frame_contexts[&node]
+        };
+        run_in_context_realm(&mut engine, context, "original local Document clock", |engine| {
+            assert_eq!(string_value(engine, "document.readyState"), "complete");
+            let stamps: Vec<f64> = serde_json::from_str(&string_value(engine,
+                "JSON.stringify([performance.timeOrigin,performance.timing.navigationStart,performance.timing.domLoading,performance.timing.fetchStart,performance.timing.domainLookupStart,performance.timing.connectStart,performance.timing.domInteractive,performance.timing.domComplete,performance.timing.loadEventEnd,performance.getEntriesByType('navigation').length,performance.now()])"
+            )).unwrap();
+            assert!(stamps[0] > 0. && stamps[0] <= completed, "{name}: {stamps:?}");
+            assert_eq!(stamps[1], stamps[0].floor());
+            if matches!(name, "blank" | "no-content") {
+                assert_eq!(stamps[2], 0., "initial blank never entered loading");
+            } else {
+                assert!(stamps[1] <= stamps[2] && stamps[2] <= completed.floor(), "{name}: {stamps:?}");
+            }
+            assert_eq!(&stamps[3..10], &[0.,0.,0.,0.,0.,0.,0.], "missing phases: {name}");
+            assert!(stamps[10] >= 20., "local clock restarted at materialization: {name}: {stamps:?}");
+            Ok(())
+        }).unwrap();
+    }
+    assert_eq!(string_value(&mut engine, "String(replayed)"), "0");
+    assert_eq!(requests.lock().unwrap().len(), 2);
+    server.await.unwrap();
+}
+
+#[test]
+fn document_clock_live_local_replacement_updates_initial_blank_clock() {
+    let data = crate::img::base64_encode(b"<!doctype html><body>local data");
+    for source in ["srcdoc", "data"] {
+        let mut engine = platform_engine_with_body();
+        eval(
+            &mut engine,
+            r#"
+            globalThis.frame=document.createElement('iframe');document.body.append(frame);
+            globalThis.initialWindow=frame.contentWindow;
+        "#,
+            "initial blank clock",
+        )
+        .unwrap();
+        let initial_context = *engine
+            .ctx()
+            .host::<HostState>()
+            .unwrap()
+            .frame_contexts
+            .values()
+            .next()
+            .unwrap();
+        let mut initial_origin = 0.;
+        run_in_context_realm(&mut engine, initial_context, "initial clock", |engine| {
+            assert_eq!(
+                string_value(engine, "String(performance.timing.domLoading)"),
+                "0"
+            );
+            initial_origin = string_value(engine, "String(performance.timeOrigin)")
+                .parse::<f64>()
+                .unwrap();
+            Ok(())
+        })
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        let navigate = if source == "srcdoc" {
+            "frame.srcdoc='<body>local inline';__trust.hydrateFrames();".into()
+        } else {
+            format!("frame.src='data:text/html;base64,{data}';__trust.hydrateFrames();")
+        };
+        eval(&mut engine, &navigate, "replace initial blank locally").unwrap();
+        if source == "srcdoc" {
+            assert_eq!(
+                string_value(&mut engine, "String(frame.contentWindow===initialWindow)"),
+                "true"
+            );
+        }
+        let context = *engine
+            .ctx()
+            .host::<HostState>()
+            .unwrap()
+            .frame_contexts
+            .values()
+            .next()
+            .unwrap();
+        run_in_context_realm(&mut engine, context, "replacement clock", |engine| {
+            let stamps: Vec<f64> = serde_json::from_str(&string_value(engine,
+                "JSON.stringify([performance.timeOrigin,performance.timing.navigationStart,performance.timing.domLoading,performance.timing.fetchStart,performance.getEntriesByType('navigation').length])"
+            )).unwrap();
+            assert!(stamps[0] > initial_origin, "{source}: {stamps:?}");
+            assert!(stamps[1] <= stamps[2] && stamps[2] > 0., "{source}: {stamps:?}");
+            assert_eq!(&stamps[3..], &[0.,0.], "local navigation invented fetch metadata");
+            Ok(())
+        }).unwrap();
+    }
+}
+
 #[test]
 fn static_frames_resumed_styles_keep_resource_states_and_allow_later_insertions() {
     let mut dom = Dom::parse_document(
