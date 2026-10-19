@@ -324,6 +324,9 @@ tempfile = "3.27.0"
 wat = "1"
 
 [patch.crates-io]
+# Preserve cluster offsets in shaping contexts spanning more than 64 KiB.
+# Same pinned release, with one private storage correction; see PATCHES.txt.
+parley = { path = "vendor/parley-0.11.1" }
 # Preserve usvg's exact shaping clusters for SVG DOM character geometry.
 # Optional records stay off for ordinary rendering; see vendor/usvg-0.48.1/README.trust.txt.
 usvg = { path = "vendor/usvg-0.48.1" }

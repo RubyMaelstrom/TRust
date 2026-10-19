@@ -1,0 +1,13 @@
+TRust Parley 0.11.1 correction
+
+Source: crates.io parley 0.11.1, from the unchanged local Cargo registry
+package. Upstream repository/revision is recorded in .cargo_vcs_info.json;
+the original Apache-2.0 and MIT licenses are retained.
+
+CSS Text 3 #boundary-shaping requires shaping through unchanged inline
+formatting, regardless of DOM Text-node boundaries. ClusterData text_offset
+formerly truncated a run-relative source byte offset to u16, wrapping text
+ranges in contexts over 64 KiB. Store the offset as usize, matching the
+source iterator and RunData text ranges. No font, shaping, or line-breaking
+algorithm changes. Browser regression coverage lives in src/text/context.rs
+and src/layout2/servo_regressions.rs.
