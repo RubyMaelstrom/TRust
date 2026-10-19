@@ -98,6 +98,7 @@ pub(crate) const HOST_BOUNDARY_SIGNATURES: &[(&str, usize)] = &[
     ("__dom_get_attr", 2),
     ("__dom_input", 3),
     ("__dom_computed", 2),
+    ("__dom_text_transform", 2),
     ("__dom_transition_events", 0),
     ("__dom_animation_events", 0),
     ("__dom_offset_style", 1),

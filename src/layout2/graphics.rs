@@ -144,6 +144,9 @@ struct Builder<'a> {
     last_selection_paint: Option<(NodeId, Option<crate::render::HighlightPaint>)>,
     /// The document styles `::selection` (`Dom::has_selection_rules`).
     selection_rules: bool,
+    /// UTF-16 boundary indexes for original Text data copied by transformed
+    /// runs. A long node split over many lines is indexed only once.
+    original_text_indices: rustc_hash::FxHashMap<NodeId, Vec<usize>>,
     /// Elements whose images are replaced content (`PagePaint::replaced_images`).
     replaced_images: HashSet<NodeId>,
     /// The retained leaf cache of this paint (`paint_cache`); `None` paints
@@ -165,7 +168,7 @@ impl<'a> Builder<'a> {
     /// selection), and how its originating element's `::selection` paints
     /// (CSS Pseudo 4 #highlight-styling). The element is the parent of the
     /// run's Text node, which a selection's highlight belongs to.
-    fn run_selection(&mut self, sources: &[TextSourceSpan]) -> RunSelection {
+    fn run_selection(&mut self, sources: &[TextSourceSpan], style: PaintStyle) -> RunSelection {
         let Some(element) = sources
             .first()
             .and_then(|span| self.dom.node(span.node).parent)
@@ -194,6 +197,46 @@ impl<'a> Builder<'a> {
         match paint {
             Some(highlight) => RunSelection {
                 sources: Some(std::sync::Arc::from(sources)),
+                // CSS Text #text-transform-property / CSS Pseudo
+                // #first-letter-styling: a pseudo's own transform must not
+                // change copied text either. Use the run's actual style.
+                original: style
+                    .value(self.dom, "text-transform")
+                    .filter(|value| value.trim() != "none")
+                    .map(|_| {
+                        let mut original = sources
+                            .iter()
+                            .filter_map(|span| {
+                                let crate::dom::NodeData::Text(text) =
+                                    &self.dom.node(span.node).data
+                                else {
+                                    return None;
+                                };
+                                let indices = self
+                                    .original_text_indices
+                                    .entry(span.node)
+                                    .or_insert_with(|| {
+                                        let mut indices = Vec::with_capacity(text.len() + 1);
+                                        for (byte, c) in text.char_indices() {
+                                            indices
+                                                .extend(std::iter::repeat_n(byte, c.len_utf16()));
+                                        }
+                                        indices.push(text.len());
+                                        indices
+                                    });
+                                let start = *indices.get(span.offset as usize)?;
+                                let end = *indices.get(span.offset_end as usize)?;
+                                Some(crate::render::selection::OriginalText {
+                                    node: span.node,
+                                    offset: span.offset,
+                                    offset_end: span.offset_end,
+                                    text: text[start..end].to_string(),
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        original.sort_by_key(|source| (source.node, source.offset));
+                        original.into()
+                    }),
                 highlight,
                 ..RunSelection::default()
             },
@@ -323,6 +366,7 @@ impl<'a> Builder<'a> {
                     .iter()
                     .any(|top| has_backdrop_filter(&top.fragment)),
             selection_paint: Default::default(),
+            original_text_indices: Default::default(),
             user_select: Default::default(),
             last_selection_paint: None,
             selection_rules: dom.has_selection_rules(),
@@ -1519,6 +1563,13 @@ fn paint_animation_scope(fragment: &Frag, builder: &Builder<'_>) -> Option<CssAn
     if fragment.node == NO_NODE || fragment.paint.pseudo.is_some() {
         return None;
     }
+    // Terminal layout also builds a graphical snapshot, but its cell
+    // compositor does not sample these stacks. Keep its actor sampling.
+    if crate::text::cell_metrics().is_some()
+        && builder.dom.css_composition_can_composite(fragment.node)
+    {
+        return None;
+    }
     let definitions = builder.dom.css_animation_definitions(fragment.node);
     if definitions.is_empty() {
         return None;
@@ -1664,7 +1715,28 @@ fn paint_animation_scope(fragment: &Frag, builder: &Builder<'_>) -> Option<CssAn
             opacity,
         });
     }
-    (!animations.is_empty()).then_some(CssAnimationScope { animations })
+    let composition = super::transform::matrix(fragment)
+        .inverse()
+        .and_then(|inverse_static| {
+            builder
+                .dom
+                .css_composition_stack(fragment.node)
+                .map(|stack| crate::render::ComposedPaint {
+                    stack,
+                    units,
+                    viewport,
+                    reference,
+                    origin: transform_origin,
+                    inverse_static,
+                })
+        });
+    if composition.is_none() && builder.dom.css_composition_can_composite(fragment.node) {
+        return None;
+    }
+    (!animations.is_empty()).then_some(CssAnimationScope {
+        animations,
+        composition,
+    })
 }
 
 /// CSS Animations 1 §3.3 synthesizes missing 0%/100% values from the
@@ -2357,7 +2429,7 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
                 } else {
                     RunSelection {
                         line_start: piece.line_start,
-                        ..builder.run_selection(&piece.sources)
+                        ..builder.run_selection(&piece.sources, paint_style)
                     }
                 };
                 let label_layer = placeholder_paint
@@ -3348,7 +3420,11 @@ fn push_layer(
     let Some(style) = PaintStyle::of(fragment) else {
         return ContextLayers::default();
     };
-    let opacity = fragment.paint.opacity.clamp(0.0, 1.0);
+    let opacity = if builder.dom.css_composition_is_painted(fragment.node) {
+        1.0
+    } else {
+        fragment.paint.opacity.clamp(0.0, 1.0)
+    };
     let blend = style
         .value(builder.dom, "mix-blend-mode")
         .as_deref()
@@ -3372,6 +3448,7 @@ fn push_layer(
     // of those. Only needed once some box uses a backdrop filter.
     let backdrop_root = builder.backdrop_filters
         && (opacity < 1.0
+            || builder.dom.css_composition_is_painted(fragment.node)
             || !filters.is_empty()
             || mask.is_some()
             || backdrop.is_some()

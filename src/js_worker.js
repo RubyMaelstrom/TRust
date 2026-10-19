@@ -786,6 +786,18 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         context: 0,
     };
 
+    // CSS Font Loading's shared implementation uses this worker's slots,
+    // task queue and URL; its font source begins empty, independently of its
+    // creator Document (CSS Font Loading 3 #fontfacesource-workers).
+    g.__font_adapter = {
+        control: WK, slots: internalsFor,
+        queue(fn) { platformTasks.push(fn); },
+        baseURL() { return lp[0]; },
+        fire(target, Interface, type, init) {
+            dispatchScopeEvent(trustedScopeEvent(Interface, type, init), true, target);
+        },
+    };
+
     // --- atob / btoa ---
     var B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     g.btoa = function (s) {

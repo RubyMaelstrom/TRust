@@ -102,6 +102,13 @@ impl Flow<'_> {
             };
         }
         let resolved = self.intrinsic_height_basis_in(b, cb_h);
+        if self.vertical_text(b) && cb_h.is_some() {
+            // CSS Writing Modes #orthogonal-flows and Grid #algo-grid-sizing:
+            // the containing row is the available inline space of vertical
+            // text, even when its own height is auto. Key this constraint so
+            // the second track-sizing pass cannot reuse an unconstrained probe.
+            return self.intrinsic_w_keyed(b, mode, inl, Some(resolved.or(cb_h)));
+        }
         if resolved == self.intrinsic_height_basis(b) {
             self.intrinsic_w(b, mode, inl)
         } else {
@@ -125,7 +132,12 @@ impl Flow<'_> {
         if b.style.size_container != 0 {
             return 0.0;
         }
-        if b.node != NO_NODE
+        // Subgrid track constraints are transaction-local and are not part
+        // of either intrinsic memo key (CSS Grid 2 #algo-grid-sizing).
+        let independent =
+            !self.subgrid_columns.borrow().active() && !self.subgrid_rows.borrow().active();
+        if independent
+            && b.node != NO_NODE
             && height.is_none()
             && let Some(hit) = self.imemo.borrow().get(&(b.node, mode == IMode::Min))
         {
@@ -140,7 +152,7 @@ impl Flow<'_> {
             parent: inl,
             constraint: super::memo::Constraint::Intrinsic(mode == IMode::Min, height),
         };
-        let reuse = self.reuse && b.node != NO_NODE;
+        let reuse = self.reuse && b.node != NO_NODE && independent;
         if reuse && let Some(value) = self.dom.layout_cache.borrow_mut().intrinsic(&request) {
             let width = value.value;
             if height.is_none() {
@@ -167,7 +179,7 @@ impl Flow<'_> {
                 .borrow_mut()
                 .store_intrinsic(&request, &value);
         }
-        if b.node != NO_NODE && height.is_none() {
+        if independent && b.node != NO_NODE && height.is_none() {
             self.imemo
                 .borrow_mut()
                 .insert((b.node, mode == IMode::Min), value);
@@ -184,7 +196,7 @@ impl Flow<'_> {
     ) -> f32 {
         let _profile = super::diagnostics::enter(super::diagnostics::Op::IntrinsicCompute);
         let here = InlineStyle::for_box(self.dom, b.node, &b.style, inl, self.base);
-        if let Some((_, width, _)) = self.vertical_lines(b, None, None, &here) {
+        if let Some((_, width, _)) = self.vertical_lines(b, basis, None, &here) {
             return width;
         }
         // HTML Rendering #the-marquee-element-2 slides a horizontal marquee's

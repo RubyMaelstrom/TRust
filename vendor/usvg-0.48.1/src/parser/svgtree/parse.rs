@@ -451,7 +451,11 @@ fn append_attribute<'input>(
         return false;
     }
 
-    if aid.allows_inherit_value() && &*value == "inherit" {
+    if aid.allows_inherit_value()
+        && (&*value == "inherit"
+            || (aid == AId::TextTransform
+                && (value.eq_ignore_ascii_case("inherit") || value.eq_ignore_ascii_case("unset"))))
+    {
         return resolve_inherit(parent_id, aid, doc);
     }
 

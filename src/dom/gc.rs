@@ -147,6 +147,17 @@ impl Dom {
         dead: &FxHashSet<NodeId>,
         mut retired_slot: bool,
     ) {
+        self.downloaded_fonts
+            .retain(|(document, _), _| !dead.contains(document));
+        self.font_requests
+            .get_mut()
+            .0
+            .retain(|request| !dead.contains(&request.document));
+        self.font_requests
+            .get_mut()
+            .1
+            .retain(|(document, _)| !dead.contains(document));
+        self.font_demands.forget_scopes(dead);
         let mut changed_popovers = false;
         let mut retired_scope = false;
         let mut svg_consumers = Vec::new();

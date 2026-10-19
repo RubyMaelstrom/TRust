@@ -258,7 +258,11 @@ impl StyleBackend for Dom {
     }
     #[inline]
     fn transition_value(&self, id: NodeId, name: &str) -> Option<String> {
-        self.transitions.value(id, name)
+        if self.animations.composed_value((id, None), name).is_some() {
+            None
+        } else {
+            self.transitions.value(id, name)
+        }
     }
     #[inline]
     fn transition_affects(&self, name: &str) -> bool {
@@ -675,7 +679,8 @@ impl Dom {
     }
     #[inline]
     pub(crate) fn css_animation_definitions(&self, id: NodeId) -> Vec<CssAnimationDefinition> {
-        ComputeView(self).css_animation_definitions(id)
+        ComputeView(self)
+            .css_animation_definitions_with_composition(id, self.css_composition_can_composite(id))
     }
     #[inline]
     pub fn computed_display(&self, id: NodeId) -> Option<String> {

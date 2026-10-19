@@ -211,6 +211,6 @@
         "self", "name", "performance", "crypto", "createImageBitmap", "OffscreenCanvas", "Request", "Response",
         "Headers", "FileReader", "FileReaderSync", "WorkerGlobalScope", "DedicatedWorkerGlobalScope",
         "WorkerNavigator", "WorkerLocation", "atob", "btoa", "reportError", "structuredClone", "isSecureContext",
-        "origin", "crossOriginIsolated", "scheduler"])
+        "origin", "crossOriginIsolated", "scheduler", "FontFace", "FontFaceSet", "FontFaceSetLoadEvent"])
         Reflect.deleteProperty(g, name);
 })(globalThis);

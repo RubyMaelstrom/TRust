@@ -135,6 +135,36 @@ fn pixel(frame: &OwnedRgbaFrame, x: usize, y: usize) -> [u8; 4] {
 }
 
 #[test]
+fn presentation_snapshot_keeps_video_and_backdrop_on_the_same_frame() {
+    let surface = VideoSurface::new();
+    let handle = ImageHandle::for_video(surface.id());
+    let scene = video_scene(handle);
+    surface.show_for_test(picture(Layout::SemiPlanar, 8, color(1, false), |_, _| {
+        (90, 200)
+    }));
+    let images = super::frame_images::FrameImages::default();
+    let effects = images.clone();
+    let (first, serial) = images.video(&scene, handle).unwrap();
+    surface.show_for_test(picture(Layout::SemiPlanar, 8, color(1, false), |_, _| {
+        (200, 90)
+    }));
+    let (backdrop, backdrop_serial) = effects.image(&scene, handle).unwrap();
+    assert_eq!(serial, backdrop_serial);
+    assert_eq!(&*backdrop.rgba, first.to_rgba(1).unwrap().0);
+    let next = super::frame_images::FrameImages::default();
+    assert_ne!(next.video(&scene, handle).unwrap().1, serial);
+    // Ending/replacing a load must not erase a frame an in-flight paint
+    // already sampled, nor make a later presentation reuse that old frame.
+    surface.clear();
+    assert!(images.video(&scene, handle).is_some());
+    assert!(
+        super::frame_images::FrameImages::default()
+            .video(&scene, handle)
+            .is_none()
+    );
+}
+
+#[test]
 fn hybrid_video_frames_match_the_cpu_conversion() {
     let Ok(mut hybrid) = futures::executor::block_on(VelloHybridRenderer::new_headless()) else {
         eprintln!("skipped: no GPU adapter");

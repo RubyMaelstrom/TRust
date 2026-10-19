@@ -744,6 +744,7 @@ impl AId {
                 | AId::TextDecoration
                 | AId::TextOverflow
                 | AId::TextRendering
+                | AId::TextTransform
                 | AId::Transform
                 | AId::TransformOrigin
                 | AId::UnicodeBidi
@@ -813,6 +814,7 @@ impl AId {
                 | AId::TextAnchor
                 | AId::TextDecoration
                 | AId::TextRendering
+                | AId::TextTransform
                 | AId::Visibility
                 | AId::WordSpacing
                 | AId::WritingMode

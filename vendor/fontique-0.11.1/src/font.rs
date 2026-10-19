@@ -6,10 +6,10 @@
 use crate::{CharmapIndex, Script, ScriptExt as _};
 
 use super::source::{SourceInfo, SourceKind};
-use super::{Blob, source_cache::SourceCache};
+use super::{source_cache::SourceCache, Blob};
 use crate::{FontStyle, FontWeight, FontWidth};
 use core::fmt;
-use read_fonts::{FontRef, TableProvider as _, types::Tag};
+use read_fonts::{types::Tag, FontRef, TableProvider as _};
 use smallvec::SmallVec;
 
 type AxisVec = SmallVec<[AxisInfo; 1]>;
@@ -31,6 +31,8 @@ pub struct FontInfo {
     /// TRust: CSS `@font-face` descriptors replacing the attributes implied
     /// by the font data (`None`: the font data's own).
     descriptors: Option<FaceDescriptors>,
+    /// TRust: a CSS face, possibly a member of a unicode-range composite.
+    pub(crate) composite: bool,
 }
 
 /// TRust: the italic values and oblique angles a face supports (CSS Fonts 4
@@ -210,7 +212,9 @@ impl FontInfo {
                     if -target != axis.default {
                         push(&mut synth, b"slnt", -target);
                     }
-                } else if range.oblique.is_some_and(|[lo, hi]| lo <= angle && angle <= hi)
+                } else if range
+                    .oblique
+                    .is_some_and(|[lo, hi]| lo <= angle && angle <= hi)
                     || has_oblique(range)
                 {
                     // A face of the requested (or the nearest) angle.
@@ -457,6 +461,7 @@ impl FontInfo {
             monospaced,
             script_coverage,
             descriptors: None,
+            composite: false,
         })
     }
 
@@ -479,6 +484,7 @@ impl FontInfo {
     }
 
     pub(crate) fn apply_override(&mut self, info_override: &FontInfoOverride<'_>) {
+        self.composite = info_override.composite;
         if info_override.descriptors != FaceDescriptors::default() {
             self.descriptors = Some(info_override.descriptors);
         }
@@ -613,12 +619,12 @@ impl fmt::Debug for Synthesis {
 
 fn read_attributes(font: &FontRef<'_>) -> (FontWidth, FontStyle, FontWeight) {
     use read_fonts::{
-        TableProvider,
         tables::{
             head::{Head, MacStyle},
             os2::{Os2, SelectionFlags},
             post::Post,
         },
+        TableProvider,
     };
 
     fn width_from_width_class(width_class: u16) -> FontWidth {
@@ -715,4 +721,7 @@ pub struct FontInfoOverride<'a> {
     /// descriptors, used for matching and synthesis in place of the font's
     /// own attributes.
     pub descriptors: FaceDescriptors,
+    /// TRust: match all equally styled CSS faces in reverse registration
+    /// order, so their effective character maps form a composite face.
+    pub composite: bool,
 }

@@ -349,6 +349,8 @@ pub enum AId {
     TextOrientation,
     TextOverflow,
     TextRendering,
+    TextTransform,
+    Lang,
     TextUnderlinePosition,
     TextLength,
     Transform,
@@ -640,12 +642,22 @@ static ATTRIBUTES: Map<AId> = Map {
 
 impl AId {
     pub(crate) fn from_str(text: &str) -> Option<AId> {
+        match text {
+            "text-transform" => return Some(AId::TextTransform),
+            "lang" => return Some(AId::Lang),
+            _ => {}
+        }
         ATTRIBUTES.get(text).cloned()
     }
 
     /// Returns the original string.
     #[inline(never)]
     pub fn to_str(self) -> &'static str {
+        match self {
+            AId::TextTransform => return "text-transform",
+            AId::Lang => return "lang",
+            _ => {}
+        }
         ATTRIBUTES.key(&self)
     }
 }

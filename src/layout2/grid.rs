@@ -9,9 +9,9 @@
 //!
 //! Track sizing uses the parenthesis-aware token stream and a separate
 //! line-name index. Named lines, occurrences, spans and areas participate in
-//! signed placement before implicit tracks are normalized. Row subgrids share
-//! track sizing and placement with their parent (css-grid-2 §9).
-//! Column subgrids require the matching parent inline-track constraint pass.
+//! signed placement before implicit tracks are normalized. Subgrids share
+//! track sizing and placement with their parent in either or both axes
+//! (CSS Grid 2 #subgrids / #algo-grid-sizing, CSSWG 81c27f686901).
 
 use std::ops::Range;
 
@@ -798,26 +798,31 @@ struct Contrib {
 }
 
 struct GridSetup<'t> {
+    col_contributions: Vec<Contrib>,
     ordered: Vec<&'t BoxNode>,
     cols: Vec<Track>,
     rows: Vec<Track>,
     placed: Vec<Placed>,
     row_names: Vec<Vec<String>>,
+    col_names: Vec<Vec<String>>,
+    row_areas: AxisAreas,
+    col_areas: AxisAreas,
     gap_col: f32,
     gap_row: f32,
-    inherited: Option<RowInput>,
+    inherited: Option<AxisInput>,
+    inherited_columns: Option<AxisInput>,
 }
 
 /// Per-transaction parent constraints, never retained across layouts. A subgrid
 /// is NOT an independent formatting context (#subgrid-items): its descendants'
 /// contributions travel up, and the resulting track positions travel down.
 #[derive(Default)]
-pub(super) struct SubgridRows {
-    inputs: std::collections::HashMap<NodeId, RowInput>,
+pub(super) struct SubgridAxis {
+    inputs: std::collections::HashMap<NodeId, AxisInput>,
     contributions: std::collections::HashMap<NodeId, Vec<Contrib>>,
 }
 
-impl SubgridRows {
+impl SubgridAxis {
     pub(super) fn active(&self) -> bool {
         !self.inputs.is_empty()
     }
@@ -827,9 +832,10 @@ impl SubgridRows {
 }
 
 #[derive(Clone)]
-struct RowInput {
+struct AxisInput {
     tracks: Vec<Track>,
     names: Vec<Vec<String>>,
+    areas: AxisAreas,
     // None during intrinsic measurement; exact parent positions on final layout.
     positions: Option<Vec<f32>>,
     gap: f32,
@@ -837,7 +843,59 @@ struct RowInput {
     end_edge: f32,
 }
 
-impl RowInput {
+type AxisAreas = Vec<(String, Range<usize>)>;
+
+/// Grid 2 #subgrid-area-inheritance: a partially overlapping named area
+/// supplies start/end names on the clipped subgrid edge as well.
+fn subgrid_names(
+    names: &[Vec<String>],
+    areas: &AxisAreas,
+    span: &Range<usize>,
+) -> (Vec<Vec<String>>, AxisAreas) {
+    let mut names = names[span.start..=span.end].to_vec();
+    let mut inherited = Vec::new();
+    for (name, area) in areas {
+        let start = area.start.max(span.start);
+        let end = area.end.min(span.end);
+        if start >= end {
+            continue;
+        }
+        let local = start - span.start..end - span.start;
+        if area.start < span.start {
+            names[local.start].push(format!("{name}-start"));
+        }
+        if area.end > span.end {
+            names[local.end].push(format!("{name}-end"));
+        }
+        inherited.push((name.clone(), local));
+    }
+    (names, inherited)
+}
+
+impl AxisInput {
+    /// Grid 2 #subgrid-indexing: inherited lines follow the subgrid's own
+    /// inline direction, including when it opposes its parent's direction.
+    fn reversed(mut self) -> Self {
+        if let Some(positions) = &mut self.positions {
+            let extent = positions.last().copied().unwrap_or(0.)
+                + self.tracks.last().map_or(0., |track| track.base);
+            *positions = positions
+                .iter()
+                .zip(&self.tracks)
+                .rev()
+                .map(|(position, track)| extent - position - track.base)
+                .collect();
+        }
+        self.tracks.reverse();
+        self.names.reverse();
+        let count = self.tracks.len();
+        for (_, range) in &mut self.areas {
+            *range = count - range.end..count - range.start;
+        }
+        std::mem::swap(&mut self.start_edge, &mut self.end_edge);
+        self
+    }
+
     fn export(&self, mut items: Vec<Contrib>, gap: f32) -> Vec<Contrib> {
         let n = self.tracks.len();
         let difference = (gap - self.gap) / 2.0;
@@ -1635,11 +1693,13 @@ impl Flow<'_> {
         def_ch: Option<f32>,
         inl: &InlineStyle,
         mode: Option<IMode>,
+        row_bases: Option<&[f32]>,
     ) -> GridSetup<'t> {
         let node = b.node;
         let u = Units::of(self.dom, node);
         let cv = |p: &str| self.dom.computed_value_resolved(node, p);
         let inherited = self.subgrid_rows.borrow().inputs.get(&node).cloned();
+        let inherited_columns = self.subgrid_columns.borrow().inputs.get(&node).cloned();
 
         // Gaps: `gap` = <row-gap> <column-gap>; longhands win.
         let (short_row, short_col) = {
@@ -1656,7 +1716,15 @@ impl Flow<'_> {
                 .unwrap_or(0.0)
                 .max(0.0)
         };
-        let gap_col = parse_gap(cv("column-gap"), short_col, basis);
+        let col_gap_value = cv("column-gap").or(short_col);
+        let gap_col = if col_gap_value
+            .as_deref()
+            .is_none_or(|v| v.trim().is_empty() || v.trim() == "normal")
+        {
+            inherited_columns.as_ref().map_or(0.0, |c| c.gap)
+        } else {
+            parse_gap(col_gap_value, None, basis)
+        };
         let row_gap_value = cv("row-gap").or(short_row);
         let gap_row = if row_gap_value
             .as_deref()
@@ -1674,10 +1742,15 @@ impl Flow<'_> {
             min: TrackFn::Auto,
             max: TrackFn::Auto,
         };
-        let mut cols: Vec<Track> = cv("grid-template-columns")
-            .as_deref()
-            .and_then(|v| parse_template(v, u, self.vp, basis, gap_col))
-            .unwrap_or_default();
+        let mut cols: Vec<Track> = inherited_columns
+            .as_ref()
+            .map(|c| c.tracks.clone())
+            .unwrap_or_else(|| {
+                cv("grid-template-columns")
+                    .as_deref()
+                    .and_then(|v| parse_template(v, u, self.vp, basis, gap_col))
+                    .unwrap_or_default()
+            });
         let mut rows: Vec<Track> =
             inherited
                 .as_ref()
@@ -1688,7 +1761,7 @@ impl Flow<'_> {
                         .and_then(|v| parse_template(v, u, self.vp, def_ch, gap_row))
                         .unwrap_or_default()
                 });
-        while cols.len() < area_cols_n {
+        while inherited_columns.is_none() && cols.len() < area_cols_n {
             cols.push(Track::new(auto_ts(), false));
         }
         while inherited.is_none() && rows.len() < area_rows_n {
@@ -1710,31 +1783,38 @@ impl Flow<'_> {
 
         // Per-item grid lines: grid-area, overridden by grid-row/column
         // shorthands, overridden by the *-start/*-end longhands.
-        let mut col_names = template_line_names(
-            &cv("grid-template-columns").unwrap_or_default(),
-            explicit_cols,
-        );
-        let mut row_names = if let Some(parent) = &inherited {
-            let mut names = parent.names.clone();
-            let serialized = serialize_subgrid_rows(
-                &cv("grid-template-rows").unwrap_or_default(),
-                explicit_rows,
-            );
-            for (line, token) in named_track_tokens(&serialized)
-                .into_iter()
-                .skip(1)
-                .enumerate()
-            {
-                if let Some(group) = token.strip_prefix('[').and_then(|v| v.strip_suffix(']')) {
-                    names[line].extend(group.split_whitespace().map(str::to_owned));
+        let axis_names = |property: &str, count: usize, parent: &Option<AxisInput>| {
+            if let Some(parent) = parent {
+                let mut names = parent.names.clone();
+                let serialized = serialize_subgrid_rows(&cv(property).unwrap_or_default(), count);
+                for (line, token) in named_track_tokens(&serialized)
+                    .into_iter()
+                    .skip(1)
+                    .enumerate()
+                {
+                    if let Some(group) = token.strip_prefix('[').and_then(|v| v.strip_suffix(']')) {
+                        names[line].extend(group.split_whitespace().map(str::to_owned));
+                    }
                 }
+                names
+            } else {
+                template_line_names(&cv(property).unwrap_or_default(), count)
             }
-            names
-        } else {
-            template_line_names(&cv("grid-template-rows").unwrap_or_default(), explicit_rows)
         };
+        let mut col_names = axis_names("grid-template-columns", explicit_cols, &inherited_columns);
+        let mut row_names = axis_names("grid-template-rows", explicit_rows, &inherited);
+        let mut col_areas = inherited_columns
+            .as_ref()
+            .map(|input| input.areas.clone())
+            .unwrap_or_default();
+        let mut row_areas = inherited
+            .as_ref()
+            .map(|input| input.areas.clone())
+            .unwrap_or_default();
         if let Some((areas, _, _)) = &areas {
             for (name, (rr, cc)) in areas {
+                col_areas.push((name.clone(), cc.clone()));
+                row_areas.push((name.clone(), rr.clone()));
                 for (names, range) in [(&mut col_names, cc), (&mut row_names, rr)] {
                     if let Some(line) = names.get_mut(range.start) {
                         line.push(format!("{name}-start"));
@@ -1814,13 +1894,17 @@ impl Flow<'_> {
         // Grid 2 #implicit-grids: signed placements can create tracks on
         // either side. Shift all definite placements by the prepended extent
         // before passing nonnegative indices to the occupancy algorithm.
-        let before_cols = placements
-            .iter()
-            .filter_map(|(c, _)| c.start)
-            .min()
-            .unwrap_or(0)
-            .min(0)
-            .unsigned_abs() as usize;
+        let before_cols = if inherited_columns.is_some() {
+            0
+        } else {
+            placements
+                .iter()
+                .filter_map(|(c, _)| c.start)
+                .min()
+                .unwrap_or(0)
+                .min(0)
+                .unsigned_abs() as usize
+        };
         let before_rows = if inherited.is_some() {
             0
         } else {
@@ -1834,7 +1918,25 @@ impl Flow<'_> {
         };
         for (c, r) in &mut placements {
             c.start = c.start.map(|n| n + before_cols as i32);
-            r.start = r.start.map(|n| (n + before_rows as i32).max(0));
+            r.start = r.start.map(|n| n + before_rows as i32);
+            // #subgrid-implicit / #overlarge-grids: a definite area crossing
+            // an edge is clipped; an area wholly outside occupies its nearest
+            // track. Preserve the end line when clipping a negative start.
+            for (place, count, subgridded) in [
+                (c, explicit_cols, inherited_columns.is_some()),
+                (r, explicit_rows, inherited.is_some()),
+            ] {
+                if subgridded {
+                    if let Some(start) = place.start {
+                        let end = (start + place.span as i32).clamp(1, count as i32);
+                        let start = start.clamp(0, count as i32 - 1);
+                        place.start = Some(start);
+                        place.span = (end - start).max(1) as usize;
+                    } else {
+                        place.span = place.span.min(count);
+                    }
+                }
+            }
         }
         // §8.5 works in flow-relative axes: its "columns" are the real
         // columns under row flow, the real ROWS under column flow.
@@ -1844,6 +1946,12 @@ impl Flow<'_> {
             explicit_rows + before_rows
         };
         let mut placed = auto_place(placements, minor_tracks.max(1), row_flow, dense);
+        if inherited_columns.is_some() {
+            for p in &mut placed {
+                p.cols.start = p.cols.start.min(explicit_cols - 1);
+                p.cols.end = p.cols.end.min(explicit_cols).max(p.cols.start + 1);
+            }
+        }
         if inherited.is_some() {
             // #subgrid-implicit: placement is resolved normally, then clamped
             // to the inherited explicit grid. No implicit subgrid rows exist.
@@ -1897,26 +2005,187 @@ impl Flow<'_> {
         }
         row_names.splice(0..0, (0..before_rows).map(|_| Vec::new()));
         row_names.resize(rows.len() + 1, Vec::new());
+        col_names.splice(0..0, (0..before_cols).map(|_| Vec::new()));
+        col_names.resize(cols.len() + 1, Vec::new());
+        for (areas, before) in [(&mut col_areas, before_cols), (&mut row_areas, before_rows)] {
+            for (_, range) in areas {
+                range.start += before;
+                range.end += before;
+            }
+        }
 
         // auto-fit: collapse repetition tracks no item spans (§7.2.3.2).
         for (ci, t) in cols.iter_mut().enumerate() {
-            if t.collapsible && !placed.iter().any(|p| p.cols.contains(&ci)) {
+            if inherited_columns.is_none()
+                && t.collapsible
+                && !placed.iter().any(|p| p.cols.contains(&ci))
+            {
                 t.collapsed = true;
             }
         }
         for (ri, t) in rows.iter_mut().enumerate() {
-            if t.collapsible && !placed.iter().any(|p| p.rows.contains(&ri)) {
+            if inherited.is_none() && t.collapsible && !placed.iter().any(|p| p.rows.contains(&ri))
+            {
                 t.collapsed = true;
             }
         }
 
+        // Grid 2 #algo-grid-sizing step 1: definite row maxima include
+        // distributed gaps when both the container and every row are definite.
+        let distributed_row_gap = def_ch
+            .and_then(|height| {
+                let sizes = rows
+                    .iter()
+                    .map(|track| {
+                        if track.collapsed {
+                            Some(0.)
+                        } else {
+                            track.size.max.definite(def_ch)
+                        }
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                let live = rows.iter().filter(|track| !track.collapsed).count();
+                let free =
+                    height - sizes.iter().sum::<f32>() - gap_row * live.saturating_sub(1) as f32;
+                Some(justify_offsets(dist_of(cv("align-content").as_deref()), free, live).1)
+            })
+            .unwrap_or(0.);
         // ---- §11 column sizing from intrinsic contributions ----
         let mut col_contribs: Vec<Contrib> = ordered
             .iter()
             .zip(&placed)
-            .map(|(it, p)| {
-                let min = self.contribution(it, IMode::Min, inl, None);
-                let max = self.contribution(it, IMode::Max, inl, None);
+            .enumerate()
+            .flat_map(|(index, (it, p))| {
+                // #algo-grid-sizing: definite row maxima are available to
+                // inline intrinsic contributions (e.g. a percentage height
+                // transferred through an aspect ratio) in this first pass.
+                let block_basis = row_bases
+                    .and_then(|bases| bases.get(index).copied())
+                    .or_else(|| {
+                        rows[p.rows.clone()]
+                            .iter()
+                            .map(|track| track.size.max.definite(def_ch))
+                            .collect::<Option<Vec<_>>>()
+                            .map(|heights| {
+                                heights.iter().sum::<f32>()
+                                    + (gap_row + distributed_row_gap)
+                                        * p.rows.len().saturating_sub(1) as f32
+                            })
+                    });
+                // CSS Grid 2 #algo-grid-sizing: recurse in the inline axis
+                // before resolving the parent's columns. The subgrid's own
+                // width constraints do not replace its descendants' sizes.
+                if let Content::Grid(children) = &it.content
+                    && self.dom.is_column_subgrid_item(it.node)
+                {
+                    let s = &it.style;
+                    let (names, areas) = subgrid_names(&col_names, &col_areas, &p.cols);
+                    let (start, end) = if b.style.rtl {
+                        (RIGHT, LEFT)
+                    } else {
+                        (LEFT, RIGHT)
+                    };
+                    let input = AxisInput {
+                        tracks: cols[p.cols.clone()].to_vec(),
+                        names,
+                        areas,
+                        positions: None,
+                        gap: gap_col,
+                        start_edge: s.margin[start].resolve(Some(0.)).unwrap_or(0.)
+                            + s.border[start]
+                            + self.pad(s, start, 0.),
+                        end_edge: s.margin[end].resolve(Some(0.)).unwrap_or(0.)
+                            + s.border[end]
+                            + self.pad(s, end, 0.),
+                    };
+                    let reversed = s.rtl != b.style.rtl;
+                    self.subgrid_columns
+                        .borrow_mut()
+                        .inputs
+                        .insert(it.node, if reversed { input.reversed() } else { input });
+                    let child_inline = InlineStyle::for_box(self.dom, it.node, s, inl, self.base);
+                    let bt = s.border[TOP] + self.pad(s, TOP, 0.);
+                    let bb = s.border[BOTTOM] + self.pad(s, BOTTOM, 0.);
+                    let row_subgrid = self.dom.is_row_subgrid_item(it.node);
+                    let child_height = if row_subgrid {
+                        None
+                    } else {
+                        self.height_px(&s.height, s, bt, bb, block_basis)
+                    }
+                    .or_else(|| {
+                        let align = cv("align-items");
+                        let align = self_align(align.as_deref(), super::flex::AlignItem::Stretch);
+                        let align = self_align(
+                            self.dom
+                                .computed_value_resolved(it.node, "align-self")
+                                .as_deref(),
+                            align,
+                        );
+                        (row_subgrid
+                            || (align == super::flex::AlignItem::Stretch
+                                && matches!(s.height, Len::Auto)
+                                && !matches!(s.margin[TOP], Len::Auto)
+                                && !matches!(s.margin[BOTTOM], Len::Auto)))
+                        .then(|| {
+                            block_basis.map(|height| {
+                                (height
+                                    - bt
+                                    - bb
+                                    - s.margin[TOP].resolve(Some(0.)).unwrap_or(0.)
+                                    - s.margin[BOTTOM].resolve(Some(0.)).unwrap_or(0.))
+                                .max(0.)
+                            })
+                        })
+                        .flatten()
+                    });
+                    let row_input = row_subgrid.then(|| {
+                        let (names, areas) = subgrid_names(&row_names, &row_areas, &p.rows);
+                        AxisInput {
+                            tracks: rows[p.rows.clone()].to_vec(),
+                            names,
+                            areas,
+                            positions: None,
+                            gap: gap_row,
+                            start_edge: bt + s.margin[TOP].resolve(Some(0.)).unwrap_or(0.),
+                            end_edge: bb + s.margin[BOTTOM].resolve(Some(0.)).unwrap_or(0.),
+                        }
+                    });
+                    let previous_row = row_input.as_ref().and_then(|input| {
+                        self.subgrid_rows
+                            .borrow_mut()
+                            .inputs
+                            .insert(it.node, input.clone())
+                    });
+                    self.grid_setup(it, children, None, child_height, &child_inline, mode, None);
+                    if row_input.is_some() {
+                        let mut state = self.subgrid_rows.borrow_mut();
+                        state.inputs.remove(&it.node);
+                        if let Some(previous) = previous_row {
+                            state.inputs.insert(it.node, previous);
+                        }
+                    }
+                    let mut state = self.subgrid_columns.borrow_mut();
+                    state.inputs.remove(&it.node);
+                    return state
+                        .contributions
+                        .remove(&it.node)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|c| {
+                            let tracks = if reversed {
+                                p.cols.len() - c.tracks.end..p.cols.len() - c.tracks.start
+                            } else {
+                                c.tracks.clone()
+                            };
+                            Contrib {
+                                tracks: tracks.start + p.cols.start..tracks.end + p.cols.start,
+                                ..c
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                }
+                let min = self.contribution(it, IMode::Min, inl, block_basis);
+                let max = self.contribution(it, IMode::Max, inl, block_basis);
                 let s = &it.style;
                 let bp = s.border[LEFT]
                     + s.border[RIGHT]
@@ -1924,7 +2193,7 @@ impl Flow<'_> {
                     + self.pad(s, RIGHT, 0.0);
                 let margins = s.margin[LEFT].resolve(Some(0.0)).unwrap_or(0.0)
                     + s.margin[RIGHT].resolve(Some(0.0)).unwrap_or(0.0);
-                Contrib {
+                vec![Contrib {
                     tracks: p.cols.clone(),
                     minimum: self.grid_minimum_contribution(
                         it,
@@ -1937,7 +2206,7 @@ impl Flow<'_> {
                     ),
                     min,
                     max,
-                }
+                }]
             })
             .collect();
         if mode.is_some() {
@@ -1959,23 +2228,38 @@ impl Flow<'_> {
             }
         }
         let jc = cv("justify-content");
-        size_tracks_constrained(
-            &mut cols,
-            &col_contribs,
-            basis,
-            gap_col,
-            dist_stretches(jc.as_deref()),
-            mode == Some(IMode::Min),
-        );
+        if let Some(input) = &inherited_columns {
+            self.subgrid_columns
+                .borrow_mut()
+                .contributions
+                .insert(node, input.export(col_contribs.clone(), gap_col));
+        }
+        if let Some((tracks, _)) = inherited_columns.as_ref().and_then(|c| c.resolved(gap_col)) {
+            cols = tracks;
+        } else {
+            size_tracks_constrained(
+                &mut cols,
+                &col_contribs,
+                basis,
+                gap_col,
+                dist_stretches(jc.as_deref()),
+                mode == Some(IMode::Min),
+            );
+        }
         GridSetup {
+            col_contributions: col_contribs,
             ordered,
             cols,
             rows,
             placed,
             row_names,
+            col_names,
+            row_areas,
+            col_areas,
             gap_col,
             gap_row,
             inherited,
+            inherited_columns,
         }
     }
 
@@ -1986,7 +2270,7 @@ impl Flow<'_> {
         mode: IMode,
         inl: &InlineStyle,
     ) -> f32 {
-        let setup = self.grid_setup(b, items, None, None, inl, Some(mode));
+        let setup = self.grid_setup(b, items, None, None, inl, Some(mode), None);
         let live = setup.cols.iter().filter(|t| !t.collapsed).count();
         setup.cols.iter().map(|t| t.base).sum::<f32>()
             + setup.gap_col * live.saturating_sub(1) as f32
@@ -2009,20 +2293,56 @@ impl Flow<'_> {
         inl: &InlineStyle,
         anchors: &mut Vec<(NodeId, f32)>,
     ) -> (Vec<Frag>, f32) {
+        let setup = self.grid_setup(b, items, Some(content_w), def_ch, inl, None, None);
+        self.grid_content_pass(
+            b,
+            items,
+            content_x,
+            content_top,
+            content_w,
+            def_ch,
+            min_ch,
+            inl,
+            anchors,
+            setup,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn grid_content_pass<'t>(
+        &self,
+        b: &'t BoxNode,
+        items: &'t [SharedBox],
+        content_x: f32,
+        content_top: f32,
+        content_w: f32,
+        def_ch: Option<f32>,
+        min_ch: f32,
+        inl: &InlineStyle,
+        anchors: &mut Vec<(NodeId, f32)>,
+        setup: GridSetup<'t>,
+        repeat_columns: bool,
+    ) -> (Vec<Frag>, f32) {
         use super::flex::AlignItem;
         let node = b.node;
         let cv = |p: &str| self.dom.computed_value_resolved(node, p);
         let jc = cv("justify-content");
         let GridSetup {
+            col_contributions,
             ordered,
             cols,
             mut rows,
             placed,
             row_names,
+            col_names,
+            row_areas,
+            col_areas,
             gap_col,
             gap_row,
             inherited,
-        } = self.grid_setup(b, items, Some(content_w), def_ch, inl, None);
+            inherited_columns,
+        } = setup;
 
         // Track positions + content-distribution of leftover main space.
         let positions =
@@ -2049,7 +2369,11 @@ impl Flow<'_> {
                 }
                 xs
             };
-        let col_x = positions(&cols, gap_col, Some(content_w), dist_of(jc.as_deref()));
+        let col_x = inherited_columns
+            .as_ref()
+            .and_then(|c| c.resolved(gap_col))
+            .map(|(_, positions)| positions)
+            .unwrap_or_else(|| positions(&cols, gap_col, Some(content_w), dist_of(jc.as_deref())));
 
         // ---- lay items at their area widths ----
         // (`place-items`/`place-self` expand to these longhands in the
@@ -2078,16 +2402,23 @@ impl Flow<'_> {
             /// The item's height is a percentage of its grid area, resolved
             /// once the rows are sized.
             area_percentage_h: bool,
-            subgrid: Option<RowInput>,
+            subgrid: Option<AxisInput>,
+            column_subgrid: Option<AxisInput>,
             row_contributions: Option<Vec<Contrib>>,
         }
         let mut gitems: Vec<GItem<'t>> = Vec::with_capacity(ordered.len());
         for (it, p) in ordered.iter().zip(&placed) {
             let s = &it.style;
             let (m, auto) = self.margins_of(s, content_w);
-            let area_x = col_x[p.cols.start];
+            let area_start = col_x[p.cols.start];
             let last = p.cols.end - 1;
-            let area_w = (col_x[last] + cols[last].base - area_x).max(0.0);
+            let area_end = col_x[last] + cols[last].base;
+            let area_w = (area_end - area_start).max(0.0);
+            let area_x = if b.style.rtl {
+                content_w - area_end
+            } else {
+                area_start
+            };
             let bp_l = s.border[LEFT] + self.pad(s, LEFT, area_w);
             let bp_r = s.border[RIGHT] + self.pad(s, RIGHT, area_w);
             let bp_h = bp_l + bp_r;
@@ -2109,37 +2440,92 @@ impl Flow<'_> {
                     self.dom.computed_value_resolved(it.node, pn)
                 }
             };
-            let justify = self_align(icv("justify-self").as_deref(), justify_items);
+            let column_subgrid = (matches!(it.content, Content::Grid(_))
+                && self.dom.is_column_subgrid_item(it.node))
+            .then(|| {
+                let (names, areas) = subgrid_names(&col_names, &col_areas, &p.cols);
+                AxisInput {
+                    tracks: cols[p.cols.clone()].to_vec(),
+                    names,
+                    areas,
+                    positions: Some(
+                        col_x[p.cols.clone()]
+                            .iter()
+                            .map(|x| x - area_start)
+                            .collect(),
+                    ),
+                    gap: if p.cols.len() > 1 {
+                        col_x[p.cols.start + 1] - col_x[p.cols.start] - cols[p.cols.start].base
+                    } else {
+                        gap_col
+                    },
+                    start_edge: if b.style.rtl {
+                        m[RIGHT] + bp_r
+                    } else {
+                        m[LEFT] + bp_l
+                    },
+                    end_edge: if b.style.rtl {
+                        m[LEFT] + bp_l
+                    } else {
+                        m[RIGHT] + bp_r
+                    },
+                }
+            })
+            .map(|input| {
+                if s.rtl != b.style.rtl {
+                    input.reversed()
+                } else {
+                    input
+                }
+            });
+            let justify = if column_subgrid.is_some() {
+                AlignItem::Stretch
+            } else {
+                self_align(icv("justify-self").as_deref(), justify_items)
+            };
             let width_value = |l: &Len| {
                 self.intrinsic_width_value(l, it, Some(area_w), inl)
                     .or_else(|| l.resolve(Some(area_w)).map(to_content))
             };
-            let width_def = width_value(&s.width);
             let avail_c = (area_w - m[LEFT] - m[RIGHT] - bp_h).max(0.0);
-            let w = match width_def {
-                Some(v) => v,
-                None if justify == AlignItem::Stretch && !auto[LEFT] && !auto[RIGHT] => avail_c,
-                None => {
-                    let minc = self.intrinsic_w(it, IMode::Min, inl);
-                    let maxc = self.intrinsic_w(it, IMode::Max, inl).max(minc);
-                    avail_c.max(minc).min(maxc)
-                }
+            let w = if column_subgrid.is_some() {
+                avail_c
+            } else {
+                let w = match width_value(&s.width) {
+                    Some(v) => v,
+                    None if justify == AlignItem::Stretch && !auto[LEFT] && !auto[RIGHT] => avail_c,
+                    None => {
+                        let minc = self.intrinsic_w(it, IMode::Min, inl);
+                        let maxc = self.intrinsic_w(it, IMode::Max, inl).max(minc);
+                        avail_c.max(minc).min(maxc)
+                    }
+                };
+                let min = width_value(&s.min_width).unwrap_or(0.);
+                let max = width_value(&s.max_width).unwrap_or(f32::INFINITY).max(min);
+                w.clamp(min, max)
             };
-            let min = width_value(&s.min_width).unwrap_or(0.);
-            let max = width_value(&s.max_width).unwrap_or(f32::INFINITY).max(min);
-            let w = w.clamp(min, max);
             let subgrid = (matches!(it.content, Content::Grid(_))
                 && self.dom.is_row_subgrid_item(it.node))
-            .then(|| RowInput {
-                tracks: rows[p.rows.clone()].to_vec(),
-                names: row_names[p.rows.start..=p.rows.end].to_vec(),
-                positions: None,
-                gap: gap_row,
-                start_edge: m[TOP] + s.border[TOP] + self.pad(s, TOP, area_w),
-                end_edge: m[BOTTOM] + s.border[BOTTOM] + self.pad(s, BOTTOM, area_w),
+            .then(|| {
+                let (names, areas) = subgrid_names(&row_names, &row_areas, &p.rows);
+                AxisInput {
+                    tracks: rows[p.rows.clone()].to_vec(),
+                    names,
+                    areas,
+                    positions: None,
+                    gap: gap_row,
+                    start_edge: m[TOP] + s.border[TOP] + self.pad(s, TOP, area_w),
+                    end_edge: m[BOTTOM] + s.border[BOTTOM] + self.pad(s, BOTTOM, area_w),
+                }
             });
             if let Some(input) = &subgrid {
                 self.subgrid_rows
+                    .borrow_mut()
+                    .inputs
+                    .insert(it.node, input.clone());
+            }
+            if let Some(input) = &column_subgrid {
+                self.subgrid_columns
                     .borrow_mut()
                     .inputs
                     .insert(it.node, input.clone());
@@ -2159,13 +2545,19 @@ impl Flow<'_> {
             // yet sized grid area stay unresolved here).
             let item_bt = s.border[TOP] + self.pad(s, TOP, area_w);
             let item_bb = s.border[BOTTOM] + self.pad(s, BOTTOM, area_w);
-            let min_h = self
-                .height_px(&s.min_height, s, item_bt, item_bb, None)
-                .unwrap_or(0.0);
-            let max_h = self
-                .height_px(&s.max_height, s, item_bt, item_bb, None)
-                .unwrap_or(f32::INFINITY)
-                .max(min_h);
+            let min_h = if subgrid.is_some() {
+                0.
+            } else {
+                self.height_px(&s.min_height, s, item_bt, item_bb, None)
+                    .unwrap_or(0.0)
+            };
+            let max_h = if subgrid.is_some() {
+                f32::INFINITY
+            } else {
+                self.height_px(&s.max_height, s, item_bt, item_bb, None)
+                    .unwrap_or(f32::INFINITY)
+                    .max(min_h)
+            };
             let def_h = def_h.map(|h| h.clamp(min_h, max_h));
             let (mut frag, mut anc) = self.item_frag(it, w.max(0.0), area_w, def_h, inl);
             if def_h.is_none() && subgrid.is_none() {
@@ -2182,10 +2574,19 @@ impl Flow<'_> {
             } else {
                 None
             };
+            if column_subgrid.is_some() {
+                let mut state = self.subgrid_columns.borrow_mut();
+                state.inputs.remove(&it.node);
+                state.contributions.remove(&it.node);
+            }
             // Horizontal placement within the area (css-align self-alignment;
             // auto margins win over the alignment keyword).
             let extra = area_w - (frag.w + m[LEFT] + m[RIGHT]);
-            let shift = super::flow::cross_shift(extra, auto[LEFT], auto[RIGHT], justify);
+            let shift = if b.style.rtl {
+                extra - super::flow::cross_shift(extra, auto[RIGHT], auto[LEFT], justify)
+            } else {
+                super::flow::cross_shift(extra, auto[LEFT], auto[RIGHT], justify)
+            };
             let last_baseline = icv("align-self")
                 .filter(|v| v != "auto")
                 .or_else(|| cv("align-items"))
@@ -2229,6 +2630,7 @@ impl Flow<'_> {
                 last_baseline,
                 baseline_shim: 0.,
                 subgrid,
+                column_subgrid,
                 row_contributions,
             });
         }
@@ -2373,6 +2775,56 @@ impl Flow<'_> {
             )
         };
 
+        // Grid 2 #algo-grid-sizing steps 3-4: row sizes and alignment can
+        // change an item's inline contribution (orthogonal text, ratios,
+        // column wrapping). Re-resolve columns once, then rows at the new
+        // widths. Never iterate this dependency to a fixed point.
+        if repeat_columns
+            && inherited_columns.is_none()
+            && cols.iter().any(|track| {
+                !matches!(track.size.min, TrackFn::Fixed(_))
+                    || !matches!(track.size.max, TrackFn::Fixed(_) | TrackFn::Fr(_))
+            })
+        {
+            let row_bases: Vec<_> = placed
+                .iter()
+                .map(|p| {
+                    let last = p.rows.end - 1;
+                    (row_y[last] + rows[last].base - row_y[p.rows.start]).max(0.)
+                })
+                .collect();
+            let next = self.grid_setup(
+                b,
+                items,
+                Some(content_w),
+                def_ch,
+                inl,
+                None,
+                Some(&row_bases),
+            );
+            let changed = next.col_contributions.len() != col_contributions.len()
+                || next
+                    .col_contributions
+                    .iter()
+                    .zip(&col_contributions)
+                    .any(|(a, b)| a.tracks != b.tracks || (a.min - b.min).abs() > 0.01);
+            if changed {
+                return self.grid_content_pass(
+                    b,
+                    items,
+                    content_x,
+                    content_top,
+                    content_w,
+                    def_ch,
+                    min_ch,
+                    inl,
+                    anchors,
+                    next,
+                    false,
+                );
+            }
+        }
+
         // Record the USED track sizes for the CSSOM resolved value that
         // `getComputedStyle(grid-template-columns/-rows)` reports (§ CSS Grid
         // serialization): the used lengths, not the declared `repeat(…)`.
@@ -2392,6 +2844,15 @@ impl Flow<'_> {
             let area_y = row_y[p.rows.start];
             let last = p.rows.end - 1;
             let area_h = (row_y[last] + rows[last].base - area_y).max(0.0);
+            // Row stretching can lay this child out again. Keep its parent
+            // column constraints for every such pass, including both-axis
+            // and nested subgrids.
+            if let Some(input) = &g.column_subgrid {
+                self.subgrid_columns
+                    .borrow_mut()
+                    .inputs
+                    .insert(g.it.node, input.clone());
+            }
             if g.subgrid.is_some()
                 || (g.align == AlignItem::Stretch
                     && g.cross_auto
@@ -2443,6 +2904,11 @@ impl Flow<'_> {
                     g.frag = frag;
                     g.anchors = anchors;
                 }
+            }
+            if g.column_subgrid.is_some() {
+                let mut state = self.subgrid_columns.borrow_mut();
+                state.inputs.remove(&g.it.node);
+                state.contributions.remove(&g.it.node);
             }
             let extra = area_h - (g.frag.h + g.m[TOP] + g.m[BOTTOM]);
             let shift = if g.align == AlignItem::Baseline && !g.auto[TOP] && !g.auto[BOTTOM] {
@@ -2565,6 +3031,246 @@ mod tests {
         assert_eq!(rect("g3").height, 200.0);
         assert_eq!(rect("r3").top - rect("g3").top, 100.0);
         assert_eq!(rect("r4").height, 150.0);
+    }
+
+    #[test]
+    fn column_subgrid_nested_intrinsic_contributions_and_forced_stretch() {
+        // Grid 2 #algo-grid-sizing and #subgrid-box-alignment: grandchildren
+        // size the ancestor's columns; the intervening grids' width and
+        // min/max-width constraints are ignored in their subgridded axis.
+        let (dom, layout) = measured_grid(
+            r#"
+            <style>body{margin:0}#outer{display:grid;width:max-content;grid-template-columns:auto auto;gap:10px}
+            .sub{display:grid;grid-column:span 2;grid-template-columns:subgrid;
+                 width:1px;min-width:999px;max-width:1px;justify-self:end;justify-content:end}</style>
+            <div id=outer><div id=middle class=sub><div id=inner class=sub>
+              <div id=a style='width:40px'></div><div id=b style='width:60px'></div></div></div>
+              <div class=sub><div style='width:90px'></div><div style='width:20px'></div></div></div>
+        "#,
+        );
+        let rect = |id| layout.boxes[&dom.get_by_id(id).unwrap()];
+        assert_eq!(
+            layout.grid_tracks[&dom.get_by_id("outer").unwrap()].0,
+            [90., 60.]
+        );
+        for name in ["outer", "middle", "inner"] {
+            assert_eq!(rect(name).width, 160., "{name}");
+        }
+        assert_eq!(rect("a").left, 0.);
+        assert_eq!(rect("b").left, 100.);
+    }
+
+    #[test]
+    fn column_subgrid_edges_gutters_and_parent_content_distribution() {
+        // Grid 2 #subgrid-gaps: the gap difference is split between neighbors;
+        // normal also inherits extra spacing from parent content distribution.
+        for (parent, gap, first, second, width) in [
+            ("width:300px;column-gap:50px", "0", 115., 125., 155.),
+            ("width:300px;column-gap:50px", "normal", 90., 150., 130.),
+            (
+                "width:300px;column-gap:0;justify-content:space-between",
+                "normal",
+                90.,
+                150.,
+                130.,
+            ),
+        ] {
+            let (dom, layout) = measured_grid(&format!(
+                r#"
+                <style>body{{margin:0}}#outer{{display:grid;grid-template-columns:100px 150px;{parent}}}
+                #sub{{display:grid;grid-column:span 2;grid-template-columns:subgrid;column-gap:{gap};padding:0 20px 0 10px}}
+                </style><div id=outer><div id=sub><div id=a></div><div id=b></div></div></div>
+            "#
+            ));
+            let rect = |id| layout.boxes[&dom.get_by_id(id).unwrap()];
+            assert_eq!(rect("sub").width, 300.);
+            assert_eq!(rect("a").left, 10.);
+            assert_eq!(rect("a").width, first, "{parent}; {gap}");
+            assert_eq!(rect("b").left, second, "{parent}; {gap}");
+            assert_eq!(rect("b").width, width, "{parent}; {gap}");
+        }
+    }
+
+    #[test]
+    fn column_subgrid_clamps_placement_and_inherits_line_names() {
+        let (dom, layout) = measured_grid(
+            r#"
+            <style>body{margin:0}#outer{display:grid;grid-template-columns:10px [begin] 40px [middle] 60px [end]}
+            #sub{display:grid;grid-column:2/4;grid-template-columns:subgrid [local]}
+            </style><div id=outer><div id=sub>
+            <div id=a style='grid-column:8/span 2'></div><div id=b style='grid-column:-2/-1'></div>
+            <div id=c style='grid-column:-8/span 2'></div><div id=d style='grid-column:local/middle'></div>
+            <div id=e style='grid-column:middle/end'></div></div></div>
+        "#,
+        );
+        let rect = |id| layout.boxes[&dom.get_by_id(id).unwrap()];
+        assert_eq!(rect("sub").left, 10.);
+        for name in ["a", "b", "e"] {
+            assert_eq!((rect(name).left, rect(name).width), (50., 60.), "{name}");
+        }
+        for name in ["c", "d"] {
+            assert_eq!((rect(name).left, rect(name).width), (10., 40.), "{name}");
+        }
+        assert_eq!(
+            layout.grid_tracks[&dom.get_by_id("sub").unwrap()].0.len(),
+            2
+        );
+    }
+
+    #[test]
+    fn subgrid_in_both_axes_keeps_columns_during_row_stretch() {
+        let (dom, layout) = measured_grid(
+            r#"
+            <style>body{margin:0}#outer{display:grid;width:260px;grid-template-columns:100px 150px;grid-template-rows:40px 80px;gap:10px}
+            .sub{display:grid;grid-column:span 2;grid-row:span 2;grid-template-columns:subgrid;grid-template-rows:subgrid;min-height:999px;max-height:1px}
+            </style><div id=outer><div class=sub><div id=inner class=sub>
+            <div id=a></div><div id=b></div><div id=c></div><div id=d></div></div></div></div>
+        "#,
+        );
+        let rect = |id| layout.boxes[&dom.get_by_id(id).unwrap()];
+        assert_eq!((rect("inner").width, rect("inner").height), (260., 130.));
+        for (name, left, top, width, height) in [
+            ("a", 0., 0., 100., 40.),
+            ("b", 110., 0., 150., 40.),
+            ("c", 0., 50., 100., 80.),
+            ("d", 110., 50., 150., 80.),
+        ] {
+            let r = rect(name);
+            assert_eq!(
+                (r.left, r.top, r.width, r.height),
+                (left, top, width, height),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn column_subgrid_uses_its_own_inline_direction() {
+        for parent in ["ltr", "rtl"] {
+            for child in ["ltr", "rtl"] {
+                let (dom, layout) = measured_grid(&format!(
+                    r#"
+                    <style>body{{margin:0}}#outer{{display:grid;width:160px;direction:{parent};grid-template-columns:auto auto;gap:10px}}
+                    #sub{{display:grid;direction:{child};grid-template-columns:subgrid;grid-column:span 2}}
+                    </style><div id=outer><div id=sub><div id=a style='width:40px'></div><div id=b style='width:60px'></div></div></div>
+                "#
+                ));
+                let rect = |id| layout.boxes[&dom.get_by_id(id).unwrap()];
+                let (a, b) = if child == "ltr" {
+                    (0., 75.)
+                } else {
+                    (120., 25.)
+                };
+                assert_eq!((rect("a").left, rect("b").left), (a, b), "{parent}/{child}");
+                let tracks = &layout.grid_tracks[&dom.get_by_id("sub").unwrap()].0;
+                assert_eq!(tracks, &[65., 85.], "{parent}/{child}");
+            }
+        }
+    }
+
+    #[test]
+    fn column_subgrid_cache_rechecks_inherited_tracks_at_equal_outer_sizes() {
+        let mut dom = crate::dom::Dom::parse_document(
+            r#"
+            <style>body{margin:0}#outer{display:grid;width:100px;grid-template-columns:40px 60px}
+            #sub{display:grid;grid-column:span 2;grid-template-columns:subgrid}</style>
+            <div id=outer><div id=sub><div id=a></div><div id=b></div></div></div>
+        "#,
+        );
+        let measure = |dom: &crate::dom::Dom| {
+            crate::layout2::lay_out_graphical(
+                dom,
+                &url::Url::parse("https://example.test/").unwrap(),
+                crate::layout2::Viewport::new(800., 600.),
+                &[],
+                &Default::default(),
+                &Default::default(),
+            )
+        };
+        let _inputs = crate::layout2::stable_global_layout_inputs();
+        let outer = dom.get_by_id("outer").unwrap();
+        assert!(!dom.establishes_independent_formatting_context(dom.get_by_id("sub").unwrap()));
+        for (template, left) in [("40px 60px", 40.), ("70px 30px", 70.), ("20px 80px", 20.)] {
+            let _ = measure(&dom);
+            dom.set_attr(outer, "style", &format!("grid-template-columns:{template}"));
+            let warm = measure(&dom);
+            assert_eq!(warm.boxes[&dom.get_by_id("b").unwrap()].left, left);
+            dom.force_cold_style_layout_for_test();
+            let cold = measure(&dom);
+            assert_eq!(warm.boxes, cold.boxes);
+            assert_eq!(warm.grid_tracks, cold.grid_tracks);
+            assert!(warm.presentation_eq(&cold));
+            dom.layout_cache.borrow_mut().cold = false;
+        }
+    }
+
+    #[test]
+    fn column_subgrid_clips_inherited_named_areas_through_nested_grids() {
+        // Grid 2 #subgrid-area-inheritance: info-start must be synthesized
+        // on inner's first line even though that line was inside the area.
+        let (dom, layout) = measured_grid(
+            r#"
+            <style>body{margin:0}#outer{display:grid;width:400px;grid-template-columns:20px [main-start] 100px [center] 120px 160px [main-end];grid-template-areas:'gutter info info photos'}
+            #middle{display:grid;grid-template-columns:subgrid;grid-column:main-start/main-end}
+            #inner{display:grid;grid-template-columns:subgrid;grid-column:center/-1}
+            </style><div id=outer><div id=middle><div id=inner>
+            <div id=a style='grid-column:info-start/info-end'></div>
+            <div id=b style='grid-column:photos-start/photos-end'></div></div></div></div>
+        "#,
+        );
+        let rect = |id| layout.boxes[&dom.get_by_id(id).unwrap()];
+        assert_eq!((rect("inner").left, rect("inner").width), (120., 280.));
+        assert_eq!((rect("a").left, rect("a").width), (120., 120.));
+        assert_eq!((rect("b").left, rect("b").width), (240., 160.));
+    }
+
+    #[test]
+    fn column_subgrid_intrinsic_width_uses_definite_row_constraints() {
+        let (dom, layout) = measured_grid(
+            r#"
+            <style>body{margin:0}#outer{display:grid;width:max-content;grid-template-columns:auto auto;grid-template-rows:100px;gap:10px}
+            #sub{display:grid;grid-column:span 2;grid-template-columns:subgrid;grid-template-rows:100%}
+            </style><div id=outer><div id=sub><div style='height:100%;aspect-ratio:2'></div><div style='width:60px'></div></div></div>
+        "#,
+        );
+        assert_eq!(
+            layout.grid_tracks[&dom.get_by_id("outer").unwrap()].0,
+            [200., 60.]
+        );
+        assert_eq!(layout.boxes[&dom.get_by_id("outer").unwrap()].width, 270.);
+    }
+
+    #[test]
+    fn column_subgrid_padding_contributes_across_empty_edge_tracks() {
+        let (dom, layout) = measured_grid(
+            r#"
+            <style>body{margin:0}#outer{display:grid;width:max-content;grid-template-columns:5px auto 5px}
+            #sub{display:grid;grid-column:span 3;grid-template-columns:subgrid;padding:0 25px}
+            </style><div id=outer><div id=sub><div style='grid-column:2;width:50px'></div></div></div>
+        "#,
+        );
+        assert_eq!(
+            layout.grid_tracks[&dom.get_by_id("outer").unwrap()].0,
+            [5., 90., 5.]
+        );
+    }
+
+    #[test]
+    fn column_subgrid_requires_parent_grid_and_no_layout_containment() {
+        for parent in ["block", "grid"] {
+            let (dom, layout) = measured_grid(&format!(
+                r#"
+                <style>#outer{{display:{parent};grid-template-columns:10px 10px}}
+                #sub{{display:grid;grid-column:span 2;grid-template-columns:subgrid;contain:layout;grid-auto-flow:column;justify-content:start}}
+                </style><div id=outer><div id=sub><div style='width:40px'></div><div style='width:60px'></div></div></div>
+            "#
+            ));
+            assert_eq!(
+                layout.grid_tracks[&dom.get_by_id("sub").unwrap()].0,
+                [40., 60.],
+                "{parent}"
+            );
+        }
     }
 
     #[test]

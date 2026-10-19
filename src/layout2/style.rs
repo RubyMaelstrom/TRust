@@ -1672,7 +1672,7 @@ impl InlineStyle {
             node: NO_NODE,
             pseudo: None,
             ws: WhiteSpace::Normal,
-            transform: TextTransform::None,
+            transform: TextTransform::NONE,
             letter: 0.0,
             word: 0.0,
             font_family: String::from("sans-serif"),
@@ -1822,7 +1822,7 @@ impl InlineStyle {
             .computed_value_resolved(id, "text-transform")
             .as_deref()
             .and_then(TextTransform::from_css)
-            .unwrap_or(TextTransform::None);
+            .unwrap_or(TextTransform::NONE);
         s.letter = dom
             .computed_value_resolved(id, "letter-spacing")
             .as_deref()
@@ -2008,7 +2008,7 @@ impl InlineStyle {
             s.transform = value("text-transform")
                 .as_deref()
                 .and_then(TextTransform::from_css)
-                .unwrap_or(TextTransform::None);
+                .unwrap_or(TextTransform::NONE);
         }
         if declared("letter-spacing") {
             s.letter = value("letter-spacing")
@@ -2093,11 +2093,11 @@ impl InlineStyle {
         // The UA style sheet gives ::marker `text-transform: none`, which
         // only an author ::marker declaration overrides.
         if self.node == NO_NODE || !dom.has_marker_style(self.node) {
-            return if self.transform == TextTransform::None {
+            return if self.transform == TextTransform::NONE {
                 std::borrow::Cow::Borrowed(self)
             } else {
                 std::borrow::Cow::Owned(Self {
-                    transform: TextTransform::None,
+                    transform: TextTransform::NONE,
                     ..self.clone()
                 })
             };
@@ -2108,7 +2108,7 @@ impl InlineStyle {
             .or_else(|| dom.baked_pseudo_value(self.node, PseudoEl::Marker, "text-transform"))
             .is_none()
         {
-            s.transform = TextTransform::None;
+            s.transform = TextTransform::NONE;
         }
         s.vertical_align = self.vertical_align;
         s.emph.underline = self.emph.underline;

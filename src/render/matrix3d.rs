@@ -50,6 +50,12 @@ pub(crate) fn scale(x: f32, y: f32, z: f32) -> Matrix3d {
     m
 }
 
+/// CSS Transforms 2 #combining-transform-lists: matrix parameters add;
+/// diagonal parameters use one-based accumulation.
+pub(crate) fn accumulate(a: &Matrix3d, b: &Matrix3d) -> Matrix3d {
+    std::array::from_fn(|i| a[i] + b[i] - IDENTITY[i])
+}
+
 /// Transforms 2 #funcdef-perspective: a depth below 1px is treated as 1px;
 /// an infinite depth (`none`) is the identity.
 pub(crate) fn perspective(depth: f32) -> Matrix3d {

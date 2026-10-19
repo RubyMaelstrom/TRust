@@ -974,64 +974,92 @@ pub(crate) struct Ifc<'a, 'f, 't> {
     /// The DOM text being placed, while `text_followed` places a Text
     /// node's run in a painted (not intrinsic or terminal) layout.
     source: Option<SourceCursor>,
+    /// Built lazily only for context-dependent text transforms. The content
+    /// remains borrowed for this IFC, so run addresses are stable keys.
+    text_content: Option<&'t [Inline]>,
+    transform_context: std::cell::OnceCell<InlineTextContext>,
+}
+
+struct InlineTextContext {
+    offsets: rustc_hash::FxHashMap<(usize, usize), usize>,
+    context: crate::text::transform::Context,
+}
+
+impl InlineTextContext {
+    fn new(content: &[Inline]) -> Self {
+        fn collect(
+            items: &[Inline],
+            text: &mut String,
+            offsets: &mut rustc_hash::FxHashMap<(usize, usize), usize>,
+        ) {
+            for item in items {
+                match item {
+                    Inline::Text(run, _) => {
+                        offsets.insert((run.as_ptr() as usize, run.len()), text.len());
+                        text.push_str(run);
+                    }
+                    Inline::Box { kids, .. } => collect(kids, text, offsets),
+                    Inline::Br => text.push('\n'),
+                    Inline::Atom(_) | Inline::AtomBox(_) => text.push('\u{fffc}'),
+                    Inline::OutOfFlow(_) | Inline::Float(_) => {}
+                }
+            }
+        }
+        let mut text = String::new();
+        let mut offsets = rustc_hash::FxHashMap::default();
+        collect(content, &mut text, &mut offsets);
+        Self {
+            offsets,
+            context: crate::text::transform::Context::new(&text),
+        }
+    }
 }
 
 /// Where the text being placed came from (`TextOrigin`). Laid-out text is
 /// the Text data after `text-transform` and segment-break normalization;
 /// this maps each placed segment back to its UTF-16 range of the data, in
-/// placement order. Text that kept its characters maps exactly; text whose
-/// transform changed their number maps proportionally.
+/// placement order. Expanding/contracting transformations retain each
+/// affected cluster's original range, without shifting unrelated letters.
 struct SourceCursor {
     node: NodeId,
-    /// The UTF-16 offset of the laid-out text's start in the data.
     origin: u32,
-    /// The UTF-16 length of the data the laid-out text came from.
-    units: u32,
-    /// The laid-out text's byte length.
-    len: usize,
-    exact: bool,
-    /// Both texts are ASCII: a byte is a UTF-16 code unit (the common case,
-    /// mapped without decoding any text).
     ascii: bool,
-    /// The next byte to place, and (exactly mapped) its UTF-16 offset.
     byte: usize,
     unit: u32,
+    mapped: Option<(String, Vec<TextSourceSpan>)>,
 }
 
 impl SourceCursor {
-    fn new(origin: TextOrigin, data: &str, laid: &str) -> Self {
-        let ascii = data.is_ascii() && laid.is_ascii();
-        let units = if ascii {
-            data.len() as u32
-        } else {
-            utf16_len(data)
-        };
+    fn new(origin: TextOrigin, laid: &crate::text::transform::Transformed<'_>) -> Self {
+        let mapped = (!laid.mappings.is_empty()).then(|| {
+            (
+                laid.text.to_string(),
+                laid.mappings
+                    .iter()
+                    .map(|mapping| TextSourceSpan {
+                        start: mapping.bytes.start as u32,
+                        end: mapping.bytes.end as u32,
+                        node: origin.node,
+                        offset: origin.offset + mapping.units.start,
+                        offset_end: origin.offset + mapping.units.end,
+                    })
+                    .collect(),
+            )
+        });
         Self {
             node: origin.node,
             origin: origin.offset,
-            units,
-            len: laid.len(),
-            exact: laid.len() == data.len() && (ascii || utf16_len(laid) == units),
-            ascii,
+            ascii: laid.text.is_ascii(),
             byte: 0,
             unit: 0,
-        }
-    }
-
-    fn unit_at(&self, byte: usize) -> u32 {
-        if self.exact {
-            self.unit
-        } else if self.len == 0 {
-            0
-        } else {
-            (f64::from(self.units) * byte.min(self.len) as f64 / self.len as f64).round() as u32
+            mapped,
         }
     }
 
     /// Pass over laid-out text that is not placed (collapsed white space,
     /// segment breaks, tabs).
     fn skip(&mut self, text: &str) {
-        if self.exact {
+        if self.mapped.is_none() {
             self.unit += if self.ascii {
                 text.len() as u32
             } else {
@@ -1042,16 +1070,22 @@ impl SourceCursor {
     }
 
     /// The span of the next placed segment, `text`.
-    fn take(&mut self, text: &str) -> TextSourceSpan {
-        let offset = self.origin + self.unit_at(self.byte);
+    fn take(&mut self, text: &str) -> Vec<TextSourceSpan> {
+        if let Some((laid, spans)) = &self.mapped {
+            let end = self.byte + text.len();
+            let sources = crate::render::selection::slice_sources(laid, spans, self.byte..end);
+            self.byte = end;
+            return sources;
+        }
+        let offset = self.origin + self.unit;
         self.skip(text);
-        TextSourceSpan {
+        vec![TextSourceSpan {
             start: 0,
             end: text.len() as u32,
             node: self.node,
             offset,
-            offset_end: self.origin + self.unit_at(self.byte),
-        }
+            offset_end: self.origin + self.unit,
+        }]
     }
 }
 
@@ -1148,6 +1182,8 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             cells: crate::text::cell_metrics(),
             bidi: None,
             source: None,
+            text_content: None,
+            transform_context: std::cell::OnceCell::new(),
         };
         ifc.begin_line();
         ifc
@@ -1388,6 +1424,8 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
     /// Lay the IFC's content. `root` is the block container's own inline
     /// context (text directly under the block uses it).
     pub fn run(&mut self, content: &'t [Inline], root: &InlineStyle) {
+        self.text_content = Some(content);
+        self.transform_context.take();
         let mut root = self.form_context(root.node, root);
         // CSS 2 #propdef-vertical-align is not inherited. Its accumulated
         // aligned-subtree offset only belongs to the enclosing line; a new
@@ -1701,20 +1739,44 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             // idiom); it neither paints nor owes spaces.
             return;
         }
-        let data = t;
-        let t = ctx.transform.apply(t);
-        let t = if ctx.ws.converts_to_spaces() {
-            std::borrow::Cow::Owned(t.replace("\r\n", " ").replace(['\t', '\n', '\r'], " "))
-        } else if t.contains('\r') {
-            std::borrow::Cow::Owned(t.replace("\r\n", "\n").replace('\r', "\n"))
-        } else {
-            t
-        };
+        let t = self.transformed_text(t, origin, ctx);
         // Painted layouts keep where each placed segment came from.
         self.source = (!origin.is_none() && !self.measuring && self.cells.is_none())
-            .then(|| SourceCursor::new(origin, data, &t));
-        self.place_text(&t, ctx, following);
+            .then(|| SourceCursor::new(origin, &t));
+        self.place_text(&t.text, ctx, following);
         self.source = None;
+    }
+
+    fn transformed_text<'s>(
+        &self,
+        text: &'s str,
+        origin: TextOrigin,
+        ctx: &InlineStyle,
+    ) -> crate::text::transform::Transformed<'s> {
+        let context = if ctx.transform.needs_context() {
+            self.text_content.and_then(|content| {
+                let context = self
+                    .transform_context
+                    .get_or_init(|| InlineTextContext::new(content));
+                context
+                    .offsets
+                    .get(&(text.as_ptr() as usize, text.len()))
+                    .map(|&offset| (&context.context, offset))
+            })
+        } else {
+            None
+        };
+        let single = !ctx.transform.is_math()
+            || origin.is_none()
+            || self.dom.text_content(origin.node).chars().count() == 1;
+        ctx.transform.transform(
+            text,
+            ctx.language.as_deref(),
+            ctx.ws.converts_to_spaces(),
+            !ctx.ws.collapses_spaces(),
+            single,
+            context,
+        )
     }
 
     fn skip_source(&mut self, text: &str) {
@@ -1723,8 +1785,10 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         }
     }
 
-    fn take_source(&mut self, text: &str) -> Option<TextSourceSpan> {
-        self.source.as_mut().map(|source| source.take(text))
+    fn take_source(&mut self, text: &str) -> Vec<TextSourceSpan> {
+        self.source
+            .as_mut()
+            .map_or_else(Vec::new, |source| source.take(text))
     }
 
     /// `text_followed`'s laid-out text `t`, placed word by word or as
@@ -1926,11 +1990,11 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
     ) -> Continues {
         for item in items {
             match item {
-                Inline::Text(text, _) => {
+                Inline::Text(text, origin) => {
                     if !ctx.ws.collapses_spaces() || ctx.font_zero {
                         return Continues::Stopped;
                     }
-                    let text = ctx.transform.apply(text);
+                    let text = self.transformed_text(text, *origin, ctx).text;
                     let lead = text.split(is_collapsible_space).next().unwrap_or("");
                     if lead.is_empty() {
                         if text.is_empty() {
@@ -2353,7 +2417,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             if space {
                 last.item.text.push(' ');
             }
-            if let Some(mut span) = source {
+            for mut span in source {
                 let at = last.item.text.len() as u32;
                 span.start += at;
                 span.end += at;
@@ -2422,7 +2486,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             shift: [0.0; 2],
             bidi_level: 0,
             bidi_pos,
-            sources: source.into_iter().collect(),
+            sources: source,
             line_start: Default::default(),
         });
         self.attach_boxes(gap);
@@ -4709,12 +4773,14 @@ impl<'s> ControlLabel<'s> {
         control: &crate::text::ShapedText,
     ) -> Option<crate::text::ShapedText> {
         let transformed =
-            self.pseudo.is_some() && self.style.transform != crate::layout2::TextTransform::None;
+            self.pseudo.is_some() && self.style.transform != crate::layout2::TextTransform::NONE;
         if matches!(self.style, std::borrow::Cow::Borrowed(_)) && !transformed {
             return None;
         }
         let text = if transformed {
-            self.style.transform.apply(text)
+            self.style
+                .transform
+                .apply(text, self.style.language.as_deref())
         } else {
             std::borrow::Cow::Borrowed(text)
         };

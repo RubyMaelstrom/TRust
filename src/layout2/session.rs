@@ -347,6 +347,7 @@ pub(super) fn with_layout<R>(
             imemo: Default::default(),
             grid_tracks: Default::default(),
             subgrid_rows: Default::default(),
+            subgrid_columns: Default::default(),
             marker_line: Default::default(),
         };
         let started = Instant::now();

@@ -151,9 +151,33 @@ mod tests {
         let letter = runs.iter().find(|(t, _)| t == "S").unwrap();
         assert_eq!(spans(&letter.1), vec![(0, 1, text, 0, 1)]);
         let rest = runs.iter().find(|(t, _)| t.starts_with("TRASSE")).unwrap();
-        assert_eq!(rest.1.spans()[0].node, text);
-        assert_eq!(rest.1.spans()[0].offset, 1);
-        assert_eq!(rest.1.spans()[0].offset_end, 6, "the data's 'traße'");
+        assert_eq!(
+            &spans(&rest.1)[..3],
+            &[(0, 3, text, 1, 4), (3, 5, text, 4, 5), (5, 6, text, 5, 6)],
+            "TRA / SS / E preserve the data's tra / ß / e boundaries"
+        );
+        // Expansion must not shift the following source characters.
+        assert_eq!(rest.1.spans()[2].offset_at(&rest.0, 5), 5);
+    }
+
+    #[test]
+    fn a_first_letter_transform_preserves_plain_text_copy() {
+        let (dom, layout) = layout(
+            "<style>p::first-letter{text-transform:uppercase}</style><p id=p>ßeta</p>",
+            640.0,
+        );
+        let node = text_child(&dom, "p", 0);
+        let runs = runs(&layout);
+        let letter = runs.iter().find(|(text, _)| text == "SS").unwrap();
+        assert_eq!(spans(&letter.1), [(0, 2, node, 0, 1)]);
+        let selected = crate::render::selection::PageSelection::Painted {
+            anchor: crate::core::TextPoint { node, offset: 0 },
+            focus: crate::core::TextPoint { node, offset: 4 },
+        };
+        assert_eq!(
+            crate::render::selection::selected_page_text(&layout.paint, &selected),
+            "ßeta"
+        );
     }
 
     #[test]

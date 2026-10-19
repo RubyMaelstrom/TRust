@@ -154,6 +154,7 @@ pub struct VelloHybridRenderer {
     format: TextureFormat,
     size: PhysicalSize,
     images: HashMap<ImageCacheKey, CachedImage>,
+    frame_images: super::frame_images::FrameImages,
     frame_id: u64,
     headless: Option<HeadlessTarget>,
     window_target: Option<WindowTarget>,
@@ -326,6 +327,7 @@ impl VelloHybridRenderer {
             format,
             size,
             images: HashMap::new(),
+            frame_images: super::frame_images::FrameImages::default(),
             frame_id: 0,
             headless: None,
             window_target: None,
@@ -816,6 +818,7 @@ impl VelloHybridRenderer {
         let height = u16::try_from(size.height)
             .map_err(|_| format!("framebuffer height {} exceeds Vello limit", size.height))?;
         self.frame_id = self.frame_id.wrapping_add(1);
+        self.frame_images = super::frame_images::FrameImages::default();
         if let Some(video) = &mut self.video {
             video.release_idle(self.frame_id);
         }
@@ -878,7 +881,7 @@ impl VelloHybridRenderer {
         if uses_effects {
             self.effects
                 .get_or_insert_with(|| Box::new(VelloCpuRenderer::new()))
-                .begin_effects_frame();
+                .begin_effects_frame(self.frame_images.clone());
         } else {
             self.effects = None;
         }
@@ -1369,13 +1372,24 @@ impl VelloHybridRenderer {
         sampling: ImageSampling,
         transform: [f64; 6],
     ) -> Result<(), String> {
-        if let Some(painted) =
-            self.paint_video_frame(target, encoder, handle, rect, source_rect, fit, sampling)
-        {
+        if let Some(painted) = self.paint_video_frame(
+            scene,
+            target,
+            encoder,
+            handle,
+            rect,
+            source_rect,
+            fit,
+            sampling,
+        ) {
             return painted;
         }
-        let store_revision = scene.image_revision(handle);
-        let resource = scene.image(handle);
+        let (resource, store_revision) = self
+            .frame_images
+            .image(scene, handle)
+            .map_or((None, None), |(image, revision)| {
+                (Some(image), Some(revision))
+            });
         let svg_size = resource
             .as_ref()
             .filter(|image| image.svg_source.is_some())
@@ -1540,6 +1554,7 @@ impl VelloHybridRenderer {
     #[allow(clippy::too_many_arguments)]
     fn paint_video_frame(
         &mut self,
+        scene: &Scene,
         target: &mut vello_gpu::Scene,
         encoder: &mut wgpu::CommandEncoder,
         handle: ImageHandle,
@@ -1549,7 +1564,7 @@ impl VelloHybridRenderer {
         sampling: ImageSampling,
     ) -> Option<Result<(), String>> {
         let surface = handle.video_surface()?;
-        let (frame, serial) = crate::media::player::surface(surface)?.current()?;
+        let (frame, serial) = self.frame_images.video(scene, handle)?;
         let key = ImageCacheKey::from(handle);
         let upload_limit = HYBRID_IMAGE_ATLAS_LIMIT
             .min(self.device.limits().max_texture_dimension_2d)

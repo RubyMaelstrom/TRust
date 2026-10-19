@@ -64,6 +64,7 @@ const ON_PATH_TOLERANCE: f64 = 1e-6;
 /// SVG ancestors of a copied subtree contribute these, as presentation
 /// attributes or cascaded declarations, through one wrapper group each.
 const INHERITED_GEOMETRY_PROPERTIES: &[&str] = &[
+    "text-transform",
     "font",
     "font-family",
     "font-size",
@@ -142,6 +143,7 @@ const GEOMETRY_LENGTH_ATTRIBUTES: &[&str] = &[
 /// CSS properties an outermost `<svg>` inherits from its HTML ancestors that
 /// affect text layout. Paint inheritance is `Dom::svg_inherited_paint_style`.
 const HTML_INHERITED_TEXT_PROPERTIES: &[&str] = &[
+    "text-transform",
     "font-family",
     "font-size",
     "font-stretch",
@@ -977,6 +979,8 @@ impl Dom {
             let local: &str = &attr.name.local;
             if attr.name.ns == ns!(xml) && local == "space" {
                 write_attr(out, "xml:space", &attr.value);
+            } else if local == "lang" {
+                write_attr(out, "lang", &attr.value);
             } else if attr.name.ns == ns!() && keep(local) && local != "font-size" {
                 write_attr(out, local, &self.resolve_vars(id, &attr.value));
             }
@@ -2214,6 +2218,33 @@ fn rewrite_first_start_tag(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn svg_text_transform_preserves_dom_character_counts_and_grouped_glyph_cells() {
+        let dom = Dom::parse_document(
+            r#"<svg width="200" height="100" font-family="DejaVu Sans" font-size="24">
+            <text id="upper" x="10 40 100" y="35" style="text-transform:uppercase">aßb</text>
+            <text id="literal" y="35">ASSB</text>
+            <text id="rotated" x="40" y="35" rotate="90" style="text-transform:uppercase">ß</text>
+            <g transform="translate(40 35) rotate(90)"><text id="reference">SS</text></g>
+            </svg>"#,
+        );
+        let id = |name| dom.get_by_id(name).unwrap();
+        let upper = dom.svg_text_metrics(id("upper"), (200., 100.));
+        let literal = dom.svg_text_metrics(id("literal"), (200., 100.));
+        assert_eq!(upper.number_of_chars(), 3);
+        assert_eq!(literal.number_of_chars(), 4);
+        assert!((upper.computed_length() - literal.computed_length()).abs() < 0.01);
+        let cell = dom.svg_text_extent(id("upper"), 1, (200., 100.)).unwrap();
+        assert!((cell[0] - 40.).abs() < 0.01);
+        let b = dom.svg_text_extent(id("upper"), 2, (200., 100.)).unwrap();
+        assert!((b[0] - 100.).abs() < 0.01);
+        let rotated = dom.svg_text_extent(id("rotated"), 0, (200., 100.)).unwrap();
+        assert!(
+            rotated[3] > rotated[2],
+            "the expanded character rotates as one group: {rotated:?}"
+        );
+    }
 
     #[test]
     fn view_box_transform_follows_preserve_aspect_ratio() {

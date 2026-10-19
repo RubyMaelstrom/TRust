@@ -2417,6 +2417,57 @@ pub(crate) fn red_png() -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn svg_text_transform_keeps_context_and_original_position_indices() {
+        let cases = [
+            (
+                r#"<text y="35" style="text-transform:uppercase" x="10 40 100">aßb</text>"#,
+                r#"<text y="35"><tspan x="10">A</tspan><tspan x="40">SS</tspan><tspan x="100">B</tspan></text>"#,
+            ),
+            (
+                r#"<text y="35" style="text-transform:capitalize">he<tspan>llo</tspan> ijssel</text>"#,
+                r#"<text y="35">He<tspan>llo</tspan> Ijssel</text>"#,
+            ),
+            (
+                r#"<text y="35" xml:lang="nl" style="text-transform:capitalize">i<tspan>jssel</tspan></text>"#,
+                r#"<text y="35">I<tspan>Jssel</tspan></text>"#,
+            ),
+            (
+                r#"<text y="35" style="text-transform:lowercase">Ο<tspan>Σ</tspan>Α</text>"#,
+                r#"<text y="35">ο<tspan>σ</tspan>α</text>"#,
+            ),
+            (
+                r#"<text y="35" xml:space="preserve" style="text-transform:uppercase full-width">a b</text>"#,
+                r#"<text y="35" xml:space="preserve">Ａ　Ｂ</text>"#,
+            ),
+            (
+                r#"<text y="35" textLength="80" lengthAdjust="spacingAndGlyphs" style="text-transform:uppercase">ß</text>"#,
+                r#"<text y="35" textLength="80" lengthAdjust="spacingAndGlyphs">SS</text>"#,
+            ),
+            (
+                r#"<g style="text-transform:uppercase"><text y="35"><tspan style="text-transform:INHERIT">abc</tspan><tspan style="text-transform:UNSET">def</tspan><tspan style="text-transform:initial">ghi</tspan></text></g>"#,
+                r#"<text y="35"><tspan>ABC</tspan><tspan>DEF</tspan><tspan>ghi</tspan></text>"#,
+            ),
+            (
+                r#"<text y="35">A<tspan font-family="DejaVu Serif" style="text-transform:uppercase">ß</tspan>B</text>"#,
+                r#"<text y="35">A<tspan font-family="DejaVu Serif">SS</tspan>B</text>"#,
+            ),
+            (
+                r#"<text y="35" style="text-transform:math-auto">h</text>"#,
+                r#"<text y="35">ℎ</text>"#,
+            ),
+        ];
+        for (source, reference) in cases {
+            let raster = |body| {
+                let svg = format!(
+                    r#"<svg xmlns="http://www.w3.org/2000/svg" width="220" height="50" font-size="24" font-family="DejaVu Sans">{body}</svg>"#
+                );
+                decode_graphical(svg.as_bytes()).unwrap().rgba
+            };
+            assert!(raster(source) == raster(reference), "{source}");
+        }
+    }
+
+    #[test]
     fn canvas_frames_round_trip_and_reject_foreign_bytes() {
         let frame = canvas_frame(2, 1, true, &[1, 2, 3, 4, 5, 6, 7, 128]);
         let parsed = info(&frame).unwrap();

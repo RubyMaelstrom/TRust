@@ -35,6 +35,7 @@ dependencies = [
  "html5ever",
  "http",
  "httpdate",
+ "icu_normalizer",
  "icu_properties",
  "icu_segmenter",
  "image",

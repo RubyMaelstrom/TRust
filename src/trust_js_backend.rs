@@ -206,16 +206,22 @@ enum TrustJsHostTask {
     CanvasFrame {
         node: usize,
     },
+    /// Text shaping (including an SVG decoding thread) found a font use.
+    FontUse {
+        traversable: TraversableId,
+    },
     /// CSS Font Loading completion for a FontFace object in one realm.
     FontFaceDone {
         traversable: TraversableId,
         context: u64,
+        document: usize,
         request: u64,
         source: Option<String>,
         bytes: Option<Vec<u8>>,
     },
     FontDone {
         traversable: TraversableId,
+        document: usize,
         url: String,
         bytes: Option<Vec<u8>>,
     },
@@ -1480,6 +1486,7 @@ impl HostState {
     ) {
         self.base = page;
         self.task_events = Some(TrustJsTaskSender::Page(events.clone()));
+        self.install_font_demand_waker();
         self.enable_websockets(
             self.base.clone(),
             &handle,
@@ -1504,6 +1511,20 @@ impl HostState {
             pending_fetches: HashMap::new(),
             body_streams: HashMap::new(),
         });
+    }
+
+    /// Raster threads can discover a font after the page actor went idle.
+    fn install_font_demand_waker(&self) {
+        let Some(events) = self.task_events.clone() else {
+            return;
+        };
+        let traversable = self.traversables.selected;
+        self.dom.borrow().set_font_demand_waker(Arc::new(move || {
+            let _ = events.send(TrustJsHostTask::FontUse { traversable });
+        }));
+        if let Some(network) = &self.network {
+            self.dom.borrow().arm_font_display_timer(&network.handle);
+        }
     }
 
     /// WebSockets for a Window or worker global: connection events become
@@ -5486,6 +5507,7 @@ mod desktop {
         // Inline and data-backed module scripts use the HTML task queue even when this document
         // has no network runtime. Keep that local task source independent of `enable_network`.
         state.task_events = Some(TrustJsTaskSender::Page(host_tasks.clone()));
+        state.install_font_demand_waker();
         if let Some(handle) = env.net.clone() {
             state.enable_network(
                 response_url.clone(),
@@ -7465,59 +7487,52 @@ mod desktop {
     }
 
     fn start_font_fetches(page: &mut TrustJsPage) {
+        if let Some(state) = page.engine.ctx().host::<HostState>() {
+            state.install_font_demand_waker();
+        }
         let urls = page.dom.borrow().take_font_requests();
         if urls.is_empty() {
             return;
         }
         let traversable = selected_id(page);
-        let client = request_context_url(page.engine.ctx(), 0);
-        let Some((handle, cache, events, source, policy)) =
+        let Some((handle, cache, events)) =
             page.engine.ctx().host_mut::<HostState>().and_then(|state| {
-                // Referrer Policy #integration-with-css: the Document's URL
-                // and policy container referrer policy.
-                let source = environment_referrer_source(state, 0);
-                let policy = environment_referrer_policy(state, 0);
                 let network = state.network.as_ref()?;
                 Some((
                     network.handle.clone(),
                     network.cache.clone(),
                     state.task_events.clone()?,
-                    source,
-                    policy,
                 ))
             })
         else {
             return;
         };
-        for url in urls {
+        for crate::font_system::FontRequest { document, url, .. } in urls {
+            let context = page
+                .engine
+                .ctx()
+                .host::<HostState>()
+                .and_then(|state| node_window_context(state, &page.dom.borrow(), document))
+                .unwrap_or(0);
+            let client = request_context_url(page.engine.ctx(), context);
+            let cookies = cookie_context_for_id(page.engine.ctx(), context);
+            let (source, policy) = {
+                let state = page
+                    .engine
+                    .ctx()
+                    .host_mut::<HostState>()
+                    .expect("font host");
+                state.pending_fonts += 1;
+                (
+                    environment_referrer_source(state, context),
+                    environment_referrer_policy(state, context),
+                )
+            };
             let name = url.to_string();
-            // CSS Fonts 4 #font-display-timeline: a face of the navigation
-            // still loading after its block period. Wait for that load, not
-            // a second one, and refuse it after its swap period.
-            if let Some((mut late, failure)) = crate::font_system::late_page_face(&name) {
-                let events = events.clone();
-                cache.spawn(&handle, async move {
-                    let result = late
-                        .wait_for(Option::is_some)
-                        .await
-                        .ok()
-                        .and_then(|result| result.clone())
-                        .flatten();
-                    let bytes = result
-                        .filter(|(winner, _)| *winner == name)
-                        .map(|(_, bytes)| bytes)
-                        .filter(|_| failure.is_none_or(|end| std::time::Instant::now() <= end));
-                    let _ = events.send(TrustJsHostTask::FontDone {
-                        traversable,
-                        url: name,
-                        bytes,
-                    });
-                });
-                continue;
-            }
             if !crate::http::subresource_allowed(&client, &url) {
                 let _ = events.send(TrustJsHostTask::FontDone {
                     traversable,
+                    document,
                     url: name,
                     bytes: None,
                 });
@@ -7525,7 +7540,7 @@ mod desktop {
             }
             let credentials = Some(crate::http::CredentialsMode::SameOrigin);
             let mut request = crate::http::Request::subresource(url, &client, "font", credentials);
-            request.cookie_context = Some(crate::http::CookieContext::subresource(&client));
+            request.cookie_context = Some(cookies);
             crate::http::set_request_referrer(&mut request, source.as_ref(), policy);
             let fetched =
                 cache.fetch_prepared_resource(&handle, request, &client, "font", credentials);
@@ -7538,6 +7553,7 @@ mod desktop {
                     .map(|response| response.body.clone());
                 let _ = events.send(TrustJsHostTask::FontDone {
                     traversable,
+                    document,
                     url: name,
                     bytes,
                 });
@@ -10862,6 +10878,28 @@ mod desktop {
                 }
             }
             (frames, colors.len())
+        }
+
+        #[tokio::test]
+        async fn additive_compositor_does_not_relayout_for_raf_font_readiness_checks() {
+            let html = r#"<!doctype html><style>body{margin:0}
+                div{width:50px;height:30px;transform:translateX(10px);animation:c 2s linear infinite;animation-composition:add}
+                @keyframes c{from{transform:translateX(0)}to{transform:translateX(100px)}}
+                </style><div>moving</div><script>
+                function tick(){requestAnimationFrame(tick)}requestAnimationFrame(tick);
+                </script>"#;
+            let (frames, _) =
+                css_animation_frames(html, false, Duration::from_millis(750), vec![]).await;
+            assert_eq!(
+                frames, 0,
+                "the frontend samples the retained stack; RAF font discovery must not rebuild it"
+            );
+            let (terminal_frames, _) =
+                css_animation_frames(html, true, Duration::from_millis(750), vec![]).await;
+            assert!(
+                terminal_frames > 0,
+                "the cell compositor retains actor-driven animation"
+            );
         }
 
         #[tokio::test]
@@ -14606,6 +14644,7 @@ host_functions! {
     ("__worker_self_post", 1, host_worker_self_post, []),
     ("__worker_self_close", 0, host_worker_self_close, []),
     ("__dom_computed", 2, guarded_computed_style, [0]),
+    ("__dom_text_transform", 2, guarded_text_transform, [0]),
     ("__dom_transition_events", 0, host_transition_events, []),
     ("__dom_animation_events", 0, host_animation_events, []),
     ("__dom_offset_style", 1, guarded_offset_style, [0]),
@@ -15296,6 +15335,17 @@ fn node_window_context(state: &HostState, dom: &Dom, node: usize) -> Option<u64>
     state.frame_contexts.get(&container).copied()
 }
 
+fn window_document(state: &HostState, dom: &Dom, context: u64) -> Option<usize> {
+    if context == state.top_context {
+        return Some(dom.document());
+    }
+    state.frame_contexts.iter().find_map(|(&frame, &owner)| {
+        (owner == context)
+            .then(|| dom.frame_document(frame))
+            .flatten()
+    })
+}
+
 /// Defense in depth for DOM host operations (HTML #same-origin-domain, applied as
 /// IsPlatformObjectSameOrigin would to the node's relevant settings object): the calling
 /// Window Realm may act on a node only when the node's Document is same origin-domain with it.
@@ -15438,6 +15488,7 @@ node_access_guards! {
     guarded_ce_candidates = host_ce_candidates, [0], Invalidate;
     guarded_input = host_input, [0], Invalidate;
     guarded_computed_style = host_computed_style, [0], Invalidate;
+    guarded_text_transform = host_text_transform, [0], Invalidate;
     guarded_editable_model = host_editable_model, [0, 1, 3], Invalidate;
     guarded_offset_style = host_offset_style, [0], Invalidate;
     guarded_rect = host_rect, [0], Invalidate;
@@ -20011,6 +20062,9 @@ fn host_worker_self_close(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Resul
 }
 
 fn install_trust_js_worker_boundary(engine: &mut trust_js::Engine) {
+    engine.define_global("__font_query", 4, font_loading_host::query);
+    engine.define_global("__font_load", 4, font_loading_host::load);
+    engine.define_global("__font_install", 3, font_loading_host::install);
     engine.define_global("__geometry_bind", 2, geometry_host::bind);
     engine.define_global("__message_port_binding", 3, message_port_host::call);
     engine.ctx().op_state().register_gc::<HostState>();
@@ -20775,6 +20829,7 @@ fn run_trust_js_worker(
         // #run-a-worker inherits it for a local-scheme script URL).
         referrer_policy: launch.referrer_policy,
     });
+    state.install_font_demand_waker();
 
     let mut engine = trust_js::Engine::new_with_interrupt(interrupt);
     let engine_clock = clock.clone();
@@ -22157,7 +22212,8 @@ fn host_task_traversable(state: &HostState, task: &TrustJsHostTask) -> Option<Tr
     let context = match task {
         // The traversable whose count the fetch joined, also when its element
         // has moved to another traversable since.
-        TrustJsHostTask::FontFaceDone { traversable, .. }
+        TrustJsHostTask::FontUse { traversable }
+        | TrustJsHostTask::FontFaceDone { traversable, .. }
         | TrustJsHostTask::FontDone { traversable, .. }
         | TrustJsHostTask::StyleImportsDone { traversable, .. }
         | TrustJsHostTask::ParserResourceTiming { traversable, .. }
@@ -22210,8 +22266,38 @@ fn dispatch_host_task(engine: &mut trust_js::Engine, task: TrustJsHostTask) -> R
                 }
             }
         }
+        TrustJsHostTask::FontUse { .. } => {
+            if let Some(state) = engine.ctx().host::<HostState>() {
+                state.dom.borrow_mut().advance_font_display();
+            }
+            let contexts = engine
+                .ctx()
+                .host::<HostState>()
+                .map(|state| {
+                    let selected = state.traversables.selected;
+                    let mut contexts: Vec<_> = std::iter::once(state.top_context)
+                        .chain(state.window_realms.keys().copied())
+                        .filter(|&context| state.traversable_of_context(context) == selected)
+                        .collect();
+                    contexts.sort_unstable();
+                    contexts.dedup();
+                    contexts
+                })
+                .unwrap_or_default();
+            for context in contexts {
+                run_in_context_realm(engine, context, "font use", |engine| {
+                    host_call_trust(engine.ctx(), "refreshFontSources", &[])
+                        .map(|_| ())
+                        .map_err(|_| String::from("font discovery failed"))
+                })?;
+            }
+            if let Some(state) = engine.ctx().host::<HostState>() {
+                state.install_font_demand_waker();
+            }
+        }
         TrustJsHostTask::FontFaceDone {
             context,
+            document,
             request,
             source,
             bytes,
@@ -22220,10 +22306,11 @@ fn dispatch_host_task(engine: &mut trust_js::Engine, task: TrustJsHostTask) -> R
             if let Some(state) = engine.ctx().host_mut::<HostState>() {
                 state.pending_fonts = state.pending_fonts.saturating_sub(1);
                 if let (Some(source), Some(bytes)) = (&source, &bytes) {
-                    state
-                        .dom
-                        .borrow_mut()
-                        .install_downloaded_font(source, Some(bytes.clone()));
+                    state.dom.borrow_mut().install_document_font(
+                        document,
+                        source,
+                        Some(bytes.clone()),
+                    );
                 }
             }
             run_in_context_realm(engine, context, "font loading", |engine| {
@@ -22243,14 +22330,23 @@ fn dispatch_host_task(engine: &mut trust_js::Engine, task: TrustJsHostTask) -> R
                 .map_err(|_| String::from("font loading completion failed"))
             })?;
         }
-        TrustJsHostTask::FontDone { url, bytes, .. } => {
+        TrustJsHostTask::FontDone {
+            document,
+            url,
+            bytes,
+            ..
+        } => {
+            if let Some(state) = engine.ctx().host_mut::<HostState>() {
+                state.pending_fonts = state.pending_fonts.saturating_sub(1);
+            }
             let dom = engine
                 .ctx()
                 .host_mut::<HostState>()
                 .expect("HostState installed before host tasks")
                 .dom
                 .clone();
-            dom.borrow_mut().install_downloaded_font(&url, bytes);
+            dom.borrow_mut()
+                .install_document_font(document, &url, bytes);
         }
         TrustJsHostTask::StyleImportsDone { url, sheets, .. } => {
             let dom = {
@@ -25865,6 +25961,10 @@ fn host_layout_environment(ctx: &mut Ctx) -> (url::Url, crate::layout2::Viewport
 /// resources/viewport (explicit invalidation), and activation metadata all
 /// participate in freshness. Paint is a later, independently lazy consumer.
 fn sync_css_transitions(ctx: &mut Ctx) {
+    sync_css_transitions_for(ctx, true);
+}
+
+fn sync_css_transitions_for(ctx: &mut Ctx, geometry_read: bool) {
     let (dom, seconds, origin_ms, viewport, base) = {
         let state = ctx.host_mut::<HostState>().expect("DOM host");
         (
@@ -25889,11 +25989,15 @@ fn sync_css_transitions(ctx: &mut Ctx) {
     dom.update_css_transitions(seconds);
     // CSS Animations 1 #animations shares the document timeline sample, so
     // CSSOM, observers and paint see one animation-origin value per frame.
-    dom.update_css_animations(seconds);
+    if geometry_read {
+        dom.update_css_animations(seconds);
+    } else {
+        dom.update_css_animations_for_paint(seconds);
+    }
 }
 
 fn host_transition_events(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
-    sync_css_transitions(ctx);
+    sync_css_transitions_for(ctx, false);
     let events = host_dom(ctx).borrow_mut().take_css_transition_events();
     Ok(Value::from_engine_text(
         serde_json::to_string(&events).unwrap(),
@@ -25902,7 +26006,7 @@ fn host_transition_events(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Resul
 
 /// CSS Animations 2 #event-dispatch for this rendering update's sample.
 fn host_animation_events(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
-    sync_css_transitions(ctx);
+    sync_css_transitions_for(ctx, false);
     let events = host_dom(ctx).borrow_mut().take_css_animation_events();
     Ok(Value::from_engine_text(
         serde_json::to_string(&events).unwrap(),
@@ -25918,7 +26022,16 @@ fn ensure_host_geometry(
     reason: &'static str,
     requested_box: Option<crate::dom::NodeId>,
 ) -> Rc<RefCell<TrustJsGeomCache>> {
-    sync_css_transitions(ctx);
+    ensure_host_geometry_for(ctx, reason, requested_box, true)
+}
+
+fn ensure_host_geometry_for(
+    ctx: &mut Ctx,
+    reason: &'static str,
+    requested_box: Option<crate::dom::NodeId>,
+    geometry_read: bool,
+) -> Rc<RefCell<TrustJsGeomCache>> {
+    sync_css_transitions_for(ctx, geometry_read);
     let top_key = top_hit_key(ctx);
     let (dom_handle, base, viewport, cache, images) = {
         let state = ctx
@@ -26225,13 +26338,24 @@ fn host_resolved_grid_tracks(ctx: &mut Ctx, args: &[Value], columns: bool) -> Op
     let cached = cache.borrow();
     let (column_tracks, row_tracks) = cached.tracks.get(&id)?;
     let tracks = if columns { column_tracks } else { row_tracks };
-    if !columns {
+    {
         let dom = host_dom(ctx);
         let dom = dom.borrow();
-        if dom.is_row_subgrid_item(id) {
+        if if columns {
+            dom.is_column_subgrid_item(id)
+        } else {
+            dom.is_row_subgrid_item(id)
+        } {
             return Some(crate::layout2::serialize_subgrid_rows(
-                &dom.computed_value_resolved(id, "grid-template-rows")
-                    .unwrap_or_default(),
+                &dom.computed_value_resolved(
+                    id,
+                    if columns {
+                        "grid-template-columns"
+                    } else {
+                        "grid-template-rows"
+                    },
+                )
+                .unwrap_or_default(),
                 tracks.len(),
             ));
         }
@@ -26320,6 +26444,62 @@ fn host_computed_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
             None => Value::Null,
         },
     ))
+}
+
+/// HTML #rendered-text-collection-steps applies the same CSS Text mappings
+/// as layout. Batch adjacent text so inline boundaries preserve word/case
+/// context, and check every node against the authorized root's Document.
+fn host_text_transform(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let records =
+        serde_json::from_str::<Vec<(Option<usize>, String, bool)>>(&host_arg_string(ctx, args, 1))
+            .unwrap_or_default();
+    let dom = host_dom(ctx);
+    let dom = dom.borrow();
+    let document = host_arg_node(&dom, args, 0).and_then(|node| dom.owner_document(node));
+    let mut text = String::new();
+    let mut offsets = Vec::with_capacity(records.len());
+    for (_, part, _) in &records {
+        offsets.push(text.len());
+        text.push_str(part);
+    }
+    let context = crate::text::transform::Context::new(&text);
+    let surrounding = crate::text::dom_context::DomTextContexts::new(
+        &dom,
+        records.iter().filter_map(|(node, _, _)| {
+            node.filter(|&node| dom.is_valid(node) && dom.owner_document(node) == document)
+        }),
+    );
+    let result: Vec<_> = records
+        .iter()
+        .zip(offsets)
+        .map(|((node, text, preserve), offset)| {
+            let node =
+                node.filter(|&node| dom.is_valid(node) && dom.owner_document(node) == document);
+            let Some(node) = node else {
+                return text.clone();
+            };
+            let Some(parent) = dom.node(node).parent else {
+                return text.clone();
+            };
+            let transform = dom
+                .computed_value_resolved(parent, "text-transform")
+                .as_deref()
+                .and_then(crate::text::transform::TextTransform::from_css)
+                .unwrap_or_default();
+            transform
+                .transform(
+                    text,
+                    dom.inherited_lang(parent),
+                    false,
+                    *preserve,
+                    dom.text_content(node).chars().count() == 1,
+                    surrounding.get(node).or(Some((&context, offset))),
+                )
+                .text
+                .into_owned()
+        })
+        .collect();
+    Ok(Value::from_string(serde_json::to_string(&result).unwrap()))
 }
 
 fn host_offset_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
@@ -31559,6 +31739,82 @@ mod tests {
                 })()"#
             ),
             "ac|1|xy|false|onetwo|three|true||true|true|false|true|false|def|abc|SyntaxError|ok|ok|ok"
+        );
+    }
+
+    #[test]
+    fn animation_composition_cssom_and_geometry_include_the_composed_transforms() {
+        let mut engine = platform_engine_with_body();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+            document.body.innerHTML='<style>div{width:100px;height:50px;transform:scale(2);transform-origin:0 0;animation:s 2s linear -1s paused both;animation-composition:add}' +
+                '#acc{animation-composition:accumulate} #p{transform:translateX(50%);animation-name:r;animation-composition:accumulate}' +
+                '@keyframes s{from{transform:scale(3)}to{transform:scale(5)}}' +
+                '@keyframes r{from,to{transform:rotate(90deg) translateX(10%)}}</style>' +
+                '<div id=add></div><div id=acc></div><div id=p></div>';
+            return [CSS.supports('animation-composition','add, accumulate'),CSS.supports('animation-composition','add bogus'),
+                getComputedStyle(add).animationComposition,add.getBoundingClientRect().width,
+                acc.getBoundingClientRect().width,getComputedStyle(p).transform].join('|');
+        })()"#
+            ),
+            "true|false|add|800|500|matrix(0, 1, -1, 0, 50, 10)"
+        );
+    }
+
+    #[test]
+    fn text_transform_inner_text_and_plain_copy_use_their_respective_text() {
+        let mut engine = platform_engine_with_body();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+            document.body.innerHTML='<p id=a style="text-transform:capitalize">he<b>llo</b>-ǳUNGLE</p>' +
+                '<p id=b style="text-transform:uppercase">aßb</p>' +
+                '<p id=c lang=tr style="text-transform:full-width uppercase">istanbul</p>' +
+                '<span id=d style="text-transform:math-auto">h</span>';
+            const out=[a.innerText,b.innerText,c.innerText,d.innerText];
+            getSelection().setBaseAndExtent(b.firstChild,0,b.firstChild,3);
+            __trust.userCopy();
+            out.push(b.textContent,getSelection().toString());
+            return out.join('|');
+        })()"#
+            ),
+            "Hello-ǲUNGLE|ASSB|İＳＴＡＮＢＵＬ|ℎ|aßb|aßb"
+        );
+        let written = std::mem::take(
+            &mut engine
+                .ctx()
+                .host_mut::<HostState>()
+                .unwrap()
+                .clipboard_requests,
+        );
+        assert_eq!(
+            written
+                .into_iter()
+                .map(|(_, text)| text)
+                .collect::<Vec<_>>(),
+            ["aßb"]
+        );
+    }
+
+    #[test]
+    fn text_transform_inner_text_uses_context_outside_the_requested_subtree() {
+        let mut engine = platform_engine_with_body();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+            document.body.innerHTML='<p style="text-transform:capitalize">he<b id=a>llo</b><i style="position:absolute">X</i><em id=b>world</em></p>' +
+              '<p style="text-transform:lowercase">Ο<b id=c>Σ</b>Α</p>' +
+              '<p lang=nl style="text-transform:capitalize">i<b id=d>jssel</b></p>' +
+              '<p style="text-transform:capitalize">word<span style="display:inline-block"></span><b id=e>next</b></p>' +
+              '<p style="text-transform:lowercase">A   <b id=f>ΟΣ</b></p>';
+            return [a.innerText,b.innerText,c.innerText,d.innerText,e.innerText,f.innerText].join('|');
+        })()"#
+            ),
+            "llo|world|σ|Jssel|Next|ος"
         );
     }
 
@@ -37664,7 +37920,7 @@ mod tests {
     #[test]
     fn trust_js_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 266, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 267, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -37675,7 +37931,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(trust_js_registry_matches_canonical_boundary());
-        assert_eq!(TRUST_JS_HOST_FUNCTIONS.len(), 266);
+        assert_eq!(TRUST_JS_HOST_FUNCTIONS.len(), 267);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(
@@ -59693,6 +59949,65 @@ mod tests {
                 "{tier:?}"
             );
         }
+    }
+
+    #[test]
+    fn column_subgrid_resolved_values_keep_local_line_names_and_used_span() {
+        // CSS Grid 2 #resolved-track-list-subgrid: local names, empty line
+        // sets and the used span, never inherited names or pixel lengths.
+        let mut engine = platform_engine();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"
+            (() => {
+                const root=document.createElement('html'); document.appendChild(root);
+                root.innerHTML=`<style>body{margin:0}#outer{display:grid;width:400px;grid-template-columns:repeat(4,100px)}
+                    #sub{display:grid;grid-column:span 4;grid-template-columns:subgrid [a] repeat(auto-fill,[b]) [c]}</style>
+                    <div id=outer><div id=sub><div id=child></div></div></div>`;
+                const sub=document.getElementById('sub'), style=getComputedStyle(sub), result=[style.gridTemplateColumns];
+                sub.style.gridColumn='span 2'; result.push(style.gridTemplateColumns);
+                const outer=document.getElementById('outer');
+                outer.style.gridTemplateColumns='80px 120px 90px 110px';
+                result.push(style.gridTemplateColumns,document.getElementById('child').getBoundingClientRect().width);
+                return result.join('|');
+            })()
+        "#
+            ),
+            "subgrid [a] [b] [b] [b] [c]|subgrid [a] [b] [c]|subgrid [a] [b] [c]|80"
+        );
+    }
+
+    #[test]
+    fn legacy_performance_timing_keeps_its_window_and_live_navigation_record() {
+        // Navigation Timing #the-performancetiming-interface and
+        // #extensions-to-the-performance-interface; Web IDL #js-default-tojson.
+        let mut engine = platform_engine();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"
+            (() => {
+                const root=document.createElement('html'); document.appendChild(root);
+                const frame=document.createElement('iframe'); root.appendChild(frame);
+                const child=frame.contentWindow, local=performance.timing, remote=child.performance.timing;
+                const before=remote.navigationStart;
+                const get=Object.getOwnPropertyDescriptor(Performance.prototype,'timing').get;
+                const stamp=Object.getOwnPropertyDescriptor(PerformanceTiming.prototype,'navigationStart').get;
+                const json=PerformanceTiming.prototype.toJSON.call(remote);
+                const values=[get.call(child.performance)===remote, stamp.call(remote)===before,
+                    remote instanceof child.PerformanceTiming, !(remote instanceof PerformanceTiming),
+                    Object.getPrototypeOf(json)===Object.prototype];
+                __trust.replaceNavigationTiming({name:location.href,timeOrigin:17,
+                    'legacy:navigationStart':17,'legacy:responseEnd':23});
+                values.push(performance.timing===local, local.navigationStart===17, local.responseEnd===23,
+                    remote.navigationStart===before, json.navigationStart===before);
+                return values.join();
+            })()
+        "#
+            ),
+            "true,true,true,true,true,true,true,true,true,true"
+        );
     }
 
     #[test]

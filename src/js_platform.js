@@ -9513,6 +9513,20 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             || (internalsFor(element).trustRelList = createDOMTokenList(element, "rel", supported));
     }
 
+    const fontLoading = (function(g) {
+    /*__FONT_LOADING_BEGIN__*/
+    const fontAdapter = g.__font_adapter || null;
+    delete g.__font_adapter;
+    const fontControl = fontAdapter ? fontAdapter.control : trust;
+    const fontSlots = fontAdapter ? fontAdapter.slots : internalsFor;
+    const fontRead = fontAdapter ? fontAdapter.slots : internalsOf;
+    const fontDocumentId = fontAdapter ? () => 0 : object => nodeIds.get(object);
+    const fontString = fontAdapter ? value => `${value}` : domString;
+    const fontEnumerable = fontAdapter ? Interface => {
+        for (const key of Object.getOwnPropertyNames(Interface.prototype)) {
+            if (key !== "constructor") Object.defineProperty(Interface.prototype,key,{enumerable:true});
+        }
+    } : enumerableMembers;
     // CSS Font Loading 3 #fontface-interface, #font-face-css-connection and
     // #FontFaceSet-interface (CSSWG 81c27f686901). Native loading uses the
     // renderer's decoder/cache; script owns identity, promises and task order.
@@ -9527,21 +9541,24 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     const fontTasks = [], fontSources = new Set(), pendingFontLoads = new Map();
     const fontPromise = Promise, fontAll = Promise.all.bind(Promise);
     const nativeFontLoad = __font_load, nativeFontInstall = __font_install, nativeFontQuery = __font_query;
+    const fontDeclarationGet = fontAdapter ? null : CSSStyleDeclaration.prototype.getPropertyValue;
+    const fontDeclarationSet = fontAdapter ? null : CSSStyleDeclaration.prototype.setProperty;
+    const fontApply = Reflect.apply;
     const fontBufferLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength").get;
     const fontIsView = ArrayBuffer.isView;
     const fontRealm = {};
     let nextFontLoad = 1, nextFontMember = 1;
-    function fontTask(fn) { fontTasks.push({fn, frame:trust.__activeFrame, windowState:activeWindowState()}); }
+    function fontTask(fn) { if (fontAdapter) fontAdapter.queue(fn); else fontTasks.push({fn, frame:fontControl.__activeFrame, windowState:activeWindowState()}); }
     function fontFaceDescriptor(name, value) {
-        return JSON.parse(nativeFontQuery("descriptor", name, domString(value), ""));
+        return JSON.parse(nativeFontQuery("descriptor", name, fontString(value), ""));
     }
     function fontFaceState(face) {
-        const state = internalsOf(face).fontFace;
+        const state = fontRead(face).fontFace;
         if (!state) throw new TypeError("Illegal FontFace invocation");
         return state;
     }
     function fontSetState(set) {
-        const state = internalsOf(set).fontFaceSet;
+        const state = fontRead(set).fontFaceSet;
         if (!state) throw new TypeError("Illegal FontFaceSet invocation");
         return state;
     }
@@ -9554,7 +9571,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const state = {descriptors:{}, source:null, binary:null, bytes:null, base,
             status:"unloaded", sets:new Set(), connection:null, promise:null, resolve:null, reject:null,
             realm:fontRealm, load:() => loadFontFace(face)};
-        internalsFor(face).fontFace = state;
+        fontSlots(face).fontFace = state;
         state.promise = new fontPromise((resolve, reject) => {state.resolve = resolve; state.reject = reject;});
         let binary = fontIsView(source);
         if (!binary && source !== null && typeof source === "object") {
@@ -9565,7 +9582,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const converted = {};
         for (const key of FONT_FACE_DESCRIPTORS.map(([key]) => key).concat(["width"]).sort()) {
             const value = descriptors[key];
-            converted[key] = value === undefined ? undefined : domString(value);
+            converted[key] = value === undefined ? undefined : fontString(value);
         }
         const values = {family:fontFaceDescriptor("font-family", family)};
         let valid = values.family !== null;
@@ -9604,21 +9621,21 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const state = fontRefreshConnection(face), parsed = fontFaceDescriptor(name, value);
         if (parsed === null) throw new DOMException("Invalid " + name + " value", "SyntaxError");
         state.descriptors[attribute] = parsed;
-        if (state.connection) state.connection.rule.style.setProperty(name, parsed);
+        if (state.connection) fontApply(fontDeclarationSet,fontRead(state.connection.rule).style,[name,parsed]);
         for (const set of state.sets) installFontSet(set);
     }
     class FontFace {
         constructor(family, source, descriptors = {}) {
             if (arguments.length < 2) throw new TypeError("FontFace requires family and source");
-            family = domString(family);
+            family = fontString(family);
             let binary = fontIsView(source);
             if (!binary && source !== null && typeof source === "object") {
                 try { Reflect.apply(fontBufferLength, source, []); binary = true; } catch (_) {}
             }
-            if (!binary) source = domString(source);
+            if (!binary) source = fontString(source);
             if (descriptors === null) descriptors = {};
             if ((typeof descriptors !== "object" && typeof descriptors !== "function")) throw new TypeError("FontFaceDescriptors must be a dictionary");
-            newFontFace(this, family, source, descriptors, documentBaseURL(trust.__activeFrame || realmRootFrame));
+            newFontFace(this, family, source, descriptors, (fontAdapter ? fontAdapter.baseURL() : documentBaseURL(fontControl.__activeFrame || realmRootFrame)));
         }
         get family() { return fontRefreshConnection(this).descriptors.family; }
         set family(value) { fontFaceSet(this, "family", "font-family", value); }
@@ -9651,14 +9668,14 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         fontStart(face);
         const request = nextFontLoad++;
         pendingFontLoads.set(request, face);
-        const result = nativeFontLoad(request, fontCSS(face), state.base, null);
+        const result = nativeFontLoad(request, fontCSS(face), JSON.stringify({base:state.base,css:!!(state.connection && state.connection.external)}), null);
         if (result !== null) {
             pendingFontLoads.delete(request);
             fontTask(() => fontComplete(face, result, "NetworkError"));
         }
         return state.promise;
     }
-    trust.fontFaceLoaded = function (request, result) {
+    fontControl.fontFaceLoaded = function (request, result) {
         const face = pendingFontLoads.get(request);
         if (!face) return;
         pendingFontLoads.delete(request);
@@ -9692,13 +9709,16 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     function fontFire(set, type, fonts) {
         const own = fontSetState(set);
         const present = fonts.filter(face => own.members.has(face));
-        dispatch(set, createTrustedEvent(FontFaceSetLoadEvent, type, {fontfaces:present}), false);
+        if (fontAdapter) fontAdapter.fire(set, FontFaceSetLoadEvent, type, {fontfaces:present});
+        else dispatch(set, createTrustedEvent(FontFaceSetLoadEvent, type, {fontfaces:present}), false);
     }
     function fontSetLoaded(set) {
         const own = fontSetState(set);
+        if (own.syncing || own.checking) {own.stuck = true; return;}
+        if (loadUsedFonts(set)) {own.stuck = true; return;}
         if (own.loading.size) return;
-        if (own.document && (own.document.readyState !== "complete" ||
-                nativeFontQuery("pending",nodeIds.get(own.document),"","") === "true" ||
+        if (!fontAdapter && own.document && (own.document.readyState !== "complete" ||
+                nativeFontQuery("pending",fontDocumentId(own.document),"","") === "true" ||
                 Array.from(styleSheetWaits).some(([element,wait]) => !wait.queued &&
                     element.ownerDocument === own.document && criticalSubresourceState(element) === "pending"))) {
             own.stuck = true; return;
@@ -9717,8 +9737,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     function initFontSet(set, document) {
         const own = {document, members:new Map(), css:new Map(), loading:new Set(), loaded:new Set(), failed:new Set(),
             status:"loaded", ready:null, resolveReady:null, readyDone:false, stuck:false, syncing:false, epoch:-1,
-            installed:"", handlers:{}, realm:fontRealm, sync:() => syncFontSet(set)};
-        internalsFor(set).fontFaceSet = own;
+            installed:"", sentBytes:new Map(), checking:false, handlers:{}, realm:fontRealm,
+            sync:() => syncFontSet(set), use:() => loadUsedFonts(set)};
+        fontSlots(set).fontFaceSet = own;
         own.ready = new fontPromise(resolve => {own.resolveReady = resolve;});
         if (document) fontSources.add(new WeakRef(set));
         fontTask(() => {syncFontSet(set); fontSetLoaded(set);});
@@ -9726,7 +9747,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     const fontSetToken = {};
     function fontSource(document) {
-        const slots = internalsFor(document);
+        const slots = fontSlots(document);
         if (!slots.fonts) slots.fonts = initFontSet(new FontFaceSet(fontSetToken), document);
         syncFontSet(slots.fonts);
         return slots.fonts;
@@ -9750,41 +9771,51 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     function installFontSet(set) {
         const own = fontSetState(set);
         if (!own.document || own.syncing) return;
-        const css = [], buffers = [], signature = [];
+        const records = [], buffers = [], sent = new Map();
         for (const [face, member] of own.members) {
             const state = fontFaceState(face);
-            if (state.connection || state.status !== "loaded") continue;
-            const text = fontCSS(face); css.push(text); buffers.push(state.bytes); signature.push([member,text]);
+            const connection = state.connection;
+            const css = connection ? declarationText(fontRead(connection.rule).style,true) : fontCSS(face);
+            const scopes = connection ? connection.scopes : [fontDocumentId(own.document)];
+            for (const scope of scopes) {
+                records.push({member,scope,css,base:state.base,connected:!!connection,status:state.status});
+                buffers.push(state.bytes && own.sentBytes.get(member) !== state.bytes ? state.bytes : null);
+            }
+            if (state.bytes) sent.set(member,state.bytes);
         }
-        const key = JSON.stringify(signature);
+        const key = JSON.stringify(records);
         if (own.installed === key) return;
+        nativeFontInstall(fontDocumentId(own.document), key, buffers);
         own.installed = key;
-        nativeFontInstall(nodeIds.get(own.document), JSON.stringify(css), buffers);
+        own.sentBytes = sent;
     }
     // Read the internal CSSOM lists, including cross-origin sheets. This does
     // not give author code access to their cssRules or their source text.
     function cssFontRules(document) {
-        const out = [], visited = new Set();
-        function rules(list, base) {
+        if (fontAdapter) return [];
+        const out = [], visited = new Map();
+        function rules(list, base, scope, external) {
             for (const rule of list || []) {
-                if (rule instanceof CSSFontFaceRule) { out.push([rule,base]); continue; }
-                if (rule instanceof CSSImportRule) { const sheet = rule.styleSheet; if (sheet) visit(sheet); continue; }
+                if (rule instanceof CSSFontFaceRule) { out.push([rule,base,scope,external]); continue; }
+                if (rule instanceof CSSImportRule) { const sheet = rule.styleSheet; if (sheet) visit(sheet,scope); continue; }
                 if (rule instanceof CSSMediaRule && !rule.matches) continue;
                 if (rule instanceof CSSSupportsRule && !rule.matches) continue;
-                if (!(rule instanceof CSSKeyframesRule)) rules(internalsOf(rule).children, base);
+                if (!(rule instanceof CSSKeyframesRule)) rules(fontRead(rule).children, base, scope, external);
             }
         }
-        function visit(sheet) {
-            if (!sheet || visited.has(sheet)) return;
-            visited.add(sheet);
+        function visit(sheet, scope) {
+            let seen = visited.get(scope); if (!seen) visited.set(scope,seen = new Set());
+            if (!sheet || seen.has(sheet)) return;
+            seen.add(sheet);
             if (sheet.disabled || (sheet.media.mediaText && !g.matchMedia(sheet.media.mediaText).matches)) return;
-            rules(internalsOf(sheet).children, internalsOf(sheet).importBase || internalsOf(sheet).baseURL || document.baseURI);
+            const slots = fontRead(sheet);
+            rules(slots.children, slots.baseURL || slots.importBase || document.baseURI, scope, !!slots.location && !slots.constructed);
         }
-        for (const scopeId of JSON.parse(nativeFontQuery("scopes", nodeIds.get(document), "", ""))) {
+        for (const scopeId of JSON.parse(nativeFontQuery("scopes", fontDocumentId(document), "", ""))) {
             const scope = wrap(scopeId);
             const owners = wrapQueryResults(scope, __dom_query(scopeId, "style, link[rel~='stylesheet']", false));
-            for (const owner of owners) visit(elementSheet(owner));
-            for (const sheet of internalsOf(scope).adopted || []) visit(sheet);
+            for (const owner of owners) visit(elementSheet(owner),scopeId);
+            for (const sheet of fontRead(scope).adopted || []) visit(sheet,scopeId);
         }
         return out;
     }
@@ -9795,23 +9826,27 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         own.syncing = true;
         try {
             const next = new Map(), connected = [];
-            for (const [rule, base] of cssFontRules(own.document)) {
-                const style = rule.style, source = style.getPropertyValue("src"), family = style.getPropertyValue("font-family");
+            for (const [rule, base, scope, external] of cssFontRules(own.document)) {
+                const style = fontRead(rule).style;
+                const value = name => fontApply(fontDeclarationGet,style,[name]);
+                const source = value("src"), family = value("font-family");
                 if (!source || !family) continue;
-                let face = own.css.get(rule);
+                let face = next.get(rule) || own.css.get(rule);
                 if (face && fontFaceState(face).source !== source) {
                     fontDisconnect(face); fontMemberDelete(set, face); face = null;
                 }
                 const values = {};
-                for (const [key, name, initial] of FONT_FACE_DESCRIPTORS) values[key] = style.getPropertyValue(name) || initial;
+                for (const [key, name, initial] of FONT_FACE_DESCRIPTORS) values[key] = value(name) || initial;
                 if (!face) {
                     face = newFontFace(Object.create(FontFace.prototype), family, source, values, base);
-                    fontFaceState(face).connection = {rule,set,refresh:() => syncFontSet(set)};
+                    fontFaceState(face).connection = {rule,set,external,scopes:[],refresh:() => syncFontSet(set)};
                     fontMemberAdd(set, face);
                 } else {
                     const state = fontFaceState(face); state.descriptors = {family,...values}; state.base = base;
                 }
-                next.set(rule, face); connected.push(face);
+                if (!next.has(rule)) { fontFaceState(face).connection.scopes = []; connected.push(face); }
+                fontFaceState(face).connection.scopes.push(scope);
+                next.set(rule, face);
             }
             for (const [rule, face] of own.css) if (!next.has(rule)) { fontDisconnect(face); fontMemberDelete(set, face); }
             own.css = next;
@@ -9822,16 +9857,31 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         } finally { own.syncing = false; }
         installFontSet(set);
     }
-    trust.refreshFontSources = function () {
+    function loadUsedFonts(set) {
+        const own = fontSetState(set);
+        if (own.realm !== fontRealm) return own.use();
+        if (!own.document || own.checking || own.syncing) return own.loading.size > 0;
+        own.checking = true;
+        try {
+            syncFontSet(set); installFontSet(set);
+            const needed = new Set(JSON.parse(nativeFontQuery("needed",fontDocumentId(own.document),"","")));
+            let pending = false;
+            for (const [face, member] of own.members) if (needed.has(member)) {
+                const state = fontFaceState(face);
+                if (state.status === "unloaded") loadFontFace(face).catch(() => {});
+                if (state.status === "unloaded" || state.status === "loading") pending = true;
+            }
+            return pending;
+        } finally { own.checking = false; }
+    }
+    fontControl.refreshFontSources = function () {
+        fontSource(fontAdapter ? g : g.document);
         for (const reference of fontSources) {
             const set = reference.deref();
             if (!set) {fontSources.delete(reference); continue;}
             syncFontSet(set);
             const own = fontSetState(set);
-            // Rendering may already have fetched the face. load() joins the
-            // same response and establishes its script-visible status/promise.
-            for (const face of own.members.keys()) if (fontFaceState(face).status === "unloaded")
-                loadFontFace(face).catch(() => {});
+            loadUsedFonts(set);
             if (own.stuck || !own.readyDone) fontSetLoaded(set);
         }
     };
@@ -9861,10 +9911,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     class FontFaceSetLoadEvent extends Event {
         constructor(type, init = {}) {
             super(type, init);
-            internalsFor(this).fontfaces = Object.freeze(Array.from((init && init.fontfaces) || [], face => {fontFaceState(face); return face;}));
+            fontSlots(this).fontfaces = Object.freeze(Array.from((init && init.fontfaces) || [], face => {fontFaceState(face); return face;}));
         }
         get fontfaces() {
-            const value = internalsOf(this).fontfaces;
+            const value = fontRead(this).fontfaces;
             if (!value) throw new TypeError("Illegal FontFaceSetLoadEvent invocation");
             return value;
         }
@@ -9877,9 +9927,6 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (fontSetState(this).members.has(font)) return this;
             if (state.connection) throw new DOMException("A CSS-connected font cannot be added", "InvalidModificationError");
             fontMemberAdd(this, font); installFontSet(this);
-            if (fontSetState(this).document && state.status === "unloaded") fontTask(() => {
-                if (fontSetState(this).members.has(font) && state.status === "unloaded") loadFontFace(font).catch(() => {});
-            });
             return this;
         }
         delete(font) {
@@ -9903,12 +9950,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             for (const face of this.values()) callback.call(thisArg,face,face,this);
         }
         get status() {syncFontSet(this); return fontSetState(this).status;}
-        get ready() {syncFontSet(this); trust.refreshFontSources(); fontSetLoaded(this); return fontSetState(this).ready;}
+        get ready() {syncFontSet(this); fontControl.refreshFontSources(); fontSetLoaded(this); return fontSetState(this).ready;}
         load(font, text = " ") {
             try {
                 fontSetState(this);
                 if (!arguments.length) throw new TypeError("FontFaceSet.load requires a font");
-                font = domString(font); text = domString(text);
+                font = fontString(font); text = fontString(text);
             } catch (error) {return fontPromise.reject(error);}
             return new fontPromise((resolve,reject) => fontTask(() => {
                 try {fontAll(fontMatches(this,font,text).map(loadFontFace)).then(resolve,reject);}
@@ -9918,14 +9965,14 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         check(font, text = " ") {
             fontSetState(this);
             if (!arguments.length) throw new TypeError("FontFaceSet.check requires a font");
-            return fontMatches(this,domString(font),domString(text)).every(face => fontFaceState(face).status === "loaded");
+            return fontMatches(this,fontString(font),fontString(text)).every(face => fontFaceState(face).status === "loaded");
         }
         get [Symbol.toStringTag]() {return "FontFaceSet";}
     }
     Object.defineProperty(FontFaceSet,"length",{value:0,configurable:true});
     Object.defineProperty(FontFaceSet.prototype,"keys",{value:FontFaceSet.prototype.values,writable:true,configurable:true,enumerable:true});
     Object.defineProperty(FontFaceSet.prototype,Symbol.iterator,{value:FontFaceSet.prototype.values,writable:true,configurable:true});
-    for (const Interface of [FontFace,FontFaceSet,FontFaceSetLoadEvent]) enumerableMembers(Interface);
+    for (const Interface of [FontFace,FontFaceSet,FontFaceSetLoadEvent]) fontEnumerable(Interface);
     for (const name of ["loading","loadingdone","loadingerror"]) {
         Object.defineProperty(FontFaceSet.prototype,"on"+name, {
             enumerable:true, configurable:true,
@@ -9938,6 +9985,24 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             },
         });
     }
+
+    if (fontAdapter) {
+        Object.defineProperties(g, {
+            FontFace:{value:FontFace,writable:true,configurable:true},
+            FontFaceSet:{value:FontFaceSet,writable:true,configurable:true},
+            FontFaceSetLoadEvent:{value:FontFaceSetLoadEvent,writable:true,configurable:true},
+        });
+        Object.defineProperty(WorkerGlobalScope.prototype,"fonts", {
+            configurable:true,enumerable:true,get() {
+                if (this !== g) throw new TypeError("Illegal invocation");
+                return fontSource(g);
+            },
+        });
+    }
+    return {FontFace,FontFaceSet,FontFaceSetLoadEvent,fontSource,fontTasks};
+    /*__FONT_LOADING_END__*/
+    })(g);
+    const {FontFace,FontFaceSet,FontFaceSetLoadEvent,fontSource,fontTasks} = fontLoading;
 
     // `element.dataset` is a DOMStringMap (https://html.spec.whatwg.org/#domstringmap).
     // The interface object MUST exist on the global AND `el.dataset instanceof
@@ -37328,11 +37393,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             const collapsible = whiteSpace === "normal" || whiteSpace === "nowrap" || whiteSpace === "pre-line";
             if (whiteSpace === "pre-line") text = text.replace(/[\t ]*(\r\n|\r|\n)[\t ]*/g, "\n").replace(/[\t ]+/g, " ");
             else if (collapsible) text = text.replace(/[\t\n\f\r ]+/g, " ");
-            const transform = computedOf(parent, "text-transform");
-            if (transform === "uppercase") text = text.toUpperCase();
-            else if (transform === "lowercase") text = text.toLowerCase();
-            else if (transform === "capitalize") text = text.replace(/(^|[^\p{L}\p{N}'’])(\p{L})/gu, (m, a, b) => a + b.toUpperCase());
-            items.push({text, collapsible});
+            items.push({text, collapsible, node:nodeIds.get(node)});
             return;
         }
         if (node.nodeType !== 1 && node.nodeType !== 11) return;
@@ -37422,6 +37483,14 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const items = [];
         const children = __dom_shadow_root(elementIdentity(element)) !== null ? flatTreeChildren(element) : Array.from(element.childNodes);
         for (let i = 0; i < children.length; i++) renderedTextCollection(children[i], items, context);
+        // CSS Text #text-transform-order: transform after whitespace phase
+        // one. Plain-text copying keeps the original data (§2), whereas
+        // HTML innerText reports the rendered casing and width.
+        if (!cut && items.some(item => typeof item === "object")) {
+            const converted = JSON.parse(__dom_text_transform(nodeIds.get(element), JSON.stringify(
+                items.map(item => typeof item === "object" ? [item.node,item.text,!item.collapsible] : [null,"\n",false]))));
+            for (let i=0;i<items.length;i++) if (typeof items[i] === "object") items[i].text = converted[i];
+        }
         // CSS white-space processing across the collected text: a collapsible
         // space after another (or at a line start) collapses away, and one
         // at a line end (before a block boundary or a br) is removed.
@@ -53657,6 +53726,18 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             return result;
         }
     }
+    // Navigation Timing #the-performancetiming-interface (245fee24bc57):
+    // the legacy epoch timestamps share the native record, but have their
+    // own Window-only interface and Web IDL #js-default-tojson operation.
+    class PerformanceTiming {
+        constructor() { throw new TypeErrorCtor('Illegal constructor'); }
+        toJSON() {
+            const state = requireKind(this,'legacy-timing').owner, result = {};
+            for (const name of timingNames)
+                define(result,name,{value:state.legacyTiming[name],writable:true,enumerable:true,configurable:true});
+            return result;
+        }
+    }
     function timingAttribute(prototype,name,getter) {
         // Web IDL #dfn-attribute-getter: zero arity, "get " + identifier.
         define(getter,'name',{value:'get '+name,configurable:true});
@@ -53670,6 +53751,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     for (const name of navigationNumbers)
         timingAttribute(PerformanceNavigationTiming.prototype,name,
             {get() { return requireKind(this,'navigation')[name]; }}.get);
+    for (const name of timingNames)
+        timingAttribute(PerformanceTiming.prototype,name,
+            {get() { return requireKind(this,'legacy-timing').owner.legacyTiming[name]; }}.get);
     class Performance extends g.EventTarget {
         constructor() { throw new TypeErrorCtor('Illegal constructor'); }
         now() { return requireKind(this,'performance').now(); }
@@ -53891,6 +53975,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         [PerformanceObserver,'PerformanceObserver'],[PerformanceObserverEntryList,'PerformanceObserverEntryList']]) installInterface(C,name);
     if (!worker) {
         installInterface(PerformanceNavigationTiming,'PerformanceNavigationTiming');
+        installInterface(PerformanceTiming,'PerformanceTiming');
         installInterface(VisibilityStateEntry,'VisibilityStateEntry');
         // Performance Timeline #queue-a-performanceentry with the entry
         // type's buffer limit (50, as engines register it): the Document's
@@ -53992,12 +54077,14 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         installNavigation(data);
     };
     installNavigation(navigationData);
-    // Keep the legacy timestamps coherent with the new live entry. The
-    // obsolete interface's brand/descriptor cleanup is independent of this
-    // native timing recording path.
+    // [SameObject] performance.timing owns live timestamps in its relevant
+    // Window even when another Window borrows the getter or toJSON method.
     if (!worker) {
-        for (const name of timingNames) define(oldPerformance.timing,name,
-            {get() {return owner.legacyTiming[name];},enumerable:true,configurable:true});
+        owner.timing = create(PerformanceTiming.prototype);
+        write(owner.timing,{kind:'legacy-timing',owner});
+        delete oldPerformance.timing;
+        timingAttribute(Performance.prototype,'timing',
+            {get() { return requireKind(this,'performance').timing; }}.get);
         define(oldPerformance.navigation,'redirectCount',{enumerable:true,configurable:true,
             get() {return owner.legacyRedirectCount || 0;}});
         define(oldPerformance.navigation,'type',{enumerable:true,configurable:true,

@@ -16,6 +16,7 @@ use vello_cpu::peniko::{
 };
 use vello_cpu::{ImageSource, PixelMetadata, Pixmap, RenderContext, Resources};
 
+use super::frame_images::FrameImages;
 use super::{
     Affine2d, BlendMode, CompositeOperator, CssFilter, CssRect, DecorationStyle, DisplayCommand,
     ImageFit, ImageHandle, ImageSampling, LineCap, LineJoin, PaintBrush, PaintColor, PaintShape,
@@ -77,13 +78,13 @@ pub(super) struct BackdropPaint {
 /// Filter Effects 1 #feImageElement pixels from the scene's image store: a
 /// vector image is rasterized at the size it is drawn, like an image
 /// painted directly.
-struct SceneFilterImages<'a>(&'a Scene);
+struct SceneFilterImages<'a>(&'a Scene, &'a FrameImages);
 
 impl crate::render::filter_graph::FilterImageSource for SceneFilterImages<'_> {
     fn natural_size(&self, handle: ImageHandle) -> Option<(u32, u32)> {
-        self.0
-            .image(handle)
-            .map(|image| (image.width, image.height))
+        self.1
+            .image(self.0, handle)
+            .map(|(image, _)| (image.width, image.height))
     }
 
     fn pixels(
@@ -92,7 +93,7 @@ impl crate::render::filter_graph::FilterImageSource for SceneFilterImages<'_> {
         rect: CssRect,
         to_pixel: Affine2d,
     ) -> Option<crate::render::ImageResource> {
-        let image = self.0.image(handle)?;
+        let (image, _) = self.1.image(self.0, handle)?;
         let Some(source) = image.svg_source.as_ref() else {
             return Some(image);
         };
@@ -197,6 +198,7 @@ pub struct VelloCpuRenderer {
     rgba: Vec<u8>,
     size: PhysicalSize,
     images: HashMap<ImageCacheKey, CachedImage>,
+    frame_images: FrameImages,
     frame_id: u64,
     /// Offscreen renders left in this frame (see `MAX_EFFECT_RENDERS_PER_FRAME`).
     effect_budget: usize,
@@ -218,6 +220,7 @@ impl VelloCpuRenderer {
             rgba: vec![0; 4],
             size: PhysicalSize::new(1, 1),
             images: HashMap::new(),
+            frame_images: FrameImages::default(),
             frame_id: 0,
             effect_budget: MAX_EFFECT_RENDERS_PER_FRAME,
             offscreen_contexts: Vec::new(),
@@ -263,6 +266,7 @@ impl VelloCpuRenderer {
     fn rasterize(&mut self, scene: &Scene) -> Result<(), String> {
         self.prepare(scene.viewport.physical)?;
         self.frame_id = self.frame_id.wrapping_add(1);
+        self.frame_images = FrameImages::default();
         let live_images: HashSet<_> = scene
             .primitives
             .iter()
@@ -910,8 +914,9 @@ impl VelloCpuRenderer {
 
     /// Start a frame of effect work on a renderer used as another backend's
     /// offscreen helper: refresh its budget and image-cache clock.
-    pub(super) fn begin_effects_frame(&mut self) {
+    pub(super) fn begin_effects_frame(&mut self, images: FrameImages) {
         self.frame_id = self.frame_id.wrapping_add(1);
+        self.frame_images = images;
         self.effect_budget = MAX_EFFECT_RENDERS_PER_FRAME;
     }
 
@@ -1010,7 +1015,7 @@ impl VelloCpuRenderer {
             crate::render::filter_graph::FilterOptions {
                 blur_edge: crate::render::filter_graph::EdgeMode::Mirror,
                 background: None,
-                images: Some(&SceneFilterImages(scene)),
+                images: Some(&SceneFilterImages(scene, &self.frame_images)),
             },
         );
         Some(BackdropPaint {
@@ -1122,7 +1127,7 @@ impl VelloCpuRenderer {
             crate::render::filter_graph::FilterOptions {
                 blur_edge: crate::render::filter_graph::EdgeMode::None,
                 background: background.as_ref(),
-                images: Some(&SceneFilterImages(scene)),
+                images: Some(&SceneFilterImages(scene, &self.frame_images)),
             },
         );
         Some(EffectImage {
@@ -1222,8 +1227,12 @@ impl VelloCpuRenderer {
         sampling: ImageSampling,
         transform: [f64; 6],
     ) -> Result<(), String> {
-        let store_revision = scene.image_revision(handle);
-        let resource = scene.image(handle);
+        let (resource, store_revision) = self
+            .frame_images
+            .image(scene, handle)
+            .map_or((None, None), |(image, revision)| {
+                (Some(image), Some(revision))
+            });
         let svg_size = resource
             .as_ref()
             .filter(|image| image.svg_source.is_some())
@@ -2434,6 +2443,59 @@ mod tests {
             let frame = renderer.render_rgba(scene).unwrap();
             (frame, renderer.images.len())
         });
+    }
+
+    #[test]
+    fn image_updates_during_offscreen_render_preserve_queued_draws() {
+        // An animation or video decode can publish between the main draw
+        // and a backdrop pass. Both must use the first sampled image; the
+        // update becomes visible on the next presentation.
+        let mut scene = clip_test_scene(1.0);
+        let handle = ImageHandle(42);
+        let image = |width, color: [u8; 4]| ImageResource {
+            width,
+            height: 1,
+            rgba: Arc::from(color.repeat(width as usize)),
+            has_alpha: false,
+            svg_source: None,
+        };
+        scene.image_store.insert(handle, image(1, [255, 0, 0, 255]));
+        scene.primitives = vec![DisplayCommand::Image {
+            rect: CssRect::new(0., 0., 96., 64.),
+            handle,
+            source_rect: None,
+            fit: ImageFit::Fill,
+            sampling: ImageSampling::Nearest,
+            clip: None,
+            node: 0,
+            link: None,
+        }];
+        let mut renderer = VelloCpuRenderer::new();
+        renderer.prepare(scene.viewport.physical).unwrap();
+        let base = EncodeBase {
+            device: Affine::IDENTITY,
+            logical: Affine2d::IDENTITY,
+            bounds: scene.content_viewport,
+            target: (96, 64),
+        };
+        renderer
+            .encode(&scene, &scene.primitives, base, None, 0)
+            .unwrap();
+        // Exercise the size-change case too: overwriting a stable atlas
+        // slot cannot safely substitute for retaining the sampled image.
+        scene.image_store.insert(handle, image(2, [0, 0, 255, 255]));
+        let backdrop = renderer
+            .render_offscreen(&scene, &scene.primitives, base, None, 0)
+            .unwrap();
+        assert_eq!(&backdrop.data_as_u8_slice()[..4], &[255, 0, 0, 255]);
+        renderer.context.flush();
+        renderer
+            .context
+            .render(&mut renderer.pixmap, &mut renderer.resources);
+        assert_eq!(&renderer.pixmap.data_as_u8_slice()[..4], &[255, 0, 0, 255]);
+        let next = renderer.render_rgba(&scene).unwrap();
+        assert_eq!(&next.pixels[..4], &[0, 0, 255, 255]);
+        assert_eq!(renderer.images.len(), 1);
     }
 
     fn clip_test_scene(scale: f64) -> Scene {

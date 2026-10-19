@@ -38,6 +38,10 @@ fn page(
         Rc::new(RefCell::new(Dom::new())),
         Rc::new(RealmClock::new()),
     );
+    state
+        .dom
+        .borrow_mut()
+        .set_doc_url(Some(url::Url::parse(page).unwrap()));
     state.enable_network(
         url::Url::parse(page).unwrap(),
         runtime.handle().clone(),
@@ -1538,9 +1542,101 @@ fn font_loading_uses_source_fallbacks_and_rejects_failed_decoding() {
 }
 
 #[test]
-fn font_ready_waits_for_stylesheets_and_fonts_after_document_load() {
-    // CSS Font Loading #font-face-set-ready: a newly observed font source
-    // waits for pending stylesheets and the font loads they discover.
+fn worker_font_source_loads_for_transferred_offscreen_canvas() {
+    // CSS Font Loading #fontfacesource-workers and HTML
+    // #canvastextdrawingstyles: the receiver's fonts, initially empty.
+    let runtime = runtime();
+    let (listener, base) = listen(&runtime);
+    let server = serve_each(&runtime, listener, 2, |head| {
+        let (mime, bytes): (&str, &[u8]) = if head.starts_with("get /workers/paint.js ") {
+            ("text/javascript", br#"
+                onmessage = async event => {
+                    try {
+                        const out=['empty:'+fonts.size+':'+(fonts===self.fonts)];
+                        const ctx=event.data.getContext('2d'); ctx.font='24px WorkerFont, monospace';
+                        const before=ctx.measureText('iiii').width;
+                        const face=new FontFace('WorkerFont','url(font.ttf)',{display:'optional'});
+                        fonts.add(face);
+                        const events=[];
+                        fonts.onloading=e=>events.push('loading:'+e.isTrusted);
+                        fonts.onloadingdone=e=>events.push('done:'+e.isTrusted+':'+(e.fontfaces[0]===face));
+                        ctx.fillText('iiii',0,30); // demand, without explicit load()
+                        await fonts.ready;
+                        out.push('loaded:'+face.status+':'+fonts.check('24px WorkerFont')+':'+(ctx.measureText('iiii').width<before));
+                        ctx.clearRect(0,0,160,50); ctx.fillText('iiii',0,30);
+                        const bad=new FontFace('Broken',new Uint8Array([1,2,3]));
+                        try { await bad.loaded; } catch(e) {out.push('bad:'+e.name);}
+                        await new Promise(r=>setTimeout(r,0));
+                        out.push(events.join(','));
+                        fonts.delete(face); out.push('removed:'+(ctx.measureText('iiii').width===before));
+                        postMessage(out.join('|'));
+                    } catch(e) {postMessage('failed:'+e);}
+                };
+            "#)
+        } else {
+            assert!(head.starts_with("get /workers/font.ttf "), "{head}");
+            (
+                "font/ttf",
+                include_bytes!("../assets/fonts/dejavu/DejaVuSerif.ttf"),
+            )
+        };
+        let mut response = format!("HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",bytes.len()).into_bytes();
+        response.extend_from_slice(bytes);
+        response
+    });
+    let (mut engine, mut tasks) = page(&runtime, &format!("{base}/page"));
+    eval(&mut engine, r#"
+        const canvas=document.createElement('canvas'); canvas.width=160;canvas.height=50;
+        const worker=new Worker('/workers/paint.js');
+        worker.onmessage=e=>log.push(e.data);
+        worker.onerror=e=>log.push('worker-error:'+e.message);
+        const offscreen=canvas.transferControlToOffscreen();worker.postMessage(offscreen,[offscreen]);
+    "#, "worker font source").unwrap();
+    run_until(&runtime, &mut engine, &mut tasks, "log.length>0");
+    assert_eq!(
+        log(&mut engine),
+        "empty:0:true|loaded:loaded:true:true|bad:SyntaxError|loading:true,done:true:true|removed:true"
+    );
+    assert_eq!(string_value(&mut engine, "document.fonts.size"), "0");
+    eval(&mut engine, "worker.terminate()", "terminate").unwrap();
+    assert_eq!(runtime.block_on(server).unwrap().len(), 2);
+}
+
+#[test]
+fn blob_worker_font_loading_uses_its_settings_origin_and_still_enforces_cors() {
+    let runtime = runtime();
+    let (listener, base) = listen(&runtime);
+    let (cross_listener, cross) = listen(&runtime);
+    let response: fn(&str) -> Vec<u8> = |_| {
+        let bytes = include_bytes!("../assets/fonts/dejavu/DejaVuSerif.ttf");
+        let mut response = format!("HTTP/1.1 200 OK\r\nContent-Type: font/ttf\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",bytes.len()).into_bytes();
+        response.extend_from_slice(bytes);
+        response
+    };
+    let server = serve_each(&runtime, listener, 1, response);
+    let cross_server = serve_each(&runtime, cross_listener, 1, response);
+    let (mut engine, mut tasks) = page(&runtime, &format!("{base}/page"));
+    let script = format!(
+        r#"(async()=>{{try {{
+        const face=new FontFace('BlobWorker','url({base}/font.ttf)');fonts.add(face);
+        const c=new OffscreenCanvas(100,50),x=c.getContext('2d');x.font='24px BlobWorker,monospace';
+        const before=x.measureText('iiii').width;await fonts.ready;
+        let blocked='';try{{await new FontFace('Cross','url({cross}/font.ttf)').load();}}catch(e){{blocked=e.name;}}
+        postMessage([face.status,x.measureText('iiii').width<before,blocked].join('|'));
+    }}catch(e){{postMessage('failed:'+e);}}}})();"#
+    );
+    eval(&mut engine,&format!(r#"const worker=new Worker(URL.createObjectURL(new Blob([{}],{{type:'text/javascript'}})));worker.onmessage=e=>log.push(e.data);worker.onerror=e=>log.push('error:'+e.message);"#,serde_json::to_string(&script).unwrap()),"blob worker fonts").unwrap();
+    run_until(&runtime, &mut engine, &mut tasks, "log.length>0");
+    assert_eq!(log(&mut engine), "loaded|true|NetworkError");
+    eval(&mut engine, "worker.terminate()", "terminate").unwrap();
+    assert_eq!(runtime.block_on(server).unwrap().len(), 1);
+    assert_eq!(runtime.block_on(cross_server).unwrap().len(), 1);
+}
+
+#[test]
+fn font_ready_waits_for_pending_stylesheets_and_their_fonts() {
+    // CSS Font Loading #font-face-set-ready: completing document loading
+    // does not settle ready while a stylesheet can still discover fonts.
     let runtime = runtime();
     let (listener, base) = listen(&runtime);
     let server = serve_each(&runtime, listener, 2, |head| {
@@ -1562,10 +1658,10 @@ fn font_ready_waits_for_stylesheets_and_fonts_after_document_load() {
     let (mut engine, mut tasks) = page(&runtime, &format!("{base}/page"));
     eval(&mut engine, r#"
         const root=document.createElement('html'); document.appendChild(root);
-        __trust.setDocumentReadiness('complete');
         const text=document.createElement('span'); text.style.fontFamily='Late'; text.textContent='Font readiness'; root.appendChild(text);
         const link=document.createElement('link'); link.rel='stylesheet'; link.href='/late.css';
         link.onload=()=>log.push('sheet'); root.appendChild(link);
+        __trust.setDocumentReadiness('complete');
         document.fonts.ready.then(()=>log.push('ready:'+document.fonts.size+':'+Array.from(document.fonts)[0].status));
         log.push('initial');
     "#, "font ready environment").unwrap();
@@ -1577,6 +1673,65 @@ fn font_ready_waits_for_stylesheets_and_fonts_after_document_load() {
     );
     assert_eq!(log(&mut engine), "initial|sheet|ready:1:loaded");
     assert_eq!(runtime.block_on(server).unwrap().len(), 2);
+}
+
+#[test]
+fn font_demand_loads_used_faces_in_layout_and_canvas_only() {
+    let runtime = runtime();
+    let (listener, base) = listen(&runtime);
+    let server = serve_each(&runtime, listener, 4, |_| {
+        let bytes = include_bytes!("../assets/fonts/dejavu/DejaVuSans.ttf");
+        let mut response = format!("HTTP/1.1 200 OK\r\nContent-Type: font/ttf\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len()).into_bytes();
+        response.extend_from_slice(bytes);
+        response
+    });
+    let (mut engine, mut tasks) = page(&runtime, &format!("{base}/page"));
+    eval(
+        &mut engine,
+        r#"
+        (async()=>{
+            const root=document.createElement('html'); document.appendChild(root);
+            root.innerHTML=`<style>
+                @font-face{font-family:Web;src:url(/latin.ttf);unicode-range:U+0-FF}
+                @font-face{font-family:Web;src:url(/cyrillic.ttf);unicode-range:U+400-4FF}
+                @font-face{font-family:Web;src:url(/bold.ttf);font-weight:700}
+                @font-face{font-family:Hidden;src:url(/hidden.ttf)}
+                @font-face{font-family:Unused;src:url(/unused.ttf)}
+                </style><p id=text style='font-family:Web'>Latin</p>
+                <p style='display:none;font-family:Hidden'>Hidden text</p>`;
+            const manual=new FontFace('Canvas','url(/canvas.ttf)'); document.fonts.add(manual);
+            __trust.setDocumentReadiness('complete');
+            await document.fonts.ready;
+            log.push(Array.from(document.fonts,f=>f.status).join(','));
+            text.style.fontWeight='700'; await document.fonts.ready;
+            text.style.fontWeight='400'; text.textContent='Ж'; await document.fonts.ready;
+            const canvas=document.createElement('canvas'), ctx=canvas.getContext('2d');
+            ctx.font='20px Canvas'; ctx.measureText('Canvas use'); await document.fonts.ready;
+            log.push(Array.from(document.fonts,f=>f.status).join(','));
+            log.push('done');
+        })().catch(e=>log.push('failed:'+e));
+    "#,
+        "font demand",
+    )
+    .unwrap();
+    run_until(
+        &runtime,
+        &mut engine,
+        &mut tasks,
+        "log.includes('done') || log.some(x=>x.startsWith('failed:'))",
+    );
+    assert_eq!(
+        log(&mut engine),
+        "loaded,unloaded,unloaded,unloaded,unloaded,unloaded|loaded,loaded,loaded,unloaded,unloaded,loaded|done"
+    );
+    let requests = runtime.block_on(server).unwrap();
+    for (request, path) in
+        requests
+            .iter()
+            .zip(["/latin.ttf", "/bold.ttf", "/cyrillic.ttf", "/canvas.ttf"])
+    {
+        assert!(request.starts_with(&format!("get {path} ")), "{request}");
+    }
 }
 
 #[test]

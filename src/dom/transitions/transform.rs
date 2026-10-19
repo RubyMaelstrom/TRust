@@ -26,7 +26,8 @@ pub(in crate::dom) struct Transform(Vec<Primitive>);
 struct Deferred {
     from: Vec<Primitive>,
     to: Vec<Primitive>,
-    progress: f32,
+    /// None accumulates the matrices; Some interpolates them.
+    progress: Option<f32>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -177,6 +178,39 @@ impl Primitive {
         }
     }
 
+    fn accumulate(&self, end: &Self) -> Option<Self> {
+        if self.family() != end.family() {
+            return None;
+        }
+        let add = |a: Linear, b: Linear| Linear {
+            px: a.px + b.px,
+            pct: a.pct + b.pct,
+        };
+        Some(match (self, end) {
+            (Self::Translate(x, y), Self::Translate(u, v)) => {
+                Self::Translate(add(*x, *u), add(*y, *v))
+            }
+            (Self::Scale(x, y), Self::Scale(u, v)) => Self::Scale(x + u - 1., y + v - 1.),
+            (Self::Rotate(x), Self::Rotate(y)) => Self::Rotate(x + y),
+            (Self::Skew(x, y), Self::Skew(u, v)) => Self::Skew(x + u, y + v),
+            _ if self.family() == Family::Translate => {
+                let (x, y, z) = self.translation3d();
+                let (u, v, w) = end.translation3d();
+                Self::Translate3d(add(x, u), add(y, v), z + w)
+            }
+            _ if self.family() == Family::Scale => {
+                let [x, y, z] = self.scale3d();
+                let [u, v, w] = end.scale3d();
+                Self::Scale3d(x + u - 1., y + v - 1., z + w - 1.)
+            }
+            _ if self.family() == Family::Rotate => match self.mix(end, 0.5)? {
+                Self::Rotate3d(axis, angle) => Self::Rotate3d(axis, angle * 2.),
+                _ => return None,
+            },
+            _ => Self::Matrix(matrix3d::accumulate(&self.matrix()?, &end.matrix()?)),
+        })
+    }
+
     fn scale3d(&self) -> [f32; 3] {
         match *self {
             Self::Scale(x, y) => [x, y, 1.],
@@ -241,13 +275,21 @@ impl Primitive {
                             .join(" ")
                     }
                 };
-                format!(
-                    "{}({}, {}, {})",
-                    crate::layout2::DEFERRED_TRANSFORM_INTERPOLATION,
-                    number(deferred.progress),
-                    list(&deferred.from),
-                    list(&deferred.to)
-                )
+                match deferred.progress {
+                    Some(progress) => format!(
+                        "{}({}, {}, {})",
+                        crate::layout2::DEFERRED_TRANSFORM_INTERPOLATION,
+                        number(progress),
+                        list(&deferred.from),
+                        list(&deferred.to)
+                    ),
+                    None => format!(
+                        "{}({}, {})",
+                        crate::layout2::DEFERRED_TRANSFORM_ACCUMULATION,
+                        list(&deferred.from),
+                        list(&deferred.to)
+                    ),
+                }
             }
         }
     }
@@ -326,6 +368,20 @@ impl Transform {
             let second = args.get(1).copied();
             let zero = Linear { px: 0., pct: 0. };
             let primitive = match name.as_str() {
+                crate::layout2::DEFERRED_TRANSFORM_INTERPOLATION if args.len() == 3 => {
+                    Primitive::Deferred(Arc::new(Deferred {
+                        from: Self::parse(args[1], units, vp)?.0,
+                        to: Self::parse(args[2], units, vp)?.0,
+                        progress: Some(number(first)?),
+                    }))
+                }
+                crate::layout2::DEFERRED_TRANSFORM_ACCUMULATION if args.len() == 2 => {
+                    Primitive::Deferred(Arc::new(Deferred {
+                        from: Self::parse(first, units, vp)?.0,
+                        to: Self::parse(args[1], units, vp)?.0,
+                        progress: None,
+                    }))
+                }
                 "translate" if args.len() <= 2 => {
                     Primitive::Translate(length(first)?, length(second.unwrap_or("0"))?)
                 }
@@ -416,7 +472,7 @@ impl Transform {
                 _ => result.push(Primitive::Deferred(Arc::new(Deferred {
                     from: a[index..].to_vec(),
                     to: b[index..].to_vec(),
-                    progress: t,
+                    progress: Some(t),
                 }))),
             }
             break;
@@ -429,6 +485,43 @@ impl Transform {
     /// layout resolves it.
     pub(in crate::dom) fn compatible(&self, other: &Self) -> bool {
         self.interpolate(other, 0.5).is_some()
+    }
+
+    pub(in crate::dom) fn add(&self, other: &Self) -> Self {
+        Self(self.0.iter().chain(&other.0).cloned().collect())
+    }
+
+    pub(in crate::dom) fn accumulate(&self, other: &Self) -> Self {
+        let length = self.0.len().max(other.0.len());
+        let pad = |list: &[Primitive], other: &[Primitive]| {
+            (0..length)
+                .map(|i| list.get(i).cloned().unwrap_or_else(|| other[i].identity()))
+                .collect::<Vec<_>>()
+        };
+        let (a, b) = (pad(&self.0, &other.0), pad(&other.0, &self.0));
+        let mut result = Vec::with_capacity(length);
+        for i in 0..length {
+            if let Some(primitive) = a[i].accumulate(&b[i]) {
+                result.push(primitive);
+                continue;
+            }
+            let compose = |list: &[Primitive]| {
+                list.iter()
+                    .try_fold(matrix3d::IDENTITY, |matrix, primitive| {
+                        Some(matrix3d::multiply(&matrix, &primitive.matrix()?))
+                    })
+            };
+            result.push(match (compose(&a[i..]), compose(&b[i..])) {
+                (Some(a), Some(b)) => Primitive::Matrix(matrix3d::accumulate(&a, &b)),
+                _ => Primitive::Deferred(Arc::new(Deferred {
+                    from: a[i..].to_vec(),
+                    to: b[i..].to_vec(),
+                    progress: None,
+                })),
+            });
+            break;
+        }
+        Self(result)
     }
 
     pub(in crate::dom) fn mix(&self, end: &Self, t: f32) -> Self {

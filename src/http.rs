@@ -6965,15 +6965,10 @@ async fn execute_js_with_presentation(
                 .await;
         push_imported_sheets(&mut sheets, inline);
     }
-    install_stylesheet_fonts(
-        &html,
-        &sheets,
-        &response.url,
-        true,
-        referrer_policy,
-        Some(cache.clone()),
-    )
-    .await;
+    // CSS Fonts 4 #font-style-matching: the actor requests faces when text
+    // uses them. Stylesheet enumeration must not start every font download.
+    crate::img::begin_document_svg_navigation();
+    crate::font_system::install_page_fonts(Vec::new());
     // Created HERE so it outlives the engine: the app hangs it on the Doc
     // and decodes blob: image srcs from it even after the page froze.
     let blobs = group
@@ -8144,6 +8139,28 @@ pub(crate) struct CssFontFace {
     pub descriptors: crate::font_system::FaceDescriptors,
 }
 
+impl CssFontFace {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.family.capacity()
+            + self.sources.capacity() * std::mem::size_of::<CssFontSource>()
+            + self
+                .sources
+                .iter()
+                .map(|source| match source {
+                    CssFontSource::Url(value) | CssFontSource::Local(value) => value.capacity(),
+                })
+                .sum::<usize>()
+            + self.unicode_range.capacity() * std::mem::size_of::<(u32, u32)>()
+            + self.descriptors.features.capacity() * std::mem::size_of::<([u8; 4], u32)>()
+            + self.descriptors.variations.capacity() * std::mem::size_of::<([u8; 4], f32)>()
+            + self
+                .descriptors
+                .named_instance
+                .as_ref()
+                .map_or(0, String::capacity)
+    }
+}
+
 /// One supported item of a `src` descriptor (CSS Fonts 4 #src-desc).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CssFontSource {
@@ -8678,108 +8695,6 @@ pub(crate) async fn load_font_face(
     Some((winner.into_inner().unwrap(), font))
 }
 
-/// Load the document's downloadable faces before its first rendering.
-/// CSS Fonts 4 #font-display-timeline: a face's font download timer starts
-/// with the navigation. The first rendering waits for each face through its
-/// block period (during which its text would be invisible). A `live` page
-/// keeps loading the rest: they reach its document (`Dom::face_font`) as
-/// late faces, used if they load within their swap period. A document
-/// rendered once (`!live`) waits through the swap period instead, so each
-/// face is either used or, after it, a failed load.
-/// `referrer_policy` is the document's policy container's referrer policy.
-async fn install_stylesheet_fonts(
-    html: &str,
-    sheets: &[PageSheet],
-    page_url: &Url,
-    live: bool,
-    referrer_policy: crate::referrer_policy::ReferrerPolicy,
-    cache: Option<std::sync::Arc<PageCache>>,
-) {
-    let started = tokio::time::Instant::now();
-    let faces = document_font_faces(html, sheets, page_url, referrer_policy);
-    let mut late = Vec::new();
-    let fonts = futures::stream::iter(faces.into_iter().map(|face| {
-        let (block, swap) = face.descriptors.display.periods();
-        let wait = if live {
-            Some(block)
-        } else {
-            swap.map(|swap| block + swap)
-        };
-        let failure = swap.map(|swap| std::time::Instant::now() + block + swap);
-        let page_url = page_url.clone();
-        let cache = cache.clone();
-        async move {
-            let (sender, receiver) = tokio::sync::watch::channel(None);
-            let urls: Vec<String> = face
-                .sources
-                .iter()
-                .filter_map(|source| match source {
-                    DocumentFontSource::Url(url) => Some(url.to_string()),
-                    DocumentFontSource::Local(_) => None,
-                })
-                .collect();
-            let mut task = tokio::spawn(async move {
-                let winner = std::sync::Mutex::new(None);
-                let font = load_document_face(
-                    &face,
-                    &page_url,
-                    cache.as_deref(),
-                    None,
-                    None,
-                    |url, loaded| {
-                        if loaded {
-                            *winner
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                Some(url.to_string());
-                        }
-                    },
-                )
-                .await;
-                let winner = winner
-                    .into_inner()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let _ = sender.send(Some(
-                    font.as_ref()
-                        .zip(winner)
-                        .map(|(font, url)| (url, font.bytes.clone())),
-                ));
-                font
-            });
-            let outcome = match wait {
-                Some(wait) => tokio::time::timeout_at(started + wait, &mut task).await,
-                None => Ok((&mut task).await),
-            };
-            match outcome {
-                Ok(font) => (font.ok().flatten(), None),
-                // Still loading after the block period: a late face.
-                Err(_) => (
-                    None,
-                    Some(crate::font_system::LateFace {
-                        sources: urls,
-                        result: receiver,
-                        failure,
-                    }),
-                ),
-            }
-        }
-    }))
-    .buffered(PREFETCH_CONCURRENCY)
-    .filter_map(|(font, pending)| {
-        if let Some(pending) = pending {
-            late.push(pending);
-        }
-        async move { font }
-    })
-    .collect::<Vec<_>>()
-    .await;
-    // A new foreground document: its inline SVG must not draw document
-    // images another page loaded under its own cookies and credentials.
-    crate::img::begin_document_svg_navigation();
-    crate::font_system::install_page_fonts(fonts);
-    crate::font_system::set_late_page_faces(late);
-}
-
 /// Render an HTML page with ONLY its CSS cascade applied (no JS): fetch its
 /// stylesheets and bake the cascade into the serialized DOM. The path for
 /// every page JS won't transform — no `<script>`, `set js off`, and the
@@ -8850,7 +8765,8 @@ async fn css_only_with_sheets(
     // document leaves for its requests and the frontend's navigations.
     let referrer_policy = document_referrer_policy(&html, response_referrer_policy(&response));
     response.referrer_policy = Some(referrer_policy);
-    install_stylesheet_fonts(&html, &sheets, &response.url, false, referrer_policy, None).await;
+    crate::img::begin_document_svg_navigation();
+    crate::font_system::install_page_fonts(Vec::new());
     let base = base_with_doc_base(&html, &response.url);
     fetch_svg_sprite_sheets(&html, &base, &response.url, referrer_policy).await;
     // The frame documents are fetched up front into a url→content map (Dom is
@@ -8873,9 +8789,18 @@ async fn css_only_with_sheets(
     // each frame's `<link rel=stylesheet>` against that frame's own URL. The
     // installed frame tree carries absolutized hrefs, so key them absolutely.
     let mut frame_sheets = Vec::new();
+    let mut font_faces = HashMap::from([(
+        response.url.to_string(),
+        document_font_faces(&html, &sheets, &response.url, referrer_policy),
+    )]);
     for (frame_url, markup, encoding, frame_policy) in frames.values() {
         let frame_base = base_with_doc_base(markup, frame_url);
-        for mut sheet in fetch_page_sheets(markup, frame_url, encoding, *frame_policy).await {
+        let fetched = fetch_page_sheets(markup, frame_url, encoding, *frame_policy).await;
+        font_faces.insert(
+            frame_url.to_string(),
+            document_font_faces(markup, &fetched, frame_url, *frame_policy),
+        );
+        for mut sheet in fetched {
             if let Some(source) = sheet.link_href.take() {
                 match frame_base.join(&source) {
                     Ok(url) => sheet.link_href = Some(url.to_string()),
@@ -8885,7 +8810,9 @@ async fn css_only_with_sheets(
             frame_sheets.push(sheet);
         }
     }
-    let render = || {
+    let mut font_data = StaticFontData::default();
+    let font_demands = std::sync::Arc::new(crate::font_system::FontDemands::default());
+    let render = |fonts: &StaticFontData| {
         css_only_render(
             &html,
             &sheets,
@@ -8895,14 +8822,45 @@ async fn css_only_with_sheets(
             (viewport, cell_px, device_pixel_ratio),
             document_encoding,
             terminal_presentation,
+            fonts,
+            font_demands.clone(),
         )
     };
-    let (mut rendered, mut body, requests) = render();
-    // External SVG resource documents the rendering referenced: fetch them,
-    // then render once more with them (`dom::svg_external`).
-    if fetch_svg_resource_documents(requests, &response.url).await {
-        (rendered, body, _) = render();
-    }
+    // CSS Fonts 4 #font-style-matching: only actual text usage starts a
+    // download. Re-layout can discover another face (unicode-range or
+    // fallback after a missing glyph). Each document/URL is attempted once.
+    let (rendered, body) = loop {
+        let (rendered, body, svg, fonts) = render(&font_data);
+        let svg_changed = fetch_svg_resource_documents(svg, &response.url).await;
+        let requested = fonts
+            .iter()
+            .any(|(font, _, _)| !font_data.contains_key(&(font.document, font.url.to_string())));
+        if !requested && !svg_changed {
+            break (rendered, body);
+        }
+        let outcomes = futures::stream::iter(fonts.into_iter().filter(|(font, _, _)| {
+            !font_data.contains_key(&(font.document, font.url.to_string()))
+        }).map(|(font, client, restricted)| {
+            let referrer = font_faces.get(client.as_str()).and_then(|faces| {
+                faces.iter().rev().find(|face| face.sources.iter().any(|source| matches!(source, DocumentFontSource::Url(url) if *url == font.url)))
+            }).map(|face| face.referrer.clone()).unwrap_or_else(|| SheetReferrer::document(&client, referrer_policy));
+            let top = response.url.clone();
+            async move {
+                let mut request = Request::subresource(font.url.clone(), &client, "font", Some(CredentialsMode::SameOrigin));
+                referrer.apply(&mut request);
+                let mut cookies = CookieContext::subresource(&top);
+                cookies.cross_site_ancestor = restricted;
+                request.cookie_context = Some(cookies);
+                let loading = async {
+                    if !subresource_allowed(&client, &font.url) { return None; }
+                    fetch(&request).await.ok().filter(|r| (200..300).contains(&r.status)).map(|r| r.body)
+                };
+                let bytes = loading.await;
+                ((font.document, font.url.to_string()), bytes)
+            }
+        })).buffered(PREFETCH_CONCURRENCY).collect::<Vec<_>>().await;
+        font_data.extend(outcomes);
+    };
     response.rendered = Some(Box::new(rendered));
     // Retain a baked source snapshot for history/diagnostics only. Frontends
     // consume `response.rendered` and never parse this presentation copy.
@@ -8910,6 +8868,9 @@ async fn css_only_with_sheets(
     response.content_type = String::from("text/html; charset=utf-8");
     response
 }
+
+type StaticFontData = HashMap<(crate::dom::NodeId, String), Option<Vec<u8>>>;
+type StaticFontRequest = (crate::font_system::FontRequest, Url, bool);
 
 /// Build and render a script-free document's arena: its rendering, its baked
 /// serialization, and the external SVG resource documents it referenced
@@ -8924,12 +8885,20 @@ fn css_only_render(
     (viewport, cell_px, device_pixel_ratio): ((u16, u16), (u16, u16), f32),
     document_encoding: &'static encoding_rs::Encoding,
     terminal_presentation: bool,
-) -> (RenderedPage, Vec<u8>, Vec<crate::dom::ExternalSvgRequest>) {
+    fonts: &StaticFontData,
+    font_demands: std::sync::Arc<crate::font_system::FontDemands>,
+) -> (
+    RenderedPage,
+    Vec<u8>,
+    Vec<crate::dom::ExternalSvgRequest>,
+    Vec<StaticFontRequest>,
+) {
     // The terminal lays text out in its cell font from the cascade on (`ch`
     // units resolve against it).
     let _cells = terminal_presentation
         .then(|| crate::text::cell_metrics_scope(terminal_cell_metrics(cell_px)));
     let mut dom = crate::js::css_prepare(html, viewport, cell_px);
+    dom.use_font_demands(font_demands);
     let document = dom.document();
     dom.set_document_encoding(document, document_encoding);
     // As in a graphical page actor: media elements are players there, an
@@ -8946,6 +8915,9 @@ fn css_only_render(
     }
     dom.set_doc_url(Some(base.clone()));
     dom.set_device_pixel_ratio(device_pixel_ratio);
+    for ((document, url), bytes) in fonts {
+        dom.install_document_font(*document, url, bytes.clone());
+    }
     let css_viewport = crate::layout2::TerminalViewport::from_font_pixels(
         usize::from(viewport.0),
         usize::from(viewport.1),
@@ -8961,7 +8933,16 @@ fn css_only_render(
         &crate::layout2::ImageSizes::new(),
     );
     let body = dom.serialize(dom.document()).into_bytes();
-    (rendered, body, dom.take_svg_resource_requests())
+    let fonts = dom
+        .take_font_requests()
+        .into_iter()
+        .map(|font| {
+            let client = dom.media_document_url(font.document, page_url);
+            let restricted = dom.resource_cookies_restricted(font.document);
+            (font, client, restricted)
+        })
+        .collect();
+    (rendered, body, dom.take_svg_resource_requests(), fonts)
 }
 
 /// Filter Effects 1 #origin-restrictions and CSS Masking 1 #priv-sec for a
@@ -11796,6 +11777,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn static_font_demand_skips_unused_faces_and_advances_failed_sources() {
+        let server = referer_server::Server::start(|path| {
+            let body = if path == "/bad.ttf" {
+                b"not a font".to_vec()
+            } else {
+                include_bytes!("../assets/fonts/dejavu/DejaVuSans.ttf").to_vec()
+            };
+            (String::from("font/ttf"), String::new(), body)
+        })
+        .await;
+        let page = Url::parse(&format!("{}/page", server.base)).unwrap();
+        let html = "<style>
+            @font-face{font-family:Web;src:url(/bad.ttf),url(/latin.ttf);unicode-range:U+0-FF}
+            @font-face{font-family:Web;src:url(/cyrillic.ttf);unicode-range:U+400-4FF}
+            @font-face{font-family:Unused;src:url(/unused.ttf)}
+            </style><p style='font-family:Web'>Latin text</p>
+            <p style='font-family:Unused;display:none'>Hidden</p>";
+        let result = css_only_for_device(
+            html_response(&page, vec![], html),
+            (80, 24),
+            (8, 16),
+            1.,
+            false,
+        )
+        .await;
+        assert!(result.rendered.is_some());
+        let requests: Vec<_> = server
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect();
+        assert_eq!(requests, ["/bad.ttf", "/latin.ttf"]);
+    }
+
+    #[tokio::test]
     async fn static_pipeline_requests_follow_the_document_referrer_policy() {
         // HTML #meta-referrer (legacy "always" is unsafe-url, overriding the
         // response's Referrer-Policy), #referrer-policy-attributes for a
@@ -11839,13 +11857,13 @@ mod tests {
             <link rel=stylesheet href=/b.css referrerpolicy=NO-REFERRER>\
             <style>@import '/inline.css';</style>\
             <iframe src=/frame.html></iframe>\
-            <svg><use href='/sprite.svg#i'/></svg>";
+            <svg><use href='/sprite.svg#i'/></svg><p style='font-family:F'>Font</p>";
         let response = html_response(
             &page,
             vec![(String::from("referrer-policy"), String::from("no-referrer"))],
             html,
         );
-        let response = css_only(response, (80, 24), (8, 16)).await;
+        let response = css_only_for_device(response, (80, 24), (8, 16), 1., false).await;
         assert_eq!(
             response.referrer_policy,
             Some(crate::referrer_policy::ReferrerPolicy::UnsafeUrl)

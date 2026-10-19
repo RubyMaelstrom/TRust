@@ -41,9 +41,9 @@ impl TextSourceSpan {
         self.start as usize..self.end as usize
     }
 
-    /// Whether the laid-out text is the data itself, character for
-    /// character. A `text-transform` that changes the number of characters
-    /// (CSS Text 3 #text-transform-property) maps only proportionally.
+    /// Whether this span preserves UTF-16 lengths. Layout isolates an
+    /// expanding/contracting transformed cluster in its own span; only
+    /// positions within that cluster need interpolation.
     fn exact(&self, text: &str) -> bool {
         text.get(self.bytes())
             .is_some_and(|part| utf16_len(part) == self.offset_end - self.offset)
@@ -267,11 +267,22 @@ pub enum LineStart {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RunSelection {
     pub sources: Option<Arc<[TextSourceSpan]>>,
+    /// CSS Text #text-transform-property: copying uses original data. Only
+    /// transformed runs need these snapshots; each holds its source slice.
+    pub original: Option<Arc<[OriginalText]>>,
     pub highlight: HighlightPaint,
     pub line_start: LineStart,
     /// The run's element has `user-select: none` (CSS UI 4): pressing on
     /// it neither starts a selection nor affects the one there is.
     pub unselectable: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct OriginalText {
+    pub node: usize,
+    pub offset: u32,
+    pub offset_end: u32,
+    pub text: String,
 }
 
 impl RunSelection {
@@ -281,6 +292,52 @@ impl RunSelection {
 
     pub fn selectable(&self) -> bool {
         !self.spans().is_empty()
+    }
+
+    fn copied_text<'a>(&self, text: &'a str, range: Range<usize>) -> std::borrow::Cow<'a, str> {
+        let Some(original) = &self.original else {
+            return std::borrow::Cow::Borrowed(&text[range]);
+        };
+        let mut out = String::new();
+        let mut cursor = range.start;
+        for span in self.spans() {
+            let start = (span.start as usize).max(range.start);
+            let end = (span.end as usize).min(range.end);
+            if start >= end {
+                continue;
+            }
+            if cursor < start {
+                out.push_str(&text[cursor..start]);
+            }
+            let from = span.offset_at(text, start);
+            let to = span.offset_at(text, end);
+            let index = original
+                .partition_point(|source| (source.node, source.offset) <= (span.node, from));
+            if let Some(source) = index
+                .checked_sub(1)
+                .and_then(|i| original.get(i))
+                .filter(|source| source.node == span.node && to <= source.offset_end)
+            {
+                let mut unit = source.offset;
+                for c in source.text.chars() {
+                    let next = unit + c.len_utf16() as u32;
+                    if unit >= from && next <= to {
+                        out.push(c);
+                    }
+                    unit = next;
+                    if unit >= to {
+                        break;
+                    }
+                }
+            } else {
+                out.push_str(&text[start..end]);
+            }
+            cursor = end;
+        }
+        if cursor < range.end {
+            out.push_str(&text[cursor..range.end]);
+        }
+        std::borrow::Cow::Owned(out)
     }
 }
 
@@ -749,6 +806,7 @@ impl Scene {
                 link: link.clone(),
                 selection: RunSelection {
                     sources,
+                    original: selection.original.clone(),
                     highlight: selection.highlight,
                     line_start: if from <= 0.0 {
                         selection.line_start
@@ -1028,9 +1086,10 @@ pub fn selected_page_text(page: &PagePaint, selection: &PageSelection) -> String
                 ..
             } => {
                 for range in cursor.next_run(&shaped.text, run) {
-                    let Some(text) = shaped.text.get(range.clone()) else {
+                    let Some(_) = shaped.text.get(range.clone()) else {
                         continue;
                     };
+                    let text = run.copied_text(&shaped.text, range.clone());
                     let line_height = shaped.line_height.max(1.0);
                     let x = origin.x
                         + shaped
@@ -1078,7 +1137,7 @@ pub fn selected_page_text(page: &PagePaint, selection: &PageSelection) -> String
                             out.push_str(separator);
                         }
                     }
-                    out.push_str(text);
+                    out.push_str(&text);
                     let right = origin.x
                         + shaped
                             .clusters

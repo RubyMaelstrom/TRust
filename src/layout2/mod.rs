@@ -73,7 +73,7 @@ pub(crate) use overflow::{Overflow, scroll_reverse};
 mod style;
 mod table;
 mod text_overflow;
-mod transform;
+pub(crate) mod transform;
 // The legacy Row/Item output is now explicitly a terminal compatibility
 // adapter. Its source filename is retained to keep this refactor reviewable.
 #[path = "paint.rs"]
@@ -114,6 +114,7 @@ pub(crate) use memo::box_style_bytes;
 /// <to-list>)`. Author style sheets cannot declare it: `<transform-list>`
 /// has no such function.
 pub(crate) const DEFERRED_TRANSFORM_INTERPOLATION: &str = "-trust-interpolate-matrix";
+pub(crate) const DEFERRED_TRANSFORM_ACCUMULATION: &str = "-trust-accumulate-matrix";
 pub(crate) use style::{BoxStyle, InlineStyle, Pos, StyleSource, pseudo_units};
 pub(crate) use transform::serialize_list as serialize_transform_list;
 pub(crate) use tree_cache::BoxTreeCache;
@@ -1100,6 +1101,7 @@ pub fn lay_graphical_subtree(
         imemo: Default::default(),
         grid_tracks: Default::default(),
         subgrid_rows: Default::default(),
+        subgrid_columns: Default::default(),
         marker_line: Default::default(),
     };
     let (mut frag, mut flow_bottom, mut anchors, mut fixed, mut top_layer) = flow.layout(&root);
@@ -1580,6 +1582,7 @@ pub fn lay_subtree_fragment(
         imemo: Default::default(),
         grid_tracks: Default::default(),
         subgrid_rows: Default::default(),
+        subgrid_columns: Default::default(),
         marker_line: Default::default(),
     };
     let (mut frag, mut flow_bottom, mut anchors, mut fixed, mut top_layer) = flow.layout(&root);
@@ -1693,6 +1696,7 @@ pub fn lay_region_fragment(
         imemo: Default::default(),
         grid_tracks: Default::default(),
         subgrid_rows: Default::default(),
+        subgrid_columns: Default::default(),
         marker_line: Default::default(),
     };
     let (mut frag, _flow_bottom, _anchors, _fixed, _top_layer) = flow.layout(&root);
@@ -6920,6 +6924,55 @@ b</xmp></body>"#;
     }
 
     #[test]
+    fn grid_second_pass_uses_resolved_rows_and_distributed_gaps() {
+        let html = r#"<!doctype html><body style="margin:0">
+            <div id="auto" style="display:grid;width:500px;grid-template-columns:max-content 20px">
+              <div id="ratio" style="height:100%;aspect-ratio:2"></div><div style="height:80px"></div>
+            </div>
+            <div id="aligned" style="display:grid;width:500px;height:200px;grid-template-columns:max-content 20px;grid-template-rows:40px 40px;gap:10px;align-content:space-between">
+              <div style="grid-row:1/3;height:100%;aspect-ratio:2"></div><div></div>
+            </div></body>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 800., &HashMap::new());
+        assert_eq!(
+            layout.grid_tracks[&dom.get_by_id("auto").unwrap()].0,
+            [160., 20.]
+        );
+        assert_eq!(
+            layout.grid_tracks[&dom.get_by_id("aligned").unwrap()].0,
+            [400., 20.]
+        );
+        assert_eq!(layout.boxes[&dom.get_by_id("ratio").unwrap()].width, 160.);
+    }
+
+    #[test]
+    fn grid_orthogonal_contributions_use_the_available_row_height() {
+        let html = r#"<!doctype html><body style="margin:0;font:20px/20px monospace">
+            <div id="fixed" style="display:grid;width:500px;grid-template-columns:max-content;grid-template-rows:30px">
+              <div style="writing-mode:vertical-rl">A A A A</div>
+            </div>
+            <div id="auto" style="display:grid;width:500px;grid-template-columns:max-content 20px">
+              <div style="writing-mode:vertical-rl;height:100%">A A A A</div><div style="height:30px"></div>
+            </div>
+            <div id="flexible" style="display:grid;width:500px;height:30px;grid-template-columns:max-content 20px;grid-template-rows:minmax(0,1fr)">
+              <div style="writing-mode:vertical-rl;height:100%">A A A A</div><div></div>
+            </div></body>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 800., &HashMap::new());
+        let fixed = &layout.grid_tracks[&dom.get_by_id("fixed").unwrap()].0;
+        let auto = &layout.grid_tracks[&dom.get_by_id("auto").unwrap()].0;
+        assert_eq!(fixed, &[80.]);
+        // An auto row grows to the vertical item's original inline size.
+        assert_eq!(auto, &[20., 20.]);
+        // A flexible row has no definite maximum in step 1, but supplies
+        // a 30px inline constraint during the second column-sizing pass.
+        assert_eq!(
+            layout.grid_tracks[&dom.get_by_id("flexible").unwrap()].0,
+            [80., 20.]
+        );
+    }
+
+    #[test]
     fn grid_items_and_rows_honor_min_heights() {
         // CSS 2.2 §10.7: a centered grid item keeps its min-height; CSS Grid
         // §12.1/§11.8: an auto row stretches into the container's definite
@@ -7399,6 +7452,87 @@ b</xmp></body>"#;
                 .flat_map(|row| &row.items)
                 .any(|item| item.text.contains('▸'))
         );
+    }
+
+    #[test]
+    fn text_transform_word_context_crosses_inline_and_out_of_flow_boxes() {
+        let html = "<!doctype html><body><p style='text-transform:capitalize'>he<b>llo</b>-<i>world</i> a<span style='position:absolute'></span><b>bc</b></p><p style='text-transform:lowercase'>Ο<b>Σ</b>Α</p><p lang=tr style='text-transform:uppercase'>istanbul</p>";
+        let layout = lay_graphical(html, 400., &HashMap::new());
+        let text: String = layout
+            .paint
+            .primitives
+            .iter()
+            .filter_map(|command| match command {
+                crate::render::DisplayCommand::GlyphRun { shaped, .. } => {
+                    Some(shaped.text.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text.replace(' ', ""), "Hello-WorldAbcοσαİSTANBUL");
+        let cells: String = lay(html, 80)
+            .rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .map(|i| i.text.as_str())
+            .collect();
+        assert_eq!(cells.replace(' ', ""), "Hello-WorldAbcοσαİSTANBUL");
+    }
+
+    #[test]
+    fn text_transform_maps_selection_to_the_original_text_node() {
+        let html = "<!doctype html><p style='text-transform:uppercase'>aßb</p>";
+        let layout = lay_graphical(html, 400., &HashMap::new());
+        let (shaped, sources) = layout
+            .paint
+            .primitives
+            .iter()
+            .find_map(|command| match command {
+                crate::render::DisplayCommand::GlyphRun {
+                    shaped, selection, ..
+                } if shaped.text == "ASSB" => Some((shaped, selection.spans())),
+                _ => None,
+            })
+            .unwrap();
+        let point = |byte| {
+            crate::render::selection::point_in_run(&shaped.text, sources, byte)
+                .unwrap()
+                .offset
+        };
+        assert_eq!([point(0), point(1), point(3), point(4)], [0, 1, 2, 3]);
+        assert_eq!(sources.len(), 3);
+        let selection = crate::render::selection::PageSelection::Painted {
+            anchor: crate::core::TextPoint {
+                node: sources[0].node,
+                offset: 0,
+            },
+            focus: crate::core::TextPoint {
+                node: sources[0].node,
+                offset: 3,
+            },
+        };
+        assert_eq!(
+            crate::render::selection::selected_page_text(&layout.paint, &selection),
+            "aßb"
+        );
+    }
+
+    #[test]
+    fn text_transform_preserves_collapsible_spaces_and_math_node_boundaries() {
+        let html = "<!doctype html><p style='text-transform:full-width'>a   b</p><p style='text-transform:full-width;white-space:pre'>a  b</p><p style='text-transform:math-auto'><span>x</span><span>xy</span></p>";
+        let layout = lay_graphical(html, 400., &HashMap::new());
+        let text: String = layout
+            .paint
+            .primitives
+            .iter()
+            .filter_map(|command| match command {
+                crate::render::DisplayCommand::GlyphRun { shaped, .. } => {
+                    Some(shaped.text.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "ａ ｂａ　　ｂ𝑥xy");
     }
 
     #[test]

@@ -26,6 +26,7 @@ pub(crate) struct LinkedSheet {
     pub base: String,
     /// CSSOM #concept-css-style-sheet-origin-clean-flag.
     pub origin_clean: bool,
+    pub referrer_policy: Option<crate::referrer_policy::ReferrerPolicy>,
     /// The cascade's text: `text` with its imported sheets spliced in place
     /// of their `@import` rules (CSS Cascade 5 #at-import).
     pub cascade: String,
@@ -42,6 +43,7 @@ pub(crate) struct ImportedSheet {
     /// The response was CORS-same-origin; the imported sheet's origin-clean
     /// flag also requires its parent's.
     pub cors_same_origin: bool,
+    pub referrer_policy: Option<crate::referrer_policy::ReferrerPolicy>,
 }
 
 impl Dom {
@@ -322,6 +324,7 @@ impl Dom {
                     text: sheet.text,
                     base: sheet.base,
                     cors_same_origin: sheet.cors_same_origin,
+                    referrer_policy: sheet.referrer_policy,
                 },
             );
         }
@@ -943,7 +946,10 @@ pub(super) fn accepts_longhand(property: &str, value: &str) -> bool {
         }
         "writing-mode" => one_of("horizontal-tb vertical-rl vertical-lr sideways-rl sideways-lr"),
         "text-orientation" => one_of("mixed upright sideways"),
-        "text-transform" => one_of("none uppercase lowercase capitalize"),
+        "text-transform" => crate::layout2::TextTransform::from_css(value).is_some(),
+        "animation-composition" => split_top_level_commas(value)
+            .iter()
+            .all(|item| animations::Composition::parse(item).is_some()),
         // CSS Text 3 #text-align-property, with the legacy -webkit-/-moz-
         // descendant-alignment keywords layout implements.
         "text-align" => one_of(

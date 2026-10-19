@@ -8,10 +8,10 @@ use std::sync::Arc;
 use fontdb::{Database, ID};
 use harfrust::ShapeOptions;
 use kurbo::{ParamCurve, ParamCurveArclen, ParamCurveDeriv};
-use skrifa::MetadataProvider;
-use skrifa::Tag;
 use skrifa::prelude::Size;
 use skrifa::raw::TableProvider;
+use skrifa::MetadataProvider;
+use skrifa::Tag;
 use strict_num::NonZeroPositiveF32;
 use tiny_skia_path::{NonZeroRect, Transform};
 use unicode_script::UnicodeScript;
@@ -301,7 +301,31 @@ pub(crate) fn layout_text(
             }
         }
 
-        for span in &chunk.spans {
+        for (span_index, span) in chunk.spans.iter().enumerate() {
+            // CSS Fonts 4 #font-display-timeline: retain glyph cells and
+            // positioning, but omit ink for clusters in the block period.
+            let hidden = resolver
+                .font_use
+                .as_ref()
+                .map_or_else(Vec::new, |font_use| {
+                    let (text, start) = match &chunk.shaping {
+                        Some(shaped) => (
+                            &shaped.text[shaped.spans[span_index].clone()],
+                            shaped.spans[span_index].start,
+                        ),
+                        None => (&chunk.text[span.start..span.end], span.start),
+                    };
+                    font_use(&span.font, text)
+                        .into_iter()
+                        .map(|range| {
+                            let range = range.start + start..range.end + start;
+                            chunk.shaping.as_ref().map_or_else(
+                                || range.clone(),
+                                |shaped| shaped.source_range(range.clone()),
+                            )
+                        })
+                        .collect()
+                });
             let font = match fonts_cache.get(&span.font) {
                 Some(v) => v,
                 None => continue,
@@ -416,6 +440,14 @@ pub(crate) fn layout_text(
                             pg.cluster_ts = cluster_ts;
                             pg.span_ts = span_ts;
                         });
+                        let index =
+                            hidden.partition_point(|range| range.end <= gc.byte_idx.value());
+                        if hidden
+                            .get(index)
+                            .is_some_and(|range| range.start < gc.byte_idx.value() + gc.source_len)
+                        {
+                            gc.glyphs.clear();
+                        }
                         gc.glyphs
                     })
                     .collect();
@@ -509,7 +541,12 @@ fn vertical_cell_advance(
                     let mut buffer = UnicodeBuffer::new();
                     // Shape each font/configuration once per chunk, preserving context
                     // across typographic characters and avoiding repeated font setup.
-                    buffer.push_str(&chunk.text);
+                    buffer.push_str(
+                        chunk
+                            .shaping
+                            .as_ref()
+                            .map_or(chunk.text.as_str(), |shaped| shaped.text.as_str()),
+                    );
                     buffer.set_direction(Direction::TopToBottom);
                     buffer.guess_segment_properties();
                     let mut features = Vec::new();
@@ -526,7 +563,12 @@ fn vertical_cell_advance(
                         .iter()
                         .zip(shaped.glyph_positions())
                         .map(|(info, position)| {
-                            (info.cluster as usize, -position.y_advance as f32 * scale)
+                            let byte = info.cluster as usize;
+                            let source = chunk
+                                .shaping
+                                .as_ref()
+                                .map_or(byte, |shaped| shaped.source_range(byte..byte + 1).start);
+                            (source, -position.y_advance as f32 * scale)
                         })
                         .collect();
                     advances.sort_unstable_by_key(|entry| entry.0);
@@ -1067,8 +1109,11 @@ fn process_chunk(
             None => continue,
         };
 
-        let tmp_glyphs = shape_text(
-            &chunk.text,
+        let mut tmp_glyphs = shape_text(
+            chunk
+                .shaping
+                .as_ref()
+                .map_or(chunk.text.as_str(), |shaped| shaped.text.as_str()),
             font,
             span.small_caps,
             span.apply_kerning,
@@ -1078,6 +1123,14 @@ fn process_chunk(
             resolver,
             fontdb,
         );
+        if let Some(shaped) = &chunk.shaping {
+            for glyph in &mut tmp_glyphs {
+                let start = glyph.byte_idx.value();
+                let source = shaped.source_range(start..start + glyph.cluster_len);
+                glyph.byte_idx = ByteIndex::new(source.start);
+                glyph.cluster_len = source.end - source.start;
+            }
+        }
 
         // Do nothing with the first run.
         if glyphs.is_empty() {
@@ -1096,8 +1149,11 @@ fn process_chunk(
 
             let Some(idx) = glyphs
                 .iter()
-                .position(|g| g.byte_idx == new_glyph.byte_idx)
-                .filter(|pos| !positions.contains(pos))
+                .enumerate()
+                .find_map(|(index, glyph)| {
+                    (glyph.byte_idx == new_glyph.byte_idx && !positions.contains(&index))
+                        .then_some(index)
+                })
             else {
                 continue;
             };
@@ -1340,8 +1396,11 @@ fn form_glyph_clusters(glyphs: &[Glyph], text: &str, font_size: f32) -> GlyphClu
 
         let glyph_width = glyph.width as f32 * sx;
         advance += glyph_width;
-        if glyph_width > width {
-            width = glyph_width;
+        // SVG 2 #TextElementTextLengthAttribute uses the total advances.
+        // A transformed character (for example uppercase sharp-s -> SS)
+        // can contain several advancing glyphs in one source cluster.
+        if advance > width {
+            width = advance;
         }
     }
 
@@ -1364,7 +1423,10 @@ fn form_glyph_clusters(glyphs: &[Glyph], text: &str, font_size: f32) -> GlyphClu
             .iter()
             .position(|glyph| glyph.width != 0)
             .unwrap_or(0),
-        codepoint: byte_idx.char_from(text),
+        codepoint: glyphs
+            .iter()
+            .find_map(|glyph| glyph.text.chars().next())
+            .unwrap_or_else(|| byte_idx.char_from(text)),
         width,
         advance,
         ascent: font.ascent(font_size),

@@ -1558,6 +1558,7 @@ pub(crate) fn worker_prelude() -> &'static str {
             // HTML OffscreenCanvas, its 2D and bitmaprenderer contexts and
             // WebGL are [Exposed=(Window,Worker)].
             let canvas = platform_block("/*__CANVAS_BEGIN__*/", "/*__CANVAS_END__*/");
+            let fonts = wrapped_platform_block("/*__FONT_LOADING_BEGIN__*/", "/*__FONT_LOADING_END__*/");
             let crypto = platform_block("/*__CRYPTO_BEGIN__*/", "/*__CRYPTO_END__*/");
             let domexception = platform_block("/*__DOMEXCEPTION_BEGIN__*/", "/*__DOMEXCEPTION_END__*/");
             let abort = platform_block("/*__ABORT_BEGIN__*/", "/*__ABORT_END__*/");
@@ -1609,7 +1610,7 @@ pub(crate) fn worker_prelude() -> &'static str {
                     1,
                 );
             format!(
-                "{domexception}\n{worker_scope}\n{geometry}\n{string_list}\n{navigator}\n{permissions}\n{ports}\n{codec}\n{features}\n{abort}\n{streams}\n{file}\n{blob_url}\n{fetch}\n{cache_storage}\n{indexed_db}\n{xhr}\n{websocket}\n{eventsource}\n{dedicated_worker}\n{rejection}\n__rejection_bind(__rejection_api);\n{bitmap}\n{WEBGL}\n{canvas}\n{crypto}\n{urlpattern}\n{wasm}\n\
+                "{domexception}\n{worker_scope}\n{geometry}\n{string_list}\n{navigator}\n{permissions}\n{ports}\n{codec}\n{features}\n{abort}\n{streams}\n{file}\n{blob_url}\n{fetch}\n{cache_storage}\n{indexed_db}\n{xhr}\n{websocket}\n{eventsource}\n{dedicated_worker}\n{rejection}\n__rejection_bind(__rejection_api);\n{bitmap}\n{WEBGL}\n{canvas}\n{fonts}\n{crypto}\n{urlpattern}\n{wasm}\n\
                  __port_api.setCodec(__sc_serialize, __sc_deserialize);\n\
                  __port_api.setStreams(__streams_api);\n\
                  __port_api.setBitmaps(__bitmap_api); __sc_bitmap_codec(__bitmap_api);\n\

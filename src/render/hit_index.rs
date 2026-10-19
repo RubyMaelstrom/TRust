@@ -769,6 +769,7 @@ mod tests {
     #[test]
     fn retained_hit_index_samples_animation_properties_without_rebuilding() {
         let animation = CssAnimationScope {
+            composition: None,
             animations: vec![CssPaintAnimation {
                 name: "move".into(),
                 duration_seconds: 2.,

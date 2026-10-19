@@ -67,6 +67,7 @@ pub(crate) fn css_transform_list_matrix(text: &str) -> Option<([f64; 16], bool)>
     properties::transform_list_matrix(text)
 }
 mod animations;
+pub(crate) use animations::CompositorStack;
 mod move_node;
 mod rule_index;
 pub(crate) mod shadow;
@@ -695,12 +696,13 @@ pub struct Dom {
     document_encodings: FxHashMap<NodeId, &'static encoding_rs::Encoding>,
     /// CSS Fonts 4 #font-fetching-requirements: `@font-face` network sources
     /// the host fetched for this arena, by absolute URL (`None` = failed).
-    downloaded_fonts: FxHashMap<String, Option<std::sync::Arc<[u8]>>>,
-    /// CSS Font Loading: loaded, manually-added faces of each Document.
-    script_fonts: FxHashMap<NodeId, Vec<crate::font_system::PageFont>>,
-    /// Network font sources a font set is waiting for, for the host to fetch,
-    /// and every source ever requested with the end of its face's swap
-    /// period (CSS Fonts 4 #font-display-timeline; `None`: infinite).
+    downloaded_fonts: FxHashMap<(NodeId, String), Option<std::sync::Arc<[u8]>>>,
+    /// CSS Font Loading: CSS-connected and manual members, including faces
+    /// not loaded yet. Selection uses their descriptors before any fetch.
+    script_fonts: FxHashMap<NodeId, Vec<crate::font_system::FontRegistration>>,
+    font_demands: std::sync::Arc<crate::font_system::FontDemands>,
+    /// Network resources requested once per document. Per-face rendering
+    /// timelines are independent and live in `font_demands`.
     font_requests: RefCell<FontRequests>,
     /// Style sheets `@import` rules need that no fetch obtained yet: the
     /// importing sheet's owner node and the absolute URL, each URL once
@@ -1299,6 +1301,7 @@ impl Dom {
             document_encodings,
             downloaded_fonts,
             script_fonts,
+            font_demands,
             font_requests,
             import_requests,
             svg_resource_requests,
@@ -1479,28 +1482,27 @@ impl Dom {
         fixed_map!(document_content_types, (NodeId, String));
         fixed_map!(document_modes, (NodeId, QuirksMode));
         fixed_map!(document_encodings, (NodeId, &'static encoding_rs::Encoding));
-        fixed_map!(downloaded_fonts, (String, Option<std::sync::Arc<[u8]>>));
-        for (url, font) in downloaded_fonts {
+        fixed_map!(
+            downloaded_fonts,
+            ((NodeId, String), Option<std::sync::Arc<[u8]>>)
+        );
+        for ((_, url), font) in downloaded_fonts {
             bytes = bytes
                 .saturating_add(url.capacity())
                 .saturating_add(font.as_ref().map_or(0, |font| font.len()));
         }
-        fixed_map!(script_fonts, (NodeId, Vec<crate::font_system::PageFont>));
+        fixed_map!(
+            script_fonts,
+            (NodeId, Vec<crate::font_system::FontRegistration>)
+        );
         for fonts in script_fonts.values() {
-            bytes += fonts.capacity() * std::mem::size_of::<crate::font_system::PageFont>();
+            bytes += fonts.capacity() * std::mem::size_of::<crate::font_system::FontRegistration>();
             for font in fonts {
-                bytes += font.family.capacity()
-                    + font.bytes.capacity()
-                    + font.descriptors.features.capacity() * std::mem::size_of::<([u8; 4], u32)>()
-                    + font.descriptors.variations.capacity()
-                        * std::mem::size_of::<([u8; 4], f32)>()
-                    + font
-                        .descriptors
-                        .named_instance
-                        .as_ref()
-                        .map_or(0, String::capacity);
+                bytes +=
+                    font.face.retained_bytes() + font.data.as_ref().map_or(0, |data| data.len());
             }
         }
+        bytes += font_demands.retained_bytes();
         {
             let (pending, requested) = &*import_requests.borrow();
             fixed_map!(pending, (NodeId, String));
@@ -1511,9 +1513,9 @@ impl Dom {
         }
         {
             let (pending, requested) = &*font_requests.borrow();
-            fixed_map!(pending, url::Url);
-            fixed_map!(requested, (String, Option<std::time::Instant>));
-            for url in requested.keys() {
+            fixed_map!(pending, crate::font_system::FontRequest);
+            fixed_map!(requested, (NodeId, String));
+            for (_, url) in requested {
                 bytes = bytes.saturating_add(url.capacity());
             }
         }
@@ -1943,6 +1945,7 @@ impl Dom {
             document_encodings: FxHashMap::default(),
             downloaded_fonts: FxHashMap::default(),
             script_fonts: FxHashMap::default(),
+            font_demands: Default::default(),
             font_requests: RefCell::default(),
             import_requests: RefCell::default(),
             svg_resource_requests: RefCell::default(),
@@ -3509,14 +3512,25 @@ impl Dom {
     /// CSS Grid 2 #subgrid-listing: a row subgrid requires a parent grid and
     /// cannot independently establish a formatting context.
     pub(crate) fn is_row_subgrid_item(&self, id: NodeId) -> bool {
-        self.is_row_subgrid_item_with(id, self.effective_display(id).as_deref())
+        self.is_subgrid_item_with(id, false, self.effective_display(id).as_deref())
     }
 
-    /// `is_row_subgrid_item` given the element's `effective_display`.
-    fn is_row_subgrid_item_with(&self, id: NodeId, display: Option<&str>) -> bool {
+    pub(crate) fn is_column_subgrid_item(&self, id: NodeId) -> bool {
+        self.is_subgrid_item_with(id, true, self.effective_display(id).as_deref())
+    }
+
+    /// CSS Grid 2 #subgrid-listing, for either axis of the parent grid.
+    fn is_subgrid_item_with(&self, id: NodeId, columns: bool, display: Option<&str>) -> bool {
         if !matches!(display, Some("grid" | "inline-grid"))
             || !self
-                .computed_value_resolved(id, "grid-template-rows")
+                .computed_value_resolved(
+                    id,
+                    if columns {
+                        "grid-template-columns"
+                    } else {
+                        "grid-template-rows"
+                    },
+                )
                 .is_some_and(|v| v.split_whitespace().next() == Some("subgrid"))
             || matches!(
                 self.computed_value_resolved(id, "position").as_deref(),
@@ -3563,9 +3577,11 @@ impl Dom {
         }
         // Every check below reads the element's display; derive it once.
         let display = self.effective_display(id);
-        // CSS Grid 2 #subgrid-items: row subgrid contents participate in
+        // CSS Grid 2 #subgrid-items: subgrid contents participate in
         // their parent's sizing, so they cannot be an incremental boundary.
-        if self.is_row_subgrid_item_with(id, display.as_deref()) {
+        if self.is_subgrid_item_with(id, false, display.as_deref())
+            || self.is_subgrid_item_with(id, true, display.as_deref())
+        {
             return false;
         }
         // overflow ≠ visible on EITHER axis → BFC (a scroll/clip viewport),
@@ -6154,6 +6170,14 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// the retained keyframe values used by graphical paint. Shorter
     /// longhand lists repeat to the `animation-name` list length (§3.2).
     pub(crate) fn css_animation_definitions(&self, id: NodeId) -> Vec<CssAnimationDefinition> {
+        self.css_animation_definitions_with_composition(id, false)
+    }
+
+    pub(super) fn css_animation_definitions_with_composition(
+        &self,
+        id: NodeId,
+        composition: bool,
+    ) -> Vec<CssAnimationDefinition> {
         let shorthand = self
             .cascaded(id, "animation")
             .map(|value| {
@@ -6192,6 +6216,29 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
         let delays = list("animation-delay");
         let play_states = list("animation-play-state");
         let style_index = self.style_index();
+        // Additive effects require the complete property stack, including
+        // earlier/later replace effects. Only emit their compositor timing
+        // definitions when paint also receives that complete stack; the actor
+        // supplies all other additive targets without another paint animation.
+        let compositions = list("animation-composition");
+        if names.iter().enumerate().any(|(index, name)| {
+            style_index
+                .keyframes
+                .get(name.trim().trim_matches(['\'', '"']))
+                .is_some_and(|rule| {
+                    animation_list_value(&compositions, index)
+                        .and_then(animations::Composition::parse)
+                        .is_some_and(|c| c != animations::Composition::Replace)
+                        || rule.properties.values().flatten().any(|frame| {
+                            frame
+                                .composition
+                                .is_some_and(|c| c != animations::Composition::Replace)
+                        })
+                })
+        }) && !composition
+        {
+            return Vec::new();
+        }
 
         names
             .iter()
@@ -7494,6 +7541,7 @@ impl Dom {
             return self.computed_value_resolved(id, name).is_some_and(|value| {
                 value.contains('%')
                     || value.contains(crate::layout2::DEFERRED_TRANSFORM_INTERPOLATION)
+                    || value.contains(crate::layout2::DEFERRED_TRANSFORM_ACCUMULATION)
             });
         }
         let Some(longhands) = used_value_longhands(name) else {
@@ -9713,9 +9761,13 @@ impl Dom {
         which: PseudoEl,
         prop: &str,
     ) -> Option<String> {
-        self.transitions
-            .pseudo_value(id, which, prop)
-            .or_else(|| self.animations.pseudo_value(id, which, prop))
+        self.animations
+            .composed_value((id, Some(which)), prop)
+            .or_else(|| {
+                self.transitions
+                    .pseudo_value(id, which, prop)
+                    .or_else(|| self.animations.pseudo_value(id, which, prop))
+            })
     }
 
     /// CSS Lists 3 #declaring-a-list-item: elements whose `display` includes
@@ -10156,13 +10208,15 @@ impl Dom {
         mut faces: FxHashMap<NodeId, Vec<crate::http::CssFontFace>>,
         sets: &mut FxHashMap<NodeId, std::sync::Arc<crate::text::FontSet>>,
     ) {
+        use crate::font_system::{FontCandidate, FontKey};
         for &document in self.script_fonts.keys() {
             faces.entry(document).or_default();
         }
-        // CSS Fonts 4 #font-face-rule / #font-fetching-requirements. Data
-        // sources can be activated immediately when an applicable sheet is
-        // attached, including dynamic sheets and child navigables. Network
-        // sources continue to use the HTTP preload pipeline.
+        // Descriptor collection is pure. Only shaping may request a face
+        // (CSS Fonts 4 #font-style-matching / #unicode-range-desc).
+        let mut active = Vec::new();
+        let mut collected = FxHashSet::default();
+        let mut prepared = Vec::new();
         let mut scopes: Vec<_> = faces.keys().copied().collect();
         scopes.sort_unstable();
         for scope in scopes {
@@ -10170,48 +10224,160 @@ impl Dom {
             let mut ancestor = scope;
             while let Some(host) = self.shadow_hosts.get(&ancestor) {
                 ancestor = self.tree_scope(*host);
-                if sets.contains_key(&ancestor) {
+                if collected.contains(&ancestor) {
                     break;
                 }
                 pending.push(ancestor);
             }
             for scope in pending.into_iter().rev() {
-                if sets.contains_key(&scope) {
+                if collected.contains(&scope) {
                     continue;
                 }
                 let child_document = scope != self.document()
                     && matches!(self.nodes[scope].data, NodeData::Document);
-                let foreground =
-                    !child_document && self.registration_document(scope) == self.document();
-                let mut fonts = faces
+                let document = self.owner_document(scope).unwrap_or(scope);
+                let registrations = self
+                    .script_fonts
+                    .get(&document)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                let mut mapped = FxHashSet::default();
+                let mut fonts = Vec::new();
+                let mut candidates = Vec::new();
+                for (index, face) in faces
                     .remove(&scope)
                     .unwrap_or_default()
                     .into_iter()
-                    .filter_map(|face| self.face_font(face, foreground))
-                    .collect::<Vec<_>>();
-                fonts.extend(self.script_fonts.get(&scope).into_iter().flatten().cloned());
-                let parent = self
-                    .shadow_hosts
-                    .get(&scope)
-                    .and_then(|host| sets.get(&self.tree_scope(*host)));
-                if !fonts.is_empty() || child_document || parent.is_some() {
-                    let set = crate::text::FontSet::new(fonts, parent, foreground);
-                    sets.insert(scope, set);
+                    .enumerate()
+                {
+                    let registration = registrations.iter().find(|registered| {
+                        registered.css
+                            && registered.key.scope == scope
+                            && registered.face == face
+                            && !mapped.contains(&registered.key)
+                    });
+                    let key = registration.map_or(
+                        FontKey {
+                            scope,
+                            member: index as u64,
+                            script: false,
+                        },
+                        |r| r.key,
+                    );
+                    mapped.insert(key);
+                    let font = if registration.is_some_and(|r| r.failed) {
+                        None
+                    } else if let Some(data) = registration.and_then(|r| r.data.as_ref()) {
+                        crate::font_system::PageFont::from_web_resource(
+                            face.family.clone(),
+                            data.to_vec(),
+                        )
+                        .map(|font| {
+                            font.restrict_to(&face.unicode_range)
+                                .with_descriptors(face.descriptors.clone())
+                        })
+                    } else {
+                        self.face_font(&face, document, false, false)
+                    };
+                    let pending = face.sources.iter().any(|source| matches!(source,
+                        crate::http::CssFontSource::Url(url) if !url.starts_with("data:") && !self.downloaded_fonts.contains_key(&(document,url.clone()))));
+                    let failed =
+                        registration.is_some_and(|r| r.failed) || (font.is_none() && !pending);
+                    let data = font
+                        .as_ref()
+                        .map(|font| std::sync::Arc::from(font.bytes.clone()));
+                    if let Some(font) = font {
+                        fonts.push((key, font));
+                    }
+                    candidates.push(FontCandidate {
+                        key,
+                        face: std::sync::Arc::new(face),
+                        data,
+                        failed,
+                        css: true,
+                    });
                 }
+                for registration in registrations
+                    .iter()
+                    .filter(|registered| !registered.css && registered.key.scope == scope)
+                {
+                    let font = registration
+                        .data
+                        .as_ref()
+                        .and_then(|data| {
+                            crate::font_system::PageFont::from_web_resource(
+                                registration.face.family.clone(),
+                                data.to_vec(),
+                            )
+                        })
+                        .map(|font| {
+                            font.restrict_to(&registration.face.unicode_range)
+                                .with_descriptors(registration.face.descriptors.clone())
+                        });
+                    let data = font
+                        .as_ref()
+                        .map(|font| std::sync::Arc::from(font.bytes.clone()));
+                    if let Some(font) = font {
+                        fonts.push((registration.key, font));
+                    }
+                    candidates.push(FontCandidate {
+                        key: registration.key,
+                        face: std::sync::Arc::new(registration.face.clone()),
+                        data,
+                        failed: registration.failed,
+                        css: false,
+                    });
+                }
+                active.extend(candidates.iter().cloned());
+                collected.insert(scope);
+                prepared.push((scope, child_document, fonts, candidates));
+            }
+        }
+        self.font_demands.set_active(active);
+        for (scope, child_document, fonts, mut candidates) in prepared {
+            let canvas_fonts = fonts.iter().map(|(_, font)| font.clone()).collect();
+            let canvas_candidates = candidates.clone();
+            let fonts = fonts
+                .into_iter()
+                .filter_map(|(key, font)| (!self.font_demands.failed(key)).then_some(font))
+                .collect();
+            for source in &mut candidates {
+                source.failed |= self.font_demands.failed(source.key);
+            }
+            let parent = self
+                .shadow_hosts
+                .get(&scope)
+                .and_then(|host| sets.get(&self.tree_scope(*host)));
+            if !candidates.is_empty() || child_document || parent.is_some() {
+                sets.insert(
+                    scope,
+                    crate::text::FontSet::with_candidates(
+                        fonts,
+                        parent,
+                        candidates,
+                        self.font_demands.clone(),
+                    )
+                    .with_canvas(
+                        canvas_fonts,
+                        parent,
+                        canvas_candidates,
+                        self.font_demands.clone(),
+                    ),
+                );
             }
         }
     }
 
     /// CSS Fonts 4 #src-desc: the first of a face's sources that loads.
     /// `local()` faces come from the installed fonts and data URLs decode at
-    /// once; a network source the host has not fetched yet is queued for it,
-    /// and the face is unavailable (falling back) meanwhile. The foreground
-    /// document's load already installed its initial sheets' downloadable
-    /// faces globally, except those still loading after their block period.
+    /// once. A network source is queued only after text has requested the
+    /// face; style collection alone never starts a download.
     fn face_font(
         &self,
-        face: crate::http::CssFontFace,
-        foreground: bool,
+        face: &crate::http::CssFontFace,
+        document: NodeId,
+        requested: bool,
+        native_fetch: bool,
     ) -> Option<crate::font_system::PageFont> {
         let finish = |font: crate::font_system::PageFont, fragment: Option<&str>| {
             Some(
@@ -10220,7 +10386,6 @@ impl Dom {
                     .with_descriptors(face.descriptors.clone()),
             )
         };
-        let installed = foreground && crate::font_system::page_font_family_installed(&face.family);
         for source in &face.sources {
             let source = match source {
                 crate::http::CssFontSource::Local(name) => {
@@ -10249,7 +10414,8 @@ impl Dom {
             else {
                 continue;
             };
-            match self.downloaded_fonts.get(url.as_str()) {
+            let key = (document, url.to_string());
+            match self.downloaded_fonts.get(&key) {
                 Some(Some(bytes)) => {
                     if let Some(font) = crate::font_system::PageFont::from_web_resource(
                         face.family.clone(),
@@ -10261,16 +10427,13 @@ impl Dom {
                 }
                 Some(None) => {}
                 None => {
-                    if installed && crate::font_system::late_page_face(url.as_str()).is_none() {
-                        return None;
-                    }
-                    let mut requests = self.font_requests.borrow_mut();
-                    if !requests.1.contains_key(url.as_str()) {
-                        // The font download timer starts at this first use.
-                        let (block, swap) = face.descriptors.display.periods();
-                        let failure = swap.map(|swap| std::time::Instant::now() + block + swap);
-                        requests.1.insert(url.to_string(), failure);
-                        requests.0.push(url);
+                    if requested {
+                        let mut requests = self.font_requests.borrow_mut();
+                        if requests.1.insert(key) && native_fetch {
+                            requests
+                                .0
+                                .push(crate::font_system::FontRequest { document, url });
+                        }
                     }
                     return None;
                 }
@@ -10281,27 +10444,50 @@ impl Dom {
 
     /// Network `@font-face` sources font sets are waiting for, each returned
     /// once, for the host to fetch.
-    pub(crate) fn take_font_requests(&self) -> Vec<url::Url> {
+    pub(crate) fn take_font_requests(&self) -> Vec<crate::font_system::FontRequest> {
+        self.font_demands.take_pending();
+        for source in self.font_demands.used_sources() {
+            if source.css
+                && source.data.is_none()
+                && !source.failed
+                && !self.font_demands.failed(source.key)
+            {
+                let document = self
+                    .owner_document(source.key.scope)
+                    .unwrap_or(source.key.scope);
+                self.face_font(&source.face, document, true, !source.key.script);
+            }
+        }
         std::mem::take(&mut self.font_requests.borrow_mut().0)
     }
 
     /// Record a fetched `@font-face` source (`None` when it failed), so the
     /// rebuilt font sets use it or move on to the face's next source.
+    #[cfg(test)]
     pub(crate) fn install_downloaded_font(&mut self, url: &str, bytes: Option<Vec<u8>>) {
-        // CSS Fonts 4 #font-display-timeline: a face not loaded when its
-        // failure period starts "is marked as a failed load, causing normal
-        // font fallback"; it is not swapped in afterwards.
-        let failure = self.font_requests.borrow().1.get(url).copied().flatten();
-        let bytes = bytes.filter(|_| failure.is_none_or(|end| std::time::Instant::now() <= end));
-        self.downloaded_fonts
-            .insert(url.to_string(), bytes.map(Into::into));
+        self.install_document_font(self.document(), url, bytes);
+    }
+
+    pub(crate) fn install_document_font(
+        &mut self,
+        document: NodeId,
+        url: &str,
+        bytes: Option<Vec<u8>>,
+    ) {
+        if !self.is_valid(document) || !matches!(self.nodes[document].data, NodeData::Document) {
+            return;
+        }
+        // A resource may serve several faces with independent display timers.
+        // Keep its bytes even when one optional face has missed its deadline.
+        let key = (document, url.to_string());
+        self.downloaded_fonts.insert(key, bytes.map(Into::into));
         self.touch_style();
     }
 
     pub(crate) fn set_script_fonts(
         &mut self,
         document: NodeId,
-        fonts: Vec<crate::font_system::PageFont>,
+        fonts: Vec<crate::font_system::FontRegistration>,
     ) {
         if !self.is_valid(document)
             || !matches!(self.nodes[document].data, NodeData::Document)
@@ -10320,6 +10506,94 @@ impl Dom {
             self.script_fonts.insert(document, fonts);
         }
         self.touch_style();
+    }
+
+    /// Referrer Policy #integration-with-css (local W3C cc435b05ca4a):
+    /// external sheets use their response URL and policy; inline and
+    /// constructed sheets use their Document, independently of base URLs.
+    pub(crate) fn font_sheet_referrer(
+        &self,
+        document: NodeId,
+        base: &url::Url,
+        document_policy: crate::referrer_policy::ReferrerPolicy,
+    ) -> Option<crate::http::SheetReferrer> {
+        let (location, policy) = self
+            .external_sheets
+            .iter()
+            .find_map(|(owner, sheet)| {
+                (self.owner_document(*owner) == Some(document) && sheet.base == base.as_str())
+                    .then_some((sheet.location.as_str(), sheet.referrer_policy))
+            })
+            .or_else(|| {
+                self.imported_sheets.iter().find_map(|(location, sheet)| {
+                    (sheet.base == base.as_str())
+                        .then_some((location.as_str(), sheet.referrer_policy))
+                })
+            })?;
+        Some(crate::http::SheetReferrer {
+            source: Some(url::Url::parse(location).ok()?),
+            policy: policy.unwrap_or(document_policy),
+            document_policy,
+        })
+    }
+
+    pub(crate) fn use_font_demands(
+        &mut self,
+        demands: std::sync::Arc<crate::font_system::FontDemands>,
+    ) {
+        self.font_demands = demands;
+        self.touch_style();
+    }
+
+    pub(crate) fn advance_font_display(&mut self) {
+        self.font_demands.advance(std::time::Instant::now());
+        if self.font_demands.take_changed() {
+            self.touch_style();
+        }
+    }
+
+    pub(crate) fn arm_font_display_timer(&self, handle: &tokio::runtime::Handle) {
+        self.font_demands.arm_timer(handle);
+    }
+
+    pub(crate) fn set_font_demand_waker(&self, wake: std::sync::Arc<dyn Fn() + Send + Sync>) {
+        self.font_demands.set_waker(wake);
+    }
+
+    pub(crate) fn font_registration_data(
+        &self,
+        document: NodeId,
+        member: u64,
+    ) -> Option<std::sync::Arc<[u8]>> {
+        self.script_fonts
+            .get(&document)?
+            .iter()
+            .find(|font| font.key.member == member)?
+            .data
+            .clone()
+    }
+
+    pub(crate) fn needed_font_members(&self, document: NodeId) -> Vec<u64> {
+        for source in self
+            .font_demands
+            .used_sources()
+            .into_iter()
+            .filter(|source| source.css && source.key.script)
+        {
+            let owner = self
+                .owner_document(source.key.scope)
+                .unwrap_or(source.key.scope);
+            if owner == document {
+                self.face_font(&source.face, owner, true, false);
+            }
+        }
+        self.script_fonts
+            .get(&document)
+            .into_iter()
+            .flatten()
+            .filter(|font| self.font_demands.was_used(font.key))
+            .map(|font| font.key.member)
+            .collect()
     }
 
     /// CSS parent without crossing from a child document element to its
@@ -10844,9 +11118,8 @@ impl Dom {
 
     /// Text of author `<style>` sheets in document order. CSS Fonts 4 §4.1
     /// makes `@font-face` resources available from every stylesheet in the
-    /// document, not only externally linked sheets; the HTTP preload phase
-    /// uses this before the resident actor starts so first layout can shape
-    /// with inline-declared web fonts.
+    /// document, not only externally linked sheets. The static renderer uses
+    /// this catalog to resolve the sources requested by text shaping.
     pub(crate) fn inline_stylesheets(&self) -> Vec<String> {
         self.shadow_including_subtree(self.document())
             .into_iter()
@@ -10873,6 +11146,7 @@ impl Dom {
                     text: sheet.text.clone(),
                     base: sheet.base.clone(),
                     cors_same_origin: sheet.cors_same_origin,
+                    referrer_policy: sheet.referrer_policy,
                 },
             );
             imported = true;
@@ -10928,6 +11202,7 @@ impl Dom {
             location: sheet.url.clone(),
             base: sheet.base.clone(),
             origin_clean: sheet.cors_same_origin,
+            referrer_policy: sheet.referrer_policy,
             cascade,
         }
     }
@@ -10961,6 +11236,7 @@ impl Dom {
                     text: import.text,
                     base: import.base,
                     cors_same_origin: import.cors_same_origin,
+                    referrer_policy: import.referrer_policy,
                 },
             );
         }
@@ -13322,6 +13598,12 @@ impl Dom {
                 let image =
                     tag == "image" && self.namespace_uri(id) == Some("http://www.w3.org/2000/svg");
                 let mut serialized_attrs = String::new();
+                if tag == "svg"
+                    && self.attr(id, "lang").is_none()
+                    && let Some(language) = self.inherited_lang(id)
+                {
+                    serialized_attrs.push_str(&format!(" lang=\"{}\"", escape_attr(language)));
+                }
                 self.write_attrs_with_extra_style(
                     id,
                     attrs,
@@ -16110,6 +16392,7 @@ impl SvgImageRefs<'_> {
 }
 
 const SVG_PRESENTATION_PROPERTIES: &[&str] = &[
+    "text-transform",
     "fill",
     "fill-opacity",
     "fill-rule",
@@ -16139,6 +16422,7 @@ const SVG_PRESENTATION_PROPERTIES: &[&str] = &[
 /// tables): `vector-effect`, `stop-color`, `stop-opacity`, `flood-color`,
 /// `flood-opacity`, `lighting-color` and `mask-type` do not inherit.
 const SVG_INHERITED_PRESENTATION_PROPERTIES: &[&str] = &[
+    "text-transform",
     "color-interpolation-filters",
     "color-interpolation",
     "fill",
@@ -18698,6 +18982,7 @@ const PROPS: &[PropDef] = &[
     prop("animation-name", false, false),
     prop("animation-duration", false, false),
     prop("animation-timing-function", false, false),
+    prop("animation-composition", false, false),
     prop("animation-iteration-count", false, false),
     prop("animation-direction", false, false),
     prop("animation-fill-mode", false, false),
@@ -19130,6 +19415,7 @@ fn cssom_initial_value(name: &str) -> Option<&'static str> {
         "animation-duration" | "animation-delay" => Some("0s"),
         "animation-play-state" => Some("running"),
         "animation-timing-function" => Some("ease"),
+        "animation-composition" => Some("replace"),
         "object-position" => Some("50% 50%"),
         "tab-size" => Some("8"),
         "hyphens" => Some("manual"),
@@ -22727,6 +23013,7 @@ struct KeyframesRule {
 struct KeyframeValue {
     offset: f32,
     value: String,
+    composition: Option<animations::Composition>,
 }
 
 impl KeyframesRule {
@@ -24730,9 +25017,11 @@ fn parse_sheet(
 
 /// WHATWG Compatibility #css-legacy-name-aliases: a `-webkit-` name that
 /// parses exactly as its unprefixed property.
-/// The network font sources a document waits for, and each requested
-/// source's failure time (`Dom::font_requests`).
-type FontRequests = (Vec<url::Url>, FxHashMap<String, Option<std::time::Instant>>);
+/// The network font sources a document waits for and its requested URLs.
+type FontRequests = (
+    Vec<crate::font_system::FontRequest>,
+    FxHashSet<(NodeId, String)>,
+);
 
 /// CSS Font Loading 3: a FontFace attribute value as its `@font-face`
 /// descriptor `name` serializes it; `None` when invalid.
@@ -25724,7 +26013,8 @@ fn media_px(value: &str) -> Option<f32> {
 /// repeated selectors cascade in source order and `!important` is invalid.
 /// Shorthands expand to their longhands. The animation properties are
 /// ignored, except `animation-timing-function`, which eases the interval
-/// starting at its keyframe (#timing-functions).
+/// starting at its keyframe (#timing-functions), and `animation-composition`,
+/// which overrides the effect's operation (CSS Animations 2 #keyframe-processing).
 fn parse_keyframes_rule(block: &str, quirks: bool) -> KeyframesRule {
     let mut rule = KeyframesRule::default();
     let mut rest = block;
@@ -25739,11 +26029,23 @@ fn parse_keyframes_rule(block: &str, quirks: bool) -> KeyframesRule {
         if offsets.is_empty() {
             continue;
         }
-        for decl in split_top_level(decls, ';') {
-            let Some((property, value, important)) = parse_decl_in(decl, quirks) else {
-                continue;
-            };
+        let declarations: Vec<_> = split_top_level(decls, ';')
+            .into_iter()
+            .filter_map(|decl| parse_decl_in(decl, quirks))
+            .collect();
+        let composition = declarations
+            .iter()
+            .rev()
+            .find_map(|(property, value, important)| {
+                (property == "animation-composition" && !important)
+                    .then(|| animations::Composition::parse(value))
+                    .flatten()
+            });
+        for (property, value, important) in declarations {
             if important {
+                continue;
+            }
+            if property == "animation-composition" {
                 continue;
             }
             if property == "animation-timing-function" {
@@ -25762,12 +26064,16 @@ fn parse_keyframes_rule(block: &str, quirks: bool) -> KeyframesRule {
                 }
                 for &offset in &offsets {
                     let values = rule.properties.entry(longhand.clone()).or_default();
-                    if let Some(existing) = values.iter_mut().find(|frame| frame.offset == offset) {
+                    if let Some(existing) = values
+                        .iter_mut()
+                        .find(|frame| frame.offset == offset && frame.composition == composition)
+                    {
                         existing.value = value.clone();
                     } else {
                         values.push(KeyframeValue {
                             offset,
                             value: value.clone(),
+                            composition,
                         });
                     }
                 }
@@ -31020,14 +31326,32 @@ mod tests {
         );
         dom.set_doc_url(Some(url::Url::parse("https://example.test/page/").unwrap()));
         let p = dom.get_by_id("p").unwrap();
-        assert!(dom.scope_font_set(p).is_none());
+        assert!(dom.scope_font_set(p).is_some());
+        assert!(
+            dom.take_font_requests().is_empty(),
+            "enumeration does not fetch fonts"
+        );
+        let use_font = |dom: &Dom| {
+            crate::text::shape(
+                "x",
+                &crate::text::TextStyle {
+                    family: "Late".into(),
+                    font_set: dom.scope_font_set(p),
+                    ..Default::default()
+                },
+            )
+        };
+        use_font(&dom);
         let url = "https://example.test/page/fonts/late.ttf";
         assert_eq!(
-            dom.take_font_requests(),
+            dom.take_font_requests()
+                .into_iter()
+                .map(|request| request.url)
+                .collect::<Vec<_>>(),
             vec![url::Url::parse(url).unwrap()]
         );
         dom.touch_style();
-        assert!(dom.scope_font_set(p).is_none());
+        use_font(&dom);
         assert!(dom.take_font_requests().is_empty(), "requested once");
         let bytes = std::fs::read(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -31036,6 +31360,89 @@ mod tests {
         .unwrap();
         dom.install_downloaded_font(url, Some(bytes));
         assert!(dom.scope_font_set(p).is_some());
+    }
+
+    #[test]
+    fn font_display_hides_only_ink_and_reveals_fallback_without_a_download() {
+        let mut dom = Dom::parse_document(
+            "<style>@font-face{font-family:Slow;src:url(slow.ttf);font-display:block;unicode-range:U+41-5A}</style><p id=p>Aaa</p>",
+        );
+        dom.set_doc_url(Some(url::Url::parse("https://font.test/").unwrap()));
+        let p = dom.get_by_id("p").unwrap();
+        let style = |dom: &Dom| crate::text::TextStyle {
+            family: "Slow, serif".into(),
+            font_set: dom.scope_font_set(p),
+            ..Default::default()
+        };
+        let before = crate::text::shape("Aaa", &style(&dom));
+        let glyphs = |text: &crate::text::ShapedText| {
+            text.runs.iter().map(|run| run.glyphs.len()).sum::<usize>()
+        };
+        assert_eq!(
+            glyphs(&before),
+            2,
+            "only the face's Unicode range is blocked"
+        );
+        let mut editor = crate::text::TextEditor::new("A", &style(&dom), 100., false);
+        assert_eq!(glyphs(&editor.line_layout(false).shaped), 0);
+        assert_eq!(dom.take_font_requests().len(), 1);
+        dom.font_demands.elapse(std::time::Duration::from_secs(4));
+        dom.advance_font_display();
+        let after = crate::text::shape("Aaa", &style(&dom));
+        assert_eq!(glyphs(&after), 3);
+        assert_eq!(glyphs(&editor.line_layout(false).shaped), 1);
+        assert_eq!(before.advance, after.advance);
+        assert_eq!(before.line_height, after.line_height);
+        assert_eq!(before.clusters, after.clusters);
+        assert_eq!(before.text, "Aaa");
+        assert!(dom.take_font_requests().is_empty());
+    }
+
+    #[test]
+    fn font_display_deadlines_are_per_face_and_canvas_can_use_a_late_face() {
+        let mut dom = Dom::parse_document(
+            "<style>@font-face{font-family:Optional;src:url(shared.ttf);font-display:optional}\
+             @font-face{font-family:Block;src:url(shared.ttf);font-display:block}</style><p id=p>x</p>",
+        );
+        let url = "https://font.test/shared.ttf";
+        dom.set_doc_url(Some(url::Url::parse("https://font.test/").unwrap()));
+        let p = dom.get_by_id("p").unwrap();
+        let style = |dom: &Dom, family: &str, canvas| crate::text::TextStyle {
+            family: format!("{family}, monospace"),
+            font_set: dom
+                .scope_font_set(p)
+                .map(|fonts| if canvas { fonts.for_canvas() } else { fonts }),
+            ..Default::default()
+        };
+        for family in ["Optional", "Block"] {
+            assert!(
+                crate::text::shape("iiii", &style(&dom, family, false))
+                    .runs
+                    .iter()
+                    .all(|run| run.glyphs.is_empty())
+            );
+        }
+        let pending_canvas = crate::text::shape_canvas("iiii", &style(&dom, "Optional", true));
+        assert!(pending_canvas.runs.iter().any(|run| !run.glyphs.is_empty()));
+        dom.font_demands
+            .elapse(std::time::Duration::from_millis(200));
+        dom.advance_font_display();
+        dom.install_downloaded_font(
+            url,
+            Some(include_bytes!("../assets/fonts/dejavu/DejaVuSerif.ttf").to_vec()),
+        );
+        let css = crate::text::shape("iiii", &style(&dom, "Optional", false));
+        let block = crate::text::shape("iiii", &style(&dom, "Block", false));
+        let canvas = crate::text::shape_canvas("iiii", &style(&dom, "Optional", true));
+        assert_eq!(
+            css.advance, pending_canvas.advance,
+            "late optional never swaps CSS"
+        );
+        assert_eq!(
+            canvas.advance, block.advance,
+            "Canvas and the still-eligible face use the loaded data"
+        );
+        assert_ne!(css.advance, block.advance);
     }
 
     /// CSS Fonts 4 #font-fetching-requirements: text in the fallback font is
@@ -31073,12 +31480,30 @@ mod tests {
             let columns: Vec<u32> = (0..image.width())
                 .filter(|&x| (0..image.height()).any(|y| image.get_pixel(x, y)[3] > 64))
                 .collect();
-            (request, columns.last().unwrap() - columns[0] + 1)
+            (
+                request,
+                columns
+                    .first()
+                    .zip(columns.last())
+                    .map_or(0, |(first, last)| last - first + 1),
+            )
         };
+        let (blocked, blocked_ink) = source(&dom);
+        assert_eq!(
+            blocked_ink, 0,
+            "font-display:auto initially has invisible ink"
+        );
+        dom.font_demands.elapse(std::time::Duration::from_secs(4));
+        dom.advance_font_display();
         let (fallback, fallback_ink) = source(&dom);
+        assert_ne!(blocked, fallback, "phase change invalidates the SVG raster");
+        assert!(fallback_ink > 0);
         let url = "https://example.test/page/fonts/late-svg.ttf";
         assert_eq!(
-            dom.take_font_requests(),
+            dom.take_font_requests()
+                .into_iter()
+                .map(|request| request.url)
+                .collect::<Vec<_>>(),
             vec![url::Url::parse(url).unwrap()]
         );
         let mono = include_bytes!("../assets/fonts/dejavu/DejaVuSansMono.ttf");

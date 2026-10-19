@@ -17,6 +17,7 @@ mod command_panel;
 mod context_menu;
 pub mod documents;
 pub mod filter_graph;
+mod frame_images;
 pub mod headless;
 mod hit_index;
 pub(crate) mod matrix3d;
@@ -624,18 +625,27 @@ pub fn video_frame_serial(handle: ImageHandle) -> Option<u64> {
 
 /// A video element's current frame as an image: converted to RGBA once per
 /// frame (keyed by surface and frame serial) and shared by every draw of it.
+#[cfg(test)]
 pub(crate) fn video_frame_image(handle: ImageHandle) -> Option<(ImageResource, u64)> {
-    use std::sync::{Mutex, OnceLock};
-    type Cache = Mutex<HashMap<u64, (u64, ImageResource)>>;
-    static CACHE: OnceLock<Cache> = OnceLock::new();
     let surface_id = handle.video_surface()?;
     let surface = crate::media::player::surface(surface_id)?;
     let (frame, serial) = surface.current()?;
+    video_frame_pixels(surface_id, &frame, serial).map(|image| (image, serial))
+}
+
+fn video_frame_pixels(
+    surface_id: u64,
+    frame: &crate::media::frame::VideoFrame,
+    serial: u64,
+) -> Option<ImageResource> {
+    use std::sync::{Mutex, OnceLock};
+    type Cache = Mutex<HashMap<u64, (u64, ImageResource)>>;
+    static CACHE: OnceLock<Cache> = OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
     if let Some((cached_serial, image)) = cache.lock().ok()?.get(&surface_id)
         && *cached_serial == serial
     {
-        return Some((image.clone(), serial));
+        return Some(image.clone());
     }
     let (rgba, width, height) = frame.to_rgba(1)?;
     let image = ImageResource {
@@ -649,7 +659,7 @@ pub(crate) fn video_frame_image(handle: ImageHandle) -> Option<(ImageResource, u
     // Forget surfaces whose players are gone.
     cache.retain(|id, _| *id == surface_id || crate::media::player::surface(*id).is_some());
     cache.insert(surface_id, (serial, image.clone()));
-    Some((image, serial))
+    Some(image)
 }
 
 impl PagePaint {
@@ -886,6 +896,10 @@ impl DisplayCommand {
             DisplayCommand::BeginCssAnimation(scope) => {
                 let mut bytes =
                     scope.animations.capacity() * std::mem::size_of::<CssPaintAnimation>();
+                bytes += scope
+                    .composition
+                    .as_ref()
+                    .map_or(0, |composition| composition.stack.retained_bytes());
                 for animation in &scope.animations {
                     bytes = bytes
                         .saturating_add(animation.name.capacity())
@@ -937,6 +951,16 @@ impl DisplayCommand {
                     .retained_bytes()
                     .saturating_add(shadows.capacity() * std::mem::size_of::<TextShadowPaint>())
                     .saturating_add(std::mem::size_of_val(selection.spans()));
+                if let Some(original) = &selection.original {
+                    bytes = bytes
+                        .saturating_add(std::mem::size_of_val(original.as_ref()))
+                        .saturating_add(
+                            original
+                                .iter()
+                                .map(|source| source.text.capacity())
+                                .sum::<usize>(),
+                        );
+                }
                 if let Some(link) = link {
                     let (link_bytes, link_opaque) = link.retained_memory();
                     bytes = bytes.saturating_add(link_bytes);
@@ -1138,8 +1162,17 @@ impl ImageStore {
     }
 
     pub fn get(&self, handle: ImageHandle) -> Option<ImageResource> {
+        self.get_with_revision(handle).map(|(image, _)| image)
+    }
+
+    /// Read the content and its identity under the same lock. A decoder may
+    /// replace a shared image while a renderer is building a presentation.
+    fn get_with_revision(&self, handle: ImageHandle) -> Option<(ImageResource, u64)> {
         let mut store = self.0.write().expect("image store poisoned");
-        let image = store.entries.get(&handle).map(|entry| entry.image.clone());
+        let image = store
+            .entries
+            .get(&handle)
+            .map(|entry| (entry.image.clone(), entry.revision));
         if image.is_some() {
             // Explicit LRU ownership: the shared decoded store is touched by
             // display-list construction/backends, while each backend owns its
@@ -1150,6 +1183,7 @@ impl ImageStore {
         image
     }
 
+    #[cfg(test)]
     pub(crate) fn revision(&self, handle: ImageHandle) -> Option<u64> {
         self.0
             .read()
@@ -1516,6 +1550,30 @@ pub type Primitive = DisplayCommand;
 #[derive(Clone, Debug, PartialEq)]
 pub struct CssAnimationScope {
     pub animations: Vec<CssPaintAnimation>,
+    pub(crate) composition: Option<ComposedPaint>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ComposedPaint {
+    pub stack: Arc<crate::dom::CompositorStack>,
+    pub units: crate::layout2::Units,
+    pub viewport: crate::layout2::value::Vp,
+    pub reference: CssRect,
+    pub origin: CssPoint,
+    pub inverse_static: Affine2d,
+}
+
+impl PartialEq for ComposedPaint {
+    fn eq(&self, other: &Self) -> bool {
+        self.stack == other.stack
+            && self.reference == other.reference
+            && self.origin == other.origin
+            && self.inverse_static == other.inverse_static
+            && self.viewport == other.viewport
+            && self.units.fs == other.units.fs
+            && self.units.root == other.units.root
+            && self.units.ch == other.units.ch
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2886,6 +2944,7 @@ impl Scene {
         visible
     }
 
+    #[cfg(test)]
     pub(crate) fn image(&self, handle: ImageHandle) -> Option<ImageResource> {
         if handle.video_surface().is_some() {
             return video_frame_image(handle).map(|(image, _)| image);
@@ -2896,15 +2955,6 @@ impl Scene {
             .or_else(|| self.image_store.get(handle))
     }
 
-    pub(crate) fn image_revision(&self, handle: ImageHandle) -> Option<u64> {
-        if let Some(surface) = handle.video_surface() {
-            return crate::media::player::surface(surface).map(|surface| surface.serial());
-        }
-        self.canvas_images
-            .get(&handle)
-            .map(|canvas| canvas.generation)
-            .or_else(|| self.image_store.revision(handle))
-    }
     pub fn control_at(&self, point: CssPoint) -> Option<ControlId> {
         self.controls
             .iter()
@@ -3705,6 +3755,26 @@ fn sample_marquee_scope(scope: &MarqueeScope, elapsed_seconds: f32) -> CssPoint 
 /// affect the same property. An animated `top` translates; an animated
 /// `transform` replaces the static transform the paint already applies.
 fn sample_css_animation_scope(scope: &CssAnimationScope, elapsed_seconds: f32) -> Affine2d {
+    if let Some(composed) = &scope.composition {
+        return composed
+            .stack
+            .sample("transform", f64::from(elapsed_seconds))
+            .and_then(|value| {
+                crate::layout2::transform::animation_steps(
+                    &value,
+                    composed.units,
+                    composed.viewport,
+                    composed.reference,
+                )
+            })
+            .map_or(Affine2d::IDENTITY, |steps| {
+                let origin = composed.origin;
+                Affine2d::translate(origin.x, origin.y)
+                    .then(interpolate_transform_steps(&steps, &steps, 0.))
+                    .then(Affine2d::translate(-origin.x, -origin.y))
+                    .then(composed.inverse_static)
+            });
+    }
     let mut position = None;
     let mut transform = None;
     for animation in &scope.animations {
@@ -3769,6 +3839,14 @@ fn sample_transform_track(
 /// The group opacity of a scope's last active opacity animation (CSS
 /// Animations 1 §4.2), relative to the element's static opacity.
 fn sample_css_animation_opacity(scope: &CssAnimationScope, elapsed_seconds: f32) -> Option<f32> {
+    if let Some(composed) = &scope.composition {
+        return composed
+            .stack
+            .sample("opacity", f64::from(elapsed_seconds))?
+            .parse::<f32>()
+            .ok()
+            .map(|v| v.clamp(0., 1.));
+    }
     scope
         .animations
         .iter()
@@ -5849,6 +5927,7 @@ mod tests {
         // `transform: translateX(100px)` the paint already applies.
         let static_transform = Affine2d::translate(100., 0.);
         let scope = CssAnimationScope {
+            composition: None,
             animations: vec![CssPaintAnimation {
                 name: "spin".into(),
                 duration_seconds: 4.0,
@@ -5889,6 +5968,7 @@ mod tests {
     #[test]
     fn css_animation_tracks_sample_timing_direction_and_composition() {
         let scope = CssAnimationScope {
+            composition: None,
             animations: vec![
                 CssPaintAnimation {
                     name: "fall".into(),
@@ -6063,6 +6143,85 @@ mod tests {
     }
 
     #[test]
+    fn additive_animation_compositor_matches_actor_without_per_frame_layout() {
+        let html = r#"<style>body{margin:0}#box{width:50px;height:30px;transform:translateX(10px);opacity:0;
+            animation:move 2s linear infinite,fade 2s linear infinite;animation-composition:add,accumulate}
+            @keyframes move{from{transform:translateX(0)}to{transform:translateX(40px)}}
+            @keyframes fade{from{opacity:0}to{opacity:.8}}</style><div id=box></div>"#;
+        let mut dom = crate::dom::Dom::parse_document(html);
+        let id = dom.get_by_id("box").unwrap();
+        dom.update_css_animations(0.);
+        let base = url::Url::parse("https://animation.test/").unwrap();
+        let layout = crate::layout2::lay_out_graphical(
+            &dom,
+            &base,
+            crate::layout2::Viewport::new(400., 200.),
+            &[],
+            &Default::default(),
+            &Default::default(),
+        );
+        let scope = layout
+            .paint
+            .primitives
+            .iter()
+            .find_map(|command| match command {
+                Primitive::BeginCssAnimation(scope) if scope.composition.is_some() => Some(scope),
+                _ => None,
+            })
+            .expect("the complete additive stack is retained");
+        assert!(dom.css_animation_frame_targets().is_empty());
+        let epoch = dom.layout_presentation_epoch();
+        for frame in 1..=60 {
+            let seconds = f64::from(frame) / 60.;
+            dom.update_css_animations_for_paint(seconds);
+            assert_eq!(dom.layout_presentation_epoch(), epoch);
+            let opacity = dom
+                .computed_value_resolved(id, "opacity")
+                .unwrap()
+                .parse::<f32>()
+                .unwrap();
+            assert!(
+                (sample_css_animation_opacity(scope, seconds as f32).unwrap() - opacity).abs()
+                    < 0.0002
+            );
+            let composed = scope.composition.as_ref().unwrap();
+            let matrix = sample_css_animation_scope(scope, seconds as f32)
+                .then(composed.inverse_static.inverse().unwrap());
+            let css = dom.computed_value_resolved(id, "transform").unwrap();
+            let steps = crate::layout2::transform::animation_steps(
+                &css,
+                composed.units,
+                composed.viewport,
+                composed.reference,
+            )
+            .unwrap();
+            let expected = Affine2d::translate(composed.origin.x, composed.origin.y)
+                .then(interpolate_transform_steps(&steps, &steps, 0.))
+                .then(Affine2d::translate(-composed.origin.x, -composed.origin.y));
+            assert!(
+                matrix
+                    .0
+                    .iter()
+                    .zip(expected.0)
+                    .all(|(a, b)| (*a - b).abs() < 0.001)
+            );
+        }
+        // A geometry read refreshes the actor's retained geometry on demand.
+        dom.update_css_animations(1.);
+        assert!(dom.layout_presentation_epoch() > epoch);
+        // The opacity belongs to the compositor's group. A zero initial
+        // value must not leave a second static zero-alpha layer underneath.
+        assert!(
+            !layout
+                .paint
+                .primitives
+                .iter()
+                .any(|command| matches!(command,
+            Primitive::PushLayer(layer) if layer.opacity == 0.))
+        );
+    }
+
+    #[test]
     fn css_animation_wake_follows_the_effect_phases() {
         // Web Animations 1 #animation-effect-phases-and-states: only the
         // active phase changes each frame; a before phase ends at the
@@ -6098,7 +6257,10 @@ mod tests {
             };
         let page = |animations: Vec<CssPaintAnimation>| PagePaint {
             primitives: vec![
-                Primitive::BeginCssAnimation(CssAnimationScope { animations }),
+                Primitive::BeginCssAnimation(CssAnimationScope {
+                    animations,
+                    composition: None,
+                }),
                 Primitive::EndCssAnimation,
             ],
             ..PagePaint::default()

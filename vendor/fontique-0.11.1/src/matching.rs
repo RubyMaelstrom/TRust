@@ -108,6 +108,47 @@ pub fn match_face_descriptors(
         .collect()
 }
 
+/// CSS Fonts 4 #font-style-matching steps 4–6: choose one composite face,
+/// then try its members in reverse rule order. Other styles in the same
+/// family must not fill gaps in the chosen face's effective character map.
+pub(crate) fn match_composite_fonts(
+    fonts: &[FontInfo],
+    width: FontWidth,
+    style: FontStyle,
+    weight: FontWeight,
+) -> Option<alloc::vec::Vec<usize>> {
+    let set: SmallVec<[Candidate; 16]> = fonts
+        .iter()
+        .enumerate()
+        .filter(|(_, font)| font.composite)
+        .map(|(index, font)| Candidate {
+            index,
+            width: font.width_range(),
+            weight: font.weight_range(),
+            style: font.style_range(),
+        })
+        .collect();
+    if set.is_empty() {
+        return None;
+    }
+    let matching = match_candidates(set, width, style, weight, true);
+    let Some(first) = matching.first().copied() else {
+        return Some(alloc::vec::Vec::new());
+    };
+    Some(
+        matching
+            .into_iter()
+            .rev()
+            .filter(|candidate| {
+                candidate.width == first.width
+                    && candidate.weight == first.weight
+                    && candidate.style == first.style
+            })
+            .map(|candidate| candidate.index)
+            .collect(),
+    )
+}
+
 fn match_candidates(
     mut set: SmallVec<[Candidate; 16]>,
     width: FontWidth,
@@ -121,9 +162,11 @@ fn match_candidates(
     let found = if contains_any(&widths, desired) {
         Some(desired)
     } else if desired <= 1.0 {
-        below(&widths, desired, f32::NEG_INFINITY).or_else(|| above(&widths, desired, f32::INFINITY))
+        below(&widths, desired, f32::NEG_INFINITY)
+            .or_else(|| above(&widths, desired, f32::INFINITY))
     } else {
-        above(&widths, desired, f32::INFINITY).or_else(|| below(&widths, desired, f32::NEG_INFINITY))
+        above(&widths, desired, f32::INFINITY)
+            .or_else(|| below(&widths, desired, f32::NEG_INFINITY))
     };
     if let Some(found) = found {
         set.retain(|f| contains(f.width, found));
@@ -178,9 +221,8 @@ fn style_match(set: &[Candidate], style: FontStyle, synthesize: bool) -> Option<
     let oblique = |value: Option<f32>| value.map(StyleMatch::Oblique);
     let italic = |value: Option<f32>| value.map(StyleMatch::Italic);
     // The faces a synthetic oblique of the default (upright) face can serve.
-    let synthetic = || {
-        (synthesize && contains_any(&obliques, 0.0)).then_some(StyleMatch::Oblique(0.0))
-    };
+    let synthetic =
+        || (synthesize && contains_any(&obliques, 0.0)).then_some(StyleMatch::Oblique(0.0));
     let inf = f32::INFINITY;
     match style {
         FontStyle::Italic => {
@@ -325,14 +367,22 @@ mod tests {
     fn weight_search_orders_follow_the_desired_weight() {
         // #font-style-matching step 4.3, "weight: 450": 450-500 ascending,
         // then below 450 descending, then above 500.
-        let ranges = [[300.0, 300.0], [400.0, 400.0], [500.0, 500.0], [600.0, 600.0]];
+        let ranges = [
+            [300.0, 300.0],
+            [400.0, 400.0],
+            [500.0, 500.0],
+            [600.0, 600.0],
+        ];
         assert_eq!(above(&ranges, 450.0, 500.0), Some(500.0));
         assert_eq!(below(&ranges, 450.0, f32::NEG_INFINITY), Some(400.0));
         // A range containing the desired value supplies it exactly.
         assert!(contains_any(&[[100.0, 900.0]], 750.0));
         // Ranges contribute their nearest endpoint.
         assert_eq!(above(&[[620.0, 800.0]], 550.0, f32::INFINITY), Some(620.0));
-        assert_eq!(below(&[[100.0, 399.0]], 700.0, f32::NEG_INFINITY), Some(399.0));
+        assert_eq!(
+            below(&[[100.0, 399.0]], 700.0, f32::NEG_INFINITY),
+            Some(399.0)
+        );
     }
 
     #[test]
@@ -366,7 +416,10 @@ mod tests {
             italic: None,
             oblique: Some([0.0, 15.0]),
         };
-        let set = [candidate([1.0; 2], [400.0; 2], variable), candidate([1.0; 2], [400.0; 2], ITALIC)];
+        let set = [
+            candidate([1.0; 2], [400.0; 2], variable),
+            candidate([1.0; 2], [400.0; 2], ITALIC),
+        ];
         assert_eq!(
             style_match(&set, FontStyle::Oblique(Some(10.0)), true),
             Some(StyleMatch::Oblique(10.0))
@@ -378,7 +431,10 @@ mod tests {
         );
         // Upright and italic faces only: a synthetic oblique of the upright
         // face, unless synthesis is disabled, when the italic face serves.
-        let set = [candidate([1.0; 2], [400.0; 2], NORMAL), candidate([1.0; 2], [400.0; 2], ITALIC)];
+        let set = [
+            candidate([1.0; 2], [400.0; 2], NORMAL),
+            candidate([1.0; 2], [400.0; 2], ITALIC),
+        ];
         assert_eq!(
             style_match(&set, FontStyle::Oblique(Some(20.0)), true),
             Some(StyleMatch::Oblique(0.0))

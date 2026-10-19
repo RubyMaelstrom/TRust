@@ -28,10 +28,12 @@ use unicode_segmentation::UnicodeSegmentation as _;
 use crate::core::{ImeAction, Key, KeyInput, KeyState};
 
 mod cells;
+pub(crate) mod dom_context;
 mod layout_cache;
 mod outline;
 #[cfg(test)]
 pub(crate) mod test_fonts;
+pub(crate) mod transform;
 pub mod typography;
 pub use crate::font_system::FontSet;
 pub use cells::CellMetrics;
@@ -81,7 +83,7 @@ impl Default for TextStyle {
 
 impl TextStyle {
     /// #font-style-prop as Parley's style: the oblique angle, else italic.
-    fn font_style(&self) -> FontStyle {
+    pub(crate) fn font_style(&self) -> FontStyle {
         match self.typography.as_ref().and_then(|t| t.oblique) {
             Some(angle) => FontStyle::Oblique(Some(angle)),
             None if self.italic => FontStyle::Italic,
@@ -90,7 +92,7 @@ impl TextStyle {
     }
 
     /// #font-width-prop as a ratio of the normal width.
-    fn font_width(&self) -> f32 {
+    pub(crate) fn font_width(&self) -> f32 {
         self.typography.as_ref().map_or(1.0, |t| t.width)
     }
 }
@@ -489,8 +491,9 @@ pub struct EditorLine {
 pub struct TextEditor {
     editor: PlainEditor<()>,
     font_set: Option<Arc<FontSet>>,
+    style: TextStyle,
     multiline: bool,
-    line_cache: Option<(parley::editing::Generation, bool, Arc<EditorLine>)>,
+    line_cache: Option<(parley::editing::Generation, bool, u64, Arc<EditorLine>)>,
 }
 
 impl std::fmt::Debug for TextEditor {
@@ -545,6 +548,7 @@ impl TextEditor {
         let mut this = Self {
             editor,
             font_set: style.font_set.clone(),
+            style: style.clone(),
             multiline,
             line_cache: None,
         };
@@ -776,9 +780,14 @@ impl TextEditor {
         debug_assert!(!self.multiline);
         self.drive(|driver| driver.refresh_layout());
         let generation = self.editor.generation();
-        if let Some((cached_generation, cached_masked, line)) = &self.line_cache
+        let revision = self
+            .font_set
+            .as_ref()
+            .map_or(0, |fonts| fonts.display_revision());
+        if let Some((cached_generation, cached_masked, cached_revision, line)) = &self.line_cache
             && *cached_generation == generation
             && *cached_masked == masked
+            && *cached_revision == revision
         {
             return line.clone();
         }
@@ -789,7 +798,7 @@ impl TextEditor {
             self.retain_editor_line()
         };
         let line = Arc::new(line);
-        self.line_cache = Some((generation, masked, line.clone()));
+        self.line_cache = Some((generation, masked, revision, line.clone()));
         line
     }
 
@@ -820,6 +829,7 @@ impl TextEditor {
         let mut display = Self {
             editor: self.editor.clone(),
             font_set: self.font_set.clone(),
+            style: self.style.clone(),
             multiline: false,
             line_cache: None,
         };
@@ -842,6 +852,9 @@ impl TextEditor {
 
     fn retain_editor_line(&mut self) -> EditorLine {
         TEXT.with_borrow_mut(|system| {
+            let blocked = self.font_set.as_ref().map_or_else(Vec::new, |fonts| {
+                fonts.request_fonts(self.editor.raw_text(), &self.style)
+            });
             system.select_fonts(self.font_set.as_ref());
             self.editor
                 .refresh_layout(&mut system.fonts, &mut system.layouts);
@@ -877,7 +890,7 @@ impl TextEditor {
                     ..Default::default()
                 })
             } else {
-                retain_first_line(self.editor.raw_text(), layout)
+                retain_first_line(self.editor.raw_text(), layout, &blocked)
             };
             EditorLine {
                 shaped,
@@ -1069,6 +1082,7 @@ impl From<&CanvasTypography> for TypographyKey {
 struct TextStyleKey {
     family: String,
     font_set: u64,
+    font_display: u64,
     language: Option<String>,
     size: u32,
     weight: u32,
@@ -1091,6 +1105,10 @@ impl From<&TextStyle> for TextStyleKey {
         Self {
             family: style.family.clone(),
             font_set: style.font_set.as_ref().map_or(0, |fonts| fonts.id()),
+            font_display: style
+                .font_set
+                .as_ref()
+                .map_or(0, |fonts| fonts.display_revision()),
             language: style.language.clone(),
             size: style.size.to_bits(),
             weight: style.weight.to_bits(),
@@ -1211,7 +1229,13 @@ impl TextSystem {
         let mut layout = self.prepared_layout::<()>(&prepared, style, quantize, None, &[]);
         layout.break_all_lines(None);
         let mut retained = match layout.lines().next() {
-            Some(line) => retain_line(&prepared.text, &line, &prepared.synthesis),
+            Some(line) => retain_line(
+                &prepared.text,
+                &line,
+                &prepared.synthesis,
+                &prepared.blocked,
+                prepared.map.as_ref(),
+            ),
             None => ShapedText::default(),
         };
         self.finish_line(
@@ -1238,7 +1262,22 @@ impl TextSystem {
         style: &TextStyle,
         canvas: Option<&CanvasTypography>,
     ) -> Prepared<'t> {
+        let mut blocked = if style.size > 0. {
+            style
+                .font_set
+                .as_ref()
+                .map_or_else(Vec::new, |fonts| fonts.request_fonts(text, style))
+        } else {
+            Vec::new()
+        };
+        // HTML #dom-context-2d-font treats an unloaded font as unknown for
+        // immediate canvas drawing. CSS's invisible fallback applies to text
+        // elements; a canvas's already painted bitmap is not repainted later.
+        if canvas.is_some() {
+            blocked.clear();
+        }
         let mut prepared = Prepared {
+            blocked,
             text: Cow::Borrowed(text),
             map: None,
             width: style.font_width(),
@@ -1749,7 +1788,13 @@ impl TextSystem {
             .lines()
             .map(|line| {
                 (
-                    retain_line(&prepared.text, &line, &prepared.synthesis),
+                    retain_line(
+                        &prepared.text,
+                        &line,
+                        &prepared.synthesis,
+                        &prepared.blocked,
+                        prepared.map.as_ref(),
+                    ),
                     line.text_range(),
                 )
             })
@@ -1828,6 +1873,8 @@ impl TextSystem {
 /// Text prepared for shaping: CSS Fonts 4 #feature-variation-precedence
 /// resolved for one element's text, or Canvas text preparation's settings.
 struct Prepared<'t> {
+    /// Original text byte ranges using invisible fallback glyphs.
+    blocked: Vec<Range<usize>>,
     /// The text to shape: the source, or with synthesized small capitals.
     text: Cow<'t, str>,
     /// Offsets of `text` back to the source, when they differ.
@@ -2414,7 +2461,13 @@ pub(crate) fn colored_lines(
             .lines()
             .take(if width.is_some() { usize::MAX } else { 1 })
             .map(|line| {
-                let mut shaped = retain_line(&prepared.text, &line, &prepared.synthesis);
+                let mut shaped = retain_line(
+                    &prepared.text,
+                    &line,
+                    &prepared.synthesis,
+                    &prepared.blocked,
+                    prepared.map.as_ref(),
+                );
                 for (run, item) in
                     shaped
                         .runs
@@ -2449,7 +2502,9 @@ pub(crate) fn colored_lines(
 /// transforms. Share the bounded font/shape cache without changing layout's
 /// existing quantization choice or aliasing its entries.
 pub(crate) fn shape_canvas(text: &str, style: &TextStyle) -> ShapedText {
-    TEXT.with_borrow_mut(|system| system.shape_with_quantization(text, style, false))
+    TEXT.with_borrow_mut(|system| {
+        system.shape_with_typography(text, style, false, Some(&CanvasTypography::default()))
+    })
 }
 
 /// [`shape_canvas`] with Canvas text preparation's typographic settings.
@@ -2578,14 +2633,14 @@ fn css_baseline(metrics: &parley::LineMetrics) -> f32 {
         }
 }
 
-fn retain_first_line(text: &str, layout: &Layout<()>) -> ShapedText {
+fn retain_first_line(text: &str, layout: &Layout<()>, blocked: &[Range<usize>]) -> ShapedText {
     let Some(line) = layout.lines().next() else {
         return ShapedText {
             text: text.to_string(),
             ..ShapedText::default()
         };
     };
-    let mut shaped = retain_line(text, &line, &SynthesisPolicy::default());
+    let mut shaped = retain_line(text, &line, &SynthesisPolicy::default(), blocked, None);
     shaped.text = text.to_string();
     shaped
 }
@@ -2594,6 +2649,8 @@ fn retain_line<B: parley::Brush>(
     text: &str,
     line: &parley::Line<'_, B>,
     synthesis: &SynthesisPolicy,
+    blocked: &[Range<usize>],
+    map: Option<&typography::OffsetMap>,
 ) -> ShapedText {
     let range = line.text_range();
     let line_text = &text[range.clone()];
@@ -2642,11 +2699,35 @@ fn retain_line<B: parley::Brush>(
             cluster_x += cluster.advance();
         }
     }
+    // GlyphRun can split one shaping run at brush boundaries. Keep a mask
+    // cursor per run/cluster range, following Parley's visual glyph order.
+    let mut masked_run = None;
+    let mut mask = Vec::new();
+    let mut glyph_index = 0;
     for item in line.items() {
         let PositionedLayoutItem::GlyphRun(glyph_run) = item else {
             continue;
         };
         let run = glyph_run.run();
+        if !blocked.is_empty() {
+            let key = (run.index(), run.cluster_range());
+            if masked_run.as_ref() != Some(&key) {
+                masked_run = Some(key);
+                mask.clear();
+                glyph_index = 0;
+                for cluster in run.visual_clusters() {
+                    let range = map.map_or_else(
+                        || cluster.text_range(),
+                        |map| map.range_to_source(cluster.text_range()),
+                    );
+                    let index = blocked.partition_point(|blocked| blocked.end <= range.start);
+                    let hidden = blocked
+                        .get(index)
+                        .is_some_and(|blocked| blocked.start < range.end);
+                    mask.extend(std::iter::repeat_n(hidden, cluster.glyphs().count()));
+                }
+            }
+        }
         let (synthesis, policy) = (run.synthesis(), synthesis);
         runs.push(ShapedRun {
             font: FontFace(run.font().clone()),
@@ -2655,11 +2736,15 @@ fn retain_line<B: parley::Brush>(
             normalized_coords: run.normalized_coords().to_vec(),
             glyphs: glyph_run
                 .positioned_glyphs()
-                .map(|glyph| ShapedGlyph {
-                    id: glyph.id,
-                    x: glyph.x,
-                    y: glyph.y - metrics.baseline + baseline,
-                    advance: glyph.advance,
+                .filter_map(|glyph| {
+                    let hidden = mask.get(glyph_index).copied().unwrap_or(false);
+                    glyph_index += 1;
+                    (!hidden).then_some(ShapedGlyph {
+                        id: glyph.id,
+                        x: glyph.x,
+                        y: glyph.y - metrics.baseline + baseline,
+                        advance: glyph.advance,
+                    })
                 })
                 .collect(),
             text_range: run.text_range().start - range.start..run.text_range().end - range.start,

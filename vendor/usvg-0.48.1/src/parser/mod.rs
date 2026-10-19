@@ -144,6 +144,23 @@ impl crate::Tree {
             // Can't clone the resolver, so we create a new one that forwards to it.
             #[cfg(feature = "text")]
             font_resolver: crate::FontResolver {
+                text_transform: opt.font_resolver.text_transform.as_ref().map(|transform| {
+                    Box::new(move |spans: &[crate::TextTransformInput<'_>]| transform(spans))
+                        as Box<
+                            dyn Fn(
+                                    &[crate::TextTransformInput<'_>],
+                                )
+                                    -> Vec<crate::TextTransformOutput>
+                                + Send
+                                + Sync,
+                        >
+                }),
+                font_use: opt.font_resolver.font_use.as_ref().map(|font_use| {
+                    Box::new(move |font: &crate::Font, text: &str| font_use(font, text))
+                        as Box<
+                            dyn Fn(&crate::Font, &str) -> Vec<std::ops::Range<usize>> + Send + Sync,
+                        >
+                }),
                 select_font: Box::new(|font, db| (opt.font_resolver.select_font)(font, db)),
                 select_fallback: Box::new(|c, used_fonts, db| {
                     (opt.font_resolver.select_fallback)(c, used_fonts, db)

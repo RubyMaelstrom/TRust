@@ -15,6 +15,40 @@
     check(entry.encodedBodySize === 24 && entry.decodedBodySize === 48 && entry.transferSize === 324, 'byte counts');
     check(entry.contentType === 'text/html' && entry.nextHopProtocol === 'http/1.1' && entry.responseStatus === 200, 'transport metadata');
     check(entry.secureConnectionStart === 0, 'HTTP has no TLS handshake');
+    const legacy = performance.timing;
+    const legacyNames = ['navigationStart','unloadEventStart','unloadEventEnd','redirectStart','redirectEnd',
+        'fetchStart','domainLookupStart','domainLookupEnd','connectStart','connectEnd','secureConnectionStart',
+        'requestStart','responseStart','responseEnd','domLoading','domInteractive',
+        'domContentLoadedEventStart','domContentLoadedEventEnd','domComplete','loadEventStart','loadEventEnd'];
+    check(legacy instanceof PerformanceTiming && legacy.constructor === PerformanceTiming &&
+        Object.getPrototypeOf(PerformanceTiming.prototype) === Object.prototype &&
+        Object.prototype.toString.call(legacy) === '[object PerformanceTiming]', 'legacy timing interface');
+    check(performance.timing === legacy && !Object.hasOwn(performance,'timing') &&
+        Object.keys(legacy).length === 0, 'legacy timing SameObject and prototype attributes');
+    throws(TypeError, () => new PerformanceTiming());
+    throws(TypeError, () => PerformanceTiming());
+    const timingGetter = Object.getOwnPropertyDescriptor(Performance.prototype,'timing');
+    check(timingGetter.enumerable && timingGetter.configurable && timingGetter.set === undefined,
+        'performance.timing readonly IDL attribute');
+    throws(TypeError, () => timingGetter.get.call({}));
+    for (const name of legacyNames) {
+        const d=Object.getOwnPropertyDescriptor(PerformanceTiming.prototype,name);
+        check(d.get.name==='get '+name && d.get.length===0 && d.set===undefined &&
+            d.enumerable && d.configurable,'legacy IDL getter '+name);
+        check(Number.isInteger(legacy[name]) && legacy[name]>=0,'legacy unsigned timestamp '+name);
+        throws(TypeError, () => d.get.call({}));
+        throws(TypeError, () => d.get.call(new Proxy(legacy,{})));
+    }
+    throws(TypeError, () => PerformanceTiming.prototype.toJSON.call({}));
+    const legacyJson = legacy.toJSON(), legacyStart = legacy.navigationStart;
+    check(Object.keys(legacyJson).join() === legacyNames.join(), 'legacy default JSON IDL order');
+    legacy.navigationStart = 0;
+    check(legacy.navigationStart === legacyStart,'legacy timestamps are readonly');
+    Object.defineProperty(legacy,'navigationStart',{get(){throw Error('author timing getter')},configurable:true});
+    legacy.extra='author value';
+    check(legacy.toJSON().navigationStart === legacyStart && !('extra' in legacy.toJSON()),
+        'default JSON uses IDL getters and ignores author properties');
+    delete legacy.navigationStart; delete legacy.extra;
     for (const C of [PerformanceEntry, PerformanceResourceTiming, PerformanceNavigationTiming]) throws(TypeError, () => new C());
     const startGetter = Object.getOwnPropertyDescriptor(PerformanceResourceTiming.prototype, 'requestStart').get;
     for (const name of ['unloadEventStart','unloadEventEnd','domInteractive','domContentLoadedEventStart',
@@ -67,6 +101,8 @@
         check(entry.loadEventEnd >= entry.loadEventStart && entry.duration === entry.loadEventEnd, 'final duration');
         check(entry.toJSON().loadEventEnd === entry.loadEventEnd, 'JSON reads live entry');
         check(Math.abs(performance.timeOrigin + entry.responseEnd - performance.timing.responseEnd) < 1.1, 'legacy epoch coherence');
+        check(performance.timing === legacy && legacyJson.loadEventEnd === 0 && legacy.loadEventEnd > 0 &&
+            legacy.toJSON().loadEventEnd === legacy.loadEventEnd,'live legacy object, independent JSON snapshot');
         check(navigationTimingLog.join(',') === 'dom,load,observer', 'observer task order');
         check(performance.getEntriesByName(location.href, 'navigation')[0] === entry, 'name lookup');
         return 'navigation-timing-ok';

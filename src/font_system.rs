@@ -33,7 +33,12 @@ use parley::fontique::{
 use roxmltree::{Document, Node, ParsingOptions};
 use unicode_casefold::UnicodeCaseFold as _;
 
+mod demand;
+mod display;
 mod faces;
+pub(crate) use demand::{
+    FontCandidate, FontDemands, FontKey, FontRegistration, FontRequest, FontSelection,
+};
 #[allow(unused_imports)]
 pub(crate) use faces::FontDisplay;
 pub(crate) use faces::{FaceDescriptors, FaceRendering, local_face};
@@ -67,9 +72,6 @@ impl AsRef<[u8]> for EmbeddedFont {
 static CATALOG: OnceLock<Catalog> = OnceLock::new();
 static SVG_CATALOG: OnceLock<SvgCatalog> = OnceLock::new();
 static PAGE_FONT_EPOCH: AtomicU64 = AtomicU64::new(0);
-/// Case-folded families `install_page_fonts` installed for the foreground
-/// page, so its document need not download them again.
-static PAGE_FONT_FAMILIES: std::sync::Mutex<Option<HashSet<String>>> = std::sync::Mutex::new(None);
 static NEXT_FONT_SET: AtomicU64 = AtomicU64::new(1);
 static FONT_SOURCES: OnceLock<SourceCache> = OnceLock::new();
 /// The face renderings (`FaceRendering`) of the foreground page's installed
@@ -102,6 +104,10 @@ pub struct FontSet {
     /// The per-face shaping settings of the set's downloadable faces, by
     /// font resource id.
     renderings: Arc<HashMap<u64, Arc<FaceRendering>>>,
+    selection: Option<Arc<FontSelection>>,
+    /// Canvas uses every loaded font, even after CSS's display deadline.
+    /// HTML #canvastextdrawingstyles also paints pending fallback normally.
+    canvas: Option<Arc<FontSet>>,
 }
 
 impl std::fmt::Debug for FontSet {
@@ -178,6 +184,7 @@ impl FontSet {
                 Some(FontInfoOverride {
                     family_name: Some(&font.family),
                     descriptors: font.descriptors.matching(),
+                    composite: true,
                     ..FontInfoOverride::default()
                 }),
             );
@@ -199,7 +206,117 @@ impl FontSet {
             collection,
             svg,
             renderings: renderings.map_or(inherited_renderings, Arc::new),
+            selection: parent.and_then(|parent| parent.selection.clone()),
+            canvas: None,
         })
+    }
+
+    pub(crate) fn with_candidates(
+        fonts: Vec<PageFont>,
+        parent: Option<&Arc<Self>>,
+        candidates: Vec<FontCandidate>,
+        demands: Arc<FontDemands>,
+    ) -> Arc<Self> {
+        Self::for_context(fonts, parent, candidates, demands, false)
+    }
+
+    pub(crate) fn with_canvas(
+        mut self: Arc<Self>,
+        fonts: Vec<PageFont>,
+        parent: Option<&Arc<Self>>,
+        candidates: Vec<FontCandidate>,
+        demands: Arc<FontDemands>,
+    ) -> Arc<Self> {
+        let parent = parent.map(|parent| parent.for_canvas());
+        let canvas = Self::for_context(fonts, parent.as_ref(), candidates, demands, true);
+        Arc::get_mut(&mut self)
+            .expect("new font environment")
+            .canvas = Some(canvas);
+        self
+    }
+
+    pub(crate) fn for_canvas(self: &Arc<Self>) -> Arc<Self> {
+        self.canvas.as_ref().unwrap_or(self).clone()
+    }
+
+    fn for_context(
+        fonts: Vec<PageFont>,
+        parent: Option<&Arc<Self>>,
+        candidates: Vec<FontCandidate>,
+        demands: Arc<FontDemands>,
+        canvas: bool,
+    ) -> Arc<Self> {
+        let families: HashSet<_> = candidates
+            .iter()
+            .map(|source| fold(&source.face.family))
+            .collect();
+        let loaded: HashSet<_> = fonts.iter().map(|font| fold(&font.family)).collect();
+        let unloaded: Vec<_> = candidates
+            .iter()
+            .filter(|source| !loaded.contains(&fold(&source.face.family)))
+            .map(|source| source.face.family.clone())
+            .collect();
+        let mut sources = parent
+            .and_then(|parent| parent.selection.as_ref())
+            .map(|parent| {
+                parent
+                    .sources
+                    .iter()
+                    .filter(|source| !families.contains(&fold(&source.face.family)))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        sources.extend(candidates);
+        let mut set = Self::new(fonts, parent, false);
+        let selection = FontSelection::for_context(sources, demands, canvas);
+        let inner = Arc::get_mut(&mut set).expect("new font environment");
+        for family in &unloaded {
+            if let Some(id) = inner.collection.family_id(family)
+                && let Some(family) = inner.collection.family(id)
+            {
+                for font in family.fonts() {
+                    inner
+                        .collection
+                        .unregister_font(id, font.width(), font.style(), font.weight());
+                }
+            }
+        }
+        let mut svg_faces = inner
+            .svg
+            .as_ref()
+            .map_or_else(Vec::new, |svg| svg.faces.clone());
+        svg_faces.retain(|face| {
+            !unloaded
+                .iter()
+                .any(|family| fold(family) == fold(&face.family))
+        });
+        inner.svg = SvgFontEnvironment::register_with_selection(svg_faces, Some(selection.clone()));
+        inner.selection = Some(selection);
+        set
+    }
+
+    pub(crate) fn request_fonts(
+        &self,
+        text: &str,
+        style: &crate::text::TextStyle,
+    ) -> Vec<std::ops::Range<usize>> {
+        if let Some(selection) = &self.selection {
+            return selection.request(
+                text,
+                &style.family,
+                style.font_width(),
+                style.font_style(),
+                style.weight,
+            );
+        }
+        Vec::new()
+    }
+
+    pub(crate) fn display_revision(&self) -> u64 {
+        self.selection
+            .as_ref()
+            .map_or(0, |selection| selection.demands.revision())
     }
 
     /// The inline-SVG font environment matching this set's text fonts, as the
@@ -546,14 +663,6 @@ pub(crate) fn font_context() -> FontContext {
 pub(crate) fn install_page_fonts(fonts: Vec<PageFont>) {
     #[cfg(test)]
     let _inputs = crate::layout2::global_layout_input_change();
-    *PAGE_FONT_FAMILIES
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(
-        fonts
-            .iter()
-            .map(|font| font.family.trim().case_fold().collect())
-            .collect(),
-    );
     // One shared byte buffer per face serves both the HTML text collection
     // and inline SVG text, which is document text as well (CSS Fonts 4
     // #font-face-rule: the rules define fonts "for use within the documents
@@ -586,6 +695,7 @@ pub(crate) fn install_page_fonts(fonts: Vec<PageFont>) {
                 Some(FontInfoOverride {
                     family_name: Some(&face.family),
                     descriptors: descriptors.matching(),
+                    composite: true,
                     ..FontInfoOverride::default()
                 }),
             );
@@ -627,40 +737,6 @@ fn percent_decode(text: &str) -> Option<String> {
         }
     }
     String::from_utf8(out).ok()
-}
-
-/// A downloadable face of the foreground navigation still loading when its
-/// block period ended (CSS Fonts 4 #font-display-timeline). `result` yields
-/// the source URL that loaded and its bytes, or `None` once every source
-/// failed; `failure` is when its swap period ends (`None`: never).
-pub(crate) struct LateFace {
-    pub sources: Vec<String>,
-    pub result: LateResult,
-    pub failure: Option<std::time::Instant>,
-}
-
-/// A late face's eventual (source URL, bytes), `Some(None)` when it failed.
-pub(crate) type LateResult = tokio::sync::watch::Receiver<Option<Option<(String, Vec<u8>)>>>;
-
-static LATE_PAGE_FACES: Mutex<Vec<LateFace>> = Mutex::new(Vec::new());
-
-/// Record the late faces of a new foreground navigation.
-pub(crate) fn set_late_page_faces(faces: Vec<LateFace>) {
-    *LATE_PAGE_FACES
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = faces;
-}
-
-/// The pending load of `url` begun by the foreground navigation, if it is a
-/// source of a late face: its eventual bytes (`None` when another source
-/// of the face loaded, or none did) and the face's failure time.
-pub(crate) fn late_page_face(url: &str) -> Option<(LateResult, Option<std::time::Instant>)> {
-    LATE_PAGE_FACES
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .iter()
-        .find(|face| face.sources.iter().any(|source| source == url))
-        .map(|face| (face.result.clone(), face.failure))
 }
 
 fn page_renderings() -> Arc<HashMap<u64, Arc<FaceRendering>>> {
@@ -714,6 +790,7 @@ pub(crate) struct SvgFontEnvironment {
     id: u64,
     faces: Vec<SvgPageFace>,
     fonts: OnceLock<SvgDocumentFonts>,
+    selection: Option<Arc<FontSelection>>,
 }
 
 struct SvgDocumentFonts {
@@ -744,7 +821,18 @@ struct SvgFontEnvironments {
 
 impl SvgFontEnvironment {
     fn register(faces: Vec<SvgPageFace>) -> Option<Arc<Self>> {
-        if faces.is_empty() {
+        Self::register_with_selection(faces, None)
+    }
+
+    fn register_with_selection(
+        faces: Vec<SvgPageFace>,
+        selection: Option<Arc<FontSelection>>,
+    ) -> Option<Arc<Self>> {
+        if faces.is_empty()
+            && selection
+                .as_ref()
+                .is_none_or(|selection| selection.sources.is_empty())
+        {
             return None;
         }
         let mut registry = SVG_FONT_ENVIRONMENTS
@@ -753,11 +841,14 @@ impl SvgFontEnvironment {
         // Font sets are rebuilt with every style index. Reusing an identical
         // environment keeps its token, and so every inline SVG image source,
         // stable when the faces did not change.
-        if let Some(index) = registry
-            .recent
-            .iter()
-            .position(|environment| environment.faces == faces)
-        {
+        if let Some(index) = registry.recent.iter().position(|environment| {
+            environment.faces == faces
+                && match (&environment.selection, &selection) {
+                    (None, None) => true,
+                    (Some(a), Some(b)) => a.same_as(b),
+                    _ => false,
+                }
+        }) {
             let environment = registry.recent.remove(index)?;
             registry.recent.push_back(environment.clone());
             return Some(environment);
@@ -766,6 +857,7 @@ impl SvgFontEnvironment {
             id: NEXT_SVG_FONT_ENVIRONMENT.fetch_add(1, Ordering::Relaxed),
             faces,
             fonts: OnceLock::new(),
+            selection,
         });
         let by_id = registry.by_id.get_or_insert_with(HashMap::new);
         if by_id.len() >= MAX_SVG_FONT_ENVIRONMENT_ENTRIES {
@@ -855,20 +947,13 @@ pub(crate) fn svg_document_font_options(
         return (svg_fontdb(), svg_font_resolver());
     };
     let fonts = environment.fonts();
-    (
-        fonts.db.clone(),
-        svg_font_resolver_with(Some(fonts.families.clone())),
-    )
-}
-
-/// Whether the foreground page's load installed a face of `family`.
-pub(crate) fn page_font_family_installed(family: &str) -> bool {
-    let family: String = family.trim().case_fold().collect();
-    PAGE_FONT_FAMILIES
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .as_ref()
-        .is_some_and(|families| families.contains(&family))
+    let mut resolver = svg_font_resolver_with(Some(fonts.families.clone()));
+    if let Some(selection) = environment.selection.clone() {
+        resolver.font_use = Some(Box::new(move |font, text| {
+            selection.request_svg(font, text)
+        }));
+    }
+    (fonts.db.clone(), resolver)
 }
 
 pub(crate) fn page_font_epoch() -> u64 {
@@ -1019,6 +1104,8 @@ fn svg_font_resolver_with(
     let materialized = Arc::new(Mutex::new(HashMap::new()));
     let select_materialized = materialized.clone();
     resvg::usvg::FontResolver {
+        text_transform: Some(Box::new(crate::text::transform::svg_transform)),
+        font_use: None,
         select_font: Box::new(move |font, db| {
             select_svg_font(font, db, page_families.as_deref())
                 .and_then(|id| materialize_svg_face(db, id, &select_materialized))
@@ -2448,6 +2535,76 @@ mod tests {
             .restrict_to(&[]);
         let face = ttf_parser::Face::parse(&all.bytes, 0).unwrap();
         assert!(face.glyph_index('1').is_some());
+    }
+
+    #[test]
+    fn composite_css_font_queries_and_shaping_use_every_matching_subset() {
+        use parley::fontique::{Attributes, FontWeight, QueryStatus};
+        let make = |file: &[u8], range| {
+            PageFont::from_web_resource("Composite".into(), file.to_vec())
+                .unwrap()
+                .restrict_to(&[range])
+        };
+        let sans = include_bytes!("../assets/fonts/dejavu/DejaVuSans.ttf");
+        let serif = include_bytes!("../assets/fonts/dejavu/DejaVuSerif.ttf");
+        let mut bold = make(sans, (0x41, 0x5a));
+        bold.descriptors.apply("font-weight", "700");
+        let fonts = FontSet::new(
+            vec![
+                make(sans, (0x41, 0x41)),
+                make(sans, (0x42, 0x42)),
+                make(sans, (0x43, 0x43)),
+                make(serif, (0x41, 0x41)),
+                bold,
+            ],
+            None,
+            false,
+        );
+        let mut collection = fonts.collection.clone();
+        let mut cache = font_source_cache();
+        let mut query = collection.query(&mut cache);
+        query.set_families(["Composite"]);
+        let mut found = Vec::new();
+        query.matches_with(|font| {
+            found.push((font.family.1, font.blob.id()));
+            QueryStatus::Continue
+        });
+        assert_eq!(found.iter().map(|f| f.0).collect::<Vec<_>>(), [3, 2, 1, 0]);
+        // Changing the request invalidates the cached composite selection.
+        query.set_attributes(Attributes {
+            weight: FontWeight::new(700.),
+            ..Attributes::default()
+        });
+        let mut bold = Vec::new();
+        query.matches_with(|font| {
+            bold.push(font.family.1);
+            QueryStatus::Continue
+        });
+        assert_eq!(bold, [4]);
+        drop(query);
+        let shaped = crate::text::shape(
+            "ABC",
+            &crate::text::TextStyle {
+                family: "Composite".into(),
+                font_set: Some(fonts),
+                ..crate::text::TextStyle::default()
+            },
+        );
+        assert_eq!(
+            shaped
+                .runs
+                .iter()
+                .map(|run| run.font.resource_id())
+                .collect::<Vec<_>>(),
+            [found[0].1, found[2].1, found[1].1],
+            "A uses the last overlapping rule, B and C use their own subsets"
+        );
+        assert!(
+            shaped
+                .runs
+                .iter()
+                .all(|run| run.glyphs.iter().all(|glyph| glyph.id != 0))
+        );
     }
 
     /// Font sets are rebuilt with each style index. Unchanged downloadable

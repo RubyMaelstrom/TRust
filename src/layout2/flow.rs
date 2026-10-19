@@ -573,7 +573,8 @@ pub(crate) struct Flow<'a> {
     /// `repeat(auto-fill, …)`). Populated by the layout pass; read by
     /// `measure_boxes_and_grid_tracks`.
     pub grid_tracks: std::cell::RefCell<GridTrackMap>,
-    pub subgrid_rows: std::cell::RefCell<super::grid::SubgridRows>,
+    pub subgrid_rows: std::cell::RefCell<super::grid::SubgridAxis>,
+    pub subgrid_columns: std::cell::RefCell<super::grid::SubgridAxis>,
     /// An outside list marker's ascent above its baseline, until the list
     /// item's first in-flow line box takes it (`lay_inlines`). Blink grows
     /// that line to hold a marker taller than its content, by the marker's
@@ -824,6 +825,7 @@ impl Flow<'_> {
             && b.node != NO_NODE
             && fc.is_empty()
             && !self.subgrid_rows.borrow().active()
+            && !self.subgrid_columns.borrow().active()
             && self.marker_line.get().is_none();
         let request = super::memo::Request {
             node: b,
@@ -3929,7 +3931,10 @@ impl Flow<'_> {
         // Subgrid descendants depend on inherited track positions as well as
         // their own containing-block size. Do not reuse independent-item
         // entries while these additional per-axis constraints are active.
-        let reuse = self.reuse && b.node != NO_NODE && !self.subgrid_rows.borrow().active();
+        let reuse = self.reuse
+            && b.node != NO_NODE
+            && !self.subgrid_rows.borrow().active()
+            && !self.subgrid_columns.borrow().active();
         if reuse && let Some(item) = self.dom.layout_cache.borrow_mut().item(&request) {
             self.grid_tracks.borrow_mut().extend(item.tracks);
             return (item.fragment, item.anchors);

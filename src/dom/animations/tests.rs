@@ -13,6 +13,133 @@ fn value(dom: &Dom, id: &str, property: &str) -> Option<String> {
 }
 
 #[test]
+fn animation_composition_combines_in_list_order_before_interpolation() {
+    let mut dom = setup(
+        "div{width:10px;animation:a 2s linear,b 2s linear;animation-composition:replace,add}
+        #both{animation-composition:add} #last{animation-composition:add,replace}
+        @keyframes a{from{width:0px}to{width:20px}}
+        @keyframes b{from{width:2px}to{width:4px}}",
+        "<div id=base></div><div id=both></div><div id=last></div>",
+    );
+    assert!(dom.css_animations_declared());
+    dom.update_css_animations(0.);
+    dom.update_css_animations(1.);
+    assert_eq!(value(&dom, "base", "width").as_deref(), Some("13px"));
+    assert_eq!(value(&dom, "both", "width").as_deref(), Some("23px"));
+    assert_eq!(value(&dom, "last", "width").as_deref(), Some("3px"));
+}
+
+#[test]
+fn animation_composition_keyframe_overrides_and_implicit_endpoints() {
+    let mut dom=setup("#mixed{width:10px;animation:m 2s linear}
+        #implicit{width:10px;animation:lower 2s linear,upper 2s linear;animation-composition:replace,add}
+        @keyframes m{from{width:5px;animation-composition:add}to{width:25px;animation-composition:replace}}
+        @keyframes lower{from,to{width:30px}} @keyframes upper{to{width:10px}}",
+        "<div id=mixed></div><div id=implicit></div>");
+    dom.update_css_animations(0.);
+    dom.update_css_animations(1.);
+    assert_eq!(value(&dom, "mixed", "width").as_deref(), Some("20px"));
+    assert_eq!(value(&dom, "implicit", "width").as_deref(), Some("35px"));
+}
+
+#[test]
+fn animation_composition_distinguishes_transform_addition_and_accumulation() {
+    let mut dom = setup(
+        "div{transform:scale(2);animation:s 2s linear;animation-composition:add}
+        #acc{animation-composition:accumulate}
+        @keyframes s{from{transform:scale(3)}to{transform:scale(5)}}",
+        "<div id=add></div><div id=acc></div>",
+    );
+    dom.update_css_animations(0.);
+    dom.update_css_animations(1.);
+    assert_eq!(
+        value(&dom, "add", "transform").as_deref(),
+        Some("scale(2, 2) scale(4, 4)")
+    );
+    assert_eq!(
+        value(&dom, "acc", "transform").as_deref(),
+        Some("scale(5, 5)")
+    );
+    assert_eq!(
+        dom.css_animation_definitions(dom.get_by_id("add").unwrap())
+            .len(),
+        1
+    );
+    assert!(dom.css_composition_can_composite(dom.get_by_id("add").unwrap()));
+    assert!(dom.css_animations_keep_alive());
+}
+
+#[test]
+fn animation_composition_filters_and_non_additive_colors_follow_their_types() {
+    let mut dom=setup("div{filter:blur(2px) brightness(2);color:red;animation:f 2s linear;animation-composition:add}
+        #acc{animation-composition:accumulate} #mismatch{filter:contrast(2);animation-composition:accumulate}
+        @keyframes f{from,to{filter:blur(4px) brightness(3);color:blue}}",
+        "<div id=add></div><div id=acc></div><div id=mismatch></div>");
+    dom.update_css_animations(0.);
+    dom.update_css_animations(1.);
+    assert_eq!(
+        value(&dom, "add", "filter").as_deref(),
+        Some("blur(2px) brightness(2) blur(4px) brightness(3)")
+    );
+    assert_eq!(
+        value(&dom, "acc", "filter").as_deref(),
+        Some("blur(6px) brightness(4)")
+    );
+    assert_eq!(
+        value(&dom, "mismatch", "filter").as_deref(),
+        Some("blur(4px) brightness(3)")
+    );
+    assert_eq!(
+        value(&dom, "add", "color").as_deref(),
+        Some("rgb(0, 0, 255)")
+    );
+}
+
+#[test]
+fn animation_composition_keeps_each_duplicate_keyframe_blocks_operation() {
+    let mut dom=setup("#a{width:10px;height:10px;animation:f 2s linear}
+        @keyframes f{from{width:5px;animation-composition:add}from{height:5px;animation-composition:replace}
+                    to{width:15px;height:15px;animation-composition:replace}}","<div id=a></div>");
+    dom.update_css_animations(0.);
+    dom.update_css_animations(1.);
+    assert_eq!(value(&dom, "a", "width").as_deref(), Some("15px"));
+    assert_eq!(value(&dom, "a", "height").as_deref(), Some("10px"));
+}
+
+#[test]
+fn animation_composition_clamps_after_later_effects_can_restore_range() {
+    let mut dom=setup("#a{width:0px;animation:a 2s cubic-bezier(0,2,1,2),b 2s linear;animation-composition:replace,add}
+        @keyframes a{from{width:20px}to{width:0px}} @keyframes b{from,to{width:30px}}","<div id=a></div>");
+    dom.update_css_animations(0.);
+    dom.update_css_animations(1.);
+    // At halfway the eased progress is 1.625: -12.5px + 30px = 17.5px.
+    assert_eq!(value(&dom, "a", "width").as_deref(), Some("17.5px"));
+}
+
+#[test]
+fn animation_composition_uses_the_current_underlying_transition() {
+    let mut dom = setup(
+        "#a{margin-left:10px;transition:margin-left 2s linear}
+        #a.on{margin-left:30px} #a.animate{animation:delta 10s linear;animation-composition:add}
+        @keyframes delta{from,to{margin-left:5px}}",
+        "<div id=a></div>",
+    );
+    let a = dom.get_by_id("a").unwrap();
+    dom.update_css_transitions(0.);
+    dom.set_attr(a, "class", "on");
+    dom.update_css_transitions(1.);
+    dom.update_css_transitions(1.5);
+    assert_eq!(value(&dom, "a", "margin-left").as_deref(), Some("15px"));
+    dom.set_attr(a, "class", "on animate");
+    dom.update_css_transitions(1.5);
+    dom.update_css_animations(1.5);
+    assert_eq!(value(&dom, "a", "margin-left").as_deref(), Some("20px"));
+    dom.update_css_transitions(2.);
+    dom.update_css_animations(2.);
+    assert_eq!(value(&dom, "a", "margin-left").as_deref(), Some("25px"));
+}
+
+#[test]
 fn color_animation_origin_reaches_computed_values_and_inheritance() {
     let mut dom = setup(
         "#a{color:black;animation:fade 2s linear}

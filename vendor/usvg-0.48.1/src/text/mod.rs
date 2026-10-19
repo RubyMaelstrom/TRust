@@ -9,8 +9,10 @@ use svgtypes::FontFamily;
 use self::layout::DatabaseExt;
 use crate::{Cache, Font, FontStretch, FontStyle, Text};
 
+pub(crate) mod case_mapping;
 pub(crate) mod flatten;
 mod transform;
+pub use case_mapping::{TextTransformInput, TextTransformOutput};
 
 mod colr;
 /// Provides access to the layout of a text node.
@@ -72,6 +74,18 @@ pub type FallbackSelectionFn<'a> =
 /// you to load additional fonts on-demand and customize the font selection
 /// process.
 pub struct FontResolver<'a> {
+    /// CSS Text transformations over every original span in a text element,
+    /// in logical order. Source byte ranges preserve SVG character indices.
+    pub text_transform: Option<
+        Box<dyn Fn(&[TextTransformInput<'_>]) -> Vec<TextTransformOutput> + Send + Sync + 'a>,
+    >,
+    /// Called for text that participates in layout.
+    /// Hosts can use this to request downloadable faces for the actual
+    /// characters, including their CSS unicode-range restrictions. Returns
+    /// ordered, disjoint byte ranges whose fallback glyphs have no ink during
+    /// the CSS font-display block period; their layout metrics are preserved.
+    pub font_use:
+        Option<Box<dyn Fn(&Font, &str) -> Vec<std::ops::Range<usize>> + Send + Sync + 'a>>,
     /// Resolver function that will be used when selecting a specific font
     /// for a generic [`Font`] specification.
     pub select_font: FontSelectionFn<'a>,
@@ -84,6 +98,8 @@ pub struct FontResolver<'a> {
 impl Default for FontResolver<'_> {
     fn default() -> Self {
         FontResolver {
+            text_transform: None,
+            font_use: None,
             select_font: FontResolver::default_font_selector(),
             select_fallback: FontResolver::default_fallback_selector(),
         }

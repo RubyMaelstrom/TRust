@@ -1269,37 +1269,7 @@ impl WhiteSpace {
     }
 }
 
-/// CSS `text-transform`: alters the rendered text of a run. Inherits; read
-/// from the cascade (`computed_value`) per run.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum TextTransform {
-    None,
-    Upper,
-    Lower,
-    Capitalize,
-}
-
-impl TextTransform {
-    pub(crate) fn from_css(value: &str) -> Option<TextTransform> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "none" => Some(TextTransform::None),
-            "uppercase" => Some(TextTransform::Upper),
-            "lowercase" => Some(TextTransform::Lower),
-            "capitalize" => Some(TextTransform::Capitalize),
-            _ => None,
-        }
-    }
-    /// Apply the transform to a text run (borrowing unchanged when `None`).
-    pub(crate) fn apply<'t>(self, s: &'t str) -> std::borrow::Cow<'t, str> {
-        use std::borrow::Cow;
-        match self {
-            TextTransform::None => Cow::Borrowed(s),
-            TextTransform::Upper => Cow::Owned(s.to_uppercase()),
-            TextTransform::Lower => Cow::Owned(s.to_lowercase()),
-            TextTransform::Capitalize => Cow::Owned(capitalize_words(s)),
-        }
-    }
-}
+pub(crate) use crate::text::transform::TextTransform;
 
 /// CSS "document white space" (CSS Text 3 §4.1.1): the ONLY characters that
 /// collapse and offer soft-wrap opportunities in the collapsing `white-space`
@@ -1311,25 +1281,6 @@ impl TextTransform {
 /// treating them as word glue costs only a rare break opportunity.
 pub(crate) fn is_collapsible_space(c: char) -> bool {
     matches!(c, ' ' | '\t' | '\n' | '\r' | '\u{c}')
-}
-
-/// Uppercase the first letter of each whitespace-separated word, leaving
-/// the rest as-is (CSS `text-transform: capitalize`).
-fn capitalize_words(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut at_word_start = true;
-    for c in s.chars() {
-        if c.is_whitespace() {
-            at_word_start = true;
-            out.push(c);
-        } else if at_word_start {
-            at_word_start = false;
-            out.extend(c.to_uppercase());
-        } else {
-            out.push(c);
-        }
-    }
-    out
 }
 
 /// The page's standard preview image (Open Graph `og:image`, else Twitter's

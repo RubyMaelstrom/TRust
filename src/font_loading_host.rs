@@ -14,7 +14,13 @@ pub(super) fn query(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
             host_dom(ctx).borrow().font_source_epoch().to_string(),
         ));
     }
-    if op == "scopes" || op == "pending" {
+    if op == "scopes" || op == "pending" || op == "needed" {
+        if ctx
+            .host::<HostState>()
+            .is_some_and(|state| state.worker_self.is_some())
+        {
+            return scopes(ctx, _this, args);
+        }
         return guard_node_arguments(
             ctx,
             _this,
@@ -48,10 +54,37 @@ pub(super) fn query(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
 }
 
 fn scopes(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let op = host_arg_string(ctx, args, 0);
+    if op == "needed"
+        && ctx
+            .host::<HostState>()
+            .is_none_or(|state| state.worker_self.is_none())
+    {
+        // CSS Font Loading #font-face-set-ready waits for layout, including
+        // newly discovered fallback faces after another font has loaded.
+        // Readiness needs current font/layout inputs, not the visual bounds
+        // of compositor-only transforms. Ordinary rendering opportunities
+        // also call this discovery path; forcing CSSOM geometry here would
+        // undo compositor retention on every animation frame.
+        ensure_host_geometry_for(ctx, "font loading readiness", None, false);
+    }
     let dom = host_dom(ctx);
     let dom = dom.borrow();
-    let document = host_arg_node(&dom, &args[1..], 0);
-    if host_arg_string(ctx, args, 0) == "pending" {
+    let document = if ctx
+        .host::<HostState>()
+        .is_some_and(|state| state.worker_self.is_some())
+    {
+        Some(dom.document())
+    } else {
+        host_arg_node(&dom, &args[1..], 0)
+    };
+    if op == "needed" {
+        let needed = document
+            .map(|document| dom.needed_font_members(document))
+            .unwrap_or_default();
+        return Ok(Value::from_string(serde_json::to_string(&needed).unwrap()));
+    }
+    if op == "pending" {
         let pending = ctx.host::<HostState>().is_some_and(|state| {
             document
                 .and_then(|document| node_window_context(state, &dom, document))
@@ -173,7 +206,16 @@ fn matching_faces(font: &str, text: &str, declarations: &[String]) -> Option<Vec
 pub(super) fn load(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let request = args.first().and_then(Value::as_num_opt).unwrap_or(0.) as u64;
     let declarations = host_arg_string(ctx, args, 1);
-    let base = host_arg_string(ctx, args, 2);
+    let source = host_arg_string(ctx, args, 2);
+    let options = serde_json::from_str::<serde_json::Value>(&source).ok();
+    let base = options
+        .as_ref()
+        .and_then(|v| v["base"].as_str())
+        .unwrap_or(&source);
+    let css = options
+        .as_ref()
+        .and_then(|v| v["css"].as_bool())
+        .unwrap_or(false);
     let bytes = args
         .get(3)
         .and_then(|value| ctx.buffer_source_bytes(value, false));
@@ -214,20 +256,40 @@ pub(super) fn load(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
         return Ok(Value::Bool(false));
     }
     let context = ctx.host_job_context();
-    let client = request_client_url(ctx);
+    let document = {
+        let state = ctx.host::<HostState>().expect("font host");
+        window_document(state, &state.dom.borrow(), context)
+            .unwrap_or_else(|| state.dom.borrow().document())
+    };
+    let client_url = request_client_url(ctx);
+    // HTML #set-up-a-worker-environment-settings-object separates the API
+    // base URL from the inherited origin (notably for blob: workers).
+    // Fetch #concept-request-origin uses that origin for CORS/credentials.
+    let client = ctx
+        .host::<HostState>()
+        .and_then(|state| state.worker_self.as_ref())
+        .map_or(client_url, |worker| worker.origin.clone());
     let cookies = request_cookie_context(ctx);
     let environment = ModuleFetchEnvironment::of(ctx, context);
-    let base = url::Url::parse(&base).unwrap_or_else(|_| client.clone());
+    let base = url::Url::parse(base).unwrap_or_else(|_| client.clone());
     let Some((handle, cache, events, traversable, referrer)) =
         ctx.host_mut::<HostState>().and_then(|state| {
             let policy = environment_referrer_policy(state, context);
+            let referrer = css
+                .then(|| {
+                    state
+                        .dom
+                        .borrow()
+                        .font_sheet_referrer(document, &base, policy)
+                })
+                .flatten()
+                .unwrap_or_else(|| crate::http::SheetReferrer {
+                    source: environment_referrer_source(state, context),
+                    policy,
+                    document_policy: policy,
+                });
             let network = state.network.as_ref()?;
             let events = state.task_events.clone()?;
-            let referrer = crate::http::SheetReferrer {
-                source: Some(base.clone()),
-                policy,
-                document_policy: policy,
-            };
             let result = (
                 network.handle.clone(),
                 network.cache.clone(),
@@ -261,6 +323,7 @@ pub(super) fn load(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
         let _ = events.send(TrustJsHostTask::FontFaceDone {
             traversable,
             context,
+            document,
             request,
             source,
             bytes,
@@ -269,31 +332,66 @@ pub(super) fn load(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
     Ok(Value::Null)
 }
 
-/// The manually-added, loaded faces of a Document's font source. The source
-/// controls their lifetime; CSS-connected faces continue through its sheets.
+/// Register all font-source members before layout, including unloaded faces.
+/// Their member identities let shaping request the precise FontFace object.
 pub(super) fn install(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    #[derive(serde::Deserialize)]
+    struct Registration {
+        member: u64,
+        scope: usize,
+        css: String,
+        base: String,
+        connected: bool,
+        status: String,
+    }
     let dom = host_dom(ctx);
     let Some(document) = host_arg_node(&dom.borrow(), args, 0) else {
         return Ok(Value::Undefined);
     };
-    let declarations =
-        serde_json::from_str::<Vec<String>>(&host_arg_string(ctx, args, 1)).unwrap_or_default();
+    let declarations = serde_json::from_str::<Vec<Registration>>(&host_arg_string(ctx, args, 1))
+        .unwrap_or_default();
     let buffers = args.get(2).cloned().unwrap_or(Value::Undefined);
     let mut fonts = Vec::new();
-    for (index, declarations) in declarations.iter().enumerate() {
-        let Some(face) = crate::http::font_face_descriptors(declarations) else {
+    for (index, registration) in declarations.iter().enumerate() {
+        if registration.scope != document
+            && dom.borrow().owner_document(registration.scope) != Some(document)
+        {
             continue;
-        };
-        let value = ctx.member_get(&buffers, &index.to_string())?;
-        let Some(bytes) = ctx.buffer_source_bytes(&value, false) else {
-            continue;
-        };
-        if let Some(font) = crate::font_system::PageFont::from_web_resource(face.family, bytes) {
-            fonts.push(
-                font.restrict_to(&face.unicode_range)
-                    .with_descriptors(face.descriptors),
-            );
         }
+        let Some(mut face) = crate::http::font_face_descriptors(&registration.css) else {
+            continue;
+        };
+        if let Ok(base) = url::Url::parse(&registration.base) {
+            for source in &mut face.sources {
+                if let crate::http::CssFontSource::Url(source) = source
+                    && let Ok(resolved) = base.join(source)
+                {
+                    *source = resolved.to_string();
+                }
+            }
+        }
+        let value = ctx.member_get(&buffers, &index.to_string())?;
+        let bytes = if registration.status == "loaded" {
+            ctx.buffer_source_bytes(&value, false)
+                .map(std::sync::Arc::from)
+                .or_else(|| {
+                    dom.borrow()
+                        .font_registration_data(document, registration.member)
+                })
+        } else {
+            None
+        };
+        fonts.push(crate::font_system::FontRegistration {
+            key: crate::font_system::FontKey {
+                scope: registration.scope,
+                member: registration.member,
+                script: true,
+            },
+            face,
+            css: registration.connected,
+            failed: registration.status == "error",
+            data: bytes,
+        });
     }
     dom.borrow_mut().set_script_fonts(document, fonts);
     Ok(Value::Undefined)

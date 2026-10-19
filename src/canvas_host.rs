@@ -130,10 +130,12 @@ impl<'a> Environment<'a> {
         crate::canvas_text::TextEnvironment {
             // HTML #canvastextdrawingstyles resolves fonts against the
             // canvas's Document, including manually added FontFace objects.
-            font_set: self.document.and_then(|node| {
+            font_set: {
+                let node = self.document.unwrap_or_else(|| self.dom.document());
                 self.dom
                     .scope_font_set(self.dom.owner_document(node).unwrap_or(node))
-            }),
+                    .map(|fonts| fonts.for_canvas())
+            },
             rtl,
             language,
             root_font_size: self.dom.root_font_px(),

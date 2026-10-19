@@ -1,19 +1,23 @@
-//! The CSS Animations origin for properties that the graphical compositor
-//! path does not sample. CSS Animations 1 #animations, #keyframes,
+//! CSS Animations sampling and effect composition. CSS Animations 1 #animations, #keyframes,
 //! #animation-definition and #events; CSS Animations 2 #event-dispatch; Web
 //! Animations 1 #animation-effect-phases-and-states, #calculating-the-active-time,
 //! #calculating-the-simple-iteration-progress and
 //! #the-effect-value-of-a-keyframe-animation-effect; CSS Cascade 5
 //! #cascade-origin. CSSWG snapshot 81c27f686901 (2026-09-06).
 //!
-//! `top`, `transform` and `opacity` of an element keep the retained-display-
-//! list path (`layout2::graphics::paint_animation_scope`), sampled by the
-//! frontend renderer without the page actor. Every other animated property,
+//! Ordinary replace animations of `top`, `transform` and `opacity` keep the
+//! retained-display-list path (`layout2::graphics::paint_animation_scope`),
+//! sampled by the frontend renderer. Complete planar transform/opacity
+//! stacks can use the same retained path for additive effects. Their clocks,
+//! operands, composition and easing are copied together; the actor defers
+//! geometry work until a CSSOM read. Other additive targets sample their
+//! whole stack here, including underlying transition values, so each effect
+//! composes once before interpolation. Every other property,
 //! and every property of a pseudo-element's animations (which that path
 //! does not sample), is sampled here, on the page actor's document
 //! timeline, into an animation-origin value that `computed_value` (or, for
 //! a pseudo-element, `pseudo_layout_value`) returns ahead of normal author
-//! declarations but behind `!important` ones and transitions. Animations
+//! declarations but behind `!important` ones and uncomposed transitions. Animations
 //! are keyed by their target, an element or one of its pseudo-elements.
 //! Like Gecko's animation-only restyle, a frame never re-runs selector
 //! matching: it re-samples the retained keyframes and evicts only the
@@ -30,6 +34,27 @@ use values::{Color, Kind, Value};
 /// Properties sampled by the graphical compositor path.
 const COMPOSITOR: [&str; 3] = ["top", "transform", "opacity"];
 
+/// Web Animations #effect-composition / CSS Animations 2
+/// #animation-composition: operands are underlying value, then effect.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum Composition {
+    #[default]
+    Replace,
+    Add,
+    Accumulate,
+}
+
+impl Composition {
+    pub(super) fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "replace" => Some(Self::Replace),
+            "add" => Some(Self::Add),
+            "accumulate" => Some(Self::Accumulate),
+            _ => None,
+        }
+    }
+}
+
 /// Whether an `@keyframes` declaration of `property` is retained. CSS
 /// Animations 1 #keyframes ignores the animation properties (except
 /// `animation-timing-function`, which the parser keeps separately).
@@ -44,9 +69,9 @@ pub(super) fn keyframe_property(property: &str) -> bool {
 /// Web Animations #animating-properties: `display`, `direction`,
 /// `unicode-bidi` and the animation/transition properties are not
 /// animatable.
-fn sampled_property(property: &str, pseudo: bool) -> bool {
+fn sampled_property(property: &str, sample_compositor: bool) -> bool {
     keyframe_property(property)
-        && (pseudo || !COMPOSITOR.contains(&property))
+        && (sample_compositor || !COMPOSITOR.contains(&property))
         && !matches!(
             property,
             "display"
@@ -128,7 +153,7 @@ enum Phase {
 
 /// One coordinated `animation-*` list item (CSS Animations 1
 /// #animation-definition, CSS Values 4 #linked-properties).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct Timing {
     duration: f64,
     delay: f64,
@@ -342,17 +367,19 @@ fn keyframes_name(value: &str) -> Option<String> {
 struct Spec {
     name: String,
     timing: Timing,
+    composition: Composition,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct Frame {
     offset: f64,
     /// `None` is an implicit 0%/100% keyframe holding the underlying value.
     value: Option<Value>,
     easing: Option<Easing>,
+    composition: Composition,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct Track {
     /// `PROPS` index.
     property: u16,
@@ -395,6 +422,7 @@ impl Track {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
 struct Animation {
     name: String,
     timing: Timing,
@@ -429,6 +457,215 @@ struct Element {
     svg_epoch: u64,
 }
 
+/// Web Animations #effect-composition / #the-effect-value-of-a-keyframe-animation-effect.
+/// Immutable, DOM-free operands and clocks for a complete effect stack.
+/// Both the actor and renderer compose endpoints before interpolating them.
+#[derive(Clone, Debug)]
+pub(crate) struct CompositorStack {
+    animations: Vec<Animation>,
+    underlying: Vec<(u16, Kind, Value)>,
+}
+
+impl PartialEq for CompositorStack {
+    fn eq(&self, other: &Self) -> bool {
+        self.underlying == other.underlying
+            && self.animations.len() == other.animations.len()
+            && self.animations.iter().zip(&other.animations).all(|(a, b)| {
+                a.name == b.name
+                    && a.timing == b.timing
+                    && a.start == b.start
+                    && a.hold == b.hold
+                    && a.tracks == b.tracks
+            })
+    }
+}
+
+impl CompositorStack {
+    pub(crate) fn sample(&self, name: &str, seconds: f64) -> Option<String> {
+        let property = prop_index(name)? as u16;
+        let (_, kind, mut value) = self
+            .underlying
+            .iter()
+            .find(|(p, _, _)| *p == property)?
+            .clone();
+        for animation in &self.animations {
+            let Some(track) = animation.track(property) else {
+                continue;
+            };
+            let Some((progress, _)) = animation.timing.progress(animation.current(seconds)) else {
+                continue;
+            };
+            let (a, b, t) = track.interval(progress, animation.timing.easing);
+            let endpoint = |frame: &Frame| {
+                frame.value.as_ref().map_or_else(
+                    || value.clone(),
+                    |effect| values::compose(&value, effect, frame.composition),
+                )
+            };
+            value = values::sample(kind, &endpoint(a), &endpoint(b), t, &|| None);
+        }
+        Some(value.final_css(kind))
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        let value = |value: &Value| match value {
+            Value::Transform(transform) => transform.retained_bytes(),
+            Value::Other(text) => text.capacity(),
+            _ => 0,
+        };
+        self.underlying.capacity() * std::mem::size_of::<(u16, Kind, Value)>()
+            + self
+                .underlying
+                .iter()
+                .map(|(_, _, v)| value(v))
+                .sum::<usize>()
+            + self
+                .animations
+                .iter()
+                .map(|a| {
+                    std::mem::size_of::<Animation>()
+                        + a.name.capacity()
+                        + a.tracks
+                            .iter()
+                            .map(|t| {
+                                std::mem::size_of::<Track>()
+                                    + value(&t.underlying)
+                                    + t.frames
+                                        .iter()
+                                        .map(|f| {
+                                            std::mem::size_of::<Frame>()
+                                                + f.value.as_ref().map_or(0, value)
+                                        })
+                                        .sum::<usize>()
+                            })
+                            .sum::<usize>()
+                })
+                .sum::<usize>()
+    }
+}
+
+impl Dom {
+    pub(crate) fn update_css_animations_for_paint(&mut self, seconds: f64) {
+        self.animations.defer_compositor_layout = true;
+        self.update_css_animations(seconds);
+        self.animations.defer_compositor_layout = false;
+    }
+
+    pub(crate) fn css_composition_can_composite(&self, id: NodeId) -> bool {
+        let Some(element) = self.animations.elements.get(&(id, None)) else {
+            return false;
+        };
+        if element.svg || element.animations.iter().all(|a| a.tracks.is_empty()) {
+            return false;
+        }
+        if ["transform", "opacity"]
+            .iter()
+            .any(|name| self.transitions.value(id, name).is_some())
+        {
+            return false;
+        }
+        let mut additive = false;
+        for track in element.animations.iter().flat_map(|a| &a.tracks) {
+            if !matches!(
+                PROPS[usize::from(track.property)].name,
+                "transform" | "opacity"
+            ) {
+                return false;
+            }
+            additive |= track
+                .frames
+                .iter()
+                .any(|f| f.composition != Composition::Replace);
+            // Perspective/3D and independently animated geometry keep the
+            // actor path. A planar compositor cannot replace their layout.
+            if track.kind == Kind::Transform
+                && track
+                    .frames
+                    .iter()
+                    .filter_map(|f| f.value.as_ref())
+                    .chain(std::iter::once(&track.underlying))
+                    .any(|v| {
+                        let css = v.final_css(track.kind).to_ascii_lowercase();
+                        [
+                            "3d(",
+                            "rotatex(",
+                            "rotatey(",
+                            "translatez(",
+                            "scalez(",
+                            "perspective(",
+                        ]
+                        .iter()
+                        .any(|needle| css.contains(needle))
+                    })
+            {
+                return false;
+            }
+        }
+        additive
+            && ["translate", "rotate", "scale"].iter().all(|name| {
+                self.computed_value_resolved(id, name)
+                    .is_none_or(|value| value == "none")
+            })
+    }
+
+    pub(crate) fn css_composition_stack(
+        &self,
+        id: NodeId,
+    ) -> Option<std::sync::Arc<CompositorStack>> {
+        if !self.css_composition_can_composite(id) {
+            return None;
+        }
+        let element = self.animations.elements.get(&(id, None))?;
+        let mut properties: Vec<_> = element
+            .animations
+            .iter()
+            .flat_map(|a| a.tracks.iter().map(|t| (t.property, t.kind)))
+            .collect();
+        properties.sort_by_key(|(p, _)| *p);
+        properties.dedup_by_key(|(p, _)| *p);
+        let underlying = properties
+            .into_iter()
+            .map(|(property, kind)| {
+                let value = self.underlying_value((id, None), PROPS[usize::from(property)].name);
+                (
+                    property,
+                    kind,
+                    Value::parse(
+                        self,
+                        id,
+                        kind,
+                        &value,
+                        Vp {
+                            w: self.viewport_px.0,
+                            h: self.viewport_px.1,
+                        },
+                    ),
+                )
+            })
+            .collect();
+        self.animations.composited.borrow_mut().insert(id);
+        Some(std::sync::Arc::new(CompositorStack {
+            animations: element.animations.clone(),
+            underlying,
+        }))
+    }
+
+    pub(crate) fn css_composition_is_painted(&self, id: NodeId) -> bool {
+        self.animations.composited.borrow().contains(&id)
+            && self
+                .animations
+                .elements
+                .get(&(id, None))
+                .is_some_and(|element| {
+                    element
+                        .animations
+                        .iter()
+                        .flat_map(|a| &a.tracks)
+                        .any(|t| PROPS[usize::from(t.property)].name == "opacity")
+                })
+    }
+}
+
 struct PendingEvent {
     event: AnimationEvent,
     time: f64,
@@ -438,6 +675,11 @@ struct PendingEvent {
 
 #[derive(Default)]
 pub(super) struct State {
+    /// Targets whose complete transform/opacity stack a retained graphical
+    /// scope samples. CSSOM geometry is refreshed lazily if script asks.
+    composited: RefCell<FxHashSet<NodeId>>,
+    compositor_geometry_dirty: FxHashSet<NodeId>,
+    defer_compositor_layout: bool,
     elements: FxHashMap<StyleTarget, Element>,
     /// Animation-origin values by target, then `PROPS` index.
     values: FxHashMap<StyleTarget, Vec<(u16, String)>>,
@@ -474,12 +716,14 @@ pub(super) struct State {
 
 impl State {
     pub(super) fn invalidate(&self, id: NodeId) {
+        self.composited.borrow_mut().remove(&id);
         if self.keyframes.get() || !self.elements.is_empty() {
             self.invalid.borrow_mut().insert(id);
         }
     }
 
     pub(super) fn invalidate_all(&self) {
+        self.composited.borrow_mut().clear();
         self.all_invalid.set(true);
         self.invalid.borrow_mut().clear();
     }
@@ -498,6 +742,27 @@ impl State {
     /// pseudo-element, if any.
     pub(super) fn pseudo_value(&self, id: NodeId, which: PseudoEl, name: &str) -> Option<String> {
         self.target_value((id, Some(which)), name)
+    }
+
+    /// The animation at the top of an additive effect stack publishes its
+    /// result once. Its underlying transition must not replace that result
+    /// again at the transition origin (Web Animations #applying-the-composited-result).
+    pub(super) fn composed_value(&self, target: StyleTarget, name: &str) -> Option<String> {
+        let property = prop_index(name)? as u16;
+        self.elements
+            .get(&target)?
+            .animations
+            .iter()
+            .any(|animation| {
+                animation.track(property).is_some_and(|track| {
+                    track
+                        .frames
+                        .iter()
+                        .any(|frame| frame.composition != Composition::Replace)
+                })
+            })
+            .then(|| self.target_value(target, name))
+            .flatten()
     }
 
     fn target_value(&self, target: StyleTarget, name: &str) -> Option<String> {
@@ -532,6 +797,8 @@ impl State {
     }
 
     pub(super) fn remove_node(&mut self, node: NodeId) {
+        self.composited.get_mut().remove(&node);
+        self.compositor_geometry_dirty.remove(&node);
         self.invalid.get_mut().remove(&node);
         for target in std::iter::once(None)
             .chain(PseudoEl::ALL.map(Some))
@@ -585,6 +852,8 @@ impl State {
     }
 
     pub(super) fn retain_nodes(&mut self, live: &dyn Fn(NodeId) -> bool) {
+        self.composited.get_mut().retain(|&id| live(id));
+        self.compositor_geometry_dirty.retain(|&id| live(id));
         self.invalid.get_mut().retain(|&id| live(id));
         self.elements.retain(|&(id, _), _| live(id));
         self.values.retain(|&(id, _), _| live(id));
@@ -602,6 +871,8 @@ impl State {
             _ => 0,
         };
         self.elements.capacity() * std::mem::size_of::<(StyleTarget, Element)>()
+            + (self.composited.borrow().capacity() + self.compositor_geometry_dirty.capacity())
+                * std::mem::size_of::<NodeId>()
             + self
                 .elements
                 .values()
@@ -716,6 +987,7 @@ impl Dom {
         let directions = list("animation-direction");
         let fills = list("animation-fill-mode");
         let states = list("animation-play-state");
+        let compositions = list("animation-composition");
         let item = |values: &[String], index: usize| {
             (!values.is_empty()).then(|| values[index % values.len()].clone())
         };
@@ -774,6 +1046,10 @@ impl Dom {
                     .is_none_or(|state| state != "paused");
                 Some(Spec {
                     name,
+                    composition: item(&compositions, index)
+                        .as_deref()
+                        .and_then(Composition::parse)
+                        .unwrap_or_default(),
                     timing: Timing {
                         duration,
                         delay,
@@ -929,6 +1205,8 @@ impl Dom {
         target: StyleTarget,
         name: &str,
         important: &FxHashSet<String>,
+        composition: Composition,
+        sample_compositor: bool,
     ) -> Vec<Track> {
         let (id, pseudo) = target;
         let index = self.style_index();
@@ -952,7 +1230,9 @@ impl Dom {
             let physical = self
                 .logical_property(id, pseudo, name)
                 .unwrap_or_else(|| name.clone());
-            if !sampled_property(&physical, pseudo.is_some()) || important.contains(&physical) {
+            if !sampled_property(&physical, pseudo.is_some() || sample_compositor)
+                || important.contains(&physical)
+            {
                 continue;
             }
             let Some(property) = prop_index(&physical) else {
@@ -969,6 +1249,7 @@ impl Dom {
                     // A timing function on the 100% keyframe is ignored
                     // (#timing-functions); no interval starts there.
                     easing: easing(frame.offset),
+                    composition: frame.composition.unwrap_or(composition),
                 })
                 .collect::<Vec<_>>();
             // CSS Animations 1 #keyframes: missing 0% and 100% keyframes
@@ -980,6 +1261,7 @@ impl Dom {
                         offset: 0.0,
                         value: None,
                         easing: easing(0.0),
+                        composition: Composition::Replace,
                     },
                 );
             }
@@ -988,9 +1270,13 @@ impl Dom {
                     offset: 1.0,
                     value: None,
                     easing: None,
+                    composition: Composition::Replace,
                 });
             }
-            let underlying = if frames.iter().any(|frame| frame.value.is_none()) {
+            let underlying = if frames
+                .iter()
+                .any(|frame| frame.value.is_none() || frame.composition != Composition::Replace)
+            {
                 Value::parse(
                     self,
                     id,
@@ -1032,6 +1318,20 @@ impl Dom {
         false
     }
 
+    fn spec_needs_composition(&self, spec: &Spec) -> bool {
+        spec.composition != Composition::Replace
+            || self
+                .style_index()
+                .keyframes
+                .get(&spec.name)
+                .is_some_and(|rule| {
+                    rule.properties
+                        .values()
+                        .flatten()
+                        .any(|frame| frame.composition.is_some_and(|c| c != Composition::Replace))
+                })
+    }
+
     /// Whether a style-origin animation applies a value or may still change
     /// one. Such a document keeps a live page actor: only the actor samples
     /// the animation origin, so a static presentation re-laid out by a
@@ -1066,9 +1366,12 @@ impl Dom {
             .any(|id| {
                 self.tag_name(id).is_some()
                     && self.animation_targets(id).into_iter().any(|target| {
-                        self.animation_specs(target)
-                            .iter()
-                            .any(|spec| sampled(&spec.name, target.1.is_some()))
+                        self.animation_specs(target).iter().any(|spec| {
+                            sampled(
+                                &spec.name,
+                                target.1.is_some() || self.spec_needs_composition(spec),
+                            )
+                        })
                     })
             })
     }
@@ -1098,6 +1401,9 @@ impl Dom {
             .elements
             .iter()
             .filter_map(|(&(node, pseudo), element)| {
+                if pseudo.is_none() && self.animations.composited.borrow().contains(&node) {
+                    return None;
+                }
                 let mut active = element
                     .animations
                     .iter()
@@ -1312,6 +1618,16 @@ impl Dom {
 
     /// Sample every CSS animation at `seconds` on the document timeline.
     pub(crate) fn update_css_animations(&mut self, seconds: f64) {
+        if !self.animations.defer_compositor_layout {
+            let dirty: Vec<_> = self.animations.compositor_geometry_dirty.drain().collect();
+            if !dirty.is_empty() {
+                self.layout_presentation_epoch = self.layout_presentation_epoch.wrapping_add(1);
+                self.invalidate_transition_layout(&dirty);
+                self.unattributed_geometry_change();
+                self.dirty_attributed = false;
+                self.animations.layout_pending = true;
+            }
+        }
         self.flush_style_invalidations();
         let now = seconds.max(self.animations.now);
         let stamp = (
@@ -1321,6 +1637,9 @@ impl Dom {
         );
         let full =
             self.animations.stamp != Some(stamp) || self.animations.all_invalid.replace(false);
+        if full {
+            self.animations.composited.get_mut().clear();
+        }
         let invalid = std::mem::take(self.animations.invalid.get_mut());
         if !full
             && invalid.is_empty()
@@ -1478,6 +1797,10 @@ impl Dom {
             }
         }
         let important = self.important_properties(target);
+        // Any additive effect requires the entire property stack, including
+        // otherwise composited properties, to be sampled together. Retain
+        // the existing compositor path for ordinary replace animations.
+        let sample_compositor = specs.iter().any(|spec| self.spec_needs_composition(spec));
         let mut built: Vec<Option<Animation>> = (0..specs.len()).map(|_| None).collect();
         for (index, spec) in specs.iter().enumerate().rev() {
             let existing = old.as_mut().and_then(|old| {
@@ -1485,7 +1808,13 @@ impl Dom {
                     .rposition(|animation| animation.name == spec.name)
                     .map(|position| old.remove(position))
             });
-            let tracks = self.animation_tracks(target, &spec.name, &important);
+            let tracks = self.animation_tracks(
+                target,
+                &spec.name,
+                &important,
+                spec.composition,
+                sample_compositor,
+            );
             built[index] = Some(match existing {
                 Some(mut animation) => {
                     // Changed animation properties apply as if they had
@@ -1644,12 +1973,50 @@ impl Dom {
             }
             let mut values: Vec<(u16, String)> = Vec::with_capacity(properties.len());
             for property in properties {
-                let sampled = element.animations.iter().rev().find_map(|animation| {
-                    let track = animation.track(property)?;
-                    let (progress, _) = animation.timing.progress(animation.current(now))?;
+                let mut sampled: Option<(Kind, Value)> = None;
+                for animation in &element.animations {
+                    let Some(track) = animation.track(property) else {
+                        continue;
+                    };
+                    let Some((progress, _)) = animation.timing.progress(animation.current(now))
+                    else {
+                        continue;
+                    };
                     let (a, b, t) = track.interval(progress, animation.timing.easing);
-                    let start = a.value.as_ref().unwrap_or(&track.underlying);
-                    let end = b.value.as_ref().unwrap_or(&track.underlying);
+                    let underlying = sampled
+                        .as_ref()
+                        .map(|(_, value)| value.clone())
+                        .unwrap_or_else(|| {
+                            // A transition is a lower effect in an additive
+                            // stack, and must be sampled at this same time.
+                            let name = PROPS[usize::from(property)].name;
+                            let transition = match pseudo {
+                                None => self.transitions.value(id, name),
+                                Some(which) => self.transitions.pseudo_value(id, which, name),
+                            };
+                            transition
+                                .map(|value| {
+                                    Value::parse(
+                                        self,
+                                        id,
+                                        track.kind,
+                                        &value,
+                                        Vp {
+                                            w: self.viewport_px.0,
+                                            h: self.viewport_px.1,
+                                        },
+                                    )
+                                })
+                                .unwrap_or_else(|| track.underlying.clone())
+                        });
+                    let endpoint = |frame: &Frame| {
+                        frame.value.as_ref().map_or_else(
+                            || underlying.clone(),
+                            |value| values::compose(&underlying, value, frame.composition),
+                        )
+                    };
+                    let start = endpoint(a);
+                    let end = endpoint(b);
                     let current = || {
                         let text = values
                             .iter()
@@ -1661,11 +2028,17 @@ impl Dom {
                             })?;
                         Color::parse(self, id, &text)
                     };
-                    Some(values::interpolate(track.kind, start, end, t, &current))
-                });
+                    sampled = Some((
+                        track.kind,
+                        values::sample(track.kind, &start, &end, t, &current),
+                    ));
+                }
                 // A discrete step to an unknown underlying value leaves the
                 // property to its ordinary computation.
-                if let Some(value) = sampled.filter(|value| !value.is_empty()) {
+                if let Some(value) = sampled
+                    .map(|(kind, value)| value.final_css(kind))
+                    .filter(|value| !value.is_empty())
+                {
                     values.push((property, value));
                 }
             }
@@ -1726,6 +2099,15 @@ impl Dom {
                     continue;
                 }
                 let name = PROPS[usize::from(property)].name;
+                if pseudo.is_none()
+                    && self.animations.defer_compositor_layout
+                    && self.animations.composited.borrow().contains(&id)
+                    && matches!(name, "transform" | "opacity")
+                {
+                    self.forget_animated_value(id, usize::from(property));
+                    self.animations.compositor_geometry_dirty.insert(id);
+                    continue;
+                }
                 let mut paint_tier = paint_only(name) && !(svg && svg_dependent(name));
                 if paint_tier && usize::from(property) == background {
                     // The terminal compositor decides at layout whether a

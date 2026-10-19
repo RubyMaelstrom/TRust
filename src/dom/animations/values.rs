@@ -477,19 +477,26 @@ impl Filter {
     }
 
     /// Filter Effects 1 #interpolation-of-filter-functions.
-    fn mix(self, end: Self, t: f32, current: &dyn Fn() -> Option<Color>) -> Option<Self> {
+    fn mix(
+        self,
+        end: Self,
+        t: f32,
+        current: &dyn Fn() -> Option<Color>,
+        clamp: bool,
+    ) -> Option<Self> {
         let lerp = |a: f32, b: f32| a + (b - a) * t;
+        let positive = |v: f32| if clamp { v.max(0.) } else { v };
         Some(match (self, end) {
-            (Self::Blur(a), Self::Blur(b)) => Self::Blur(lerp(a, b).max(0.0)),
+            (Self::Blur(a), Self::Blur(b)) => Self::Blur(positive(lerp(a, b))),
             (Self::Amount(name, a), Self::Amount(other, b)) if name == other => {
-                Self::Amount(name, lerp(a, b).max(0.0))
+                Self::Amount(name, positive(lerp(a, b)))
             }
             (Self::HueRotate(a), Self::HueRotate(b)) => Self::HueRotate(lerp(a, b)),
             (Self::DropShadow(a), Self::DropShadow(b)) => Self::DropShadow(Shadow {
                 color: a.color.mix(b.color, t, current)?,
                 x: lerp(a.x, b.x),
                 y: lerp(a.y, b.y),
-                blur: lerp(a.blur, b.blur).max(0.0),
+                blur: positive(lerp(a.blur, b.blur)),
                 spread: 0.0,
                 inset: false,
             }),
@@ -594,6 +601,7 @@ fn mix_filter_list(
     end: &[Filter],
     t: f32,
     current: &dyn Fn() -> Option<Color>,
+    clamp: bool,
 ) -> Option<Vec<Filter>> {
     if start.iter().zip(end).any(|(a, b)| a.name() != b.name()) {
         return None;
@@ -607,7 +615,7 @@ fn mix_filter_list(
             (None, Some(b)) => (b.neutral(), *b),
             (None, None) => unreachable!("index below the longer list"),
         };
-        out.push(a.mix(b, t, current)?);
+        out.push(a.mix(b, t, current, clamp)?);
     }
     Some(out)
 }
@@ -646,6 +654,13 @@ impl Value {
                 .map(|layer| parse_position(dom, id, layer, vertical, vp))
                 .collect::<Option<Vec<_>>>()
                 .map(Self::Positions),
+            Kind::Number { unit: true, .. } if trimmed.ends_with('%') => trimmed
+                [..trimmed.len() - 1]
+                .trim()
+                .parse::<f32>()
+                .ok()
+                .filter(|value| value.is_finite())
+                .map(|value| Self::Number(value / 100.)),
             Kind::Number { .. } => trimmed
                 .parse::<f32>()
                 .ok()
@@ -702,6 +717,41 @@ impl Value {
         }
     }
 
+    /// CSS Values 4 #combining-range: clamp only after the entire effect
+    /// stack has been combined, since a later effect can restore the range.
+    pub(super) fn final_css(&self, kind: Kind) -> String {
+        let mut value = self.clone();
+        match &mut value {
+            Self::Number(n) => match kind {
+                Kind::Number { unit: true, .. } => *n = n.clamp(0., 1.),
+                Kind::Number { integer: true, .. } => *n = (*n + 0.5).floor(),
+                Kind::FontWeight => *n = n.clamp(1., 1000.),
+                _ => *n = n.max(0.),
+            },
+            Self::Length(length)
+                if matches!(kind, Kind::Length { negative: false }) && length.pct == 0. =>
+            {
+                length.px = length.px.max(0.)
+            }
+            Self::Shadows(shadows) => {
+                for shadow in shadows {
+                    shadow.blur = shadow.blur.max(0.);
+                }
+            }
+            Self::Filters(filters) => {
+                for filter in filters {
+                    match filter {
+                        Filter::Blur(px) | Filter::Amount(_, px) => *px = px.max(0.),
+                        Filter::DropShadow(shadow) => shadow.blur = shadow.blur.max(0.),
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+        value.css(kind)
+    }
+
     /// Whether this value is a color with zero alpha (or no color). The
     /// terminal compositor decides at layout time whether a background
     /// paints at all.
@@ -718,6 +768,7 @@ impl Value {
 /// values. Values that cannot be combined animate discretely, switching at
 /// the midpoint (Web Animations #discrete). `current` supplies
 /// `currentcolor`'s used value.
+#[cfg(test)]
 pub(super) fn interpolate(
     kind: Kind,
     start: &Value,
@@ -728,6 +779,7 @@ pub(super) fn interpolate(
     interpolated(kind, start, end, t, current).unwrap_or_else(|| discrete(kind, start, end, t))
 }
 
+#[cfg(test)]
 fn discrete(kind: Kind, start: &Value, end: &Value, t: f32) -> String {
     if kind == Kind::Visibility {
         // CSS Display 4 #visibility: interpolating with `visible` maps every
@@ -740,6 +792,7 @@ fn discrete(kind: Kind, start: &Value, end: &Value, t: f32) -> String {
     if t < 0.5 { start } else { end }.css(kind)
 }
 
+#[cfg(test)]
 fn interpolated(
     kind: Kind,
     start: &Value,
@@ -762,6 +815,28 @@ pub(in crate::dom) fn mix_value(
     t: f32,
     current: &dyn Fn() -> Option<Color>,
 ) -> Option<Value> {
+    mix_value_range(kind, start, end, t, current, true)
+}
+
+pub(super) fn sample(
+    kind: Kind,
+    start: &Value,
+    end: &Value,
+    t: f32,
+    current: &dyn Fn() -> Option<Color>,
+) -> Value {
+    mix_value_range(kind, start, end, t, current, false)
+        .unwrap_or_else(|| if t < 0.5 { start.clone() } else { end.clone() })
+}
+
+fn mix_value_range(
+    kind: Kind,
+    start: &Value,
+    end: &Value,
+    t: f32,
+    current: &dyn Fn() -> Option<Color>,
+    clamp: bool,
+) -> Option<Value> {
     Some(match (start, end) {
         (Value::Other(a), Value::Other(b)) if kind == Kind::Visibility => {
             let visible = |value: &str| value.eq_ignore_ascii_case("visible");
@@ -778,15 +853,15 @@ pub(in crate::dom) fn mix_value(
         }
         (Value::Color(a), Value::Color(b)) => Value::Color(a.mix(*b, t, current)?),
         (Value::Shadows(a), Value::Shadows(b)) => {
-            Value::Shadows(mix_shadow_list(a, b, t, current)?)
+            Value::Shadows(mix_shadow_list(a, b, t, current, clamp)?)
         }
         (Value::Filters(a), Value::Filters(b)) => {
-            Value::Filters(mix_filter_list(a, b, t, current)?)
+            Value::Filters(mix_filter_list(a, b, t, current, clamp)?)
         }
         (Value::Length(a), Value::Length(b)) => {
             let mut value = a.mix(*b, t);
             // CSS Values 4 #combining-range: clamp to the property's range.
-            if matches!(kind, Kind::Length { negative: false }) && value.pct == 0.0 {
+            if clamp && matches!(kind, Kind::Length { negative: false }) && value.pct == 0.0 {
                 value.px = value.px.max(0.0);
             }
             Value::Length(value)
@@ -806,13 +881,15 @@ pub(in crate::dom) fn mix_value(
         }
         (Value::Number(a), Value::Number(b)) => {
             let mut value = a + (b - a) * t;
-            match kind {
-                Kind::Number { unit: true, .. } => value = value.clamp(0.0, 1.0),
-                // CSS Values 4 #combine-integers: round to the nearest
-                // integer, towards positive infinity at .5.
-                Kind::Number { integer: true, .. } => value = (value + 0.5).floor(),
-                Kind::FontWeight => value = value.clamp(1.0, 1000.0),
-                _ => value = value.max(0.0),
+            if clamp {
+                match kind {
+                    Kind::Number { unit: true, .. } => value = value.clamp(0.0, 1.0),
+                    // CSS Values 4 #combine-integers: round to the nearest
+                    // integer, towards positive infinity at .5.
+                    Kind::Number { integer: true, .. } => value = (value + 0.5).floor(),
+                    Kind::FontWeight => value = value.clamp(1.0, 1000.0),
+                    _ => value = value.max(0.0),
+                }
             }
             Value::Number(value)
         }
@@ -829,6 +906,7 @@ fn mix_shadow_list(
     end: &[Shadow],
     t: f32,
     current: &dyn Fn() -> Option<Color>,
+    clamp: bool,
 ) -> Option<Vec<Shadow>> {
     let length = start.len().max(end.len());
     let mut out = Vec::with_capacity(length);
@@ -848,7 +926,11 @@ fn mix_shadow_list(
             color,
             x: lerp(a.x, b.x),
             y: lerp(a.y, b.y),
-            blur: lerp(a.blur, b.blur).max(0.0),
+            blur: if clamp {
+                lerp(a.blur, b.blur).max(0.)
+            } else {
+                lerp(a.blur, b.blur)
+            },
             spread: lerp(a.spread, b.spread),
             inset: a.inset,
         });
@@ -864,6 +946,100 @@ fn lcm(a: usize, b: usize) -> usize {
         0
     } else {
         a / gcd(a, b) * b
+    }
+}
+
+/// Web Animations #effect-composition, #animating-shadow-lists; CSS
+/// Values 4 #addition/#accumulation/#combine-colors; Filter Effects 1
+/// #addition/#accumulation. Non-additive types use the effect value.
+pub(super) fn compose(base: &Value, effect: &Value, operation: super::Composition) -> Value {
+    use super::Composition::*;
+    if operation == Replace {
+        return effect.clone();
+    }
+    let linear = |a: Linear, b: Linear| Linear {
+        px: a.px + b.px,
+        pct: a.pct + b.pct,
+    };
+    let shadow = |a: Shadow, b: Shadow| {
+        (a.inset == b.inset).then_some(Shadow {
+            // Color is explicitly non-additive in CSS Values 4 #combine-colors.
+            color: b.color,
+            x: a.x + b.x,
+            y: a.y + b.y,
+            blur: a.blur + b.blur,
+            spread: a.spread + b.spread,
+            inset: b.inset,
+        })
+    };
+    match (base, effect) {
+        (Value::Number(a), Value::Number(b)) => Value::Number(a + b),
+        (Value::Length(a), Value::Length(b)) => Value::Length(linear(*a, *b)),
+        (Value::Positions(a), Value::Positions(b)) => {
+            let length = lcm(a.len(), b.len());
+            if length == 0 || length > 64 {
+                return effect.clone();
+            }
+            Value::Positions(
+                (0..length)
+                    .map(|i| linear(a[i % a.len()], b[i % b.len()]))
+                    .collect(),
+            )
+        }
+        (Value::Shadows(a), Value::Shadows(b)) if operation == Add => {
+            Value::Shadows(a.iter().chain(b).copied().collect())
+        }
+        (Value::Shadows(a), Value::Shadows(b)) => {
+            let values = (0..a.len().max(b.len()))
+                .map(|i| {
+                    let (a, b) = match (a.get(i), b.get(i)) {
+                        (Some(a), Some(b)) => (*a, *b),
+                        (Some(a), None) => (*a, Shadow::blank(a.inset)),
+                        (None, Some(b)) => (Shadow::blank(b.inset), *b),
+                        _ => unreachable!(),
+                    };
+                    shadow(a, b)
+                })
+                .collect::<Option<Vec<_>>>();
+            values.map(Value::Shadows).unwrap_or_else(|| effect.clone())
+        }
+        (Value::Filters(a), Value::Filters(b)) if operation == Add => {
+            Value::Filters(a.iter().chain(b).copied().collect())
+        }
+        (Value::Filters(a), Value::Filters(b)) => {
+            let values = (0..a.len().max(b.len()))
+                .map(|i| {
+                    let (a, b) = match (a.get(i), b.get(i)) {
+                        (Some(a), Some(b)) => (*a, *b),
+                        (Some(a), None) => (*a, a.neutral()),
+                        (None, Some(b)) => (b.neutral(), *b),
+                        _ => unreachable!(),
+                    };
+                    Some(match (a, b) {
+                        (Filter::Blur(a), Filter::Blur(b)) => Filter::Blur(a + b),
+                        (Filter::HueRotate(a), Filter::HueRotate(b)) => Filter::HueRotate(a + b),
+                        (Filter::Amount(name, a), Filter::Amount(other, b)) if name == other => {
+                            let Filter::Amount(_, neutral) = Filter::Amount(name, a).neutral()
+                            else {
+                                unreachable!()
+                            };
+                            Filter::Amount(name, a + b - neutral)
+                        }
+                        (Filter::DropShadow(a), Filter::DropShadow(b)) => {
+                            Filter::DropShadow(shadow(a, b)?)
+                        }
+                        _ => return None,
+                    })
+                })
+                .collect::<Option<Vec<_>>>();
+            values.map(Value::Filters).unwrap_or_else(|| effect.clone())
+        }
+        (Value::Transform(a), Value::Transform(b)) => Value::Transform(if operation == Add {
+            a.add(b)
+        } else {
+            a.accumulate(b)
+        }),
+        _ => effect.clone(),
     }
 }
 

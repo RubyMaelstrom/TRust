@@ -4,10 +4,10 @@
 use std::sync::Arc;
 
 use kurbo::{ParamCurve, ParamCurveArclen};
-use svgtypes::{FontFamily, Length, LengthUnit, parse_font_families};
+use svgtypes::{parse_font_families, FontFamily, Length, LengthUnit};
 
 use super::svgtree::{AId, EId, FromValue, SvgNode};
-use super::{OptionLog, converter, style};
+use super::{converter, style, OptionLog};
 use crate::*;
 
 impl<'a, 'input: 'a> FromValue<'a, 'input> for TextAnchor {
@@ -107,7 +107,8 @@ pub(crate) fn convert(
     let rotate_list = resolve_rotate_list(text_node);
     let writing_mode = convert_writing_mode(text_node);
 
-    let chunks = collect_text_chunks(text_node, &pos_list, state, cache);
+    let mut chunks = collect_text_chunks(text_node, &pos_list, state, cache);
+    crate::text::case_mapping::prepare(&mut chunks, &state.opt.font_resolver);
 
     let rendering_mode: TextRendering = text_node
         .find_attribute(AId::TextRendering)
@@ -287,6 +288,23 @@ fn collect_text_chunks_impl(
         let visibility: Visibility = parent.find_attribute(AId::Visibility).unwrap_or_default();
 
         let span = TextSpan {
+            text_transform: parent
+                .find_attribute::<&str>(AId::TextTransform)
+                .unwrap_or("none")
+                .to_owned(),
+            language: parent
+                .ancestors()
+                .find_map(|node| node.attribute::<&str>(AId::Lang))
+                .map(str::to_owned),
+            preserve_spaces: parent
+                .ancestors()
+                .find_map(|node| node.attribute::<&str>(AId::Space))
+                == Some("preserve")
+                || matches!(
+                    parent.find_attribute::<&str>(AId::WhiteSpace),
+                    Some("pre" | "pre-wrap" | "break-spaces")
+                ),
+            single_text_node: child.text().chars().count() == 1,
             start: 0,
             end: 0,
             fill: style::resolve_fill(parent, true, state, cache),
@@ -334,6 +352,7 @@ fn collect_text_chunks_impl(
                 span2.end = char_len;
 
                 iter_state.chunks.push(TextChunk {
+                    shaping: None,
                     x: pos_list[iter_state.chars_count].x,
                     y: pos_list[iter_state.chars_count].y,
                     anchor,

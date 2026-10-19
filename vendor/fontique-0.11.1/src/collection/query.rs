@@ -140,12 +140,44 @@ impl<'a> Query<'a> {
             let Entry::Ok(family_info) = &family.family else {
                 continue;
             };
+            if matches!(family.composite, Entry::Vacant) {
+                family.composite = match crate::matching::match_composite_fonts(
+                    family_info.fonts(),
+                    self.attributes.width,
+                    self.attributes.style,
+                    self.attributes.weight,
+                ) {
+                    Some(indices) => Entry::Ok(
+                        indices
+                            .into_iter()
+                            .map(|index| (index, Entry::Vacant))
+                            .collect(),
+                    ),
+                    None => Entry::Error,
+                };
+            }
+            if let Entry::Ok(fonts) = &mut family.composite {
+                for (index, entry) in fonts {
+                    if let Some(font) = load_font(
+                        family_info,
+                        self.attributes,
+                        entry,
+                        FontChoice::Index(*index),
+                        self.source_cache,
+                    ) {
+                        if f(font) == QueryStatus::Stop {
+                            return;
+                        }
+                    }
+                }
+                continue;
+            }
             let mut best_index = None;
             if let Some(font) = load_font(
                 family_info,
                 self.attributes,
                 &mut family.best,
-                false,
+                FontChoice::Best,
                 self.source_cache,
             ) {
                 best_index = Some(font.family.1);
@@ -162,7 +194,7 @@ impl<'a> Query<'a> {
                 family_info,
                 self.attributes,
                 &mut family.default,
-                true,
+                FontChoice::Default,
                 self.source_cache,
             ) {
                 if f(font) == QueryStatus::Stop {
@@ -244,11 +276,17 @@ impl QueryFont {
     }
 }
 
+enum FontChoice {
+    Best,
+    Default,
+    Index(usize),
+}
+
 fn load_font<'a>(
     family: &FamilyInfo,
     attributes: Attributes,
     font: &'a mut Entry<QueryFont>,
-    is_default: bool,
+    choice: FontChoice,
     source_cache: &mut SourceCache,
 ) -> Option<&'a QueryFont> {
     match font {
@@ -258,10 +296,15 @@ fn load_font<'a>(
             // Set to error in case we fail. This simplifies
             // the following code.
             *status = Entry::Error;
-            let family_index = if is_default {
-                family.default_font_index()
-            } else {
-                family.match_index(attributes.width, attributes.style, attributes.weight, true)?
+            let family_index = match choice {
+                FontChoice::Best => family.match_index(
+                    attributes.width,
+                    attributes.style,
+                    attributes.weight,
+                    true,
+                )?,
+                FontChoice::Default => family.default_font_index(),
+                FontChoice::Index(index) => index,
             };
             let font_info = family.fonts().get(family_index)?;
             let blob = font_info.load(Some(source_cache))?;
@@ -290,6 +333,7 @@ struct CachedFamily {
     family: Entry<FamilyInfo>,
     best: Entry<QueryFont>,
     default: Entry<QueryFont>,
+    composite: Entry<Vec<(usize, Entry<QueryFont>)>>,
 }
 
 impl CachedFamily {
@@ -299,12 +343,14 @@ impl CachedFamily {
             family: Entry::Vacant,
             best: Entry::Vacant,
             default: Entry::Vacant,
+            composite: Entry::Vacant,
         }
     }
 
     fn clear_fonts(&mut self) {
         self.best = Entry::Vacant;
         self.default = Entry::Vacant;
+        self.composite = Entry::Vacant;
     }
 }
 

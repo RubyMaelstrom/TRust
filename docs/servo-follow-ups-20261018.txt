@@ -1,0 +1,328 @@
+Servo August 2026 comparison and follow-ups
+=========================================
+
+Source: https://servo.org/blog/2026/10/09/august-in-servo/
+Review: 2026-10-18, TRust c3c4a14 plus the existing local rendering edits.
+The initial runtime checks used target/release/trust-headless from October 17.
+Review probes and linked patch downloads: /tmp/trust-servo-review/.
+
+Standards consulted locally, without claiming an upstream freshness check:
+- WHATWG HTML e5071a20c856 (2026-09-06 snapshot).
+- WHATWG Fetch 394d20d144ed (2026-09-06 snapshot).
+- CSSWG drafts 81c27f686901 (2026-09-06 snapshot), especially CSS Font
+  Loading 3, CSS Fonts 4, CSS Grid 2, CSS Text 4, CSS Animations 2.
+- Pointer Events 49c398264c8d and UI Events 8c1b80982c16, same snapshot date.
+- Web IDL 8f182624f632, same snapshot date (dictionary conversion and
+  setlike iterator aliases and default toJSON).
+- Navigation Timing 245fee24bc572 and MathML Core f69212ad1f21, same
+  snapshot date. Unicode 17.0.0 casing data and Core Specification §3.13
+  were retrieved from unicode.org because those files were missing locally.
+- RFC Editor bulk snapshot 2026-09-06: RFC 8305 §§4–5 and RFC 6724 §6.
+  RFC 8305 supersedes RFC 6555; OS address preference remains authoritative.
+
+Current implementation work
+---------------------------
+
+1. Failed module fetches: remove rejected network/HTTP/MIME responses from
+   TRust's shared response cache, retaining the precise fetch each existing
+   waiter joined. A later import can retry; successful evaluation remains
+   cached. HTML #fetch-a-single-module-script; Servo PR #46919.
+2. Responsive image preload: share image source selection for link
+   href/imagesrcset/imagesizes, with DPR, width descriptors, media, base URL,
+   mutation and removal handling. HTML #preload, #create-a-source-set,
+   #update-the-source-set; Servo PR #47103.
+3. FontFaceSet: connect CSS rule objects to FontFace identity, matching,
+   decoding/loading and document font installation. CSS Font Loading 3
+   #font-face-css-connection, #font-face-set-load and CSS Fonts 4
+   #font-style-matching; Servo PR #47564.
+4. CORS: require explicit Authorization in Access-Control-Allow-Headers even
+   without credentials. The post's PR #47600 explicitly adopts a deviation
+   from Fetch; TRust's preflight already had that deviation while its
+   preflight cache correctly excluded Authorization from wildcard matching.
+   Follow Fetch #cors-preflight-fetch-0, not that compatibility change.
+
+Second implementation batch (user-approved scope)
+------------------------------------------------
+
+5. Column subgrid: inherited inline tracks, line names/areas, shared gaps,
+   child intrinsic contributions, forced stretch on the subgridded axis,
+   nested/both-axis subgrids, direction reversal and CSSOM used-span values.
+   CSS Grid 2 #subgrids, #algo-track-sizing, #resolved-track-list-subgrid.
+6. Demand-driven fonts: CSS and script-added fonts load on actual text use
+   in layout, canvas and SVG, with family/style/weight/width/Unicode-range
+   matching. Unused and hidden faces remain unloaded; fonts.ready waits for
+   used faces and their fallbacks. The static renderer follows the same
+   demand loop. Document ownership, redirected stylesheet referrers and
+   stylesheet Referrer-Policy are preserved. The Fontique query now visits
+   all matching Unicode subsets in reverse CSS rule order, without falling
+   through to a different weight in the same CSS family.
+7. Text transforms: Unicode-aware capitalization, full-width, full-size-kana
+   and math-auto, including inline word context and contextual Turkish/Azeri,
+   Lithuanian, Dutch and Greek casing. Expanding/contracting mappings preserve
+   original DOM offsets and copied text, including transforms applied only
+   through ::first-letter. Unicode tables have a reproducible
+   offline generator and carry the Unicode License V3.
+8. Animation composition: replace/add/accumulate lists and per-keyframe
+   overrides compose endpoints with the underlying effect before interpolation.
+   Includes numeric/length/repeatable values, transform/filter/shadow lists,
+   scale/matrix accumulation and transition interaction. Non-additive values
+   replace (including colors under the consulted CSS Values 4 snapshot).
+9. PerformanceTiming: Window-only interface, branded readonly getters,
+   same-object performance.timing, live navigation timestamps, Web IDL
+   toJSON and cross-window receivers. Workers do not expose this interface.
+10. IPv4/IPv6 connection fallback (additional reported bug): one shared TCP
+    connector for HTTP/HTTPS, WebSocket, Gemini, Gopher/Gophers, Telnet/TLS,
+    DICT, Finger and WHOIS. Interleave address families in OS preference
+    order; start the next attempt after 250ms, or after at least 100ms when
+    an attempt fails. Keep earlier attempts alive, cancel losers on success
+    and bound DNS plus TCP to 15 seconds (shorter caller budgets still apply).
+    HTTP connection timing preserves separate DNS/TCP boundaries. HTTP/3
+    already has its own bounded staggered QUIC attempts.
+
+Third implementation batch (user-approved scope)
+-------------------------------------------------
+
+11. Font display: first-use timelines belong to individual faces and survive
+    src fallback/shared URLs. Block periods hide glyph ink while retaining
+    metrics, selection and SVG geometry; swap/failure deadlines wake the page
+    without polling. Late optional/fallback data stays available to Canvas
+    while CSS continues using fallback. CSS-connected faces retain the bytes
+    from their successfully loaded source. CSS Fonts 4 #font-display-timeline,
+    #font-display-desc; HTML #canvastextdrawingstyles.
+12. SVG text transforms use the same Unicode mappings as HTML, with context
+    spanning tspan/chunk boundaries and original shaping-cluster indices for
+    SVG positioning and text APIs. innerText on an inline subtree uses its
+    surrounding inline context. CSS Text 4 #text-transform-mapping and
+    #text-transform-order; SVG 2 #TermAddressableCharacter and character-to-
+    glyph positioning; HTML #rendered-text-collection-steps.
+13. Grid sizing rechecks column contributions using resolved/aligned row sizes
+    and performs at most one additional column/row pass. Definite row estimates
+    include distributed gaps, and vertical text intrinsic measurements retain
+    the available row height in their cache keys. CSS Grid 2 #algo-grid-sizing
+    steps 1-4; CSS Writing Modes 4 #orthogonal-flows and #orthogonal-auto.
+14. Eligible additive transform/opacity stacks are retained and sampled by
+    the graphical compositor, including their per-keyframe composition and
+    easing. Ordinary frame sampling and font-readiness checks avoid layout;
+    CSSOM geometry reads flush deferred geometry. Terminal rendering and
+    unsupported combinations continue using the actor.
+    Web Animations 1 #effect-composition and
+    #the-effect-value-of-a-keyframe-animation-effect; CSS Animations 2
+    #animation-composition. All use the same local CSSWG snapshot above.
+15. Workers share the FontFace/FontFaceSet implementation with Window, using
+    independent initially empty font sources, their own font-loading tasks,
+    resource base URL and OffscreenCanvas environment. Transferred canvases
+    use the receiver's fonts. Blob workers use their settings origin for CORS,
+    independently of the script URL used for source resolution. CSS Font
+    Loading 3 #fontfacesource-workers; HTML #canvastextdrawingstyles and
+    #concept-settings-object-origin; Fetch #concept-request-origin.
+    No trust-js engine changes.
+16. Reported PMVHaven crash: reproduced twice in the existing release browser.
+    A video update during backdrop rendering deleted a CPU image registration
+    still referenced by queued draws; Hybrid's CPU effect renderer and then
+    the CPU fallback both panicked, followed by process termination. Each
+    presentation now shares a lazy immutable image/video snapshot across its
+    main and offscreen passes. Image bytes and revision are read atomically.
+    Filter Effects 2 #backdrop-filter-operation / #BackdropRoot and HTML
+    #the-video-element. Reproduction and validation logs: target/servo-third/.
+
+Remaining features to consider
+-----------------------------
+
+- Touch-action and axis-locked panning. Native touchscreen input currently
+  becomes mouse-style interaction. Implement the permitted panning/zooming
+  intersection along the appropriate ancestor chain, transformed axes,
+  gesture-start decisions, and pointer cancellation. Preserve independent
+  wheel/mouse behavior. Pointer Events #the-touch-action-css-property;
+  Servo #47043 and #46983.
+- Accessibility semantics (explicitly deferred by the user). The geometry/AccessKit bridge exists, but the role
+  mapping lacks many landmarks, live regions and structural roles in the
+  post. Extend native role/state/name mappings with ARIA and HTML-AAM tests,
+  including multiple-token fallback roles and dynamic updates. Servo #47318.
+- Service workers and CookieStore. Cache and CacheStorage already work.
+  ServiceWorkerContainer.register explicitly rejects; ready never finds a
+  registration. There is no CookieStore interface. A real service-worker
+  lifecycle, registration/update/storage and fetch interception are separate
+  work from exposing interfaces. Servo #47044 and #47220.
+- Persistent HTTP cache (explicitly deferred by the user). PageCache is an in-memory document response/preload
+  cache. Persistent caching needs RFC 9111 freshness/revalidation, Vary and
+  request-context partitioning, bounded storage and user clearing controls.
+  It is distinct from the script CacheStorage API. Servo #43819.
+- LargestContentfulPaint. No exposed interface or supported performance
+  entry type. Requires paint-backed candidate tracking, text/image/video
+  poster geometry, timing, element/url fields and PerformanceObserver
+  delivery, not just an interface constructor. Servo #46553, #47475,
+  #43376, #43378 and #47212.
+- Further grid work: nested orthogonal subgrids and full logical-axis grid
+  layout still need dedicated conformance coverage. The third batch covers
+  row-constrained vertical text and one bounded cross-axis sizing feedback
+  pass, including distributed row gaps.
+- Further compositor work: mixed layout-property stacks, active underlying
+  transitions, SVG-dependent targets, 3D transforms and singular initial
+  transforms retain the actor path. Their existing composition semantics
+  remain covered by the actor tests.
+- A separate intermittent desktop startup SIGSEGV remains unresolved. One
+  launch of the updated build failed before page/script diagnostics. The
+  crashing thread's frames were in libnvidia-glcore.so.610.57.04; this stack
+  alone does not establish the underlying cause. Five subsequent independent
+  file-page launches and normal closes succeeded. Local evidence is retained
+  in target/servo-third/core-info.txt, core-stack-modules.txt, core-8502 and
+  startup-file-results.json. This differs from the reproduced image-registry
+  panic fixed in item 16.
+- Incremental A/AAAA resolution and NAT64 synthesis: TCP address racing uses
+  the system's combined resolver with a bounded wait. It implements RFC 8305
+  §§4–5 after resolution, not that RFC's complete asynchronous DNS algorithm.
+
+Other comparisons requiring dedicated regression work
+----------------------------------------------------
+
+Navigation/history/initial about:blank, cross-origin Window/Location, font
+matching ties, shaping across inline boundaries, sticky scrollable overflow,
+pointer-capture transitions and zero-width inline edges have related TRust
+implementations. This review did not establish parity with every referenced
+Servo edge-case fix. Use the linked reduced WPT cases and authoritative local
+standards before deciding whether each needs a change. WebDriver is not
+implemented. Servo's SpiderMonkey, Android/OpenHarmony, embedder API and
+threadboost changes concern a different engine/platform architecture.
+
+TextEvent is not a missing constructor: Servo #47391 adds legacy
+document.createEvent("TextEvent") and initTextEvent(), which TRust already
+supports. The UI Events IDL has no public constructor.
+
+Build isolation
+---------------
+
+The active /big/Code/trust-js work checkout must remain untouched. This work
+uses /tmp/trust-servo-build/trust-js, cloned from its local main revision
+e33109935c25e291da71c082cfd03d2f24c12a12. The adjacent TRust symlink points to
+/big/Code/TRust. Pass --manifest-path /tmp/trust-servo-build/TRust/Cargo.toml
+to Cargo; this resolves the path dependency through the isolated directory
+and still produces this repository's normal target/release artifacts. See
+AGENTS.md for the repeatable setup. No installed binary promotion is implied.
+
+First-batch validation
+----------------------
+
+- Full debug library run: 3,724 passed, 43 ignored. It found two issues:
+  the shared setlike keys/values function name, and the expected host-binding
+  count. Both were corrected and passed their focused reruns.
+- Final focused debug run: 93 passed, covering fonts and their existing
+  rendering tests, module retries, responsive preloads, CORS and method
+  names. The updated host-binding guard also passed separately.
+- Debug executables: desktop 62 passed / 4 ignored; headless 15 passed.
+  The replay example's one test passed. Doc tests: the one existing ignored
+  FFmpeg example remained ignored.
+- cargo clippy --all-targets --locked: clean. cargo fmt --check, JavaScript
+  syntax checking and git diff --check: clean.
+- cargo build --release --locked succeeded, producing trust, trust-desktop
+  and trust-headless in target/release with the isolated engine above.
+  Binary checksums: /tmp/trust-servo-review/release-sha256.txt.
+- Release browser acceptance passed against two local HTTP origins:
+  selected.svg was fetched once and reused by the image; fallback.svg was
+  never requested. CSS-connected FontFaceSet.load returned the actual face
+  and reused the renderer's one font download. Wildcard Authorization was
+  rejected twice without sending a GET; explicit mixed-case authorization
+  allowed the GET. A 404 module fetch was retried and returned its export.
+- The release browser loaded the Servo article successfully (HTTP 200,
+  eight decoded images, zero failed images, no reported script errors).
+  Both the local probe and article PNGs were inspected. Artifacts:
+  network-acceptance.log, network-requests.json, network.png,
+  servo-release.out, servo-release.err and servo-release.png in the log
+  directory below.
+- Final full release suite (--test-threads=4): 3,727 library tests, 62 desktop
+  tests, 15 headless tests and one replay example test passed; 48 tests were
+  ignored across the targets/doc tests. No failures. The initial eight-thread
+  run had one animation-test failure ("paint-only frame was rebuilt"); that
+  test passed unchanged both in isolation and in the final full rerun.
+
+Detailed build/test output is retained under /tmp/trust-servo-review/.
+
+Second-batch validation
+-----------------------
+
+Focused checks passed for column subgrid, font demand/matching, text transforms,
+animation composition, PerformanceTiming and dual-stack connection scheduling.
+A final copy/paste regression verifies transforms confined to ::first-letter;
+all ten highlight tests and eleven text-transform checks passed after that fix.
+The generated Unicode mapping tables reproduce byte-for-byte offline, and the
+compiler's Unicode version is 17.0.0, matching their inputs.
+
+Release acceptance:
+- Both local silent-route probes passed. A full TCP accept queue confirms the
+  first route is unresponsive; a process-local resolver shim orders the two
+  address families without changing system DNS/routes/firewall. IPv4 -> IPv6
+  connected in 279ms, and IPv6 -> IPv4 in 288ms on the final artifact,
+  including browser startup (earlier build: 271ms / 276ms).
+- All 13 feature-page checks passed. Column widths were 130/210/120px; additive
+  and accumulated transforms measured 320px and 200px. Used CSS, canvas,
+  iframe and three composite subset fonts loaded once each, while unused
+  faces were never requested. Referrers honored redirected stylesheet
+  location and the frame's no-referrer policy. The final artifact also
+  rendered the first-letter-only transform. The rendered PNG was inspected.
+- The first-batch module/preload/FontFaceSet/CORS network probe still passed.
+- The Servo article rendered successfully: HTTP 200, eight images loaded,
+  no failed images and no reported script errors. Its PNG was inspected.
+
+Final build and verification:
+- cargo build --release --offline --locked succeeded with the isolated engine.
+  Final checksums: /tmp/trust-servo-next/release-sha256.txt (verified again after
+  the test suite; the acceptance binaries remain byte-identical).
+- Full final release suite: 3,769 library tests, 62 desktop tests, 15 headless
+  tests and one replay-example test passed. 48 existing tests were ignored
+  across targets and doc tests. No failures.
+- cargo clippy --all-targets -- -D warnings: clean on the final source.
+- cargo fmt --check, node --check src/js_platform.js and git diff --check:
+  clean. Unicode-table regeneration matched the checked-in output exactly.
+- Full debug suite: 3,768 library tests, 62 desktop tests, 15 headless tests
+  and one replay-example test passed; 48 existing tests were ignored across
+  targets and doc tests. Its first run found two outdated expectations
+  (source-span granularity and the new host-binding count); both were fixed
+  before the successful rerun. The last copy-only correction was made while
+  that rerun was executing: it additionally passed its focused regression,
+  all 10 highlight tests and all 11 text-transform tests in debug, plus the
+  full final release suite (whose count includes the new copy regression).
+
+Detailed output is retained under /tmp/trust-servo-next/. The active engine
+checkout and installed binaries have not been changed.
+
+Third-batch validation
+----------------------
+
+- Focused conformance regressions cover per-face font-display deadlines,
+  source fallback, loaded fonts in Canvas after CSS failure, invisible glyph
+  ink with preserved geometry, SVG casing across spans, expanded-character
+  positioning/textLength, surrounding innerText context, cross-axis grid
+  sizing, compositor/actor agreement and worker font sources/CORS.
+- The last broad font/SVG debug run passed 238 tests (one ignored). The final
+  animation regression passed in both graphical and terminal modes, including
+  requestAnimationFrame font-readiness checks. Renderer regressions reproduce
+  an image replacement during an offscreen pass and a video frame changing
+  between the main and backdrop passes.
+- Full debug suite: 3,782 library tests, 62 desktop tests, 15 headless tests
+  and one replay-example test passed; 48 existing tests were ignored across
+  targets/doc tests. No failures. This run began before the last SVG, worker
+  origin and animation-readiness refinements; those passed focused debug
+  checks afterward and are included in the final release suite.
+- cargo build --release --offline --locked and cargo clippy --all-targets
+  -- -D warnings succeeded with the isolated engine. Final release binary
+  hashes are recorded in target/servo-third/release-sha256.txt.
+- Full final release suite: 3,784 library tests, 62 desktop tests, 15 headless
+  tests and one replay-example test passed (3,862 total); 48 existing tests
+  were ignored across targets/doc tests. No failures. cargo fmt --check,
+  JavaScript syntax checks and git diff --check also passed.
+- The final release feature page passed all 11 checks: late optional fallback,
+  late Canvas fonts, successful second font source, inline innerText context,
+  original SVG character indices/positions, second-pass grid sizing, composed
+  transform/opacity, blob-worker canvas fonts and Window/worker isolation.
+  The Servo article returned HTTP 200 with eight images loaded, zero failed
+  images and no reported script errors. Both rendered PNGs were inspected.
+- The final desktop artifact played the reported PMVHaven video through
+  three complete 16.171333-second cycles, then closed normally with exit 0.
+  No image-registry panic occurred. Evidence: video-shutdown.log and
+  video-shutdown-results.json. An earlier repeat also completed three cycles,
+  but its harness failed to find a changed diagnostic window title and sent
+  SIGTERM; that harness failure is retained in video-complete-results.json.
+  The separate startup SIGSEGV described above remains unresolved.
+
+Detailed third-batch logs, probes and crash evidence are retained under
+target/servo-third/. Failed intermediate runs are retained alongside their
+successful reruns. No installation, source commit or push has been performed.

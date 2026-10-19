@@ -239,6 +239,8 @@ unicode-casefold = "0.2.0"
 # CSS Pseudo 4 #first-letter-pattern classifies text by Unicode general
 # category. Already in the graph through URL's IDNA support.
 icu_properties = "2.3.0"
+# CSS Fonts 4 cluster matching accepts canonically equivalent glyphs.
+icu_normalizer = { version = "2.3.0", default-features = false, features = ["compiled_data"] }
 # Inline layout finds soft wrap opportunities between inline boxes with the
 # rule-based line segmenter Parley already uses within text runs.
 icu_segmenter = { version = "2.3.0", default-features = false, features = ["compiled_data"] }

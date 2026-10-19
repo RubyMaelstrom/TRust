@@ -35,7 +35,7 @@ enum Operation {
 struct Interpolation {
     from: Vec<Operation>,
     to: Vec<Operation>,
-    progress: f32,
+    progress: Option<f32>,
 }
 
 impl Operation {
@@ -56,11 +56,11 @@ impl Operation {
                         m3::multiply(&matrix, &op.matrix3d(reference))
                     })
                 };
-                crate::render::interpolate_composed(
-                    &compose(&interpolation.from),
-                    &compose(&interpolation.to),
-                    interpolation.progress,
-                )
+                let (a, b) = (compose(&interpolation.from), compose(&interpolation.to));
+                match interpolation.progress {
+                    Some(t) => crate::render::interpolate_composed(&a, &b, t),
+                    None => m3::accumulate(&a, &b),
+                }
             }
         }
     }
@@ -571,7 +571,22 @@ fn functions(text: &str, units: Units, viewport: Vp) -> Option<Vec<Operation>> {
                 operations.push(Operation::Interpolate(Box::new(Interpolation {
                     from: list(from)?,
                     to: list(to)?,
-                    progress: progress.parse().ok().filter(|t: &f32| t.is_finite())?,
+                    progress: Some(progress.parse().ok().filter(|t: &f32| t.is_finite())?),
+                })));
+                continue;
+            }
+            (name, [from, to]) if name == super::DEFERRED_TRANSFORM_ACCUMULATION => {
+                let list = |text: &str| {
+                    if none(text) {
+                        Some(Vec::new())
+                    } else {
+                        functions(text, units, viewport)
+                    }
+                };
+                operations.push(Operation::Interpolate(Box::new(Interpolation {
+                    from: list(from)?,
+                    to: list(to)?,
+                    progress: None,
                 })));
                 continue;
             }
@@ -585,7 +600,7 @@ fn functions(text: &str, units: Units, viewport: Vp) -> Option<Vec<Operation>> {
 /// An animated `transform` value's functions as interpolable steps (CSS
 /// Transforms 1 #interpolation-of-transforms): lengths resolved against the
 /// `reference` box, angles in radians. `none` is the empty list.
-pub(super) fn animation_steps(
+pub(crate) fn animation_steps(
     text: &str,
     units: Units,
     viewport: Vp,
@@ -671,6 +686,13 @@ pub(super) fn animation_steps(
                     &crate::render::compose_transform_steps(&list(from)?),
                     &crate::render::compose_transform_steps(&list(to)?),
                     progress.parse().ok().filter(|t: &f32| t.is_finite())?,
+                ))
+            }
+            (name, [from, to]) if name == super::DEFERRED_TRANSFORM_ACCUMULATION => {
+                let list = |text: &str| animation_steps(text, units, viewport, reference);
+                TransformStep::Matrix3d(m3::accumulate(
+                    &crate::render::compose_transform_steps(&list(from)?),
+                    &crate::render::compose_transform_steps(&list(to)?),
                 ))
             }
             _ => return None,

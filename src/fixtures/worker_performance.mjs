@@ -10,7 +10,7 @@
     check(p instanceof Performance && p instanceof EventTarget, 'Performance EventTarget');
     check(Object.prototype.toString.call(p) === '[object Performance]', 'Performance tag');
     check(typeof window === 'undefined' && typeof document === 'undefined' &&
-        typeof PerformanceNavigationTiming === 'undefined' && !('timing' in p) &&
+        typeof PerformanceNavigationTiming === 'undefined' && typeof PerformanceTiming === 'undefined' && !('timing' in p) &&
         !('navigation' in p), 'workers have no Window navigation APIs');
     check(typeof __performance_binding === 'undefined' && typeof __performance_adapter === 'undefined', 'installation hooks removed');
     check(p.getEntriesByType('navigation').length === 0, 'no navigation entries');

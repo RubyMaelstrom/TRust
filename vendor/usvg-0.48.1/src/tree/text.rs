@@ -329,6 +329,10 @@ impl TextDecoration {
 /// Spans do not overlap inside a text chunk.
 #[derive(Clone, Debug)]
 pub struct TextSpan {
+    pub(crate) text_transform: String,
+    pub(crate) language: Option<String>,
+    pub(crate) preserve_spaces: bool,
+    pub(crate) single_text_node: bool,
     pub(crate) start: usize,
     pub(crate) end: usize,
     pub(crate) fill: Option<Fill>,
@@ -521,6 +525,8 @@ pub enum TextFlow {
 /// Text alignment and BIDI reordering can only be done inside a text chunk.
 #[derive(Clone, Debug)]
 pub struct TextChunk {
+    #[cfg(feature = "text")]
+    pub(crate) shaping: Option<crate::text::case_mapping::ShapingText>,
     pub(crate) x: Option<f32>,
     pub(crate) y: Option<f32>,
     pub(crate) anchor: TextAnchor,
