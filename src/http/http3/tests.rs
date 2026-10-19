@@ -267,6 +267,72 @@ async fn ok(
 }
 
 #[tokio::test]
+async fn http3_script_navigation_fetches_preserve_download_bytes() {
+    // Fetch #concept-body-consume-body / SW #handle-fetch expose bytes before
+    // HTML #navigation-as-a-download chooses document presentation.
+    const BYTES: &[u8] = b"network \0preload\xff\n";
+    let site = Site::new(|request, mut stream, _connection| async move {
+        assert_eq!(request.headers()["sec-fetch-mode"], "navigate");
+        assert_eq!(request.headers()["sec-fetch-dest"], "document");
+        let path = request.uri().path();
+        let mime = if path.starts_with("/binary") {
+            "application/octet-stream"
+        } else {
+            "text/html"
+        };
+        let mut response = http_wire::Response::builder()
+            .header("content-type", mime)
+            .header("content-length", BYTES.len());
+        if path.ends_with("attachment") {
+            response = response.header("content-disposition", "attachment; filename=test.bin");
+        }
+        stream
+            .send_response(response.body(()).unwrap())
+            .await
+            .unwrap();
+        // A direct navigation may cancel this body after its head; the
+        // buffered/streaming Fetch consumers must receive every byte.
+        if stream.send_data(Bytes::from_static(BYTES)).await.is_ok() {
+            let _ = stream.finish().await;
+        }
+    })
+    .await;
+    site.warm().await;
+    let mut request = site.request.clone();
+    super::super::set_navigation_metadata(&mut request, None);
+    for (path, download) in [
+        ("/html", false),
+        ("/binary", true),
+        ("/html-attachment", true),
+        ("/binary-attachment", true),
+    ] {
+        request.url.set_path(path);
+        let response = super::super::fetch_script_with_timing(&request)
+            .await
+            .unwrap();
+        assert_eq!(response.body, BYTES, "buffered {path}");
+        assert_eq!(response.timing.unwrap().next_hop_protocol, "h3");
+        let (response, body) = super::super::fetch_script_streaming(&request)
+            .await
+            .unwrap();
+        assert!(response.body.is_empty());
+        assert_eq!(response.timing.unwrap().next_hop_protocol, "h3");
+        let mut body = body.expect("a Fetch response body streams even for downloads");
+        let mut bytes = Vec::new();
+        while let Some(chunk) = body.next().await.unwrap() {
+            bytes.extend_from_slice(&chunk);
+        }
+        assert_eq!(bytes, BYTES, "streamed {path}");
+        let direct = site.fetch(&request).await.unwrap();
+        assert_eq!(
+            direct.body.as_slice(),
+            if download { &[][..] } else { BYTES },
+            "direct navigation {path}",
+        );
+    }
+}
+
+#[tokio::test]
 async fn http3_discovers_from_http2_authenticates_origin_and_reuses_session() {
     let site = Site::new(|request, stream, connection| async move {
         assert_eq!(request.uri().host(), Some("localhost"));

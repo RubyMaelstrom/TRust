@@ -236,25 +236,47 @@ fn service_worker_module_graph_rejects_await_before_execution_and_runs_saved_imp
 
 #[test]
 fn service_worker_navigation_preload_keeps_reserved_client_and_streams_response() {
+    // SW92aba3be #handle-fetch clones navigation metadata but exposes the
+    // preload Response before HTML #navigation-as-a-download. The worker can
+    // read/replace an octet-stream or attachment just as it can HTML.
     let runtime = runtime();
     let (listener, base) = listen(&runtime);
     let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
     let seen = requests.clone();
-    let server=runtime.spawn(async move {
+    let server = runtime.spawn(async move {
         loop {
-            let(mut socket,_)=listener.accept().await.unwrap();let head=read_head(&mut socket).await;
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let head = read_head(&mut socket).await;
             seen.lock().unwrap().push(head.clone());
-            let (mime,source)=if head.starts_with("get /sw.js "){("text/javascript",r#"
+            let (mime, source) = if head.starts_with("get /sw.js ") {
+                ("text/javascript", r#"
                 addEventListener('activate',e=>e.waitUntil((async()=>{
                     await registration.navigationPreload.enable();
                     await registration.navigationPreload.setHeaderValue('  preload-test\t');
                 })()));
                 addEventListener('fetch',e=>e.respondWith((async()=>{
-                    const r=await e.preloadResponse;
-                    return new Response(e.request.mode+'|'+e.resultingClientId+'|'+await r.text(),{headers:{'content-type':'text/html'}});
+                    let r=await e.preloadResponse;
+                    const preload=await r.text();
+                    if(new URL(e.request.url).pathname==='/forwarded'){
+                        r=await fetch(e.request);
+                    }
+                    const text=new URL(e.request.url).pathname==='/forwarded'?await r.text():preload;
+                    return new Response(e.request.mode+'|'+e.request.destination+'|'+e.resultingClientId+'|'+r.headers.get('content-type')+'|'+r.headers.get('content-disposition')+'|'+text,{headers:{'content-type':'text/html'}});
                 })()));
-            "#)}else{("text/html","preloaded")};
-            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{source}",source.len()).as_bytes()).await.unwrap();
+                "#)
+            } else if head.starts_with("get /next ") {
+                ("text/html", "preloaded\n")
+            } else {
+                ("application/octet-stream", "preloaded\n")
+            };
+            let attachment = head.starts_with("get /attachment ")
+                || head.starts_with("get /forwarded ");
+            let disposition = if attachment {
+                "Content-Disposition: attachment; filename=test.bin\r\n"
+            } else {
+                ""
+            };
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\n{disposition}Content-Length: {}\r\nConnection: close\r\n\r\n{source}",source.len()).as_bytes()).await.unwrap();
         }
     });
     let (mut engine, mut tasks) = page(&runtime, &format!("{base}/page"));
@@ -269,34 +291,49 @@ fn service_worker_navigation_preload_keeps_reserved_client_and_streams_response(
     run_until(&runtime, &mut engine, &mut tasks, "done");
     assert_eq!(log(&mut engine), "true|preload-test|true");
     let storage = engine.ctx().host::<HostState>().unwrap().storage.clone();
-    let response = runtime
-        .block_on(crate::http::fetch_navigation(
-            &url::Url::parse(&format!("{base}/next")).unwrap(),
-            None,
-            None,
-            &storage,
-            false,
-        ))
-        .unwrap();
-    let id = response
-        .service_client
-        .as_ref()
-        .unwrap()
-        .client()
-        .id
-        .clone();
-    assert_eq!(
-        String::from_utf8(response.body).unwrap(),
-        format!("navigate|{id}|preloaded")
-    );
-    assert!(
-        requests
-            .lock()
+    for (path, mime, disposition) in [
+        ("next", "text/html", "null"),
+        ("binary", "application/octet-stream", "null"),
+        (
+            "attachment",
+            "application/octet-stream",
+            "attachment; filename=test.bin",
+        ),
+        (
+            "forwarded",
+            "application/octet-stream",
+            "attachment; filename=test.bin",
+        ),
+    ] {
+        let response = runtime
+            .block_on(crate::http::fetch_navigation(
+                &url::Url::parse(&format!("{base}/{path}")).unwrap(),
+                None,
+                None,
+                &storage,
+                false,
+            ))
+            .unwrap();
+        let id = response
+            .service_client
+            .as_ref()
             .unwrap()
-            .iter()
-            .any(|h| h.starts_with("get /next ")
-                && h.contains("service-worker-navigation-preload: preload-test\r\n"))
-    );
+            .client()
+            .id
+            .clone();
+        assert_eq!(
+            String::from_utf8(response.body).unwrap(),
+            format!("navigate|document|{id}|{mime}|{disposition}|preloaded\n"),
+            "worker's {path} navigation response",
+        );
+        let requests = requests.lock().unwrap();
+        assert!(requests.iter().any(|h| {
+            h.starts_with(&format!("get /{path} "))
+                && h.contains("service-worker-navigation-preload: preload-test\r\n")
+                && h.contains("sec-fetch-mode: navigate\r\n")
+                && h.contains("sec-fetch-dest: document\r\n")
+        }));
+    }
     runtime.block_on(async {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while requests

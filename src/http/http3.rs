@@ -647,11 +647,9 @@ async fn receive(
 /// read: none at all, or a download navigation (Save/Open reads it).
 fn body_unread(request: &Request, status: u16, headers: &Headers) -> (bool, bool) {
     let no_content = request.method == "HEAD" || matches!(status, 204 | 205 | 304);
-    let navigation_get = request.method == "GET"
-        && request
-            .fetch_metadata
-            .is_some_and(|m| m.destination == "document");
-    let skip = !no_content && navigation_get && super::navigation_headers_need_download(headers);
+    let skip = !no_content
+        && request.may_omit_navigation_download_body()
+        && super::navigation_headers_need_download(headers);
     (no_content, skip)
 }
 

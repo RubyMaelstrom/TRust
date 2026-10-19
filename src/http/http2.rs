@@ -652,11 +652,9 @@ async fn receive_head(
     let (status, headers, cookies, recv) = response_head(response, timing, clock).await?;
     let no_content =
         request.method.eq_ignore_ascii_case("HEAD") || matches!(status, 204 | 205 | 304);
-    let navigation_get = request.method.eq_ignore_ascii_case("GET")
-        && request
-            .fetch_metadata
-            .is_some_and(|m| m.destination == "document");
-    let skip = !no_content && navigation_get && super::navigation_headers_need_download(&headers);
+    let skip = !no_content
+        && request.may_omit_navigation_download_body()
+        && super::navigation_headers_need_download(&headers);
     Ok(Head {
         status,
         headers,
@@ -1084,6 +1082,67 @@ mod tests {
             .unwrap()
             .send_data(Bytes::from_static(bytes), true)
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn http2_script_navigation_fetches_preserve_download_bytes() {
+        // Fetch #concept-body-consume-body / SW #handle-fetch are consumers
+        // of a Response, before HTML #navigation-as-a-download presentation.
+        const BYTES: &[u8] = b"network \0preload\xff\n";
+        let site = Site::new(&[b"h2"]).await;
+        let mut request = site.request.clone();
+        super::super::set_navigation_metadata(&mut request, None);
+        let _server = site.serve(|request, mut respond| async move {
+            assert_eq!(request.headers()["sec-fetch-mode"], "navigate");
+            assert_eq!(request.headers()["sec-fetch-dest"], "document");
+            let path = request.uri().path();
+            let mime = if path.starts_with("/binary") {
+                "application/octet-stream"
+            } else {
+                "text/html"
+            };
+            let mut response = http_wire::Response::builder()
+                .header("content-type", mime)
+                .header("content-length", BYTES.len());
+            if path.ends_with("attachment") {
+                response = response.header("content-disposition", "attachment; filename=test.bin");
+            }
+            respond
+                .send_response(response.body(()).unwrap(), false)
+                .unwrap()
+                .send_data(Bytes::from_static(BYTES), true)
+                .unwrap();
+        });
+        for (path, download) in [
+            ("/html", false),
+            ("/binary", true),
+            ("/html-attachment", true),
+            ("/binary-attachment", true),
+        ] {
+            request.url.set_path(path);
+            let response = super::super::fetch_script_with_timing(&request)
+                .await
+                .unwrap();
+            assert_eq!(response.body, BYTES, "buffered {path}");
+            assert_eq!(response.timing.unwrap().next_hop_protocol, "h2");
+            let (response, body) = super::super::fetch_script_streaming(&request)
+                .await
+                .unwrap();
+            assert!(response.body.is_empty());
+            assert_eq!(response.timing.unwrap().next_hop_protocol, "h2");
+            let mut body = body.expect("a Fetch response body streams even for downloads");
+            let mut bytes = Vec::new();
+            while let Some(chunk) = body.next().await.unwrap() {
+                bytes.extend_from_slice(&chunk);
+            }
+            assert_eq!(bytes, BYTES, "streamed {path}");
+            let direct = fetch(&request).await.unwrap();
+            assert_eq!(
+                direct.body.as_slice(),
+                if download { &[][..] } else { BYTES },
+                "direct navigation {path}",
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

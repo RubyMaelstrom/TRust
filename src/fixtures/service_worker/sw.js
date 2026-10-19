@@ -36,7 +36,8 @@ addEventListener('fetch', event => {
       const cache = await caches.open('servo-acceptance');
       const saved = await (await cache.match('results')).text();
       const pass = text.trim() === 'network preload' && event.replacesClientId && event.resultingClientId;
-      return new Response(`<!doctype html><title>${pass ? 'PASS' : 'FAIL'} navigation</title><h1>${pass ? 'PASS' : 'FAIL'} navigation preload</h1><p>${saved}</p><p>Navigation committed with a new client.</p>`,
+      const detail = pass ? '' : `<p>Preload body matches: ${text.trim() === 'network preload'}; replaces client: ${!!event.replacesClientId}; resulting client: ${!!event.resultingClientId}.</p><p>Preload status: ${preload.status}; type: ${preload.type}; text: ${encodeURIComponent(text).slice(0, 512)}.</p>`;
+      return new Response(`<!doctype html><title>${pass ? 'PASS' : 'FAIL'} navigation</title><h1>${pass ? 'PASS' : 'FAIL'} navigation preload</h1><p>${saved}</p>${detail}<p>Navigation committed with a new client.</p>`,
         {headers:{'content-type':'text/html'}});
     })());
   }

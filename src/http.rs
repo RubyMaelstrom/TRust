@@ -372,7 +372,21 @@ pub(crate) struct WebRequestOptions {
     pub reload_navigation: bool,
     pub history_navigation: bool,
     pub replaces_client_id: String,
+    pub response_body: ResponseBodyPolicy,
 }
+
+/// A browser consumption choice, separate from Fetch's request mode and
+/// destination. Navigation preload retains mode `navigate` and destination
+/// `document` while exposing its Response to a service worker.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum ResponseBodyPolicy {
+    /// A direct frontend navigation can defer a download body to Save/Open.
+    #[default]
+    OmitNavigationDownload,
+    /// Fetch consumers, including navigation preload, require the body bytes.
+    Preserve,
+}
+
 impl Default for WebRequestOptions {
     fn default() -> Self {
         Self {
@@ -383,6 +397,7 @@ impl Default for WebRequestOptions {
             reload_navigation: false,
             history_navigation: false,
             replaces_client_id: String::new(),
+            response_body: ResponseBodyPolicy::default(),
         }
     }
 }
@@ -603,6 +618,14 @@ pub(crate) struct FetchMetadata {
 }
 
 impl Request {
+    fn may_omit_navigation_download_body(&self) -> bool {
+        self.web.response_body == ResponseBodyPolicy::OmitNavigationDownload
+            && self.method.eq_ignore_ascii_case("GET")
+            && self
+                .fetch_metadata
+                .is_some_and(|metadata| metadata.destination == "document")
+    }
+
     /// Fetch #concept-bodyinit-extract leaves the type null for BufferSource
     /// and untyped Blob bodies. Preserve an explicit empty header separately.
     fn content_type(&self) -> Option<&str> {
@@ -2447,20 +2470,21 @@ pub(crate) async fn fetch_with_timing(
     request: &Request,
     policy: crate::referrer_policy::ReferrerPolicy,
 ) -> Result<FetchResponseDetails, TimedFetchError> {
-    fetch_with_timing_into(request, policy, None).await
+    fetch_with_timing_into(request, policy, None, request.web.response_body).await
 }
 
 async fn fetch_with_timing_into(
     request: &Request,
     policy: crate::referrer_policy::ReferrerPolicy,
     mut sink: BodySink<'_>,
+    response_body: ResponseBodyPolicy,
 ) -> Result<FetchResponseDetails, TimedFetchError> {
     if std::env::var_os("TRUST_NET_TRACE").is_none() {
-        return fetch_redirecting(request, policy, sink).await;
+        return fetch_redirecting(request, policy, sink, response_body).await;
     }
     let at = trace_ms();
     let started = std::time::Instant::now();
-    let result = fetch_redirecting(request, policy, sink.as_deref_mut()).await;
+    let result = fetch_redirecting(request, policy, sink.as_deref_mut(), response_body).await;
     let ms = started.elapsed().as_millis();
     let streamed = if sink.is_some_and(|slot| slot.is_some()) {
         " (body streams)"
@@ -2548,9 +2572,18 @@ async fn fetch_script_timing_into(
 }
 
 async fn fetch_timed(request: &Request, sink: BodySink<'_>) -> Result<Response, TimedFetchError> {
-    fetch_with_timing_into(request, Default::default(), sink)
-        .await
-        .map(|details| details.response)
+    // Fetch #dom-global-fetch/#concept-body-consume-body and SW92aba3be
+    // #handle-fetch expose a response body even when the Request originated
+    // as a navigation. HTML #navigation-as-a-download applies only when its
+    // final response is presented, after the worker can inspect/replace it.
+    fetch_with_timing_into(
+        request,
+        Default::default(),
+        sink,
+        ResponseBodyPolicy::Preserve,
+    )
+    .await
+    .map(|details| details.response)
 }
 
 async fn fetch_script_timing_inner(
@@ -3117,8 +3150,9 @@ async fn fetch_redirecting(
     request: &Request,
     policy: crate::referrer_policy::ReferrerPolicy,
     mut sink: BodySink<'_>,
+    response_body: ResponseBodyPolicy,
 ) -> Result<FetchResponseDetails, TimedFetchError> {
-    let result = fetch_redirecting_inner(request, policy, sink.as_deref_mut()).await;
+    let result = fetch_redirecting_inner(request, policy, sink.as_deref_mut(), response_body).await;
     if let Some(slot) = sink
         && result.is_err()
     {
@@ -3131,6 +3165,7 @@ async fn fetch_redirecting_inner(
     request: &Request,
     policy: crate::referrer_policy::ReferrerPolicy,
     mut sink: BodySink<'_>,
+    response_body: ResponseBodyPolicy,
 ) -> Result<FetchResponseDetails, TimedFetchError> {
     let mut policy = request.referrer_policy.unwrap_or(policy);
     let mut navigation_context = request
@@ -3151,6 +3186,7 @@ async fn fetch_redirecting_inner(
             .iter()
             .any(|(name, _)| name.eq_ignore_ascii_case("referer"));
     let mut request = request.clone();
+    request.web.response_body = response_body;
     if let Some(context) = request.service_worker.clone() {
         context.apply_client_origin(&mut request);
     }
@@ -6268,14 +6304,10 @@ async fn exchange_head(
     }
     io.flush().await.map_err(|e| e.to_string())?;
 
-    let navigation_get = request.method.eq_ignore_ascii_case("GET")
-        && request
-            .fetch_metadata
-            .is_some_and(|metadata| metadata.destination == "document");
     read_response_head(
         io,
         request.method.eq_ignore_ascii_case("HEAD"),
-        navigation_get,
+        request.may_omit_navigation_download_body(),
         Some(timing),
     )
     .await
@@ -6559,8 +6591,10 @@ async fn read_response_head<R: AsyncRead + Unpin>(
     }
     // WHATWG HTML "loading a document": an attachment or a type for which
     // TRust has no internal presentation must not be consumed as a document.
-    // Stop after headers for GET navigations; Save/Open owns a separate bounded
-    // streaming transfer, so large PDFs/media never enter the 16 MiB page heap.
+    // Stop after headers for direct GET navigations; Save/Open owns a separate bounded
+    // streaming transfer, so large PDFs/media never enter the page heap.
+    // Script Fetch and navigation preload preserve their body independently
+    // of their unchanged Fetch mode/destination (SW #handle-fetch).
     if navigation_get && navigation_headers_need_download(&headers) {
         return Ok(Http1Head {
             status,

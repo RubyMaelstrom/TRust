@@ -439,6 +439,68 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn http1_script_navigation_fetches_preserve_download_bytes() {
+        // SW92aba3be #handle-fetch exposes navigation preload's Response;
+        // Fetch394d20d #concept-body-consume-body reads bytes regardless of
+        // MIME/disposition. Only the direct HTML navigation consumer can
+        // defer a download body to Save/Open (#navigation-as-a-download).
+        const BYTES: &[u8] = b"network \0preload\xff\n";
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..12 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let head = read_head(&mut socket).await;
+                assert!(head.contains("Sec-Fetch-Mode: navigate\r\n"), "{head}");
+                assert!(head.contains("Sec-Fetch-Dest: document\r\n"), "{head}");
+                let path = head.split_whitespace().nth(1).unwrap();
+                let mime = if path.starts_with("/binary") {
+                    "application/octet-stream"
+                } else {
+                    "text/html"
+                };
+                let disposition = if path.ends_with("attachment") {
+                    "Content-Disposition: attachment; filename=test.bin\r\n"
+                } else {
+                    ""
+                };
+                socket
+                    .write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\n{disposition}Content-Length: {}\r\nConnection: close\r\n\r\n", BYTES.len()).as_bytes())
+                    .await
+                    .unwrap();
+                socket.write_all(BYTES).await.unwrap();
+            }
+        });
+        for (path, download) in [
+            ("/html", false),
+            ("/binary", true),
+            ("/html-attachment", true),
+            ("/binary-attachment", true),
+        ] {
+            let request = super::super::navigation_request(request(address, path).url, None, None);
+            let response = super::super::fetch_script_with_timing(&request)
+                .await
+                .unwrap();
+            assert_eq!(response.body, BYTES, "buffered {path}");
+            let (response, body) = fetch_script_streaming(&request).await.unwrap();
+            assert!(response.body.is_empty());
+            let mut body = body.expect("a Fetch response body streams even for downloads");
+            let mut bytes = Vec::new();
+            while let Some(chunk) = body.next().await.unwrap() {
+                bytes.extend_from_slice(&chunk);
+            }
+            assert_eq!(bytes, BYTES, "streamed {path}");
+            let direct = fetch(&request).await.unwrap();
+            assert_eq!(
+                direct.body.as_slice(),
+                if download { &[][..] } else { BYTES },
+                "direct navigation {path}",
+            );
+        }
+        server.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn http1_chunked_body_streams_then_returns_its_connection_to_the_pool() {
         // RFC 9112 §7.1 chunks are handed over as they arrive; a body read to
         // its end leaves the connection at a message boundary for reuse.
