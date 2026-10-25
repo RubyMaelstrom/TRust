@@ -399,6 +399,12 @@ ratatui-image = { path = "vendor/ratatui-image-11.1.0" }
 # Assertions may disappear in release builds; runtime mutations must not.
 debug_assert_with_mut_call = "deny"
 
+# The JavaScript engine is optimized in debug builds too. Its debug assertions stay
+# on, among them the collector's whole-heap checks at every collection, which
+# unoptimized took most of a page load's time and missed real-time budgets in tests.
+[profile.dev.package.trust-js]
+opt-level = 2
+
 # Fast optimized binaries for development, acceptance testing, and local
 # installs. Keep release semantics while allowing parallel, incremental codegen.
 [profile.release]
