@@ -1,6 +1,6 @@
 //! Private, byte-oriented WebGL host boundary. JS bindings perform Web IDL
 //! conversions and brand checks before any driver state is borrowed.
-use super::{Ctx, HostState, Value, host_arg_node, host_arg_string, host_dom};
+use super::{Ctx, HostState, Value, ValueKind, host_arg_node, host_arg_string, host_dom};
 use crate::webgl::{Attributes, Context, Reply};
 
 #[path = "webgl_host/fast.rs"]
@@ -21,7 +21,7 @@ fn offscreen_id(key: usize) -> Option<u32> {
 }
 
 /// Whether a binding's canvas argument names an OffscreenCanvas context.
-pub(super) fn is_offscreen_argument(value: Option<&Value>) -> bool {
+pub(super) fn is_offscreen_argument<'s>(value: Option<&Value<'s>>) -> bool {
     value
         .and_then(Value::as_num_opt)
         .is_some_and(|key| key.is_finite() && key >= OFFSCREEN_KEYS as f64)
@@ -48,7 +48,7 @@ fn with_canvas<R>(
     }
 }
 
-pub(super) fn publish(ctx: &mut Ctx, present: bool, only: Option<usize>) {
+pub(super) fn publish<'s>(ctx: &mut Ctx<'s>, present: bool, only: Option<usize>) {
     let Some(state) = ctx.host_mut::<HostState>() else {
         return;
     };
@@ -111,7 +111,7 @@ pub(super) fn publish(ctx: &mut Ctx, present: bool, only: Option<usize>) {
 
 /// Read an OffscreenCanvas's WebGL drawing buffer back into its bitmap
 /// before the bitmap is consumed.
-pub(super) fn publish_offscreen(ctx: &mut Ctx, id: u32) {
+pub(super) fn publish_offscreen<'s>(ctx: &mut Ctx<'s>, id: u32) {
     let key = offscreen_key(id);
     if ctx
         .host_mut::<HostState>()
@@ -122,7 +122,7 @@ pub(super) fn publish_offscreen(ctx: &mut Ctx, id: u32) {
 }
 
 /// HTML #dom-offscreencanvas-transfertoimagebitmap step 4 for WebGL.
-pub(super) fn clear_offscreen(ctx: &mut Ctx, id: u32) {
+pub(super) fn clear_offscreen<'s>(ctx: &mut Ctx<'s>, id: u32) {
     if let Some(context) = ctx
         .host_mut::<HostState>()
         .and_then(|state| state.webgl.get_mut(&offscreen_key(id)))
@@ -131,7 +131,11 @@ pub(super) fn clear_offscreen(ctx: &mut Ctx, id: u32) {
     }
 }
 
-pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(super) fn call<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let mut op = host_arg_string(ctx, args, 1);
     let payload = args.get(3).cloned().unwrap_or(Value::Undefined);
     if op == "fastMethod" {
@@ -148,18 +152,18 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
                     .webgl_slots
                     .clone()
                     .unwrap();
+                let slots = super::held(ctx, &slots);
                 ctx.weak_map_get(&slots, args.first().unwrap_or(&Value::Undefined))
             },
         )));
     }
     if op == "slots" || op == "canvasSlots" {
-        let state = ctx.host_mut::<HostState>().unwrap();
-        let slots = if op == "slots" {
-            &mut state.webgl_slots
+        let slot: fn(&mut HostState) -> &mut Option<trust_js::embed::Handle> = if op == "slots" {
+            |state| &mut state.webgl_slots
         } else {
-            &mut state.canvas_context_slots
+            |state| &mut state.canvas_context_slots
         };
-        return Ok(slots.get_or_insert(payload).clone());
+        return Ok(super::shared_slot(ctx, slot, payload));
     }
     let mut n = Vec::new();
     if let Some(values) = args.get(2) {
@@ -219,7 +223,7 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
     if matches!(
         op.as_str(),
         "bufferData" | "bufferSubData" | "texImage2D" | "texSubImage2D" | "readPixels"
-    ) && !matches!(payload, Value::Undefined | Value::Null)
+    ) && !matches!(payload.kind(), ValueKind::Undefined | ValueKind::Null)
         && bytes.is_none()
     {
         return Err(ctx.make_error("TypeError", "Expected an attached BufferSource"));
@@ -324,13 +328,13 @@ fn attributes(n: &[f64]) -> Attributes {
 /// WebGL 1.0 §2.1 context creation for an OffscreenCanvas (HTML
 /// #dom-offscreencanvas-getcontext "webgl"): the drawing buffer takes the
 /// OffscreenCanvas's dimensions; its frames become the canvas's bitmap.
-fn init_offscreen(
-    ctx: &mut Ctx,
+fn init_offscreen<'s>(
+    ctx: &mut Ctx<'s>,
     key: usize,
     id: u32,
     n: &[f64],
     text: String,
-) -> Result<Value, Value> {
+) -> Result<Value<'s>, Value<'s>> {
     let state = ctx.host_mut::<HostState>().unwrap();
     let Some(offscreen) = state.offscreen_canvases.get(&id).cloned() else {
         return Err(ctx.make_error("TypeError", "Invalid WebGL canvas"));
@@ -381,8 +385,8 @@ fn init_offscreen(
     }
 }
 
-fn execute(
-    ctx: &mut Ctx,
+fn execute<'s>(
+    ctx: &mut Ctx<'s>,
     id: usize,
     op: &str,
     n: &[f64],
@@ -444,8 +448,8 @@ fn execute(
     result
 }
 
-fn execute_offscreen(
-    ctx: &mut Ctx,
+fn execute_offscreen<'s>(
+    ctx: &mut Ctx<'s>,
     key: usize,
     op: &str,
     n: &[f64],
@@ -501,12 +505,12 @@ fn execute_offscreen(
     result
 }
 
-fn value(ctx: &mut Ctx, result: Reply) -> Result<Value, Value> {
+fn value<'s>(ctx: &mut Ctx<'s>, result: Reply) -> Result<Value<'s>, Value<'s>> {
     Ok(match result {
         Reply::Null => Value::Null,
         Reply::Number(n) => Value::Num(n),
         Reply::Bool(b) => Value::Bool(b),
-        Reply::Text(s) => Value::from_string(s),
+        Reply::Text(s) => ctx.string(s),
         Reply::Bytes(bytes) => ctx.make_uint8array(&bytes)?,
         Reply::Array(values) => {
             let values = values

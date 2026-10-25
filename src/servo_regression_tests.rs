@@ -110,7 +110,7 @@ fn servo_audit_cross_origin_window_and_location_exotic_descriptors() {
     )
     .unwrap();
     let realm = {
-        let state = engine.ctx().host_mut::<HostState>().unwrap();
+        let state = engine.host_mut::<HostState>().unwrap();
         let context = *state.window_realms.keys().max().unwrap();
         state.window_realms[&context].clone()
     };

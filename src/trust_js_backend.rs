@@ -12,10 +12,10 @@ use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use trust_js::bytecode::Tier;
+use trust_js::Tier;
 use trust_js::embed::{
-    Ctx, EvalError, HostGc, HostGcVisitor, HostRetainedMemoryVisitor, NativeFn, NativeGcId,
-    RetainedManagedAllocation, RetainedMemory, Value,
+    Ctx, EvalError, Handle, HostGc, HostGcVisitor, HostRetainedMemoryVisitor, HostTrace, NativeFn,
+    NativeGcId, RetainedManagedAllocation, RetainedMemory, Value, ValueKind, ValueList, WeakHandle,
 };
 
 #[path = "canvas_host.rs"]
@@ -69,6 +69,154 @@ const DEFAULT_VIEWPORT: crate::layout2::Viewport = crate::layout2::Viewport {
     width: 640.0,
     height: 384.0,
 };
+
+/// The value `handle` keeps, read into `ctx`'s scope. TRust keeps handles only of the Engine
+/// whose natives and tasks read them.
+fn held<'s>(ctx: &Ctx<'s>, handle: &Handle) -> Value<'s> {
+    handle.get(ctx).expect("a handle is read by its own Engine")
+}
+
+/// A handle keeping `value`, one of `ctx`'s values.
+fn hold<'s>(ctx: &Ctx<'s>, value: &Value<'s>) -> Handle {
+    Handle::new(ctx, value).expect("a handle is made outside collections")
+}
+
+/// A weak handle naming `value`, one of `ctx`'s values.
+fn hold_weakly<'s>(ctx: &Ctx<'s>, value: &Value<'s>) -> WeakHandle {
+    WeakHandle::new(ctx, value).expect("a handle is made outside collections")
+}
+
+/// A value crossing between the page actor and a scope of its engine: a primitive by value, a
+/// string by its engine text, anything else by a handle. The actor's platform calls
+/// (`call_trust`) take their arguments and give their results in this form.
+#[derive(Clone, Debug)]
+enum TrustValue {
+    Undefined,
+    Null,
+    Bool(bool),
+    Num(f64),
+    Str(String),
+    /// An argument that becomes a new Array of these values.
+    Array(Vec<TrustValue>),
+    /// An object, Symbol or BigInt, with its ToBoolean.
+    Held {
+        value: Handle,
+        truthy: bool,
+    },
+}
+
+impl TrustValue {
+    /// `value`, read out of its scope.
+    fn read<'s>(ctx: &mut Ctx<'s>, value: Value<'s>) -> TrustValue {
+        match value.kind() {
+            ValueKind::Undefined => TrustValue::Undefined,
+            ValueKind::Null => TrustValue::Null,
+            ValueKind::Bool(value) => TrustValue::Bool(value),
+            ValueKind::Num(value) => TrustValue::Num(value),
+            ValueKind::Str(text) => TrustValue::Str(text.as_engine_text().to_owned()),
+            _ => TrustValue::Held {
+                truthy: ctx.to_boolean(&value),
+                value: hold(ctx, &value),
+            },
+        }
+    }
+
+    /// The value in `ctx`'s scope.
+    fn value<'s>(&self, ctx: &mut Ctx<'s>) -> Value<'s> {
+        match self {
+            TrustValue::Undefined => Value::Undefined,
+            TrustValue::Null => Value::Null,
+            TrustValue::Bool(value) => Value::Bool(*value),
+            TrustValue::Num(value) => Value::Num(*value),
+            TrustValue::Str(text) => ctx.string_from_engine_text(text.as_str()),
+            TrustValue::Array(items) => {
+                let items = TrustValue::values(ctx, items);
+                items.into_array(ctx)
+            }
+            TrustValue::Held { value, .. } => held(ctx, value),
+        }
+    }
+
+    /// The values in `ctx`'s scope, kept while the scope runs JavaScript.
+    fn values<'s>(ctx: &mut Ctx<'s>, values: &[TrustValue]) -> ValueList<'s> {
+        let mut list = ValueList::with_capacity(values.len());
+        for value in values {
+            let value = value.value(ctx);
+            list.push(value);
+        }
+        list
+    }
+
+    /// ECMAScript ToBoolean.
+    fn truthy(&self) -> bool {
+        match self {
+            TrustValue::Undefined | TrustValue::Null => false,
+            TrustValue::Bool(value) => *value,
+            TrustValue::Num(value) => *value != 0.0 && !value.is_nan(),
+            TrustValue::Str(text) => !text.is_empty(),
+            TrustValue::Array(_) => true,
+            TrustValue::Held { truthy, .. } => *truthy,
+        }
+    }
+
+    fn as_num_opt(&self) -> Option<f64> {
+        match self {
+            TrustValue::Num(value) => Some(*value),
+            _ => None,
+        }
+    }
+
+    /// A string of Rust text (`trust_js::embed::text_to_engine`).
+    fn from_text(text: impl AsRef<str>) -> TrustValue {
+        TrustValue::Str(trust_js::embed::text_to_engine(text.as_ref()).into_owned())
+    }
+
+    /// A string's engine text.
+    fn as_engine_text(&self) -> Option<&str> {
+        match self {
+            TrustValue::Str(text) => Some(text),
+            _ => None,
+        }
+    }
+
+    /// A string as Rust text (`trust_js::embed::engine_to_text`); empty for anything else.
+    fn text(&self) -> String {
+        self.as_engine_text()
+            .map(|text| trust_js::embed::engine_to_text(text).into_owned())
+            .unwrap_or_default()
+    }
+}
+
+/// A failed engine task, described in the scope that produced it.
+#[derive(Debug)]
+enum TaskError {
+    Interrupted(trust_js::InterruptReason, String),
+    Thrown(String),
+}
+
+impl TaskError {
+    fn read<'s>(ctx: &mut Ctx<'s>, error: EvalError<'s>, label: &str) -> TaskError {
+        match error {
+            EvalError::Interrupted(reason) => TaskError::Interrupted(reason, label.to_owned()),
+            EvalError::Throw(thrown) => TaskError::Thrown(describe_throw(ctx, thrown, label)),
+        }
+    }
+
+    /// The message a page records: none for navigation and cancellation, which end tasks by
+    /// design.
+    fn message(self) -> Option<String> {
+        match self {
+            TaskError::Interrupted(
+                trust_js::InterruptReason::UserNavigation | trust_js::InterruptReason::Cancelled,
+                _,
+            ) => None,
+            TaskError::Interrupted(reason, label) => {
+                Some(format!("{label} interrupted: {}", reason.message()))
+            }
+            TaskError::Thrown(message) => Some(message),
+        }
+    }
+}
 
 struct TrustJsGeomCache {
     epoch: u64,
@@ -147,7 +295,7 @@ struct TopHitKey {
     device_pixel_ratio: u32,
 }
 
-fn top_hit_key(ctx: &mut Ctx) -> TopHitKey {
+fn top_hit_key<'s>(ctx: &mut Ctx<'s>) -> TopHitKey {
     let state = ctx.host_mut::<HostState>().expect("HostState installed");
     let viewport = state.viewport.get();
     let device_pixel_ratio = state.device_pixel_ratio.get();
@@ -420,7 +568,7 @@ struct TrustJsBodyStream {
     /// None while the transfer runs; then whether it ended normally.
     end: Option<bool>,
     /// The resolve function of the stream's pending pullAlgorithm promise.
-    pull: Option<Value>,
+    pull: Option<Handle>,
 }
 
 impl TrustJsBodyStream {
@@ -443,7 +591,7 @@ struct TrustJsPendingFetch {
     /// Fetch's task destination: the environment whose global receives the
     /// networking task and owns the resulting Response/Body objects.
     context: u64,
-    resolve: Value,
+    resolve: Handle,
     /// HTML image requests retain their element until their networking task finishes.
     native_lease: Option<DomResourceLease>,
     /// A keepalive fetch outlives its document's loading: stopping the
@@ -487,7 +635,7 @@ struct ModuleFetchEnvironment {
 
 impl ModuleFetchEnvironment {
     /// The settings object `context` of this agent (a Window realm, or the worker's own).
-    fn of(ctx: &mut Ctx, context: u64) -> Self {
+    fn of<'s>(ctx: &mut Ctx<'s>, context: u64) -> Self {
         let Some(state) = ctx.host_mut::<HostState>() else {
             return Self::default();
         };
@@ -760,7 +908,9 @@ enum DomGcOwnerKind {
 }
 
 struct DomGcOwner {
-    value: Value,
+    /// The owner object, which the registry reports to the collector as part of the DOM's
+    /// graph (`HostState::trace_gc`) without keeping it.
+    value: WeakHandle,
     nodes: Vec<usize>,
     kind: DomGcOwnerKind,
 }
@@ -778,8 +928,6 @@ struct DomGcRegistry {
     /// Canonical Document wrappers cross Window realms during adoption. Pointer identities
     /// borrow the existing owner records; this index adds no strong JavaScript references.
     documents: rustc_hash::FxHashMap<usize, usize>,
-    /// Every inserted/replaced logical owner since the last successful native collection.
-    young_owners: rustc_hash::FxHashSet<usize>,
     /// Nodes whose wrapper has been given an event-listener list (DOM
     /// #concept-event-listener). Only their wrappers take part in listener
     /// discovery when a subtree is connected or disconnected, so the platform
@@ -788,15 +936,11 @@ struct DomGcRegistry {
     listener_nodes: rustc_hash::FxHashSet<usize>,
     pending_resources: Rc<RefCell<HashMap<usize, usize>>>,
     traced: Cell<bool>,
-    traced_minor: Cell<bool>,
 }
 
 impl DomGcRegistry {
-    fn node_identity(&self, value: &Value) -> Option<usize> {
-        let Value::Obj(object) = value else {
-            return None;
-        };
-        let entry = self.owners.get(&(Rc::as_ptr(object) as usize))?;
+    fn node_identity<'s>(&self, value: &Value<'s>) -> Option<usize> {
+        let entry = self.owners.get(&value.as_obj()?.addr())?;
         matches!(entry.kind, DomGcOwnerKind::Wrapper).then(|| entry.nodes[0])
     }
 
@@ -813,20 +957,21 @@ impl DomGcRegistry {
         }
     }
 
-    fn retain(&mut self, value: Value, nodes: Vec<usize>, kind: DomGcOwnerKind) {
-        let Value::Obj(object) = &value else {
-            return;
-        };
-        let identity = Rc::as_ptr(object) as usize;
+    /// Record the owner object `identity` (its address), named by `value`, as owning `nodes`;
+    /// no nodes forgets it.
+    fn retain(
+        &mut self,
+        identity: usize,
+        value: WeakHandle,
+        nodes: Vec<usize>,
+        kind: DomGcOwnerKind,
+    ) {
+        self.forget_document(identity);
         if nodes.is_empty() {
-            self.forget_document(identity);
             self.owners.remove(&identity);
-            self.young_owners.remove(&identity);
         } else {
-            self.forget_document(identity);
             self.owners
                 .insert(identity, DomGcOwner { value, nodes, kind });
-            self.young_owners.insert(identity);
         }
     }
 
@@ -945,7 +1090,7 @@ struct HostState {
     worker_self: Option<TrustJsWorkerSelf>,
     wasm: trust_js_wasm::PageWasm,
     next_window_context: u64,
-    window_realms: HashMap<u64, Value>,
+    window_realms: HashMap<u64, Handle>,
     /// Fetch/XHR's client settings belong to the initiating Window, not its
     /// embedding page. about:blank/srcdoc inherit their creator's origin.
     window_request_urls: HashMap<u64, url::Url>,
@@ -975,16 +1120,16 @@ struct HostState {
     early_imports: Rc<RefCell<HashMap<u64, TrustJsDynamicModuleLoader>>>,
     /// One private WeakMap shared by this Agent's ImageData interface bindings. The map is
     /// rooted, not its keys: same-Agent cross-Realm getters keep their Web IDL brand semantics.
-    image_data_slots: Option<Value>,
-    image_bitmap_slots: Option<Value>,
-    canvas_gradient_slots: Option<Value>,
-    canvas_text_metrics_slots: Option<Value>,
-    canvas_context_slots: Option<Value>,
-    webgl_slots: Option<Value>,
+    image_data_slots: Option<Handle>,
+    image_bitmap_slots: Option<Handle>,
+    canvas_gradient_slots: Option<Handle>,
+    canvas_text_metrics_slots: Option<Handle>,
+    canvas_context_slots: Option<Handle>,
+    webgl_slots: Option<Handle>,
     webgl_fast: webgl_host::FastCache,
     webgl: HashMap<usize, crate::webgl::Context>,
     import_maps: HashMap<u64, crate::import_maps::Handle>,
-    permission_slots: Option<Value>,
+    permission_slots: Option<Handle>,
     /// Permissions #dfn-permission-store for this page: origin + feature name to state. Window
     /// Realms and the page's dedicated workers share it; TRust has no permission UI, so entries
     /// only record decisions made during this page's lifetime.
@@ -992,7 +1137,7 @@ struct HostState {
     /// Clipboard API writes that passed their permission check, awaiting delivery to the
     /// frontend, and the platform callbacks that settle each request's promise.
     clipboard_requests: Vec<(u64, String)>,
-    clipboard_settlers: HashMap<u64, Value>,
+    clipboard_settlers: HashMap<u64, Handle>,
     next_clipboard_request: u64,
     /// Selection API §2 for the frontend: a Document's selection changed
     /// since the last `PageEvt::Selection` (`__selection_changed`).
@@ -1019,25 +1164,25 @@ struct HostState {
     /// `@import` URLs whose fetch started and has not completed (HTML
     /// #critical-subresources; see `dom::style_load`).
     in_flight_imports: std::collections::HashSet<String>,
-    audio_context_slots: Option<Value>,
-    history_slots: Option<Value>,
+    audio_context_slots: Option<Handle>,
+    history_slots: Option<Handle>,
     history_traversals: Vec<(u64, i32)>,
-    pointer_lock_state: Option<Value>,
-    navigator_slots: Option<Value>,
-    screen_slots: Option<Value>,
-    performance_slots: Option<Value>,
-    element_slots: Option<Value>,
+    pointer_lock_state: Option<Handle>,
+    navigator_slots: Option<Handle>,
+    screen_slots: Option<Handle>,
+    performance_slots: Option<Handle>,
+    element_slots: Option<Handle>,
     /// Platform-private, same-Agent WeakMaps created by the first bootstrap and shared by every
     /// later Realm (see `host_platform_slots`). `controls` maps each Window or worker global to its
     /// private control object; Rust reaches the platform only through it. `nodes` holds each DOM
     /// wrapper's arena id and `internals` other per-object platform state, as internal slots
     /// instead of author-visible (and forgeable) properties.
-    platform_controls: Option<Value>,
-    platform_nodes: Option<Value>,
-    platform_internals: Option<Value>,
+    platform_controls: Option<Handle>,
+    platform_nodes: Option<Handle>,
+    platform_internals: Option<Handle>,
     /// The Agent's top-level traversable records (its Windows' `opener`,
     /// `name`, named targets, `closed`), shared by every Window Realm.
-    platform_traversables: Option<Value>,
+    platform_traversables: Option<Handle>,
     live_ranges: live_range_host::Registry,
     geometry: geometry_host::Registry,
     /// Streaming TextDecoder state for non-UTF-8 encodings.
@@ -1053,10 +1198,10 @@ struct HostState {
     /// frees its entry, a transfer moves it to the receiving agent.
     offscreen_canvases: HashMap<u32, Rc<RefCell<crate::canvas_offscreen::Offscreen>>>,
     next_offscreen_canvas: u32,
-    pointer_event_slots: Option<Value>,
-    image_element_slots: Option<Value>,
-    window_message_slots: Option<Value>,
-    wasm_module_slots: Option<Value>,
+    pointer_event_slots: Option<Handle>,
+    image_element_slots: Option<Handle>,
+    window_message_slots: Option<Handle>,
+    wasm_module_slots: Option<Handle>,
     /// Child Window Realms share this Agent; dedicated workers inherit its cluster.
     agent_cluster: u64,
     /// The host settings context of the selected traversable's top-level
@@ -1088,7 +1233,7 @@ struct Traversables {
     next: u32,
     /// The engine's default Realm, Window context 0, while its Document is
     /// active (the engine pins it).
-    default_realm: Option<Value>,
+    default_realm: Option<Handle>,
     /// Auxiliary browsing contexts pages created that the page actor has
     /// yet to give a frontend (`host_create_auxiliary_traversable`).
     created: Vec<CreatedTraversable>,
@@ -1386,7 +1531,7 @@ impl HostState {
 
     /// The Window Realm of settings context `context`, if its Document is
     /// active: a Realm created for it, or the engine's default Realm.
-    fn window_realm(&self, context: u64) -> Option<Value> {
+    fn window_realm(&self, context: u64) -> Option<Handle> {
         self.window_realms.get(&context).cloned().or_else(|| {
             (context == 0)
                 .then(|| self.traversables.default_realm.clone())
@@ -1912,19 +2057,19 @@ impl RetainedMemory for HostState {
             window_parents,
             parser,
             early_imports,
-            image_data_slots,
-            image_bitmap_slots,
-            canvas_gradient_slots,
-            canvas_text_metrics_slots,
-            canvas_context_slots,
-            webgl_slots,
+            image_data_slots: _,
+            image_bitmap_slots: _,
+            canvas_gradient_slots: _,
+            canvas_text_metrics_slots: _,
+            canvas_context_slots: _,
+            webgl_slots: _,
             webgl_fast,
             webgl,
             import_maps,
-            permission_slots,
+            permission_slots: _,
             permission_store,
             clipboard_requests,
-            clipboard_settlers,
+            clipboard_settlers: _,
             next_clipboard_request: _,
             selection_dirty: _,
             selection_serial: _,
@@ -1932,22 +2077,22 @@ impl RetainedMemory for HostState {
             context_menus: _,
             fullscreen_requests: _,
             file_picker_requests,
-            file_picker_settlers,
+            file_picker_settlers: _,
             next_file_picker_request: _,
             user_files,
             in_flight_imports,
-            audio_context_slots,
-            history_slots,
+            audio_context_slots: _,
+            history_slots: _,
             history_traversals,
-            pointer_lock_state,
-            navigator_slots,
-            screen_slots,
-            performance_slots,
-            element_slots,
-            platform_controls,
-            platform_nodes,
-            platform_internals,
-            platform_traversables,
+            pointer_lock_state: _,
+            navigator_slots: _,
+            screen_slots: _,
+            performance_slots: _,
+            element_slots: _,
+            platform_controls: _,
+            platform_nodes: _,
+            platform_internals: _,
+            platform_traversables: _,
             live_ranges,
             geometry,
             text_decoders,
@@ -1956,10 +2101,10 @@ impl RetainedMemory for HostState {
             next_canvas_pattern: _,
             offscreen_canvases,
             next_offscreen_canvas: _,
-            pointer_event_slots,
-            image_element_slots,
-            window_message_slots,
-            wasm_module_slots,
+            pointer_event_slots: _,
+            image_element_slots: _,
+            window_message_slots: _,
+            wasm_module_slots: _,
             agent_cluster: _,
             top_context: _,
             traversables,
@@ -1980,7 +2125,6 @@ impl RetainedMemory for HostState {
             dom_gc.owners.capacity() * std::mem::size_of::<(usize, DomGcOwner)>()
                 + dom_gc.documents.capacity() * std::mem::size_of::<(usize, usize)>()
                 + dom_gc.wrappers.capacity() * std::mem::size_of::<(usize, usize)>()
-                + dom_gc.young_owners.capacity() * std::mem::size_of::<usize>()
                 + dom_gc.listener_nodes.capacity() * std::mem::size_of::<usize>()
                 + dom_gc
                     .owners
@@ -1990,9 +2134,6 @@ impl RetainedMemory for HostState {
                 + dom_gc.pending_resources.borrow().capacity()
                     * std::mem::size_of::<(usize, usize)>(),
         ));
-        for owner in dom_gc.owners.values() {
-            visitor.value(&owner.value);
-        }
 
         // Every traversable's arena: the selected one's, then the parked.
         for dom in std::iter::once(dom).chain(traversables.parked.iter().map(|(_, slot)| &slot.dom))
@@ -2212,16 +2353,8 @@ impl RetainedMemory for HostState {
             if network.pending_fetches.capacity() != 0 {
                 visitor.opaque_storage();
             }
-            for pending in network.pending_fetches.values() {
-                visitor.value(&pending.resolve);
-            }
             if network.body_streams.capacity() != 0 {
                 visitor.opaque_storage();
-            }
-            for stream in network.body_streams.values() {
-                if let Some(pull) = &stream.pull {
-                    visitor.value(pull);
-                }
             }
             report_arc_payload(
                 visitor,
@@ -2306,29 +2439,11 @@ impl RetainedMemory for HostState {
             visitor.opaque_storage();
             visitor.allocation(RetainedManagedAllocation::new(
                 "trust.window-realm-table",
-                window_realms as *const HashMap<u64, Value> as usize,
+                window_realms as *const HashMap<u64, Handle> as usize,
                 window_realms
                     .capacity()
-                    .saturating_mul(std::mem::size_of::<(u64, Value)>()),
+                    .saturating_mul(std::mem::size_of::<(u64, Handle)>()),
             ));
-        }
-        for value in window_realms.values() {
-            visitor.value(value);
-        }
-        if let Some(value) = image_data_slots {
-            visitor.value(value);
-        }
-        if let Some(value) = image_bitmap_slots {
-            visitor.value(value);
-        }
-        if let Some(value) = canvas_gradient_slots {
-            visitor.value(value);
-        }
-        if let Some(value) = canvas_text_metrics_slots {
-            visitor.value(value);
-        }
-        for value in [canvas_context_slots, webgl_slots].into_iter().flatten() {
-            visitor.value(value);
         }
         for map in import_maps.values() {
             visitor.allocation(RetainedManagedAllocation::new(
@@ -2357,15 +2472,6 @@ impl RetainedMemory for HostState {
                     .map(crate::webgl::Context::retained_bytes)
                     .sum(),
             ));
-        }
-        if let Some(value) = permission_slots {
-            visitor.value(value);
-        }
-        for value in clipboard_settlers.values() {
-            visitor.value(value);
-        }
-        for settler in file_picker_settlers.values() {
-            visitor.value(&settler.settle);
         }
         let picker_bytes: usize = file_picker_requests
             .iter()
@@ -2420,30 +2526,12 @@ impl RetainedMemory for HostState {
                 permission_entries,
             ));
         }
-        if let Some(value) = audio_context_slots {
-            visitor.value(value);
-        }
         if history_traversals.capacity() != 0 {
             visitor.allocation(RetainedManagedAllocation::new(
                 "trust.history-traversals",
                 history_traversals.as_ptr() as usize,
                 history_traversals.capacity() * std::mem::size_of::<(u64, i32)>(),
             ));
-        }
-        if let Some(value) = history_slots {
-            visitor.value(value);
-        }
-        if let Some(value) = pointer_lock_state {
-            visitor.value(value);
-        }
-        if let Some(value) = navigator_slots {
-            visitor.value(value);
-        }
-        if let Some(value) = screen_slots {
-            visitor.value(value);
-        }
-        if let Some(value) = performance_slots {
-            visitor.value(value);
         }
         live_ranges.scan_retained_memory(visitor);
         geometry.scan_retained_memory(visitor);
@@ -2461,35 +2549,6 @@ impl RetainedMemory for HostState {
                 .try_borrow()
                 .map_or(0, |canvas| canvas.retained_bytes());
             report_rc_payload(visitor, "trust.offscreen-canvas", canvas, bytes);
-        }
-        if let Some(value) = element_slots {
-            visitor.value(value);
-        }
-        for value in [
-            platform_controls,
-            platform_nodes,
-            platform_internals,
-            platform_traversables,
-        ]
-        .into_iter()
-        .flatten()
-        {
-            visitor.value(value);
-        }
-        if let Some(value) = &traversables.default_realm {
-            visitor.value(value);
-        }
-        if let Some(value) = pointer_event_slots {
-            visitor.value(value);
-        }
-        if let Some(value) = image_element_slots {
-            visitor.value(value);
-        }
-        if let Some(value) = window_message_slots {
-            visitor.value(value);
-        }
-        if let Some(value) = wasm_module_slots {
-            visitor.value(value);
         }
         if !window_cookie_contexts.is_empty() {
             visitor.opaque_storage();
@@ -2562,28 +2621,28 @@ impl trust_js::embed::RetainedExternalMemory for HostState {
     }
 }
 
-impl HostGc for HostState {
+impl HostTrace for HostState {
     fn trace_gc(&self, visitor: &mut dyn HostGcVisitor) {
         self.wasm.trace_gc(visitor);
-        self.live_ranges.begin_collection(visitor.is_minor());
         self.geometry.trace(visitor);
         self.dom_gc.traced.set(false);
-        if !visitor.supports_native() {
-            return;
-        }
-        // Prove sweeping can borrow exclusively BEFORE discounting any JS owner. A successful
-        // shared borrow would still allow an external reader to block the later native sweep,
-        // leaving discounted dead wrappers in a live registry after their JS fields were cleared.
-        // Every traversable's arena (`Traversables`) traces its nodes as its own native owner;
-        // node identities are unique across them.
+        // Only a collection that reports the whole DOM graph may sweep it. Every traversable's
+        // arena (`Traversables`) traces its nodes as its own native owner; node identities are
+        // unique across them.
         let mut arenas = Vec::with_capacity(1 + self.traversables.parked.len());
         for arena in self.arenas() {
             let Ok(dom) = arena.try_borrow_mut() else {
+                // A native holds an arena across an allocation: its graph cannot be read, so
+                // every owner the registry names is a root of this collection, and no node is
+                // swept (the sweep needs `traced`).
+                for entry in self.dom_gc.owners.values() {
+                    visitor.root(&entry.value);
+                }
                 return;
             };
             arenas.push((Rc::as_ptr(arena) as usize, dom));
         }
-        let (owner, dom) = (arenas[0].0, &arenas[0].1);
+        let dom = &arenas[0].1;
         let owner_of = |node: usize| {
             arenas
                 .iter()
@@ -2595,11 +2654,7 @@ impl HostGc for HostState {
             owner,
             id,
         };
-        // Young generations are an arena's own: a group's arenas collect fully.
-        let minor = arenas.len() == 1
-            && visitor.is_minor()
-            && visitor.native_old_generation("trust.dom", owner, dom.first_young_gc_id());
-        if !minor && std::env::var_os("TRUST_JS_GC_DUMP").is_some() {
+        if std::env::var_os("TRUST_JS_GC_DUMP").is_some() {
             let mut roots = std::collections::BTreeMap::<usize, usize>::new();
             let mut allocations = std::collections::BTreeMap::<usize, usize>::new();
             let mut resources = std::collections::BTreeMap::<usize, usize>::new();
@@ -2625,21 +2680,11 @@ impl HostGc for HostState {
         }
         for (owner, dom) in &arenas {
             let owner = *owner;
-            if minor {
-                dom.visit_gc_young_edges(|from, to| {
-                    visitor.native_edge(node_id(owner, from), node_id(owner, to))
-                });
-            } else {
-                dom.visit_gc_edges(|from, to| {
-                    visitor.native_edge(node_id(owner, from), node_id(owner, to))
-                });
-            }
+            dom.visit_gc_edges(|from, to| {
+                visitor.native_edge(node_id(owner, from), node_id(owner, to))
+            });
             dom.visit_gc_roots(|node| {
-                if minor {
-                    if dom.is_young_gc_node(node) {
-                        visitor.native_root(node_id(owner, node));
-                    }
-                } else if dom.is_valid(node) {
+                if dom.is_valid(node) {
                     visitor.native_root(node_id(owner, node));
                 } else if let Some(holder) = owner_of(node) {
                     // A record about a node that moved to another arena
@@ -2650,57 +2695,57 @@ impl HostGc for HostState {
             dom.visit_gc_pending_allocations(|node| visitor.native_root(node_id(owner, node)));
         }
         for &node in self.dom_gc.pending_resources.borrow().keys() {
-            if let Some(owner) = owner_of(node)
-                && (!minor || dom.is_young_gc_node(node))
-            {
+            if let Some(owner) = owner_of(node) {
                 visitor.native_root(node_id(owner, node));
             }
         }
-        let mut trace_entry = |entry: &DomGcOwner| {
-            visitor.internal(&entry.value);
+        for entry in self.dom_gc.owners.values() {
             for &node in &entry.nodes {
                 let Some(owner) = owner_of(node) else {
                     continue;
                 };
-                let id = |node| node_id(owner, node);
+                let id = node_id(owner, node);
                 match entry.kind {
                     DomGcOwnerKind::Wrapper => {
-                        visitor.js_to_native(&entry.value, id(node));
-                        visitor.native_to_js(id(node), &entry.value);
+                        visitor.js_to_native(&entry.value, id);
+                        visitor.native_to_js(id, &entry.value);
                     }
-                    DomGcOwnerKind::IdArray => visitor.js_to_native(&entry.value, id(node)),
-                    DomGcOwnerKind::Observer => visitor.native_to_js(id(node), &entry.value),
+                    DomGcOwnerKind::IdArray => visitor.js_to_native(&entry.value, id),
+                    DomGcOwnerKind::Observer => visitor.native_to_js(id, &entry.value),
                 }
-            }
-        };
-        if minor {
-            for owner in &self.dom_gc.young_owners {
-                if let Some(entry) = self.dom_gc.owners.get(owner) {
-                    trace_entry(entry);
-                }
-            }
-        } else {
-            for entry in self.dom_gc.owners.values() {
-                trace_entry(entry);
             }
         }
-        self.dom_gc.traced_minor.set(minor);
         self.dom_gc.traced.set(true);
     }
-    fn sweep_gc(&mut self, is_live: &dyn Fn(&Value) -> bool) {
-        self.wasm.sweep_gc(is_live);
-        self.live_ranges.sweep(is_live);
-        self.geometry.sweep(is_live);
-    }
+}
 
-    fn sweep_gc_with_native(
-        &mut self,
-        is_live: &dyn Fn(&Value) -> bool,
-        native_is_live: &dyn Fn(NativeGcId) -> bool,
-    ) {
-        self.wasm.sweep_gc(is_live);
-        self.live_ranges.sweep(is_live);
-        self.geometry.sweep(is_live);
+impl HostGc for HostState {
+    fn sweep_gc_with_native(&mut self, native_is_live: &dyn Fn(NativeGcId) -> bool) {
+        self.wasm.sweep_gc();
+        self.live_ranges.sweep();
+        self.geometry.sweep();
+        self.webgl_fast.sweep();
+        // Forget the owners this collection found dead, whether or not it could trace the
+        // DOM: their cells are freed next, and an identity must not name a dead owner's entry
+        // once a new object can have it.
+        {
+            let wrappers = &mut self.dom_gc.wrappers;
+            let documents = &mut self.dom_gc.documents;
+            self.dom_gc.owners.retain(|&identity, entry| {
+                if !entry.value.is_cleared() {
+                    return true;
+                }
+                for node in &entry.nodes {
+                    if wrappers.get(node) == Some(&identity) {
+                        wrappers.remove(node);
+                    }
+                    if documents.get(node) == Some(&identity) {
+                        documents.remove(node);
+                    }
+                }
+                false
+            });
+        }
         if !self.dom_gc.traced.replace(false) {
             return;
         }
@@ -2713,7 +2758,6 @@ impl HostGc for HostState {
             };
             arenas.push((Rc::as_ptr(handle) as usize, dom));
         }
-        let minor = self.dom_gc.traced_minor.get();
         {
             let live = |id: usize| {
                 arenas
@@ -2728,17 +2772,7 @@ impl HostGc for HostState {
                     })
             };
             let wrappers = &mut self.dom_gc.wrappers;
-            let mut retain_entry = |identity: usize, entry: &mut DomGcOwner| {
-                if !is_live(&entry.value) {
-                    if matches!(entry.kind, DomGcOwnerKind::Wrapper) {
-                        for node in &entry.nodes {
-                            if wrappers.get(node) == Some(&identity) {
-                                wrappers.remove(node);
-                            }
-                        }
-                    }
-                    return false;
-                }
+            self.dom_gc.owners.retain(|&identity, entry| {
                 entry.nodes.retain(|&node| {
                     let keep = live(node);
                     if !keep && wrappers.get(&node) == Some(&identity) {
@@ -2747,29 +2781,12 @@ impl HostGc for HostState {
                     keep
                 });
                 !entry.nodes.is_empty()
-            };
-            if minor {
-                for identity in &self.dom_gc.young_owners {
-                    if self
-                        .dom_gc
-                        .owners
-                        .get_mut(identity)
-                        .is_some_and(|entry| !retain_entry(*identity, entry))
-                    {
-                        self.dom_gc.owners.remove(identity);
-                    }
-                }
-            } else {
-                self.dom_gc
-                    .owners
-                    .retain(|&identity, entry| retain_entry(identity, entry));
-                self.dom_gc
-                    .documents
-                    .retain(|_, identity| self.dom_gc.owners.contains_key(identity));
-            }
+            });
+            self.dom_gc
+                .documents
+                .retain(|_, identity| self.dom_gc.owners.contains_key(identity));
         }
-        let mut removed = Vec::new();
-        for (index, (owner, dom)) in arenas.iter_mut().enumerate() {
+        for (owner, dom) in arenas.iter_mut() {
             let owner = *owner;
             let live = |id| {
                 native_is_live(NativeGcId {
@@ -2778,12 +2795,7 @@ impl HostGc for HostState {
                     id,
                 })
             };
-            let swept = if minor {
-                dom.sweep_gc_young_nodes(&live)
-            } else {
-                dom.sweep_gc_nodes(&live)
-            };
-            for node in &swept {
+            for node in &dom.sweep_gc_nodes(&live) {
                 self.dom_gc.documents.remove(node);
                 self.dom_gc.wrappers.remove(node);
                 self.dom_gc.listener_nodes.remove(node);
@@ -2792,12 +2804,8 @@ impl HostGc for HostState {
                 }
             }
             dom.finish_gc_generation();
-            if index == 0 {
-                removed = swept;
-            }
         }
         let dom = &arenas[0].1;
-        self.dom_gc.young_owners.clear();
         if self.dom_gc.documents.capacity() > self.dom_gc.documents.len().saturating_mul(4).max(64)
         {
             self.dom_gc
@@ -2813,29 +2821,14 @@ impl HostGc for HostState {
         if listener_nodes.capacity() > listener_nodes.len().saturating_mul(4).max(64) {
             listener_nodes.shrink_to(listener_nodes.len().saturating_mul(2));
         }
-        if self.dom_gc.young_owners.capacity() > 64 {
-            self.dom_gc.young_owners = Default::default();
-        }
-        if (!removed.is_empty() || !minor)
-            && let Ok(mut cache) = self.geom_cache.try_borrow_mut()
-        {
-            if minor {
-                for node in &removed {
-                    cache.boxes.remove(node);
-                    cache.tracks.remove(node);
-                    cache.scrolling_areas.remove(node);
-                    cache.frame_viewports.remove(node);
-                    cache.viewport_fixed_roots.remove(node);
-                }
-            } else {
-                cache.boxes.retain(|&node, _| dom.is_valid(node));
-                cache.tracks.retain(|&node, _| dom.is_valid(node));
-                cache.scrolling_areas.retain(|&node, _| dom.is_valid(node));
-                cache.frame_viewports.retain(|&node, _| dom.is_valid(node));
-                cache
-                    .viewport_fixed_roots
-                    .retain(|&node| dom.is_valid(node));
-            }
+        if let Ok(mut cache) = self.geom_cache.try_borrow_mut() {
+            cache.boxes.retain(|&node, _| dom.is_valid(node));
+            cache.tracks.retain(|&node, _| dom.is_valid(node));
+            cache.scrolling_areas.retain(|&node, _| dom.is_valid(node));
+            cache.frame_viewports.retain(|&node, _| dom.is_valid(node));
+            cache
+                .viewport_fixed_roots
+                .retain(|&node| dom.is_valid(node));
             macro_rules! shrink_cache {
                 ($cache:expr) => {
                     if $cache.capacity() > $cache.len().saturating_mul(4).max(64) {
@@ -2924,7 +2917,7 @@ struct CssAnimationSample {
     previous: Option<f64>,
 }
 impl CssAnimationSample {
-    fn new(ctx: &mut Ctx) -> Self {
+    fn new<'s>(ctx: &mut Ctx<'s>) -> Self {
         let clock = ctx.host_mut::<HostState>().expect("DOM host").clock.clone();
         let previous = clock.animation_sample.get();
         if previous.is_none() {
@@ -2968,17 +2961,14 @@ pub fn parse_tier(name: &str) -> Result<Tier, String> {
     }
 }
 
-fn engine_call_trust_method(
-    engine: &mut trust_js::Engine,
+fn engine_call_trust_method<'s>(
+    ctx: &mut Ctx<'s>,
     name: &str,
-    args: &[Value],
-) -> Result<Value, EvalError> {
-    let trust = platform_control(engine.ctx()).map_err(EvalError::Throw)?;
-    let function = engine
-        .ctx()
-        .member_get(&trust, name)
-        .map_err(EvalError::Throw)?;
-    engine.call_function_interruptible(&function, trust, args)
+    args: &[Value<'s>],
+) -> Result<Value<'s>, EvalError<'s>> {
+    let trust = platform_control(ctx).map_err(EvalError::Throw)?;
+    let function = ctx.member_get(&trust, name).map_err(EvalError::Throw)?;
+    ctx.call_function_interruptible(&function, trust, args)
 }
 
 /// Dispatch one HTML timer task with the author callback as the engine entry point.
@@ -2989,31 +2979,29 @@ fn engine_call_trust_method(
 /// bookkeeping, but calling the handler here avoids placing those self-hosted helper frames below
 /// author code. `null` from the selector means an animation-frame opportunity won the ordering
 /// race, which remains a batched JavaScript algorithm and falls back to `tickTo`.
-fn dispatch_timer_task_to(engine: &mut trust_js::Engine, deadline: f64) -> Result<bool, EvalError> {
-    let selected = engine_call_trust_method(engine, "takeTimerTaskTo", &[Value::Num(deadline)])?;
-    match selected {
-        Value::Bool(false) => return Ok(false),
-        Value::Null => {
-            let ran = engine_call_trust_method(engine, "tickTo", &[Value::Num(deadline)])?;
+fn dispatch_timer_task_to<'s>(ctx: &mut Ctx<'s>, deadline: f64) -> Result<bool, EvalError<'s>> {
+    let selected = engine_call_trust_method(ctx, "takeTimerTaskTo", &[Value::Num(deadline)])?;
+    match selected.kind() {
+        ValueKind::Bool(false) => return Ok(false),
+        ValueKind::Null => {
+            let ran = engine_call_trust_method(ctx, "tickTo", &[Value::Num(deadline)])?;
             return Ok(ran.as_num_opt().is_some_and(|count| count > 0.0));
         }
-        Value::Obj(_) => {}
-        other => {
+        ValueKind::Obj(_) => {}
+        _ => {
             let message = format!(
                 "timer selector returned {}, expected task, null, or false",
-                other.type_of()
+                selected.type_of()
             );
-            let error = engine.ctx().make_error("TypeError", message);
+            let error = ctx.make_error("TypeError", message);
             return Err(EvalError::Throw(error));
         }
     }
 
-    let args_value = engine
-        .ctx()
+    let args_value = ctx
         .member_get(&selected, "args")
         .map_err(EvalError::Throw)?;
-    let length = engine
-        .ctx()
+    let length = ctx
         .member_get(&args_value, "length")
         .map_err(EvalError::Throw)?
         .as_num_opt()
@@ -3023,40 +3011,37 @@ fn dispatch_timer_task_to(engine: &mut trust_js::Engine, deadline: f64) -> Resul
     // platform array has an integral ECMAScript length, so only reject values
     // that cannot be represented as a host allocation index.
     if !length.is_finite() || length < 0.0 || length.fract() != 0.0 || length > usize::MAX as f64 {
-        let error = engine.ctx().make_error(
+        let error = ctx.make_error(
             "RangeError",
             "timer callback argument list has an invalid length",
         );
         return Err(EvalError::Throw(error));
     }
-    let mut args = Vec::with_capacity(length as usize);
+    // Each read can run author getters, which can collect: the list keeps what it read.
+    let mut args = trust_js::embed::ValueList::with_capacity(length as usize);
     for index in 0..length as usize {
         args.push(
-            engine
-                .ctx()
-                .member_get(&args_value, &index.to_string())
+            ctx.member_get(&args_value, &index.to_string())
                 .map_err(EvalError::Throw)?,
         );
     }
 
-    let handler =
-        engine_call_trust_method(engine, "beginTimerTask", std::slice::from_ref(&selected))?;
-    let callback_this = engine
-        .ctx()
-        .member_get(&selected, "__trustTimerThis")
-        .unwrap_or_else(|_| engine.global_this());
-    let script_caller = engine
-        .ctx()
+    let handler = engine_call_trust_method(ctx, "beginTimerTask", std::slice::from_ref(&selected))?;
+    let callback_this = match ctx.member_get(&selected, "__trustTimerThis") {
+        Ok(value) => value,
+        Err(_) => ctx.global_this(),
+    };
+    let script_caller = ctx
         .member_get(&selected, "__trustCallbackSource")
         .map_err(EvalError::Throw)?;
     let (callback_error, callback_failed, callback_interrupted) =
-        match engine.call_callback_interruptible(&handler, callback_this, &args, &script_caller) {
+        match ctx.call_callback_interruptible(&handler, callback_this, &args, &script_caller) {
             Ok(_) => (Value::Undefined, false, None),
             Err(EvalError::Throw(error)) => (error, true, None),
             Err(EvalError::Interrupted(reason)) => (Value::Undefined, false, Some(reason)),
         };
     engine_call_trust_method(
-        engine,
+        ctx,
         "finishTimerTask",
         &[selected, callback_error, Value::Bool(callback_failed)],
     )?;
@@ -3078,7 +3063,6 @@ pub fn run_benchmark(path: &Path, tier: Tier, threshold: u32) -> Result<SpikeRep
     let mut state = HostState::new(Rc::new(RefCell::new(Dom::new())), clock);
     state.configure_module_loading(&mut engine);
     engine
-        .ctx()
         .op_state()
         .put_retained_memory_with_external_memory(state);
     install_host_boundary(&mut engine);
@@ -3095,12 +3079,12 @@ pub fn run_benchmark(path: &Path, tier: Tier, threshold: u32) -> Result<SpikeRep
     let prelude_started = Instant::now();
     eval_platform_prelude(&mut engine)?;
     let prelude_time = prelude_started.elapsed();
-    let trust = platform_control(engine.ctx())
-        .map_err(|error| describe_throw(&mut engine, error, "one-shot event-loop setup"))?;
-    engine
-        .ctx()
-        .member_set(&trust, "oneShot", Value::Bool(true))
-        .map_err(|error| describe_throw(&mut engine, error, "one-shot event-loop setup"))?;
+    engine.scope(|cx| {
+        let trust = platform_control(cx)
+            .map_err(|error| describe_throw(cx, error, "one-shot event-loop setup"))?;
+        cx.member_set(&trust, "oneShot", Value::Bool(true))
+            .map_err(|error| describe_throw(cx, error, "one-shot event-loop setup"))
+    })?;
 
     let benchmark_started = Instant::now();
     eval(&mut engine, &source, "benchmark source")?;
@@ -3110,13 +3094,18 @@ pub fn run_benchmark(path: &Path, tier: Tier, threshold: u32) -> Result<SpikeRep
 
     let mut timer_turns = 0usize;
     loop {
-        let deadline = engine_call_trust_method(&mut engine, "nextDeadline", &[])
-            .map_err(|error| describe_eval_error(&mut engine, error, "__trust.nextDeadline"))?;
-        let Value::Num(deadline) = deadline else {
+        let deadline = engine.scope(|cx| {
+            engine_call_trust_method(cx, "nextDeadline", &[])
+                .map(|deadline| deadline.as_num_opt())
+                .map_err(|error| describe_eval_error(cx, error, "__trust.nextDeadline"))
+        })?;
+        let Some(deadline) = deadline else {
             break;
         };
-        let ran = dispatch_timer_task_to(&mut engine, deadline)
-            .map_err(|error| describe_eval_error(&mut engine, error, "timer task"))?;
+        let ran = engine.scope(|cx| {
+            dispatch_timer_task_to(cx, deadline)
+                .map_err(|error| describe_eval_error(cx, error, "timer task"))
+        })?;
         engine
             .run_microtasks_interruptible()
             .map_err(|reason| format!("timer task microtasks interrupted: {}", reason.message()))?;
@@ -3130,33 +3119,30 @@ pub fn run_benchmark(path: &Path, tier: Tier, threshold: u32) -> Result<SpikeRep
         }
     }
     let benchmark_time = benchmark_started.elapsed();
-    let trust = platform_control(engine.ctx())
-        .map_err(|error| describe_throw(&mut engine, error, "benchmark logs"))?;
-    let logs_value = engine
-        .ctx()
-        .member_get(&trust, "logs")
-        .map_err(|error| describe_throw(&mut engine, error, "benchmark logs"))?;
-    let logs_value = engine
-        .ctx()
-        .member_get(&logs_value, "join")
-        .and_then(|join| {
-            engine
-                .ctx()
-                .invoke(join, logs_value, &[Value::from_string("\n".to_string())])
-        })
-        .map_err(|error| describe_throw(&mut engine, error, "benchmark logs"))?;
-    let logs = value_string(&mut engine, &logs_value);
+    let logs = engine.scope(|cx| {
+        let trust =
+            platform_control(cx).map_err(|error| describe_throw(cx, error, "benchmark logs"))?;
+        let logs_value = cx
+            .member_get(&trust, "logs")
+            .map_err(|error| describe_throw(cx, error, "benchmark logs"))?;
+        let newline = cx.str("\n");
+        let joined = cx
+            .member_get(&logs_value, "join")
+            .and_then(|join| cx.invoke(join, logs_value, &[newline]))
+            .map_err(|error| describe_throw(cx, error, "benchmark logs"))?;
+        Ok::<_, String>(value_string(cx, &joined))
+    })?;
     let score = logs
         .lines()
         .find_map(|line| line.strip_prefix("log: Score: ").map(str::to_owned));
-    let pre_idle_live_objects = engine.ctx().live_object_count();
+    let pre_idle_live_objects = engine.scope(|cx| cx.live_object_count());
     let idle_gc_started = Instant::now();
     let idle_gc_reclaimed = engine.collect_garbage_at_idle();
     let idle_gc_time = idle_gc_started.elapsed();
-    let post_idle_live_objects = engine.ctx().live_object_count();
+    let post_idle_live_objects = engine.scope(|cx| cx.live_object_count());
     // Keep a second forced collection in the probe so the idle hook's completeness is visible.
-    let final_gc_reclaimed = engine.ctx().collect_garbage_for_host();
-    let post_final_live_objects = engine.ctx().live_object_count();
+    let final_gc_reclaimed = engine.scope(|cx| cx.collect_garbage_for_host());
+    let post_final_live_objects = engine.scope(|cx| cx.live_object_count());
 
     Ok(SpikeReport {
         tier,
@@ -3311,7 +3297,7 @@ mod desktop {
             }
             if trust_bool(&mut page, "hasPlatformTask") {
                 let ran = call_trust(&mut page, "runPlatformTask", &[], "platform task")
-                    .is_some_and(|value| page.engine.ctx().to_boolean(&value));
+                    .is_some_and(|value| value.truthy());
                 checkpoint(&mut page, "platform task");
                 if ran {
                     continue;
@@ -3595,7 +3581,7 @@ mod desktop {
         id: TraversableId,
         /// Its top-level Window's global, which the actor enters while it
         /// works for the traversable; `None` for the engine's default Realm.
-        realm: Option<Value>,
+        realm: Option<Handle>,
         /// Its active Document's frontend; `None` once that Document has
         /// unloaded, until the frontend's navigation brings the next one
         /// (`GroupCmd::Load`).
@@ -3641,7 +3627,7 @@ mod desktop {
         page.traversables[previous].parked = Some(incoming);
         page.selected = index;
         let id = page.traversables[index].id;
-        let top_context = page.engine.ctx().host_mut::<HostState>().map(|state| {
+        let top_context = page.engine.host_mut::<HostState>().map(|state| {
             state.select_traversable(id);
             state.top_context
         });
@@ -3972,18 +3958,17 @@ mod desktop {
     fn destroy_active_document(page: &mut TrustJsPage, closing: bool) {
         let context = page
             .engine
-            .ctx()
             .host_mut::<HostState>()
             .map_or(0, |state| state.top_context);
-        abort_document(page.engine.ctx(), context);
+        page.engine.scope(|cx| abort_document(cx, context));
         let _ = call_trust(
             page,
             "destroyTopLevelDocument",
-            &[Value::Bool(closing)],
+            &[TrustValue::Bool(closing)],
             "destroy document",
         );
         checkpoint(page, "destroy document");
-        if let Some(state) = page.engine.ctx().host_mut::<HostState>() {
+        if let Some(state) = page.engine.host_mut::<HostState>() {
             let dom = state.dom.clone();
             let dom = dom.borrow();
             state.media.release_elements(|node| dom.is_valid(node));
@@ -4014,7 +3999,7 @@ mod desktop {
         if page.selected > index {
             page.selected -= 1;
         }
-        if let Some(state) = page.engine.ctx().host_mut::<HostState>() {
+        if let Some(state) = page.engine.host_mut::<HostState>() {
             state.forget_traversable(id);
         }
         if let Some(group) = &page.group {
@@ -4057,7 +4042,7 @@ mod desktop {
         }
         destroy_active_document(page, false);
         // The traversable's mute carries over to its new Document.
-        if let Some(state) = page.engine.ctx().host_mut::<HostState>() {
+        if let Some(state) = page.engine.host_mut::<HostState>() {
             state.set_traversable_muted(id, env.traversable.audio_muted);
         }
 
@@ -4083,7 +4068,7 @@ mod desktop {
         // HTML #resetBCName: another origin's Document clears the target
         // name of a top-level traversable that is not an auxiliary browsing
         // context with an opener (the platform checks the opener).
-        let previous_origin = page.engine.ctx().host_mut::<HostState>().map(|state| {
+        let previous_origin = page.engine.host_mut::<HostState>().map(|state| {
             let top = state.top_context;
             realm_origin(state, top)
         });
@@ -4094,7 +4079,7 @@ mod desktop {
                     |document| document.client().origin(),
                 )
         });
-        let Some(context) = page.engine.ctx().host_mut::<HostState>().map(|state| {
+        let Some(context) = page.engine.host_mut::<HostState>().map(|state| {
             let context = state.next_window_context;
             state.next_window_context = context.saturating_add(1);
             let mut fresh = TraversableHost::new(
@@ -4178,7 +4163,8 @@ mod desktop {
             &mut page.outcome.errors,
         );
         for timing in &env.resource_timings {
-            record_resource_timing_ref(page.engine.ctx(), timing);
+            page.engine
+                .scope(|cx| record_resource_timing_ref(cx, timing));
         }
         page.traversables[index].channels = Some(TraversableChannels {
             cmds,
@@ -4186,7 +4172,7 @@ mod desktop {
             hover,
             events: events.clone(),
         });
-        if let Some(state) = page.engine.ctx().host_mut::<HostState>() {
+        if let Some(state) = page.engine.host_mut::<HostState>() {
             state.parser = ParserProgress {
                 active: true,
                 watermark: parser_watermark,
@@ -4236,7 +4222,7 @@ mod desktop {
     /// rendering is its own frontend's first event, and its opener's frontend
     /// learns of it (`PageEvt::OpenAuxiliary`), which presents it.
     fn adopt_created_traversables(page: &mut TrustJsPage) {
-        let created = match page.engine.ctx().host_mut::<HostState>() {
+        let created = match page.engine.host_mut::<HostState>() {
             Some(state) if !state.traversables.created.is_empty() => {
                 std::mem::take(&mut state.traversables.created)
             }
@@ -4246,7 +4232,7 @@ mod desktop {
             return;
         };
         for created in created {
-            let parts = page.engine.ctx().host_mut::<HostState>().and_then(|state| {
+            let parts = page.engine.host_mut::<HostState>().and_then(|state| {
                 let (_, host) = state
                     .traversables
                     .parked
@@ -4337,23 +4323,27 @@ mod desktop {
         engine: &mut trust_js::Engine,
         context: u64,
         config: &str,
-    ) -> Result<(Value, trust_js::RealmEntry), String> {
+    ) -> Result<(Handle, trust_js::RealmEntry), String> {
         // Realm creation and bootstrap form one publication: no collection
         // may see a partially initialized set of intrinsics.
-        engine.ctx().suspend_gc();
-        let realm = engine.ctx().create_embed_realm();
-        if let Some(state) = engine.ctx().host_mut::<HostState>() {
+        let (realm, installed) = engine.scope(|cx| {
+            cx.suspend_gc();
+            let realm = cx.create_embed_realm();
+            let installed = cx.with_embed_realm(&realm, |realm_ctx| {
+                realm_ctx.set_host_job_context(context);
+                for &(name, len, host_fn) in TRUST_JS_HOST_FUNCTIONS {
+                    realm_ctx.define_embed_global(name, len, host_fn);
+                }
+            });
+            (hold(cx, &realm), installed.is_ok())
+        });
+        if let Some(state) = engine.host_mut::<HostState>() {
             state.window_realms.insert(context, realm.clone());
         }
-        let installed = engine.ctx().with_embed_realm(&realm, |realm_ctx| {
-            realm_ctx.set_host_job_context(context);
-            for &(name, len, host_fn) in TRUST_JS_HOST_FUNCTIONS {
-                realm_ctx.define_embed_global(name, len, host_fn);
-            }
-        });
-        let created = match installed {
-            Err(_) => Err(String::from("Window Realm: it could not be created")),
-            Ok(()) => match engine.enter_realm(&realm) {
+        let created = if !installed {
+            Err(String::from("Window Realm: it could not be created"))
+        } else {
+            match engine.enter_realm(&realm) {
                 Err(_) => Err(String::from("Window Realm: it could not be entered")),
                 Ok(entry) => match eval(engine, config, "TRust configuration")
                     .and_then(|()| eval_platform_prelude(engine))
@@ -4364,11 +4354,11 @@ mod desktop {
                         Err(error)
                     }
                 },
-            },
+            }
         };
-        engine.ctx().resume_gc();
+        engine.scope(|cx| cx.resume_gc());
         if created.is_err()
-            && let Some(state) = engine.ctx().host_mut::<HostState>()
+            && let Some(state) = engine.host_mut::<HostState>()
         {
             state.window_realms.remove(&context);
             state.pending_stylesheets.remove(&context);
@@ -4681,7 +4671,6 @@ mod desktop {
         if page.traversables.len() > 1 {
             let target = page
                 .engine
-                .ctx()
                 .host_mut::<HostState>()
                 .and_then(|state| host_task_traversable(state, &task));
             if let Some(index) = target.and_then(|id| traversable_index(page, id)) {
@@ -4920,7 +4909,7 @@ mod desktop {
                         let _ = call_trust(
                             page,
                             "deferRenderingUntil",
-                            &[Value::Num(now)],
+                            &[TrustValue::Num(now)],
                             "rendering opportunity",
                         );
                         released = true;
@@ -5214,13 +5203,18 @@ mod desktop {
                     prefer_platform = false;
                     prepare_unbounded_task(interrupt);
                     if page.task_trace.is_some() {
-                        let queues = call_trust(page, "taskQueueState", &[], "task trace")
-                            .map(|value| value_string(&mut page.engine, &value))
-                            .unwrap_or_else(|| String::from("unavailable"));
+                        let queues = call_trust_read(
+                            page,
+                            "taskQueueState",
+                            &[],
+                            "task trace",
+                            |cx, value| value_string(cx, &value),
+                        )
+                        .unwrap_or_else(|| String::from("unavailable"));
                         eprintln!("trust-js: platform task begin queues={queues}");
                     }
                     let ran = call_trust(page, "runPlatformTask", &[], "platform task")
-                        .is_some_and(|value| page.engine.ctx().to_boolean(&value));
+                        .is_some_and(|value| value.truthy());
                     if page.task_trace.is_some() {
                         eprintln!("trust-js: platform task end ran={ran}");
                     }
@@ -5241,11 +5235,11 @@ mod desktop {
                     let _ = call_trust(
                         page,
                         "startIdlePeriod",
-                        &[Value::Num(deadline)],
+                        &[TrustValue::Num(deadline)],
                         "start idle period",
                     );
                     let ran = call_trust(page, "runPlatformTask", &[], "idle task")
-                        .is_some_and(|value| page.engine.ctx().to_boolean(&value));
+                        .is_some_and(|value| value.truthy());
                     if ran && let Some(trace) = page.task_trace.as_mut() {
                         trace.platform_tasks += 1;
                     }
@@ -5263,11 +5257,16 @@ mod desktop {
                     let real_now = virtual_origin + wall_origin.elapsed().as_secs_f64() * 1000.0;
                     let animation_frame = trust_bool(page, "nextDeadlineIsAnimationFrame");
                     let _animation_sample =
-                        animation_frame.then(|| CssAnimationSample::new(page.engine.ctx()));
+                        animation_frame.then(|| page.engine.scope(CssAnimationSample::new));
                     if page.task_trace.is_some() {
-                        let queues = call_trust(page, "taskQueueState", &[], "task trace")
-                            .map(|value| value_string(&mut page.engine, &value))
-                            .unwrap_or_else(|| String::from("unavailable"));
+                        let queues = call_trust_read(
+                            page,
+                            "taskQueueState",
+                            &[],
+                            "task trace",
+                            |cx, value| value_string(cx, &value),
+                        )
+                        .unwrap_or_else(|| String::from("unavailable"));
                         eprintln!(
                             "trust-js: timer task begin deadline={real_now:.3} animation_frame={animation_frame} queues={queues}"
                         );
@@ -5277,7 +5276,7 @@ mod desktop {
                         call_trust(
                             page,
                             "runRenderingFrame",
-                            &[Value::Num(real_now)],
+                            &[TrustValue::Num(real_now)],
                             "animation frame",
                         )
                         .is_some_and(|v| v.as_num_opt().is_some_and(|n| n > 0.0))
@@ -5349,12 +5348,12 @@ mod desktop {
                     let render_started = Instant::now();
                     page.render_deadline = None;
                     prepare_unbounded_task(interrupt);
-                    let _animation_sample = CssAnimationSample::new(page.engine.ctx());
+                    let _animation_sample = page.engine.scope(CssAnimationSample::new);
                     let now = virtual_origin + wall_origin.elapsed().as_secs_f64() * 1000.0;
                     let _ = call_trust(
                         page,
                         "runRenderingFrame",
-                        &[Value::Num(now)],
+                        &[TrustValue::Num(now)],
                         "animation frame",
                     );
                     checkpoint(page, "animation frame");
@@ -5468,7 +5467,6 @@ mod desktop {
             };
             let viewport = page
                 .engine
-                .ctx()
                 .host_mut::<HostState>()
                 .map_or(DEFAULT_VIEWPORT, |state| state.viewport.get());
             let dom = page.dom.borrow();
@@ -5517,7 +5515,6 @@ mod desktop {
         if let Some(next) = next {
             let clock = page
                 .engine
-                .ctx()
                 .host_mut::<HostState>()
                 .map(|state| state.clock.clone());
             if let Some(clock) = clock {
@@ -5535,7 +5532,7 @@ mod desktop {
     /// `None` when the retained geometry no longer describes the document.
     fn repaint_animation_frame(page: &mut TrustJsPage) -> Option<crate::http::RenderedPage> {
         let (cache, images) = {
-            let state = page.engine.ctx().host_mut::<HostState>()?;
+            let state = page.engine.host_mut::<HostState>()?;
             (state.geom_cache.clone(), state.images.clone())
         };
         {
@@ -5550,7 +5547,9 @@ mod desktop {
             }
         }
         // Synchronizes the animation sample; the geometry stays current.
-        let cache = ensure_host_geom_cache(page.engine.ctx(), "animation frame");
+        let cache = page
+            .engine
+            .scope(|cx| ensure_host_geom_cache(cx, "animation frame"));
         let previous = page.last_render.as_ref()?;
         let dom = page.dom.borrow();
         let cached = cache.borrow();
@@ -5596,7 +5595,7 @@ mod desktop {
         let _ = call_trust(
             page,
             "deferRenderingUntil",
-            &[Value::Num(now + delay.as_secs_f64() * 1000.0)],
+            &[TrustValue::Num(now + delay.as_secs_f64() * 1000.0)],
             "rendering opportunity",
         );
         until
@@ -5723,9 +5722,11 @@ mod desktop {
         let engine_clock = clock.clone();
         engine.set_wall_clock(move || engine_clock.now_ms());
         state.configure_module_loading(&mut engine);
-        state.traversables.default_realm = Some(engine.global_this());
+        state.traversables.default_realm = Some(engine.scope(|cx| {
+            let global = cx.global_this();
+            hold(cx, &global)
+        }));
         engine
-            .ctx()
             .op_state()
             .put_retained_memory_with_external_memory(state);
         install_host_boundary(&mut engine);
@@ -5795,7 +5796,7 @@ mod desktop {
         // Fetch #fetch-finale: reports from parallel parser/preload requests
         // belong to this Window, and must precede author completion handlers.
         for timing in &env.resource_timings {
-            record_resource_timing_ref(engine.ctx(), timing);
+            engine.scope(|cx| record_resource_timing_ref(cx, timing));
         }
 
         let started = Instant::now();
@@ -6027,16 +6028,16 @@ mod desktop {
         // A bare actor can acquire its native client during Window setup;
         // use that initialized client, so speculative and parser requests
         // share both policy and the same client-partitioned cache entry.
-        let service_worker =
-            page.engine.ctx().host::<HostState>().and_then(|state| {
-                service_worker_host::fetch::for_context(state, state.top_context)
-            });
+        let service_worker = page
+            .engine
+            .host::<HostState>()
+            .and_then(|state| service_worker_host::fetch::for_context(state, state.top_context));
         crate::http::prefetch_page_scripts(html, env, service_worker, report);
         let mut tasks = ParserTasks::new(host_rx, events, page);
         let mut deferred = Vec::new();
         // HTML #active-parser: the Document has one until "the end" (or until
         // window.stop() aborts it, `abort_active_parser`).
-        if let Some(state) = page.engine.ctx().host_mut::<HostState>() {
+        if let Some(state) = page.engine.host_mut::<HostState>() {
             state.parser = ParserProgress {
                 active: true,
                 watermark: parser_watermark,
@@ -6097,10 +6098,10 @@ mod desktop {
             media.into()
         };
         if !parser_media.is_empty() {
-            let ids = page.engine.ctx().make_array(
+            let ids = TrustValue::Array(
                 parser_media
                     .iter()
-                    .map(|&id| Value::Num(id as f64))
+                    .map(|&id| TrustValue::Num(id as f64))
                     .collect(),
             );
             let _ = call_trust(page, "parserMediaCreated", &[ids], "parser media");
@@ -6110,7 +6111,6 @@ mod desktop {
         // needs its identity for the preparation/connectedness checks.
         let mut script_leases: Vec<_> = page
             .engine
-            .ctx()
             .host_mut::<HostState>()
             .map(|state| {
                 scripts
@@ -6134,7 +6134,7 @@ mod desktop {
             }
             if !written {
                 // The parser has consumed the input through this script.
-                if let Some(state) = page.engine.ctx().host_mut::<HostState>() {
+                if let Some(state) = page.engine.host_mut::<HostState>() {
                     state.parser.position = Some(node);
                 }
                 process_parser_links(page, &mut parser_links, Some(node));
@@ -6165,24 +6165,26 @@ mod desktop {
             let prepared = call_trust(
                 page,
                 "prepareParserScript",
-                &[Value::Num(node as f64)],
+                &[TrustValue::Num(node as f64)],
                 "prepare script",
             )
-            .is_some_and(|value| matches!(value, Value::Bool(true)));
+            .is_some_and(|value| matches!(value, TrustValue::Bool(true)));
             if !prepared {
                 continue;
             }
             if import_map {
-                let _ = host_run_injected_script(
-                    page.engine.ctx(),
-                    Value::Undefined,
-                    &[Value::Num(node as f64)],
-                );
+                page.engine.scope(|cx| {
+                    let _ =
+                        host_run_injected_script(cx, Value::Undefined, &[Value::Num(node as f64)]);
+                });
                 continue;
             }
             if classic && src.is_none() {
                 // async/defer have no effect on an inline classic script.
-                let document_url = element_request_client_url(page.engine.ctx(), node).to_string();
+                let document_url = page
+                    .engine
+                    .scope(|cx| element_request_client_url(cx, node))
+                    .to_string();
                 if let Err(error) = run_injected_classic_task(
                     &mut page.engine,
                     node,
@@ -6224,20 +6226,21 @@ mod desktop {
                             Vec::new(),
                         )
                     });
-                send_resource_completion(
-                    page.engine.ctx(),
-                    node,
-                    src.to_string(),
-                    TrustJsResourceKind::ClassicScript,
-                    result,
-                    true,
-                );
-            } else if let Err(error) = host_run_injected_script(
-                page.engine.ctx(),
-                Value::Undefined,
-                &[Value::Num(node as f64)],
-            ) {
-                let message = describe_throw(&mut page.engine, error, "prepare parser script");
+                page.engine.scope(|cx| {
+                    send_resource_completion(
+                        cx,
+                        node,
+                        src.to_string(),
+                        TrustJsResourceKind::ClassicScript,
+                        result,
+                        true,
+                    )
+                });
+            } else if let Err(message) = page.engine.scope(|cx| {
+                host_run_injected_script(cx, Value::Undefined, &[Value::Num(node as f64)])
+                    .map(|_| ())
+                    .map_err(|error| describe_throw(cx, error, "prepare parser script"))
+            }) {
                 page.outcome.errors.push(message);
                 continue;
             }
@@ -6263,13 +6266,13 @@ mod desktop {
             return true;
         }
         // The whole input has been consumed; "the end" stops the parser.
-        if let Some(state) = page.engine.ctx().host_mut::<HostState>() {
+        if let Some(state) = page.engine.host_mut::<HostState>() {
             state.parser.position = None;
         }
         process_parser_links(page, &mut parser_links, None);
         process_parser_images(page, &mut parser_images, None);
         process_parser_media(page, &mut parser_media, None);
-        if let Some(state) = page.engine.ctx().host_mut::<HostState>() {
+        if let Some(state) = page.engine.host_mut::<HostState>() {
             state.parser.active = false;
         }
         let _ = call_trust(page, "parserFinished", &[], "parser EOF");
@@ -6292,17 +6295,25 @@ mod desktop {
         queue: &mut std::collections::VecDeque<(usize, bool)>,
         leases: &mut Vec<DomResourceLease>,
     ) {
-        let Some(value) = call_trust(page, "takeWrittenScripts", &[], "written scripts") else {
-            return;
-        };
-        let Ok(joined) = page.engine.ctx().coerce_string(&value) else {
+        let joined = call_trust_read(
+            page,
+            "takeWrittenScripts",
+            &[],
+            "written scripts",
+            |cx, value| {
+                cx.coerce_string(&value)
+                    .map(|joined| joined.to_string())
+                    .ok()
+            },
+        );
+        let Some(Some(joined)) = joined else {
             return;
         };
         let written: Vec<usize> = joined
             .split(',')
             .filter_map(|part| part.parse().ok())
             .collect();
-        if let Some(state) = page.engine.ctx().host_mut::<HostState>() {
+        if let Some(state) = page.engine.host_mut::<HostState>() {
             for &node in &written {
                 state.dom_gc.start_resource(node);
                 leases.push(state.dom_gc.resource_lease(node));
@@ -6315,7 +6326,6 @@ mod desktop {
 
     fn parser_aborted(page: &mut TrustJsPage) -> bool {
         page.engine
-            .ctx()
             .host_mut::<HostState>()
             .is_some_and(|state| state.parser.aborted)
     }
@@ -6323,7 +6333,7 @@ mod desktop {
     /// Discard the queued completions of parser scripts the aborted parser
     /// will never execute (HTML #abort-a-document step 2).
     fn abandon_parser_scripts(page: &mut TrustJsPage, nodes: impl IntoIterator<Item = usize>) {
-        if let Some(state) = page.engine.ctx().host_mut::<HostState>() {
+        if let Some(state) = page.engine.host_mut::<HostState>() {
             state.parser.abandoned.extend(nodes);
         }
     }
@@ -6342,13 +6352,17 @@ mod desktop {
                 break;
             }
             images.pop_front();
-            ids.push(Value::Num(image as f64));
+            ids.push(TrustValue::Num(image as f64));
         }
         if ids.is_empty() {
             return;
         }
-        let ids = page.engine.ctx().make_array(ids);
-        let _ = call_trust(page, "startCreatedImages", &[ids], "parser images");
+        let _ = call_trust(
+            page,
+            "startCreatedImages",
+            &[TrustValue::Array(ids)],
+            "parser images",
+        );
         checkpoint(page, "parser images");
     }
 
@@ -6372,14 +6386,18 @@ mod desktop {
                     break;
                 }
                 media.pop_front();
-                ids.push(Value::Num(element as f64));
+                ids.push(TrustValue::Num(element as f64));
             }
         }
         if ids.is_empty() {
             return;
         }
-        let ids = page.engine.ctx().make_array(ids);
-        let _ = call_trust(page, "parserMediaPopped", &[ids], "parser media");
+        let _ = call_trust(
+            page,
+            "parserMediaPopped",
+            &[TrustValue::Array(ids)],
+            "parser media",
+        );
         checkpoint(page, "parser media");
     }
 
@@ -6426,22 +6444,23 @@ mod desktop {
             )
         };
         if let Some(obtained) = sheet {
-            send_resource_completion(
-                page.engine.ctx(),
-                node,
-                href,
-                TrustJsResourceKind::ParsedStylesheet { obtained },
-                None,
-                true,
-            );
+            page.engine.scope(|cx| {
+                send_resource_completion(
+                    cx,
+                    node,
+                    href,
+                    TrustJsResourceKind::ParsedStylesheet { obtained },
+                    None,
+                    true,
+                )
+            });
         } else if preload
-            && let Err(error) = host_preload_link(
-                page.engine.ctx(),
-                Value::Undefined,
-                &[Value::Num(node as f64)],
-            )
+            && let Err(message) = page.engine.scope(|cx| {
+                host_preload_link(cx, Value::Undefined, &[Value::Num(node as f64)])
+                    .map(|_| ())
+                    .map_err(|error| describe_throw(cx, error, "preload link"))
+            })
         {
-            let message = describe_throw(&mut page.engine, error, "preload link");
             page.outcome.errors.push(message);
         }
     }
@@ -6606,32 +6625,28 @@ mod desktop {
 
     fn pending_resources(page: &mut TrustJsPage) -> usize {
         page.engine
-            .ctx()
             .host_mut::<HostState>()
             .map_or(0, |state| state.pending_resources)
     }
 
     fn has_pending_host_work(page: &mut TrustJsPage) -> bool {
-        page.engine
-            .ctx()
-            .host_mut::<HostState>()
-            .is_some_and(|state| {
-                state.pending_resources > state.pending_module_evaluations
-                    || state.pending_preloads > 0
-                    || state.pending_fonts > 0
-                    || state.pending_document_images > 0
-                    || state
-                        .pending_dynamic_modules
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                        > 0
-                    || state.network.as_ref().is_some_and(|network| {
-                        !network.pending_fetches.is_empty()
-                            || network
-                                .body_streams
-                                .values()
-                                .any(TrustJsBodyStream::transferring)
-                    })
-            })
+        page.engine.host_mut::<HostState>().is_some_and(|state| {
+            state.pending_resources > state.pending_module_evaluations
+                || state.pending_preloads > 0
+                || state.pending_fonts > 0
+                || state.pending_document_images > 0
+                || state
+                    .pending_dynamic_modules
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    > 0
+                || state.network.as_ref().is_some_and(|network| {
+                    !network.pending_fetches.is_empty()
+                        || network
+                            .body_streams
+                            .values()
+                            .any(TrustJsBodyStream::transferring)
+                })
+        })
     }
 
     /// The `Static` event of a resident document that has become inert: no
@@ -6672,12 +6687,8 @@ mod desktop {
         {
             return true;
         }
-        let host_work = page
-            .engine
-            .ctx()
-            .host_mut::<HostState>()
-            .is_some_and(|state| {
-                state.service_workers.keep_native_windows
+        let host_work = page.engine.host_mut::<HostState>().is_some_and(|state| {
+            state.service_workers.keep_native_windows
                     || state.private_responses.transferring()
                     || state.pending_resources > 0
                     || state.pending_preloads > 0
@@ -6705,7 +6716,7 @@ mod desktop {
                     // Playback and audio rendering belong to the page.
                     || state.media.has_players()
                     || state.webaudio.has_contexts()
-            });
+        });
         host_work
             || page.engine.next_atomics_wait_deadline().is_some()
             || trust_number(page, "nextDeadline").is_some()
@@ -6741,14 +6752,19 @@ mod desktop {
     /// Evaluate `source` in the page as a task (tests drive pages this way; the
     /// browser reaches the prelude only through `platform_control`).
     #[cfg(test)]
-    fn evaluate_task(page: &mut TrustJsPage, source: &str, label: &str) -> Option<Value> {
+    fn evaluate_task(page: &mut TrustJsPage, source: &str, label: &str) -> Option<TrustValue> {
         let evaluated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            page.engine.eval_value_interruptible(source)
+            page.engine
+                .scope(|cx| match cx.eval_value_interruptible(source) {
+                    Ok(Ok(value)) => Ok(Ok(TrustValue::read(cx, value))),
+                    Ok(Err(error)) => Ok(Err(TaskError::read(cx, error, label))),
+                    Err(error) => Err(error),
+                })
         }));
         match evaluated {
             Ok(Ok(Ok(value))) => Some(value),
             Ok(Ok(Err(error))) => {
-                record_eval_error(page, error, label);
+                record_task_error(page, error);
                 None
             }
             Ok(Err(error)) => {
@@ -6770,36 +6786,51 @@ mod desktop {
 
     /// One-shot transforms settle every task source before serializing.
     fn set_one_shot(page: &mut TrustJsPage) {
-        if let Ok(trust) = platform_control(page.engine.ctx()) {
-            let _ = page
-                .engine
-                .ctx()
-                .member_set(&trust, "oneShot", Value::Bool(true));
-        }
+        page.engine.scope(|cx| {
+            if let Ok(trust) = platform_control(cx) {
+                let _ = cx.member_set(&trust, "oneShot", Value::Bool(true));
+            }
+        });
     }
 
-    fn engine_call_trust(
-        engine: &mut trust_js::Engine,
+    fn engine_call_trust<'s>(
+        ctx: &mut Ctx<'s>,
         name: &str,
-        args: &[Value],
-    ) -> Result<Value, EvalError> {
-        let trust = platform_control(engine.ctx()).map_err(EvalError::Throw)?;
-        let function = engine
-            .ctx()
-            .member_get(&trust, name)
-            .map_err(EvalError::Throw)?;
-        engine.call_function_interruptible(&function, trust, args)
+        args: &[Value<'s>],
+    ) -> Result<Value<'s>, EvalError<'s>> {
+        let trust = platform_control(ctx).map_err(EvalError::Throw)?;
+        let function = ctx.member_get(&trust, name).map_err(EvalError::Throw)?;
+        ctx.call_function_interruptible(&function, trust, args)
     }
 
+    /// Call the platform's `name` method with `args` in a scope of the page's engine. `None`,
+    /// once the failure is recorded, when it throws, is interrupted or panics.
     fn call_trust(
         page: &mut TrustJsPage,
         name: &str,
-        args: &[Value],
+        args: &[TrustValue],
         label: &str,
-    ) -> Option<Value> {
+    ) -> Option<TrustValue> {
+        call_trust_read(page, name, args, label, TrustValue::read)
+    }
+
+    /// [`call_trust`], reading the result with `read` in the call's scope.
+    fn call_trust_read<R>(
+        page: &mut TrustJsPage,
+        name: &str,
+        args: &[TrustValue],
+        label: &str,
+        read: impl for<'s> FnOnce(&mut Ctx<'s>, Value<'s>) -> R,
+    ) -> Option<R> {
         let started = page.task_trace.as_ref().map(|_| Instant::now());
         let called = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            engine_call_trust(&mut page.engine, name, args)
+            page.engine.scope(|cx| {
+                let args = TrustValue::values(cx, args);
+                match engine_call_trust(cx, name, &args) {
+                    Ok(value) => Ok(read(cx, value)),
+                    Err(error) => Err(TaskError::read(cx, error, label)),
+                }
+            })
         }));
         if let Some(started) = started
             && started.elapsed() >= Duration::from_millis(10)
@@ -6812,7 +6843,7 @@ mod desktop {
         match called {
             Ok(Ok(value)) => Some(value),
             Ok(Err(error)) => {
-                record_eval_error(page, error, label);
+                record_task_error(page, error);
                 None
             }
             Err(_) => {
@@ -6827,12 +6858,15 @@ mod desktop {
 
     fn dispatch_timer_task(page: &mut TrustJsPage, deadline: f64, label: &str) -> bool {
         let dispatched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            dispatch_timer_task_to(&mut page.engine, deadline)
+            page.engine.scope(|cx| {
+                dispatch_timer_task_to(cx, deadline)
+                    .map_err(|error| TaskError::read(cx, error, label))
+            })
         }));
         match dispatched {
             Ok(Ok(ran)) => ran,
             Ok(Err(error)) => {
-                record_eval_error(page, error, label);
+                record_task_error(page, error);
                 false
             }
             Err(_) => {
@@ -6845,18 +6879,10 @@ mod desktop {
         }
     }
 
-    fn record_eval_error(page: &mut TrustJsPage, error: EvalError, label: &str) {
-        match error {
-            EvalError::Interrupted(trust_js::InterruptReason::UserNavigation) => {}
-            EvalError::Interrupted(trust_js::InterruptReason::Cancelled) => {}
-            EvalError::Interrupted(reason) => page
-                .outcome
-                .errors
-                .push(format!("{label} interrupted: {}", reason.message())),
-            EvalError::Throw(error) => {
-                let message = describe_throw(&mut page.engine, error, label);
-                page.outcome.errors.push(message);
-            }
+    /// Record a failed task's error, unless navigation or cancellation interrupted it.
+    fn record_task_error(page: &mut TrustJsPage, error: TaskError) {
+        if let Some(message) = error.message() {
+            page.outcome.errors.push(message);
         }
     }
 
@@ -6875,12 +6901,12 @@ mod desktop {
             return;
         }
         let created = page.dom.borrow_mut().take_created_images();
-        let mut groups: Vec<(u64, Vec<Value>, Vec<Value>)> = Vec::new();
+        let mut groups: Vec<(u64, Vec<TrustValue>, Vec<TrustValue>)> = Vec::new();
         let mut waiting = Vec::new();
         {
             let dom = page.dom.clone();
             let dom = dom.borrow();
-            let Some(state) = page.engine.ctx().host_mut::<HostState>() else {
+            let Some(state) = page.engine.host_mut::<HostState>() else {
                 return;
             };
             for (id, adopted) in created {
@@ -6905,36 +6931,34 @@ mod desktop {
                         groups.last_mut().expect("pushed")
                     }
                 };
-                group.1.push(Value::Num(id as f64));
-                group.2.push(Value::Bool(adopted));
+                group.1.push(TrustValue::Num(id as f64));
+                group.2.push(TrustValue::Bool(adopted));
             }
         }
         if !waiting.is_empty() {
             page.dom.borrow_mut().requeue_created_images(waiting);
         }
         for (context, ids, adopted) in groups {
-            let ids = page.engine.ctx().make_array(ids);
-            let adopted = page.engine.ctx().make_array(adopted);
+            let args = [TrustValue::Array(ids), TrustValue::Array(adopted)];
             if context == 0 {
-                let _ = call_trust(
-                    page,
-                    "startCreatedImages",
-                    &[ids, adopted],
-                    "created images",
-                );
+                let _ = call_trust(page, "startCreatedImages", &args, "created images");
                 continue;
             }
             let realm = page
                 .engine
-                .ctx()
                 .host_mut::<HostState>()
                 .and_then(|state| state.window_realm(context));
             if let Some(realm) = realm {
                 let result = page.engine.with_embed_realm(&realm, |engine| {
-                    engine_call_trust(engine, "startCreatedImages", &[ids, adopted])
+                    engine.scope(|cx| {
+                        let args = TrustValue::values(cx, &args);
+                        engine_call_trust(cx, "startCreatedImages", &args)
+                            .map(|_| ())
+                            .map_err(|error| TaskError::read(cx, error, "created images"))
+                    })
                 });
                 if let Ok(Err(error)) = result {
-                    record_eval_error(page, error, "created images");
+                    record_task_error(page, error);
                 }
             }
         }
@@ -7005,16 +7029,20 @@ mod desktop {
     fn drain_diagnostics(page: &mut TrustJsPage) {
         #[cfg(feature = "architecture-diagnostics")]
         crate::dom::architecture_diagnostics::report();
-        if let Some(state) = page.engine.ctx().host_mut::<HostState>() {
+        if let Some(state) = page.engine.host_mut::<HostState>() {
             page.outcome.modules_skipped += std::mem::take(&mut state.modules_skipped);
         }
         let error_start = page.outcome.errors.len();
         let console_start = page.outcome.console.len();
         for (method, errors) in [("takeErrors", true), ("takeLogs", false)] {
-            let Ok(value) = engine_call_trust(&mut page.engine, method, &[]) else {
+            let joined = page.engine.scope(|cx| {
+                engine_call_trust(cx, method, &[])
+                    .ok()
+                    .map(|value| value_string(cx, &value))
+            });
+            let Some(joined) = joined else {
                 continue;
             };
-            let joined = value_string(&mut page.engine, &value);
             let destination = if errors {
                 &mut page.outcome.errors
             } else {
@@ -7035,7 +7063,7 @@ mod desktop {
         // Window's, never the top-level Document's.
         let rejections = page.engine.take_unhandled_rejections_in_contexts();
         for (context, list) in rejections_by_context(rejections) {
-            let reasons: Vec<Value> = list.iter().map(|(_, reason)| reason.clone()).collect();
+            let reasons: Vec<Handle> = list.iter().map(|(_, reason)| reason.clone()).collect();
             if !notify_rejections_in_context(
                 &mut page.engine,
                 context,
@@ -7044,7 +7072,10 @@ mod desktop {
             ) && is_page_context(&mut page.engine, context)
             {
                 for reason in reasons {
-                    let message = value_string(&mut page.engine, &reason);
+                    let message = page.engine.scope(|cx| {
+                        let reason = held(cx, &reason);
+                        value_string(cx, &reason)
+                    });
                     page.outcome
                         .console
                         .push(format!("unhandled rejection: {message}"));
@@ -7067,31 +7098,28 @@ mod desktop {
             }
         }
         if let Ok(source) = std::env::var("TRUST_JS_PROBE") {
-            match page.engine.eval_value_interruptible(&source) {
-                Ok(Ok(value)) => {
-                    eprintln!(
-                        "trust-js: probe: {}",
-                        value_string(&mut page.engine, &value)
-                    )
-                }
-                Ok(Err(EvalError::Throw(error))) => {
-                    eprintln!(
-                        "trust-js: probe threw: {}",
-                        describe_throw(&mut page.engine, error, "probe")
-                    );
-                }
-                Ok(Err(EvalError::Interrupted(reason))) => {
-                    eprintln!("trust-js: probe interrupted: {}", reason.message());
-                }
-                Err(error) => eprintln!(
-                    "trust-js: probe parse error at line {}: {}",
-                    error.line, error.message
-                ),
-            }
+            page.engine
+                .scope(|cx| match cx.eval_value_interruptible(&source) {
+                    Ok(Ok(value)) => {
+                        eprintln!("trust-js: probe: {}", value_string(cx, &value))
+                    }
+                    Ok(Err(EvalError::Throw(error))) => {
+                        eprintln!(
+                            "trust-js: probe threw: {}",
+                            describe_throw(cx, error, "probe")
+                        );
+                    }
+                    Ok(Err(EvalError::Interrupted(reason))) => {
+                        eprintln!("trust-js: probe interrupted: {}", reason.message());
+                    }
+                    Err(error) => eprintln!(
+                        "trust-js: probe parse error at line {}: {}",
+                        error.line, error.message
+                    ),
+                });
         }
         page.outcome.fetches = page
             .engine
-            .ctx()
             .host_mut::<HostState>()
             .and_then(|state| state.network.as_ref())
             .map_or(0, |network| {
@@ -7107,9 +7135,10 @@ mod desktop {
         if !due {
             return;
         }
-        let queues = call_trust(page, "taskQueueState", &[], "task trace")
-            .map(|value| value_string(&mut page.engine, &value))
-            .unwrap_or_else(|| String::from("unavailable"));
+        let queues = call_trust_read(page, "taskQueueState", &[], "task trace", |cx, value| {
+            value_string(cx, &value)
+        })
+        .unwrap_or_else(|| String::from("unavailable"));
         let Some(trace) = page.task_trace.as_mut() else {
             return;
         };
@@ -7141,14 +7170,16 @@ mod desktop {
     }
 
     fn trust_bool(page: &mut TrustJsPage, name: &str) -> bool {
-        call_trust(page, name, &[], name).is_some_and(|value| page.engine.ctx().to_boolean(&value))
+        call_trust(page, name, &[], name).is_some_and(|value| value.truthy())
     }
 
     fn listener_ids(page: &mut TrustJsPage, name: &str) -> HashSet<usize> {
-        let Some(value) = call_trust(page, name, &[], name) else {
-            return HashSet::new();
-        };
-        let Ok(joined) = page.engine.ctx().coerce_string(&value) else {
+        let joined = call_trust_read(page, name, &[], name, |cx, value| {
+            cx.coerce_string(&value)
+                .map(|joined| joined.to_string())
+                .ok()
+        });
+        let Some(Some(joined)) = joined else {
             return HashSet::new();
         };
         joined
@@ -7168,10 +7199,10 @@ mod desktop {
     fn install_interaction_metadata(
         page: &mut TrustJsPage,
     ) -> (std::collections::HashSet<usize>, bool) {
-        webgl_host::publish(page.engine.ctx(), true, None);
+        page.engine.scope(|cx| webgl_host::publish(cx, true, None));
         // HTML #offscreencanvas-placeholder: this Window agent's rendering
         // update pushes its OffscreenCanvases' bitmaps and presents frames.
-        canvas_host::push_placeholders(page.engine.ctx());
+        page.engine.scope(canvas_host::push_placeholders);
         prime_page_svg_sprites(page);
         let clickable_listeners = listener_ids(page, "clickables");
         let hover_listeners = listener_ids(page, "hoverables");
@@ -7206,7 +7237,6 @@ mod desktop {
     ) -> (String, crate::http::RenderedPage, bool) {
         let (viewport, ratio, images) = page
             .engine
-            .ctx()
             .host_mut::<HostState>()
             .map(|state| {
                 (
@@ -7216,7 +7246,7 @@ mod desktop {
                 )
             })
             .unwrap_or((DEFAULT_VIEWPORT, 1.0, Default::default()));
-        let geometry = ensure_host_geom_cache(page.engine.ctx(), "render");
+        let geometry = page.engine.scope(|cx| ensure_host_geom_cache(cx, "render"));
         let rendered = {
             let dom = page.dom.borrow();
             crate::http::render_arena_with_layout(
@@ -7302,7 +7332,7 @@ mod desktop {
     }
 
     fn render_with_observers(page: &mut TrustJsPage) -> (String, crate::http::RenderedPage, bool) {
-        let _animation_sample = CssAnimationSample::new(page.engine.ctx());
+        let _animation_sample = page.engine.scope(CssAnimationSample::new);
         // HTML #update-the-rendering: style and layout, then the resize
         // observation rounds (each relayouts what its callbacks changed, as
         // the observers read geometry), and only then paint. The geometry
@@ -7351,7 +7381,7 @@ mod desktop {
         if rendered.image_sources.is_empty() && paint.image_requests.is_empty() {
             return;
         }
-        let Some((store, events)) = page.engine.ctx().host_mut::<HostState>().and_then(|state| {
+        let Some((store, events)) = page.engine.host_mut::<HostState>().and_then(|state| {
             Some((
                 state.network.as_ref()?.cache.images(),
                 state.task_events.clone()?,
@@ -7430,7 +7460,7 @@ mod desktop {
             let (context, cors, referrer_policy) = {
                 let dom = page.dom.clone();
                 let dom = dom.borrow();
-                let Some(state) = page.engine.ctx().host_mut::<HostState>() else {
+                let Some(state) = page.engine.host_mut::<HostState>() else {
                     return;
                 };
                 let context = if dom.is_valid(source.node) {
@@ -7460,16 +7490,13 @@ mod desktop {
             };
             let started = crate::performance::now_ms();
             let url = url.to_owned();
-            let Some((fetch, join, handle)) = image_host::document_request(
-                page.engine.ctx(),
-                context,
-                &url,
-                cors,
-                referrer_policy,
-            ) else {
+            let Some((fetch, join, handle)) = page
+                .engine
+                .scope(|cx| image_host::document_request(cx, context, &url, cors, referrer_policy))
+            else {
                 continue;
             };
-            let Some(state) = page.engine.ctx().host_mut::<HostState>() else {
+            let Some(state) = page.engine.host_mut::<HostState>() else {
                 return;
             };
             state.pending_document_images += 1;
@@ -7542,16 +7569,14 @@ mod desktop {
             return;
         }
         let traversable = selected_id(page);
-        let Some((handle, cache, events)) =
-            page.engine.ctx().host_mut::<HostState>().and_then(|state| {
-                let network = state.network.as_ref()?;
-                Some((
-                    network.handle.clone(),
-                    network.cache.clone(),
-                    state.task_events.clone()?,
-                ))
-            })
-        else {
+        let Some((handle, cache, events)) = page.engine.host_mut::<HostState>().and_then(|state| {
+            let network = state.network.as_ref()?;
+            Some((
+                network.handle.clone(),
+                network.cache.clone(),
+                state.task_events.clone()?,
+            ))
+        }) else {
             return;
         };
         for (owner, key) in requests {
@@ -7569,13 +7594,15 @@ mod desktop {
                 };
                 (owner, dom.node_document_encoding(owner))
             };
-            let client = element_request_client_url(page.engine.ctx(), owner);
+            let client = page
+                .engine
+                .scope(|cx| element_request_client_url(cx, owner));
             if !matches!(url.scheme(), "http" | "https" | "file")
                 || !crate::http::subresource_allowed(&client, &url)
             {
                 continue;
             }
-            if let Some(state) = page.engine.ctx().host_mut::<HostState>() {
+            if let Some(state) = page.engine.host_mut::<HostState>() {
                 state.in_flight_imports.insert(key.clone());
             }
             // Referrer Policy #integration-with-css: an inline sheet's (or a
@@ -7607,23 +7634,21 @@ mod desktop {
         if requests.is_empty() {
             return;
         }
-        let Some((handle, cache, events)) =
-            page.engine.ctx().host_mut::<HostState>().and_then(|state| {
-                let network = state.network.as_ref()?;
-                Some((
-                    network.handle.clone(),
-                    network.cache.clone(),
-                    state.task_events.clone()?,
-                ))
-            })
-        else {
+        let Some((handle, cache, events)) = page.engine.host_mut::<HostState>().and_then(|state| {
+            let network = state.network.as_ref()?;
+            Some((
+                network.handle.clone(),
+                network.cache.clone(),
+                state.task_events.clone()?,
+            ))
+        }) else {
             return;
         };
         for request in requests {
             let context = {
                 let dom = page.dom.clone();
                 let dom = dom.borrow();
-                let Some(state) = page.engine.ctx().host_mut::<HostState>() else {
+                let Some(state) = page.engine.host_mut::<HostState>() else {
                     return;
                 };
                 if dom.is_valid(request.node) {
@@ -7632,7 +7657,7 @@ mod desktop {
                     0
                 }
             };
-            let client = request_context_url(page.engine.ctx(), context);
+            let client = page.engine.scope(|cx| request_context_url(cx, context));
             // Layout keyed the document by the origin it saw; only a request
             // from a client of that origin may settle it.
             if client.origin().ascii_serialization() != request.key.partition
@@ -7653,7 +7678,7 @@ mod desktop {
             fetch.cookie_context = Some(cookies);
             // Fetch #determine-requests-referrer: the referencing element's
             // Document under its policy container's referrer policy.
-            if let Some(state) = page.engine.ctx().host_mut::<HostState>() {
+            if let Some(state) = page.engine.host_mut::<HostState>() {
                 let source = environment_referrer_source(state, context);
                 let policy = environment_referrer_policy(state, context);
                 crate::http::set_request_referrer(&mut fetch, source.as_ref(), policy);
@@ -7685,10 +7710,10 @@ mod desktop {
     fn sheet_owner_referrer(page: &mut TrustJsPage, owner: usize) -> crate::http::SheetReferrer {
         let dom = page.dom.clone();
         let link = (dom.borrow().tag_name(owner) == Some("link"))
-            .then(|| host_resource_url(page.engine.ctx(), owner, None))
+            .then(|| page.engine.scope(|cx| host_resource_url(cx, owner, None)))
             .flatten()
             .and_then(|url| url::Url::parse(&url).ok());
-        let Some(state) = page.engine.ctx().host_mut::<HostState>() else {
+        let Some(state) = page.engine.host_mut::<HostState>() else {
             return crate::http::SheetReferrer {
                 source: None,
                 policy: Default::default(),
@@ -7710,7 +7735,7 @@ mod desktop {
     }
 
     fn start_font_fetches(page: &mut TrustJsPage) {
-        if let Some(state) = page.engine.ctx().host::<HostState>() {
+        if let Some(state) = page.engine.host::<HostState>() {
             state.install_font_demand_waker();
         }
         let urls = page.dom.borrow().take_font_requests();
@@ -7718,33 +7743,26 @@ mod desktop {
             return;
         }
         let traversable = selected_id(page);
-        let Some((handle, cache, events)) =
-            page.engine.ctx().host_mut::<HostState>().and_then(|state| {
-                let network = state.network.as_ref()?;
-                Some((
-                    network.handle.clone(),
-                    network.cache.clone(),
-                    state.task_events.clone()?,
-                ))
-            })
-        else {
+        let Some((handle, cache, events)) = page.engine.host_mut::<HostState>().and_then(|state| {
+            let network = state.network.as_ref()?;
+            Some((
+                network.handle.clone(),
+                network.cache.clone(),
+                state.task_events.clone()?,
+            ))
+        }) else {
             return;
         };
         for crate::font_system::FontRequest { document, url, .. } in urls {
             let context = page
                 .engine
-                .ctx()
                 .host::<HostState>()
                 .and_then(|state| node_window_context(state, &page.dom.borrow(), document))
                 .unwrap_or(0);
-            let client = request_context_url(page.engine.ctx(), context);
-            let cookies = cookie_context_for_id(page.engine.ctx(), context);
+            let client = page.engine.scope(|cx| request_context_url(cx, context));
+            let cookies = page.engine.scope(|cx| cookie_context_for_id(cx, context));
             let (source, policy) = {
-                let state = page
-                    .engine
-                    .ctx()
-                    .host_mut::<HostState>()
-                    .expect("font host");
+                let state = page.engine.host_mut::<HostState>().expect("font host");
                 state.pending_fonts += 1;
                 (
                     environment_referrer_source(state, context),
@@ -7765,7 +7783,6 @@ mod desktop {
             let mut request = crate::http::Request::subresource(url, &client, "font", credentials);
             request.service_worker = page
                 .engine
-                .ctx()
                 .host::<HostState>()
                 .and_then(|state| service_worker_host::fetch::for_context(state, context));
             request.cookie_context = Some(cookies);
@@ -7797,12 +7814,12 @@ mod desktop {
             .dom
             .borrow()
             .external_svg_use_sheet_requests(&page.base);
-        let client = request_context_url(page.engine.ctx(), 0);
+        let client = page.engine.scope(|cx| request_context_url(cx, 0));
         for (url, restricted) in urls {
             if crate::dom::sprite_sheet_cached(url.as_str()) {
                 continue;
             }
-            let prepared = page.engine.ctx().host_mut::<HostState>().and_then(|state| {
+            let prepared = page.engine.host_mut::<HostState>().and_then(|state| {
                 // The Document's request referrer (Fetch #determine-requests-referrer).
                 let source = environment_referrer_source(state, 0);
                 let policy = environment_referrer_policy(state, 0);
@@ -7864,16 +7881,19 @@ mod desktop {
         }
     }
 
-    fn value_is_nullish(value: &Value) -> bool {
-        matches!(value, Value::Null | Value::Undefined | Value::Empty)
+    fn value_is_nullish(value: &TrustValue) -> bool {
+        matches!(value, TrustValue::Null | TrustValue::Undefined)
     }
 
-    fn value_to_string(page: &mut TrustJsPage, value: &Value) -> Option<String> {
-        page.engine
-            .ctx()
-            .coerce_string(value)
-            .ok()
-            .map(|value| value.to_string())
+    /// ToString of a platform result, as Rust text.
+    fn value_to_string(page: &mut TrustJsPage, value: &TrustValue) -> Option<String> {
+        if value.as_engine_text().is_some() {
+            return Some(value.text());
+        }
+        page.engine.scope(|cx| {
+            let value = value.value(cx);
+            cx.coerce_string(&value).ok().map(|value| value.to_string())
+        })
     }
 
     // Command dispatch and event-tail handling are kept below the shared
@@ -7911,21 +7931,21 @@ mod desktop {
             page,
             "key",
             &[
-                node.map_or(Value::Null, |node| Value::Num(node as f64)),
-                Value::from_string(key.clone()),
-                Value::from_string(input.code),
-                Value::Bool(input.repeat),
-                Value::Bool(input.composing),
-                Value::Bool(input.modifiers.shift),
-                Value::Bool(input.modifiers.control),
-                Value::Bool(input.modifiers.alt),
-                Value::Bool(input.modifiers.meta),
-                Value::Bool(released),
-                Value::Num(input.location as f64),
+                node.map_or(TrustValue::Null, |node| TrustValue::Num(node as f64)),
+                TrustValue::from_text(key.clone()),
+                TrustValue::from_text(input.code),
+                TrustValue::Bool(input.repeat),
+                TrustValue::Bool(input.composing),
+                TrustValue::Bool(input.modifiers.shift),
+                TrustValue::Bool(input.modifiers.control),
+                TrustValue::Bool(input.modifiers.alt),
+                TrustValue::Bool(input.modifiers.meta),
+                TrustValue::Bool(released),
+                TrustValue::Num(input.location as f64),
             ],
             if released { "keyup" } else { "keydown" },
         )
-        .is_some_and(|value| page.engine.ctx().to_boolean(&value));
+        .is_some_and(|value| value.truthy());
         checkpoint(page, if released { "keyup" } else { "keydown" });
         if let Some((url, replace)) = take_navigation(page) {
             return send_navigation(page, events, url, replace);
@@ -7939,16 +7959,16 @@ mod desktop {
                 page,
                 "editableKeyDefault",
                 &[
-                    node.map_or(Value::Null, |node| Value::Num(node as f64)),
-                    Value::from_string(key),
-                    Value::Bool(input.modifiers.shift),
-                    Value::Bool(input.modifiers.control),
-                    Value::Bool(input.modifiers.alt),
-                    Value::Bool(input.modifiers.meta),
+                    node.map_or(TrustValue::Null, |node| TrustValue::Num(node as f64)),
+                    TrustValue::from_text(key),
+                    TrustValue::Bool(input.modifiers.shift),
+                    TrustValue::Bool(input.modifiers.control),
+                    TrustValue::Bool(input.modifiers.alt),
+                    TrustValue::Bool(input.modifiers.meta),
                 ],
                 "editable key default",
             )
-            .is_some_and(|value| page.engine.ctx().to_boolean(&value));
+            .is_some_and(|value| value.truthy());
             if editable_handled {
                 prevented = true;
                 checkpoint(page, "editable key default");
@@ -7962,7 +7982,10 @@ mod desktop {
             let _ = call_trust(
                 page,
                 "formInsertText",
-                &[Value::Num(node as f64), Value::from_string(text.clone())],
+                &[
+                    TrustValue::Num(node as f64),
+                    TrustValue::from_text(text.clone()),
+                ],
                 "text key default",
             );
             checkpoint(page, "text key default");
@@ -8002,7 +8025,7 @@ mod desktop {
                 call_trust(
                     page,
                     "formEditingState",
-                    &[Value::Num(node as f64)],
+                    &[TrustValue::Num(node as f64)],
                     "text key acknowledgement",
                 )
             })
@@ -8032,11 +8055,11 @@ mod desktop {
         match command {
             PageCmd::PointerLockResult { request, error } => {
                 prepare_interaction(page, interrupt);
-                let error = error.map_or(Value::Null, Value::from_string);
+                let error = error.map_or(TrustValue::Null, TrustValue::from_text);
                 let _ = call_trust(
                     page,
                     "pointerLockResult",
-                    &[Value::Num(request as f64), error],
+                    &[TrustValue::Num(request as f64), error],
                     "pointer lock result",
                 );
                 checkpoint(page, "pointer lock result");
@@ -8044,8 +8067,11 @@ mod desktop {
             }
             PageCmd::ClipboardResult { request, ok } => {
                 prepare_interaction(page, interrupt);
-                if let Err(error) = settle_clipboard_request(page.engine.ctx(), request, ok) {
-                    record_eval_error(page, error, "clipboard result");
+                if let Err(error) = page.engine.scope(|cx| {
+                    settle_clipboard_request(cx, request, ok)
+                        .map_err(|error| TaskError::read(cx, error, "clipboard result"))
+                }) {
+                    record_task_error(page, error);
                 }
                 checkpoint(page, "clipboard result");
                 finish_task_with_ack(page, events, false)
@@ -8058,14 +8084,14 @@ mod desktop {
                     page,
                     "closeRequest",
                     &[
-                        Value::Bool(modifiers.shift),
-                        Value::Bool(modifiers.control),
-                        Value::Bool(modifiers.alt),
-                        Value::Bool(modifiers.meta),
+                        TrustValue::Bool(modifiers.shift),
+                        TrustValue::Bool(modifiers.control),
+                        TrustValue::Bool(modifiers.alt),
+                        TrustValue::Bool(modifiers.meta),
                     ],
                     "close request",
                 )
-                .is_none_or(|value| page.engine.ctx().to_boolean(&value));
+                .is_none_or(|value| value.truthy());
                 checkpoint(page, "close request");
                 if let Some((url, replace)) = take_navigation(page) {
                     if events
@@ -8089,10 +8115,9 @@ mod desktop {
                 prepare_interaction(page, interrupt);
                 let context = page
                     .engine
-                    .ctx()
                     .host::<HostState>()
                     .map_or(0, |state| state.top_context);
-                stop_loading_navigable(page.engine.ctx(), context);
+                page.engine.scope(|cx| stop_loading_navigable(cx, context));
                 checkpoint(page, "stop loading");
                 finish_task_with_ack(page, events, false)
             }
@@ -8133,7 +8158,7 @@ mod desktop {
                 let _ = call_trust(
                     page,
                     "fullscreenResult",
-                    &[Value::Num(request as f64), Value::Bool(ok)],
+                    &[TrustValue::Num(request as f64), TrustValue::Bool(ok)],
                     "fullscreen result",
                 );
                 checkpoint(page, "fullscreen result");
@@ -8147,10 +8172,13 @@ mod desktop {
             }
             PageCmd::FilePickerResult { request, files } => {
                 prepare_interaction(page, interrupt);
-                match settle_file_picker_request(page.engine.ctx(), request, files) {
+                match page.engine.scope(|cx| {
+                    settle_file_picker_request(cx, request, files)
+                        .map_err(|error| TaskError::read(cx, error, "file picker result"))
+                }) {
                     Ok(Some(trouble)) => page.outcome.errors.push(trouble),
                     Ok(None) => {}
-                    Err(error) => record_eval_error(page, error, "file picker result"),
+                    Err(error) => record_task_error(page, error),
                 }
                 checkpoint(page, "file picker result");
                 finish_task_with_ack(page, events, false)
@@ -8169,7 +8197,7 @@ mod desktop {
                 let _ = call_trust(
                     page,
                     "releasePointerLock",
-                    &[Value::Bool(false)],
+                    &[TrustValue::Bool(false)],
                     "release pointer lock",
                 );
                 checkpoint(page, "release pointer lock");
@@ -8186,8 +8214,8 @@ mod desktop {
                     page,
                     method,
                     &[
-                        Value::Num(finite_or_zero(dx)),
-                        Value::Num(finite_or_zero(dy)),
+                        TrustValue::Num(finite_or_zero(dx)),
+                        TrustValue::Num(finite_or_zero(dy)),
                     ],
                     method,
                 );
@@ -8203,9 +8231,9 @@ mod desktop {
                     page,
                     "setSessionHistory",
                     &[
-                        Value::Num(index as f64),
-                        Value::Num(length as f64),
-                        Value::Num(applied as f64),
+                        TrustValue::Num(index as f64),
+                        TrustValue::Num(length as f64),
+                        TrustValue::Num(applied as f64),
                     ],
                     "session history",
                 );
@@ -8220,7 +8248,7 @@ mod desktop {
                 let _ = call_trust(
                     page,
                     "pointerModifiers",
-                    &[Value::Num(f64::from(metadata.modifier_bits()))],
+                    &[TrustValue::Num(f64::from(metadata.modifier_bits()))],
                     "pointer modifiers",
                 );
                 true
@@ -8230,7 +8258,7 @@ mod desktop {
                 let _ = call_trust(
                     page,
                     "lockedPointerButton",
-                    &[Value::Num(button as f64), Value::Bool(pressed)],
+                    &[TrustValue::Num(button as f64), TrustValue::Bool(pressed)],
                     "locked pointer button",
                 );
                 checkpoint(page, "locked pointer button");
@@ -8238,11 +8266,11 @@ mod desktop {
             }
             PageCmd::NavigateFragment { url, replace } => {
                 prepare_interaction(page, interrupt);
-                let url = Value::from_string(url);
+                let url = TrustValue::from_text(url);
                 let _ = call_trust(
                     page,
                     "navigateFragment",
-                    &[url, Value::Bool(replace)],
+                    &[url, TrustValue::Bool(replace)],
                     "fragment navigation",
                 );
                 checkpoint(page, "fragment navigation");
@@ -8253,11 +8281,11 @@ mod desktop {
                 page.dom
                     .borrow_mut()
                     .set_doc_url(url::Url::parse(&url).ok());
-                let url = Value::from_string(url);
+                let url = TrustValue::from_text(url);
                 let _ = call_trust(
                     page,
                     "traverseHistory",
-                    &[url, Value::Num(delta as f64)],
+                    &[url, TrustValue::Num(delta as f64)],
                     "history traversal",
                 );
                 checkpoint(page, "history traversal");
@@ -8320,9 +8348,9 @@ mod desktop {
                     page,
                     "formPickOption",
                     &[
-                        Value::Num(select as f64),
-                        Value::Num(option as f64),
-                        Value::Bool(toggle),
+                        TrustValue::Num(select as f64),
+                        TrustValue::Num(option as f64),
+                        TrustValue::Bool(toggle),
                     ],
                     "select pick",
                 );
@@ -8338,11 +8366,15 @@ mod desktop {
                 commit,
             } => {
                 prepare_interaction(page, interrupt);
-                let checked = checked.map_or(Value::Null, Value::Bool);
+                let checked = checked.map_or(TrustValue::Null, TrustValue::Bool);
                 let result = call_trust(
                     page,
                     if commit { "formCommit" } else { "formSet" },
-                    &[Value::Num(node as f64), Value::from_string(value), checked],
+                    &[
+                        TrustValue::Num(node as f64),
+                        TrustValue::from_text(value),
+                        checked,
+                    ],
                     "form input",
                 );
                 if result.is_some_and(|v| value_is_nullish(&v)) {
@@ -8366,15 +8398,15 @@ mod desktop {
                     page,
                     "formSet",
                     &[
-                        Value::Num(node as f64),
-                        Value::from_string(value),
-                        Value::Null,
-                        Value::from_string(edit.input_type),
-                        edit.data.map_or(Value::Null, Value::from_string),
-                        selection.map_or(Value::Null, |s| Value::Num(s.start as f64)),
-                        selection.map_or(Value::Null, |s| Value::Num(s.end as f64)),
-                        selection.map_or(Value::Null, |s| Value::Num(s.direction as f64)),
-                        Value::Bool(edit.composing),
+                        TrustValue::Num(node as f64),
+                        TrustValue::from_text(value),
+                        TrustValue::Null,
+                        TrustValue::from_text(edit.input_type),
+                        edit.data.map_or(TrustValue::Null, TrustValue::from_text),
+                        selection.map_or(TrustValue::Null, |s| TrustValue::Num(s.start as f64)),
+                        selection.map_or(TrustValue::Null, |s| TrustValue::Num(s.end as f64)),
+                        selection.map_or(TrustValue::Null, |s| TrustValue::Num(s.direction as f64)),
+                        TrustValue::Bool(edit.composing),
                     ],
                     "text input",
                 );
@@ -8396,9 +8428,9 @@ mod desktop {
                     page,
                     "numberStep",
                     &[
-                        Value::Num(node as f64),
-                        Value::Num(f64::from(direction)),
-                        Value::Bool(click),
+                        TrustValue::Num(node as f64),
+                        TrustValue::Num(f64::from(direction)),
+                        TrustValue::Bool(click),
                     ],
                     "number step",
                 );
@@ -8411,12 +8443,12 @@ mod desktop {
                     page,
                     "formSubmit",
                     &[
-                        Value::Num(form as f64),
-                        submitter.map_or(Value::Null, |node| Value::Num(node as f64)),
+                        TrustValue::Num(form as f64),
+                        submitter.map_or(TrustValue::Null, |node| TrustValue::Num(node as f64)),
                     ],
                     "form submit",
                 )
-                .is_some_and(|value| page.engine.ctx().to_boolean(&value));
+                .is_some_and(|value| value.truthy());
                 checkpoint(page, "form submit");
                 if let Some((url, replace)) = take_navigation(page) {
                     return send_navigation(page, events, url, replace);
@@ -8452,7 +8484,10 @@ mod desktop {
                 let _ = call_trust(
                     page,
                     "setScroll",
-                    &[Value::Num(finite_or_zero(x)), Value::Num(finite_or_zero(y))],
+                    &[
+                        TrustValue::Num(finite_or_zero(x)),
+                        TrustValue::Num(finite_or_zero(y)),
+                    ],
                     "scroll",
                 );
                 checkpoint(page, "scroll");
@@ -8471,20 +8506,20 @@ mod desktop {
                 prepare_interaction(page, interrupt);
                 let node = node
                     .filter(|node| page.dom.borrow().is_valid(*node))
-                    .map_or(Value::Null, |node| Value::Num(node as f64));
+                    .map_or(TrustValue::Null, |node| TrustValue::Num(node as f64));
                 let (text_node, text_offset) = note_selection_gesture(page, metadata);
                 let _ = call_trust(
                     page,
                     "hover",
                     &[
                         node,
-                        Value::Num(finite_or_zero(x)),
-                        Value::Num(finite_or_zero(y)),
-                        Value::Num(finite_or_zero(metadata.screen.map_or(x, |p| p.0))),
-                        Value::Num(finite_or_zero(metadata.screen.map_or(y, |p| p.1))),
-                        Value::Num(f64::from(metadata.modifier_bits())),
-                        Value::Bool(false),
-                        Value::Bool(true),
+                        TrustValue::Num(finite_or_zero(x)),
+                        TrustValue::Num(finite_or_zero(y)),
+                        TrustValue::Num(finite_or_zero(metadata.screen.map_or(x, |p| p.0))),
+                        TrustValue::Num(finite_or_zero(metadata.screen.map_or(y, |p| p.1))),
+                        TrustValue::Num(f64::from(metadata.modifier_bits())),
+                        TrustValue::Bool(false),
+                        TrustValue::Bool(true),
                         text_node,
                         text_offset,
                     ],
@@ -8522,7 +8557,7 @@ mod desktop {
                     let _ = call_trust(
                         page,
                         "fireElementScroll",
-                        &[Value::Num(node as f64)],
+                        &[TrustValue::Num(node as f64)],
                         "element scroll",
                     );
                     checkpoint(page, "element scroll");
@@ -8557,7 +8592,7 @@ mod desktop {
             }
             PageCmd::ImageSizes(sizes) => {
                 let mut changed = false;
-                if let Some(state) = page.engine.ctx().host_mut::<HostState>() {
+                if let Some(state) = page.engine.host_mut::<HostState>() {
                     let mut images = state.images.borrow_mut();
                     for (url, dimensions) in sizes {
                         if images.get(&url) != Some(&dimensions) {
@@ -8588,7 +8623,7 @@ mod desktop {
                 }
             }
             PageCmd::ScreenPosition(x, y) => {
-                if let Some(state) = page.engine.ctx().host_mut::<HostState>() {
+                if let Some(state) = page.engine.host_mut::<HostState>() {
                     state.screen_position.set((x, y));
                 }
                 // Moving a client window does not resize or relayout its DOM.
@@ -8605,7 +8640,7 @@ mod desktop {
                 let _ = call_trust(
                     page,
                     "systemVisibilityChanged",
-                    &[Value::Bool(hidden)],
+                    &[TrustValue::Bool(hidden)],
                     "system visibility",
                 );
                 if !hidden {
@@ -8614,16 +8649,12 @@ mod desktop {
                 finish_internal_task(page, events)
             }
             PageCmd::AudioMuted(muted) => {
-                let changed = page
-                    .engine
-                    .ctx()
-                    .host_mut::<HostState>()
-                    .is_some_and(|state| {
-                        let traversable = state.traversables.selected;
-                        let changed = state.muted_traversables.contains(&traversable) != muted;
-                        state.set_traversable_muted(traversable, muted);
-                        changed
-                    });
+                let changed = page.engine.host_mut::<HostState>().is_some_and(|state| {
+                    let traversable = state.traversables.selected;
+                    let changed = state.muted_traversables.contains(&traversable) != muted;
+                    state.set_traversable_muted(traversable, muted);
+                    changed
+                });
                 if !changed {
                     return true;
                 }
@@ -8632,7 +8663,7 @@ mod desktop {
                 let _ = call_trust(
                     page,
                     "audioMutedChanged",
-                    &[Value::Bool(muted)],
+                    &[TrustValue::Bool(muted)],
                     "audio mute",
                 );
                 finish_internal_task(page, events)
@@ -8649,7 +8680,7 @@ mod desktop {
                 let _ = call_trust(
                     page,
                     "systemFocusChanged",
-                    &[Value::Bool(focused)],
+                    &[TrustValue::Bool(focused)],
                     "system focus",
                 );
                 checkpoint(page, "system focus");
@@ -8657,18 +8688,14 @@ mod desktop {
             }
             PageCmd::Viewport(viewport) => {
                 let viewport = crate::layout2::Viewport::new(viewport.width, viewport.height);
-                let changed = page
-                    .engine
-                    .ctx()
-                    .host_mut::<HostState>()
-                    .is_some_and(|state| {
-                        if state.viewport.get() == viewport {
-                            return false;
-                        }
-                        state.viewport.set(viewport);
-                        state.geom_cache.borrow_mut().epoch = u64::MAX;
-                        true
-                    });
+                let changed = page.engine.host_mut::<HostState>().is_some_and(|state| {
+                    if state.viewport.get() == viewport {
+                        return false;
+                    }
+                    state.viewport.set(viewport);
+                    state.geom_cache.borrow_mut().epoch = u64::MAX;
+                    true
+                });
                 page.dom
                     .borrow_mut()
                     .set_viewport_px(viewport.width, viewport.height);
@@ -8679,8 +8706,8 @@ mod desktop {
                         page,
                         "setViewport",
                         &[
-                            Value::Num(f64::from(viewport.width)),
-                            Value::Num(f64::from(viewport.height)),
+                            TrustValue::Num(f64::from(viewport.width)),
+                            TrustValue::Num(f64::from(viewport.height)),
                         ],
                         "resize",
                     );
@@ -8698,18 +8725,14 @@ mod desktop {
                 } else {
                     1.0
                 };
-                let changed = page
-                    .engine
-                    .ctx()
-                    .host_mut::<HostState>()
-                    .is_some_and(|state| {
-                        if state.device_pixel_ratio.get() == ratio {
-                            return false;
-                        }
-                        state.device_pixel_ratio.set(ratio);
-                        state.geom_cache.borrow_mut().epoch = u64::MAX;
-                        true
-                    });
+                let changed = page.engine.host_mut::<HostState>().is_some_and(|state| {
+                    if state.device_pixel_ratio.get() == ratio {
+                        return false;
+                    }
+                    state.device_pixel_ratio.set(ratio);
+                    state.geom_cache.borrow_mut().epoch = u64::MAX;
+                    true
+                });
                 page.dom.borrow_mut().set_device_pixel_ratio(ratio);
                 if changed {
                     page.render_environment_dirty = true;
@@ -8719,7 +8742,7 @@ mod desktop {
                     let _ = call_trust(
                         page,
                         "setDevicePixelRatio",
-                        &[Value::Num(f64::from(ratio))],
+                        &[TrustValue::Num(f64::from(ratio))],
                         "devicePixelRatio",
                     );
                     let _ = call_trust(page, "reactToImageEnvironment", &[], "image environment");
@@ -8738,19 +8761,19 @@ mod desktop {
     fn note_selection_gesture(
         page: &mut TrustJsPage,
         metadata: crate::js::PointerMetadata,
-    ) -> (Value, Value) {
+    ) -> (TrustValue, TrustValue) {
         let Some(selection) = metadata.selection else {
-            return (Value::Null, Value::Num(0.0));
+            return (TrustValue::Null, TrustValue::Num(0.0));
         };
-        if let Some(state) = page.engine.ctx().host_mut::<HostState>() {
+        if let Some(state) = page.engine.host_mut::<HostState>() {
             state.selection_serial = state.selection_serial.max(selection.serial);
         }
         match selection.point() {
             Some(point) if page.dom.borrow().is_valid(point.node) => (
-                Value::Num(point.node as f64),
-                Value::Num(f64::from(point.offset)),
+                TrustValue::Num(point.node as f64),
+                TrustValue::Num(f64::from(point.offset)),
             ),
-            _ => (Value::Null, Value::Num(0.0)),
+            _ => (TrustValue::Null, TrustValue::Num(0.0)),
         }
     }
 
@@ -8761,7 +8784,7 @@ mod desktop {
     fn selection_report(page: &mut TrustJsPage) -> Option<crate::js::SelectionReport> {
         let epoch = page.dom.borrow().epoch();
         let (dirty, serial, previous) = {
-            let state = page.engine.ctx().host_mut::<HostState>()?;
+            let state = page.engine.host_mut::<HostState>()?;
             (
                 std::mem::take(&mut state.selection_dirty),
                 state.selection_serial,
@@ -8781,9 +8804,12 @@ mod desktop {
         }
         // `[startNode, startOffset, endNode, endOffset, anchorNode,
         // anchorOffset, focusNode, focusOffset]` for each Document's range.
-        let boundaries = call_trust(page, "selectionBoundaries", &[], "selection report")
-            .map(|value| {
-                let ctx = page.engine.ctx();
+        let boundaries = call_trust_read(
+            page,
+            "selectionBoundaries",
+            &[],
+            "selection report",
+            |ctx, value| {
                 let length = ctx
                     .member_get(&value, "length")
                     .ok()
@@ -8796,8 +8822,9 @@ mod desktop {
                             .and_then(|v| v.as_num_opt())
                     })
                     .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+            },
+        )
+        .unwrap_or_default();
         let mut segments = crate::render::SelectionSegments::default();
         let (mut anchor, mut focus) = (None, None);
         {
@@ -8832,7 +8859,7 @@ mod desktop {
             anchor,
             focus,
         };
-        let state = page.engine.ctx().host_mut::<HostState>()?;
+        let state = page.engine.host_mut::<HostState>()?;
         let unchanged = previous.is_some_and(|(_, previous)| previous == report);
         state.selection_report = Some((epoch, report.clone()));
         (!unchanged).then_some(report)
@@ -8843,7 +8870,7 @@ mod desktop {
         let _ = call_trust(
             page,
             "focusPage",
-            &[node.map_or(Value::Null, |node| Value::Num(node as f64))],
+            &[node.map_or(TrustValue::Null, |node| TrustValue::Num(node as f64))],
             "page focus",
         );
         checkpoint(page, "page focus");
@@ -8869,7 +8896,7 @@ mod desktop {
             "primary": input.primary, "mouse": input.mouse, "tap": input.tap,
         })
         .to_string();
-        let argument = Value::from_string(text);
+        let argument = TrustValue::from_text(text);
         if input.phase == TouchPhase::Down {
             let node = call_trust(
                 page,
@@ -8878,7 +8905,7 @@ mod desktop {
                 "touch target",
             )
             .and_then(|value| match value {
-                Value::Num(node) if node.is_finite() && node >= 0.0 => Some(node as usize),
+                TrustValue::Num(node) if node.is_finite() && node >= 0.0 => Some(node as usize),
                 _ => None,
             });
             let mut dom = page.dom.borrow_mut();
@@ -8919,21 +8946,21 @@ mod desktop {
             page,
             "pointerButton",
             &[
-                node.map_or(Value::Null, |node| Value::Num(node as f64)),
-                Value::Bool(pressed),
-                Value::Num(finite_or_zero(x)),
-                Value::Num(finite_or_zero(y)),
-                Value::Num(finite_or_zero(metadata.screen.map_or(x, |p| p.0))),
-                Value::Num(finite_or_zero(metadata.screen.map_or(y, |p| p.1))),
-                Value::Num(f64::from(button)),
-                Value::Num(f64::from(metadata.modifier_bits())),
-                Value::Bool(false),
+                node.map_or(TrustValue::Null, |node| TrustValue::Num(node as f64)),
+                TrustValue::Bool(pressed),
+                TrustValue::Num(finite_or_zero(x)),
+                TrustValue::Num(finite_or_zero(y)),
+                TrustValue::Num(finite_or_zero(metadata.screen.map_or(x, |p| p.0))),
+                TrustValue::Num(finite_or_zero(metadata.screen.map_or(y, |p| p.1))),
+                TrustValue::Num(f64::from(button)),
+                TrustValue::Num(f64::from(metadata.modifier_bits())),
+                TrustValue::Bool(false),
                 text_node,
                 text_offset,
-                Value::Bool(metadata.selection.is_some()),
-                Value::Bool(metadata.bypass_context_menu),
+                TrustValue::Bool(metadata.selection.is_some()),
+                TrustValue::Bool(metadata.bypass_context_menu),
                 // A native button: the actor hit-tests its target.
-                Value::Bool(true),
+                TrustValue::Bool(true),
             ],
             "pointer button",
         );
@@ -8948,7 +8975,7 @@ mod desktop {
         events: &tokio::sync::mpsc::Sender<PageEvt>,
     ) -> bool {
         let pending = call_trust(page, "pointerClickPending", &[], "pointer click")
-            .is_some_and(|value| page.engine.ctx().to_boolean(&value));
+            .is_some_and(|value| value.truthy());
         if pending {
             let document = page.dom.borrow().document();
             run_click(page, events, document)
@@ -8965,15 +8992,15 @@ mod desktop {
         events: &tokio::sync::mpsc::Sender<PageEvt>,
         node: usize,
     ) -> bool {
-        let prevented = call_trust(page, "click", &[Value::Num(node as f64)], "click")
-            .is_some_and(|value| page.engine.ctx().to_boolean(&value));
+        let prevented = call_trust(page, "click", &[TrustValue::Num(node as f64)], "click")
+            .is_some_and(|value| value.truthy());
         let anchor = if prevented {
             None
         } else {
             call_trust(
                 page,
                 "followAnchorDefault",
-                &[Value::Num(node as f64)],
+                &[TrustValue::Num(node as f64)],
                 "hyperlink navigation",
             )
             .filter(|value| !value_is_nullish(value))
@@ -9162,7 +9189,7 @@ mod desktop {
         // for a rendering opportunity it gets only once shown.
         let render_now = render_now && !page.hidden;
         let run_scroll_steps = run_scroll_steps && !page.hidden;
-        let _animation_sample = render_now.then(|| CssAnimationSample::new(page.engine.ctx()));
+        let _animation_sample = render_now.then(|| page.engine.scope(CssAnimationSample::new));
         if page.outcome.panicked {
             let errors = std::mem::take(&mut page.outcome.errors);
             let _ = events.blocking_send(PageEvt::Trouble(errors));
@@ -9205,11 +9232,7 @@ mod desktop {
             return send_navigation(page, events, url, replace);
         }
         let traversals = {
-            let state = page
-                .engine
-                .ctx()
-                .host_mut::<HostState>()
-                .expect("History host");
+            let state = page.engine.host_mut::<HostState>().expect("History host");
             std::mem::take(&mut state.history_traversals)
                 .into_iter()
                 .filter(|(context, _)| *context == 0 || state.window_realms.contains_key(context))
@@ -9225,47 +9248,62 @@ mod desktop {
             }
         }
         let fragment = take_scroll_fragment(page);
-        let viewport_scroll = call_trust(page, "takeViewportScroll", &[], "viewport scroll")
-            .filter(|v| !value_is_nullish(v))
-            .and_then(|v| {
-                let ctx = page.engine.ctx();
+        let viewport_scroll = call_trust_read(
+            page,
+            "takeViewportScroll",
+            &[],
+            "viewport scroll",
+            |ctx, v| {
+                if v.is_nullish() {
+                    return None;
+                }
                 Some((
                     ctx.member_get(&v, "0").ok()?.as_num_opt()?,
                     ctx.member_get(&v, "1").ok()?.as_num_opt()?,
                 ))
-            });
-        if let Some(value) = call_trust(page, "takePointerLockRequest", &[], "pointer lock request")
-            && !value_is_nullish(&value)
-        {
-            let ctx = page.engine.ctx();
-            let request = ctx
-                .member_get(&value, "0")
-                .ok()
-                .and_then(|v| v.as_num_opt())
-                .unwrap_or(0.0) as u64;
-            let node = ctx
-                .member_get(&value, "1")
-                .ok()
-                .and_then(|v| v.as_num_opt())
-                .map(|n| n as usize);
-            let unadjusted = ctx
-                .member_get(&value, "2")
-                .ok()
-                .is_some_and(|v| ctx.to_boolean(&v));
-            if events
+            },
+        )
+        .flatten();
+        let pointer_lock = call_trust_read(
+            page,
+            "takePointerLockRequest",
+            &[],
+            "pointer lock request",
+            |ctx, value| {
+                if value.is_nullish() {
+                    return None;
+                }
+                let request = ctx
+                    .member_get(&value, "0")
+                    .ok()
+                    .and_then(|v| v.as_num_opt())
+                    .unwrap_or(0.0) as u64;
+                let node = ctx
+                    .member_get(&value, "1")
+                    .ok()
+                    .and_then(|v| v.as_num_opt())
+                    .map(|n| n as usize);
+                let unadjusted = ctx
+                    .member_get(&value, "2")
+                    .ok()
+                    .is_some_and(|v| ctx.to_boolean(&v));
+                Some((request, node, unadjusted))
+            },
+        )
+        .flatten();
+        if let Some((request, node, unadjusted)) = pointer_lock
+            && events
                 .blocking_send(PageEvt::PointerLock {
                     request,
                     node,
                     unadjusted,
                 })
                 .is_err()
-            {
-                return false;
-            }
+        {
+            return false;
         }
         let clipboard_writes = page
             .engine
-            .ctx()
             .host_mut::<HostState>()
             .map(|state| std::mem::take(&mut state.clipboard_requests))
             .unwrap_or_default();
@@ -9279,7 +9317,6 @@ mod desktop {
         }
         let context_menus = page
             .engine
-            .ctx()
             .host_mut::<HostState>()
             .map(|state| std::mem::take(&mut state.context_menus))
             .unwrap_or_default();
@@ -9295,7 +9332,6 @@ mod desktop {
         }
         let fullscreen_requests = page
             .engine
-            .ctx()
             .host_mut::<HostState>()
             .map(|state| std::mem::take(&mut state.fullscreen_requests))
             .unwrap_or_default();
@@ -9311,7 +9347,6 @@ mod desktop {
         }
         let file_pickers = page
             .engine
-            .ctx()
             .host_mut::<HostState>()
             .map(|state| std::mem::take(&mut state.file_picker_requests))
             .unwrap_or_default();
@@ -9606,33 +9641,41 @@ mod desktop {
     }
 
     fn take_navigation(page: &mut TrustJsPage) -> Option<(String, NavigationAction)> {
-        let value = call_trust(page, "takeNavigationRequest", &[], "navigation")?;
-        if value_is_nullish(&value) {
-            return None;
-        }
-        let url_value = page.engine.ctx().member_get(&value, "0").ok()?;
-        let action_value = page.engine.ctx().member_get(&value, "1").ok()?;
-        let url = value_to_string(page, &url_value)?;
-        let kind = match value_to_string(page, &action_value)?.as_str() {
+        let (url, action, policy, context) = call_trust_read(
+            page,
+            "takeNavigationRequest",
+            &[],
+            "navigation",
+            |ctx, value| {
+                if value.is_nullish() {
+                    return None;
+                }
+                let url_value = ctx.member_get(&value, "0").ok()?;
+                let url = ctx.coerce_string(&url_value).ok()?.to_string();
+                let action_value = ctx.member_get(&value, "1").ok()?;
+                let action = ctx.coerce_string(&action_value).ok()?.to_string();
+                let policy = match ctx.member_get(&value, "5") {
+                    Ok(policy) => ctx
+                        .coerce_string(&policy)
+                        .map(|policy| policy.to_string())
+                        .unwrap_or_default(),
+                    Err(_) => String::new(),
+                };
+                let context = ctx
+                    .member_get(&value, "6")
+                    .ok()
+                    .and_then(|value| value.as_num_opt())
+                    .filter(|context| context.is_finite() && *context >= 0.0)
+                    .map_or(0, |context| context as u64);
+                Some((url, action, policy, context))
+            },
+        )
+        .flatten()?;
+        let kind = match action.as_str() {
             "reload" => NavigationKind::Reload,
             "replace" => NavigationKind::Replace,
             _ => NavigationKind::New,
         };
-        let policy = page
-            .engine
-            .ctx()
-            .member_get(&value, "5")
-            .ok()
-            .and_then(|value| value_to_string(page, &value))
-            .unwrap_or_default();
-        let context = page
-            .engine
-            .ctx()
-            .member_get(&value, "6")
-            .ok()
-            .and_then(|value| value.as_num_opt())
-            .filter(|context| context.is_finite() && *context >= 0.0)
-            .map_or(0, |context| context as u64);
         let url = url.trim().to_string();
         if url.is_empty() {
             return None;
@@ -9742,29 +9785,33 @@ mod desktop {
     /// HTML #following-hyperlinks-2: the hyperlink a click followed, as
     /// `[hyperlink referrer policy, its node document's settings context]`.
     fn hyperlink_navigation(page: &mut TrustJsPage, url: String) -> (String, NavigationAction) {
-        let value = call_trust(page, "takeHyperlinkNavigation", &[], "hyperlink navigation")
-            .filter(|value| !value_is_nullish(value));
-        let (policy, context) = match value {
-            Some(value) => {
-                let policy = page
-                    .engine
-                    .ctx()
-                    .member_get(&value, "0")
-                    .ok()
-                    .and_then(|value| value_to_string(page, &value))
-                    .unwrap_or_default();
-                let context = page
-                    .engine
-                    .ctx()
+        let (policy, context) = call_trust_read(
+            page,
+            "takeHyperlinkNavigation",
+            &[],
+            "hyperlink navigation",
+            |ctx, value| {
+                if value.is_nullish() {
+                    return None;
+                }
+                let policy = match ctx.member_get(&value, "0") {
+                    Ok(policy) => ctx
+                        .coerce_string(&policy)
+                        .map(|policy| policy.to_string())
+                        .unwrap_or_default(),
+                    Err(_) => String::new(),
+                };
+                let context = ctx
                     .member_get(&value, "1")
                     .ok()
                     .and_then(|value| value.as_num_opt())
                     .filter(|context| context.is_finite() && *context >= 0.0)
                     .map_or(0, |context| context as u64);
-                (policy, context)
-            }
-            None => (String::new(), 0),
-        };
+                Some((policy, context))
+            },
+        )
+        .flatten()
+        .unwrap_or_default();
         let initiator = navigation_initiator(page, &url, &policy, context);
         (
             url,
@@ -9788,7 +9835,7 @@ mod desktop {
         policy: &str,
         context: u64,
     ) -> Option<Box<crate::http::NavigationInitiator>> {
-        let state = page.engine.ctx().host_mut::<HostState>()?;
+        let state = page.engine.host_mut::<HostState>()?;
         let client = state
             .window_request_urls
             .get(&context)
@@ -9920,7 +9967,7 @@ mod desktop {
         events: &tokio::sync::mpsc::Sender<PageEvt>,
     ) -> Option<bool> {
         let ask = call_trust(page, "fireBeforeUnloadTree", &[], "beforeunload")
-            .is_some_and(|value| page.engine.ctx().to_boolean(&value));
+            .is_some_and(|value| value.truthy());
         checkpoint(page, "beforeunload");
         if !ask {
             return Some(true);
@@ -9943,19 +9990,17 @@ mod desktop {
     fn abort_for_navigation(page: &mut TrustJsPage) {
         let context = page
             .engine
-            .ctx()
             .host::<HostState>()
             .map_or(0, |state| state.top_context);
-        abort_document(page.engine.ctx(), context);
+        page.engine.scope(|cx| abort_document(cx, context));
         let descendants = page
             .engine
-            .ctx()
             .host_mut::<HostState>()
             .map(|state| descendant_contexts(state, context))
             .unwrap_or_default();
         for context in descendants {
-            let _ = run_in_context_realm(&mut page.engine, context, "abort document", |engine| {
-                abort_document(engine.ctx(), context);
+            let _ = run_in_context_realm(&mut page.engine, context, "abort document", |cx| {
+                abort_document(cx, context);
                 Ok(())
             });
         }
@@ -9992,7 +10037,7 @@ mod desktop {
     fn top_level_referrer_policy(
         page: &mut TrustJsPage,
     ) -> Option<crate::referrer_policy::ReferrerPolicy> {
-        let state = page.engine.ctx().host_mut::<HostState>()?;
+        let state = page.engine.host_mut::<HostState>()?;
         Some(environment_referrer_policy(state, 0))
     }
 
@@ -10027,8 +10072,8 @@ mod desktop {
             page,
             "formSubmission",
             &[
-                Value::Num(form as f64),
-                submitter.map_or(Value::Null, |node| Value::Num(node as f64)),
+                TrustValue::Num(form as f64),
+                submitter.map_or(TrustValue::Null, |node| TrustValue::Num(node as f64)),
             ],
             "form entry list",
         ) else {
@@ -10077,7 +10122,7 @@ mod desktop {
                         _ => return Ok(None),
                     });
                 }
-                let assembled = page.engine.ctx().host_mut::<HostState>().map(|state| {
+                let assembled = page.engine.host_mut::<HostState>().map(|state| {
                     state
                         .user_files
                         .assemble(&segments, crate::file_select::MAX_READ_BYTES)
@@ -10128,21 +10173,19 @@ mod desktop {
         let position =
             |node: Option<usize>, x: f64, y: f64, metadata: crate::js::PointerMetadata| {
                 vec![
-                    node.map_or(Value::Null, |node| Value::Num(node as f64)),
-                    Value::Num(finite_or_zero(x)),
-                    Value::Num(finite_or_zero(y)),
-                    Value::Num(finite_or_zero(metadata.screen.map_or(x, |p| p.0))),
-                    Value::Num(finite_or_zero(metadata.screen.map_or(y, |p| p.1))),
-                    Value::Num(f64::from(metadata.modifier_bits())),
+                    node.map_or(TrustValue::Null, |node| TrustValue::Num(node as f64)),
+                    TrustValue::Num(finite_or_zero(x)),
+                    TrustValue::Num(finite_or_zero(y)),
+                    TrustValue::Num(finite_or_zero(metadata.screen.map_or(x, |p| p.0))),
+                    TrustValue::Num(finite_or_zero(metadata.screen.map_or(y, |p| p.1))),
+                    TrustValue::Num(f64::from(metadata.modifier_bits())),
                 ]
             };
         let args = match drag {
             FileDrag::Enter { types } => {
-                let ctx = page.engine.ctx();
-                let types = types.into_iter().map(Value::from_string).collect();
                 vec![
-                    Value::from_string(String::from("enter")),
-                    ctx.make_array(types),
+                    TrustValue::from_text("enter"),
+                    TrustValue::Array(types.into_iter().map(TrustValue::from_text).collect()),
                 ]
             }
             FileDrag::Over {
@@ -10151,7 +10194,7 @@ mod desktop {
                 y,
                 metadata,
             } => {
-                let mut args = vec![Value::from_string(String::from("over"))];
+                let mut args = vec![TrustValue::from_text(String::from("over"))];
                 args.extend(position(node, x, y, metadata));
                 args
             }
@@ -10163,22 +10206,26 @@ mod desktop {
                 files,
             } => {
                 let records = match crate::file_select::selection_from_paths(&files, false, true)
-                    .and_then(|files| user_file_records(page.engine.ctx(), &files))
-                {
+                    .and_then(|files| {
+                        page.engine.scope(|cx| {
+                            user_file_records(cx, &files)
+                                .map(|records| TrustValue::read(cx, records))
+                        })
+                    }) {
                     Ok(records) => records,
                     Err(error) => {
                         page.outcome
                             .errors
                             .push(format!("file drop failed: {error}"));
-                        Value::Null
+                        TrustValue::Null
                     }
                 };
-                let mut args = vec![Value::from_string(String::from("drop"))];
+                let mut args = vec![TrustValue::from_text(String::from("drop"))];
                 args.extend(position(node, x, y, metadata));
                 args.push(records);
                 args
             }
-            FileDrag::Leave => vec![Value::from_string(String::from("leave"))],
+            FileDrag::Leave => vec![TrustValue::from_text(String::from("leave"))],
         };
         let _ = call_trust(page, "fileDrag", &args, "file drag");
     }
@@ -10264,7 +10311,7 @@ mod desktop {
                     )
                     .unwrap();
                     let stamps: Vec<f64> =
-                        serde_json::from_str(&value_string(&mut page.engine, &value)).unwrap();
+                        serde_json::from_str(&test_value_string(&mut page.engine, &value)).unwrap();
                     let origin = if measured_start { start } else { created };
                     assert_eq!(stamps[0], (origin * 10.).floor() / 10.);
                     assert_eq!(stamps[1], origin.floor());
@@ -11621,18 +11668,21 @@ mod desktop {
             // Exercise the maintenance wake: a future timer must not keep the
             // input hint active indefinitely, and the input checkpoint still
             // drains jobs before a collection may clear their kept objects.
+            // The input's churn makes the task boundary request a collection.
+            // The watched object is made last, so it is young when the hint
+            // ends: a generational collector frees garbage that was promoted
+            // during the input only in a major collection.
             let html = r#"<input id=editor><output id=result></output><script>
                 const editor=document.getElementById('editor'), result=document.getElementById('result');
-                let garbage, weak, jobs=0;
+                let kept, weak, jobs=0;
                 editor.oninput=()=>{
-                    garbage=[];
-                    for(let i=0;i<12000;i++){let o={};o.self=o;garbage.push(o)}
-                    weak=new WeakRef(garbage[0]);
-                    garbage=null;
+                    for(let i=0;i<20000;i++){let o={};o.self=o}
+                    kept=new WeakRef({});
                     queueMicrotask(()=>{
-                        if(weak.deref()===undefined) throw Error('kept object lost during job');
+                        if(kept.deref()===undefined) throw Error('kept object lost during job');
                         jobs++;
                         result.textContent='CHECKPOINT';
+                        weak=new WeakRef({});
                     });
                     setTimeout(()=>{
                         if(jobs!==1) throw Error('input checkpoint delayed');
@@ -13283,7 +13333,7 @@ mod desktop {
                     "geometry",
                 )
                 .unwrap();
-                value_string(&mut page.engine, &value)
+                test_value_string(&mut page.engine, &value)
             };
             assert_eq!(geometry(true), "64x16 64x16 640x16");
             let graphical = geometry(false);
@@ -13348,7 +13398,7 @@ mod desktop {
                 "[document.getElementById('first').getBoundingClientRect().height, document.getElementById('second').getBoundingClientRect().height, observed.at(-1)].join(':')",
                 "decoded geometry",
             ).unwrap();
-            assert_eq!(value_string(&mut page.engine, &value), "20:60:60");
+            assert_eq!(test_value_string(&mut page.engine, &value), "20:60:60");
             assert!(page.outcome.errors.is_empty(), "{:?}", page.outcome.errors);
         }
 
@@ -13477,7 +13527,7 @@ mod desktop {
             fn read(page: &mut TrustJsPage, source: &str) -> String {
                 let value = evaluate_task(page, source, "observe task state")
                     .expect("task state expression must evaluate");
-                value_string(&mut page.engine, &value)
+                test_value_string(&mut page.engine, &value)
             }
 
             // HTML #update-the-rendering (e5071a20) and Resize Observer
@@ -14830,7 +14880,11 @@ thread_local! {
 /// The top-level traversable a host call addresses: the one whose arena
 /// holds the first of its node arguments (an arena id or a Node wrapper),
 /// else the calling Realm's. `None` while the Agent has only one.
-fn addressed_traversable(ctx: &mut Ctx, args: &[Value], nodes: &[usize]) -> Option<TraversableId> {
+fn addressed_traversable<'s>(
+    ctx: &mut Ctx<'s>,
+    args: &[Value<'s>],
+    nodes: &[usize],
+) -> Option<TraversableId> {
     if !SEVERAL_TRAVERSABLES.with(Cell::get) {
         return None;
     }
@@ -14838,7 +14892,7 @@ fn addressed_traversable(ctx: &mut Ctx, args: &[Value], nodes: &[usize]) -> Opti
     let state = ctx.host::<HostState>()?;
     for &index in nodes {
         let node = match args.get(index) {
-            Some(value @ Value::Obj(_)) => state.dom_gc.node_identity(value),
+            Some(value) if value.as_obj().is_some() => state.dom_gc.node_identity(value),
             Some(value) => value
                 .as_num_opt()
                 .filter(|number| number.is_finite() && *number >= 0.0 && number.fract() == 0.0)
@@ -14854,10 +14908,10 @@ fn addressed_traversable(ctx: &mut Ctx, args: &[Value], nodes: &[usize]) -> Opti
 
 /// Run `operation` with `target`'s fields selected in HostState, then
 /// select again the traversable that was.
-fn with_traversable<R>(
-    ctx: &mut Ctx,
+fn with_traversable<'s, R>(
+    ctx: &mut Ctx<'s>,
     target: Option<TraversableId>,
-    operation: impl FnOnce(&mut Ctx) -> R,
+    operation: impl FnOnce(&mut Ctx<'s>) -> R,
 ) -> R {
     let previous = target.and_then(|target| {
         ctx.host_mut::<HostState>()
@@ -14874,13 +14928,13 @@ fn with_traversable<R>(
 
 /// Every host function's entry: it runs with the traversable it addresses
 /// selected (`addressed_traversable`).
-fn routed_host_call(
-    ctx: &mut Ctx,
-    this: Value,
-    args: &[Value],
+fn routed_host_call<'s>(
+    ctx: &mut Ctx<'s>,
+    this: Value<'s>,
+    args: &[Value<'s>],
     nodes: &[usize],
     operation: NativeFn,
-) -> Result<Value, Value> {
+) -> Result<Value<'s>, Value<'s>> {
     let target = addressed_traversable(ctx, args, nodes);
     with_traversable(ctx, target, |ctx| operation(ctx, this, args))
 }
@@ -14896,7 +14950,7 @@ macro_rules! host_functions {
             $name,
             $len,
             {
-                fn routed(ctx: &mut Ctx, this: Value, args: &[Value]) -> Result<Value, Value> {
+                fn routed<'s>(ctx: &mut Ctx<'s>, this: Value<'s>, args: &[Value<'s>]) -> Result<Value<'s>, Value<'s>> {
                     routed_host_call(ctx, this, args, &[$($node),*], $function)
                 }
                 routed as NativeFn
@@ -15190,49 +15244,80 @@ fn install_host_boundary(engine: &mut trust_js::Engine) {
 /// The Agent-wide half of the host boundary: HostState tracing and the
 /// settings-object job hooks. It installs nothing in any Realm.
 fn install_agent_host_hooks(engine: &mut trust_js::Engine) {
-    engine.ctx().op_state().register_gc::<HostState>();
+    engine.op_state().register_gc::<HostState>();
     debug_assert!(trust_js_registry_matches_canonical_boundary());
     engine.set_host_job_context_hooks(host_enter_job_context, host_leave_job_context);
     engine.set_job_callback_script_caller_capture(true);
 }
 
-fn host_image_data_slots(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+/// The Agent's shared value in a host slot, storing `candidate` there first if it is empty:
+/// the private objects the first Realm's bootstrap supplies and later Realms share.
+fn shared_slot<'s>(
+    ctx: &mut Ctx<'s>,
+    slot: fn(&mut HostState) -> &mut Option<Handle>,
+    candidate: Value<'s>,
+) -> Value<'s> {
+    let existing = ctx
+        .host_mut::<HostState>()
+        .and_then(|state| slot(state).clone());
+    if let Some(existing) = existing {
+        return held(ctx, &existing);
+    }
+    let handle = hold(ctx, &candidate);
+    if let Some(state) = ctx.host_mut::<HostState>() {
+        *slot(state) = Some(handle);
+    }
+    candidate
+}
+
+fn host_image_data_slots<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     // Called only while installing the prelude, which immediately deletes this global hook.
     // The first Realm supplies a pristine native WeakMap; later Realms reuse that private map.
     let candidate = args.first().cloned().unwrap_or(Value::Undefined);
-    Ok(ctx
-        .host_mut::<HostState>()
-        .expect("ImageData bindings require a HostState")
-        .image_data_slots
-        .get_or_insert(candidate)
-        .clone())
+    Ok(shared_slot(
+        ctx,
+        |state| &mut state.image_data_slots,
+        candidate,
+    ))
 }
 
-fn host_wasm_module_binding(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_wasm_module_binding<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     // Private internal slots are shared across same-Agent Realms, not author properties.
     let candidate = args.first().cloned().unwrap_or(Value::Undefined);
-    let state = ctx
+    let cluster = ctx
         .host_mut::<HostState>()
-        .expect("Wasm requires HostState");
-    let slots = state.wasm_module_slots.get_or_insert(candidate).clone();
-    let cluster = Value::from_string(state.agent_cluster.to_string());
+        .expect("Wasm requires HostState")
+        .agent_cluster;
+    let slots = shared_slot(ctx, |state| &mut state.wasm_module_slots, candidate);
+    let cluster = ctx.string(cluster.to_string());
     Ok(ctx.make_array(vec![slots, cluster]))
 }
 
 /// CSSOM View client-window origin. All Window Realms in this page share the
 /// native window, not the origin of their individual iframe viewport.
-fn host_window_screen_coordinate(
-    ctx: &mut Ctx,
-    _this: Value,
-    args: &[Value],
-) -> Result<Value, Value> {
+fn host_window_screen_coordinate<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let (x, y) = ctx
         .host_mut::<HostState>()
         .expect("Window coordinates require HostState")
         .screen_position
         .get();
     Ok(Value::Num(f64::from(
-        if matches!(args.first(), Some(Value::Bool(true))) {
+        if matches!(
+            args.first().map(|value| value.kind()),
+            Some(ValueKind::Bool(true))
+        ) {
             y
         } else {
             x
@@ -15242,29 +15327,41 @@ fn host_window_screen_coordinate(
 
 /// Private per-Agent Web IDL brands; values remain owned by the creating
 /// environment, while borrowed getters accept same-Agent Realms.
-fn host_navigator_binding(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_navigator_binding<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let value = args.first().cloned().unwrap_or(Value::Undefined);
-    let state = ctx
+    let _ = ctx
         .host_mut::<HostState>()
         .expect("Navigator requires HostState");
-    Ok(state.navigator_slots.get_or_insert(value).clone())
+    Ok(shared_slot(ctx, |state| &mut state.navigator_slots, value))
 }
 
 /// CSSOM View/Web IDL brands shared by Window Realms, retaining the private
 /// WeakMap rather than its Screen and Window keys.
-fn host_screen_binding(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_screen_binding<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let value = args.first().cloned().unwrap_or(Value::Undefined);
-    let state = ctx
+    let _ = ctx
         .host_mut::<HostState>()
         .expect("Screen requires HostState");
-    Ok(state.screen_slots.get_or_insert(value).clone())
+    Ok(shared_slot(ctx, |state| &mut state.screen_slots, value))
 }
 
 /// CSSOM View #resizing-viewports: the same browsing-context dimensions
 /// govern layout, media queries and Window getters before resize dispatch.
 /// A child navigable derives its viewport from the embedding content box;
 /// only the top-level controller invokes this private resize operation.
-fn host_set_viewport(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_set_viewport<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let dimensions = [0, 1].map(|index| args.get(index).and_then(Value::as_num_opt));
     if let [Some(width), Some(height)] = dimensions
         && [width, height]
@@ -15286,13 +15383,15 @@ fn host_set_viewport(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
 
 /// DOM #concept-live-range: discovery spans all this Agent's Window Realms.
 /// Native weak handles have no JavaScript prototype that can root a retired Realm.
-fn host_live_range_register(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let Some(range) = args
-        .first()
-        .and_then(|value| ctx.downgrade_object_value(value))
-    else {
+fn host_live_range_register<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
+    let Some(range) = args.first().filter(|value| value.as_obj().is_some()) else {
         return Err(ctx.make_error("TypeError", "Expected a Range object"));
     };
+    let range = hold_weakly(ctx, range);
     ctx.host_mut::<HostState>()
         .expect("Range bindings require HostState")
         .live_ranges
@@ -15300,12 +15399,22 @@ fn host_live_range_register(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
     Ok(Value::Undefined)
 }
 
-fn host_live_range_snapshot(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
-    let ranges = ctx
-        .host_mut::<HostState>()
+fn host_live_range_snapshot<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    _args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
+    // The registry is read without a host borrow: it is out of the host state meanwhile.
+    let mut registry = std::mem::take(
+        &mut ctx
+            .host_mut::<HostState>()
+            .expect("Range bindings require HostState")
+            .live_ranges,
+    );
+    let ranges = registry.snapshot(ctx);
+    ctx.host_mut::<HostState>()
         .expect("Range bindings require HostState")
-        .live_ranges
-        .snapshot();
+        .live_ranges = registry;
     // The common no-Range DOM mutation does not allocate an empty JS array.
     Ok(if ranges.is_empty() {
         Value::Undefined
@@ -15318,39 +15427,50 @@ fn host_live_range_snapshot(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Res
 /// candidate becomes the Agent's map and later Realms reuse it, as for `__element_slots`. The
 /// prelude captures this function lexically and the bootstrap deletes the global before author
 /// code runs, so page script can neither obtain a map nor register a control object.
-fn host_platform_slots(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_platform_slots<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let kind = host_arg_string(ctx, args, 0);
     let candidate = args.get(1).cloned().unwrap_or(Value::Undefined);
-    if !matches!(candidate, Value::Obj(_)) {
+    if !matches!(candidate.kind(), ValueKind::Obj(_)) {
         return Err(ctx.make_error("TypeError", "platform slots require a WeakMap"));
     }
-    let Some(state) = ctx.host_mut::<HostState>() else {
+    if ctx.host_mut::<HostState>().is_none() {
         return Err(ctx.make_error("InvalidStateError", "missing browser host state"));
-    };
-    let slot = match kind.as_str() {
-        "controls" => &mut state.platform_controls,
-        "nodes" => &mut state.platform_nodes,
-        "internals" => &mut state.platform_internals,
-        "traversables" => &mut state.platform_traversables,
+    }
+    let slot: fn(&mut HostState) -> &mut Option<Handle> = match kind.as_str() {
+        "controls" => |state| &mut state.platform_controls,
+        "nodes" => |state| &mut state.platform_nodes,
+        "internals" => |state| &mut state.platform_internals,
+        "traversables" => |state| &mut state.platform_traversables,
         _ => return Err(ctx.make_error("TypeError", "unknown platform slot")),
     };
-    Ok(slot.get_or_insert(candidate).clone())
+    Ok(shared_slot(ctx, slot, candidate))
 }
 
 /// This Realm's private platform control object: the Window prelude's `trust` or the worker
 /// loop. Bootstraps register it in the host-rooted `controls` WeakMap keyed by their global, so
 /// it is never an author-visible property. Fails before the Realm's bootstrap has registered.
-fn platform_control(ctx: &mut Ctx) -> Result<Value, Value> {
+fn platform_control<'s>(ctx: &mut Ctx<'s>) -> Result<Value<'s>, Value<'s>> {
     let global = ctx.global_this();
     platform_control_of(ctx, &global)
 }
 
-fn platform_control_of(ctx: &mut Ctx, global: &Value) -> Result<Value, Value> {
+fn platform_control_of<'s>(ctx: &mut Ctx<'s>, global: &Value<'s>) -> Result<Value<'s>, Value<'s>> {
     let map = ctx
         .host_mut::<HostState>()
         .and_then(|state| state.platform_controls.clone());
-    match map.map(|map| ctx.weak_map_get(&map, global)).transpose()? {
-        Some(control @ Value::Obj(_)) => Ok(control),
+    let control = match map {
+        Some(map) => {
+            let map = held(ctx, &map);
+            Some(ctx.weak_map_get(&map, global)?)
+        }
+        None => None,
+    };
+    match control {
+        Some(control) if control.as_obj().is_some() => Ok(control),
         _ => Err(ctx.make_error(
             "InvalidStateError",
             "this Realm has no platform control object",
@@ -15358,37 +15478,61 @@ fn platform_control_of(ctx: &mut Ctx, global: &Value) -> Result<Value, Value> {
     }
 }
 
-fn host_element_slots(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_element_slots<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let value = args.first().cloned().unwrap_or(Value::Undefined);
-    let state = ctx
+    let _ = ctx
         .host_mut::<HostState>()
         .expect("Element bindings require HostState");
-    Ok(state.element_slots.get_or_insert(value).clone())
+    Ok(shared_slot(ctx, |state| &mut state.element_slots, value))
 }
 
 // Same-Agent pointer-event brands/list backing, without rooting event keys.
 // Each Window deletes this installation hook before running author scripts.
-fn host_pointer_event_slots(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_pointer_event_slots<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let value = args.first().cloned().unwrap_or(Value::Undefined);
-    let state = ctx
+    let _ = ctx
         .host_mut::<HostState>()
         .expect("PointerEvent bindings require HostState");
-    Ok(state.pointer_event_slots.get_or_insert(value).clone())
+    Ok(shared_slot(
+        ctx,
+        |state| &mut state.pointer_event_slots,
+        value,
+    ))
 }
 
 // Performance entries and observers use private per-Agent weak identity slots,
 // shared by Window Realms without rooting dead entry/observer keys.
-fn host_performance_binding(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_performance_binding<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let value = args.first().cloned().unwrap_or(Value::Undefined);
-    let Some(state) = ctx.host_mut::<HostState>() else {
+    if ctx.host_mut::<HostState>().is_none() {
         return Ok(Value::Undefined);
-    };
-    Ok(state.performance_slots.get_or_insert(value).clone())
+    }
+    Ok(shared_slot(
+        ctx,
+        |state| &mut state.performance_slots,
+        value,
+    ))
 }
 
 /// Private per-Agent interface slots and Window lifecycle check. No permission
 /// grant or capability is inferred from a descriptor supplied by page script.
-fn host_permissions_binding(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_permissions_binding<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let op = host_arg_string(ctx, args, 0);
     if op == "state" || op == "set" {
         // Permissions #get-a-permission-store-entry / #set-a-permission-store-entry. Only the
@@ -15401,9 +15545,9 @@ fn host_permissions_binding(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
             .clone();
         let mut store = store.lock().unwrap_or_else(|e| e.into_inner());
         if op == "state" {
-            return Ok(store.get(&entry).map_or(Value::Undefined, |state| {
-                Value::from_string(state.to_string())
-            }));
+            return Ok(store
+                .get(&entry)
+                .map_or(Value::Undefined, |state| ctx.string(state.to_string())));
         }
         if let Some((key, decision)) = entry.rsplit_once('\0') {
             let decision = match decision {
@@ -15420,7 +15564,7 @@ fn host_permissions_binding(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
         .host_mut::<HostState>()
         .expect("Permissions require HostState");
     if op == "slots" {
-        return Ok(state.permission_slots.get_or_insert(value).clone());
+        return Ok(shared_slot(ctx, |state| &mut state.permission_slots, value));
     }
     // HTML #fully-active: Window environments are retired together with their
     // navigable subtree. A retained object does not reactivate its Document.
@@ -15432,27 +15576,34 @@ fn host_permissions_binding(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
 }
 
 /// Pointer Lock has one target and request queue across the page's Window Realms.
-fn host_pointer_lock_state(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_pointer_lock_state<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let candidate = args.first().cloned().unwrap_or(Value::Undefined);
-    Ok(ctx
-        .host_mut::<HostState>()
-        .expect("Pointer Lock requires HostState")
-        .pointer_lock_state
-        .get_or_insert(candidate)
-        .clone())
+    Ok(shared_slot(
+        ctx,
+        |state| &mut state.pointer_lock_state,
+        candidate,
+    ))
 }
 
 /// History operations may be borrowed from another Window Realm. Share the
 /// receiver brand without rooting History objects, and check the receiver's
 /// Document lifecycle rather than the Realm that supplied the method.
-fn host_history_binding(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_history_binding<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let op = host_arg_string(ctx, args, 0);
     let value = args.get(1).cloned().unwrap_or(Value::Undefined);
     let state = ctx
         .host_mut::<HostState>()
         .expect("History requires HostState");
     if op == "slots" {
-        return Ok(state.history_slots.get_or_insert(value).clone());
+        return Ok(shared_slot(ctx, |state| &mut state.history_slots, value));
     }
     if op == "traverse" {
         let delta = value.as_num_opt().unwrap_or(0.) as i32;
@@ -15468,14 +15619,22 @@ fn host_history_binding(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
 
 /// Web Audio context brands are shared by same-Agent Window Realms. Retain
 /// only the WeakMap, and check the associated Document on lifecycle operations.
-fn host_audio_context_binding(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_audio_context_binding<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let op = host_arg_string(ctx, args, 0);
     let value = args.get(1).cloned().unwrap_or(Value::Undefined);
     let state = ctx
         .host_mut::<HostState>()
         .expect("AudioContext requires HostState");
     if op == "slots" {
-        return Ok(state.audio_context_slots.get_or_insert(value).clone());
+        return Ok(shared_slot(
+            ctx,
+            |state| &mut state.audio_context_slots,
+            value,
+        ));
     }
     if op == "active" {
         let context = value.as_num_opt().unwrap_or(0.) as u64;
@@ -15489,37 +15648,28 @@ fn host_audio_context_binding(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Re
 /// A native Window operation observes its script caller BEFORE entering the
 /// self-hosted implementation in the receiver's Realm. Otherwise parent.postMessage
 /// incorrectly reports the parent's origin/source for a message sent by its child.
-fn host_window_message_binding(
-    ctx: &mut Ctx,
-    _this: Value,
-    args: &[Value],
-) -> Result<Value, Value> {
+fn host_window_message_binding<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let candidate = args.first().cloned().unwrap_or(Value::Undefined);
-    let slots = ctx
-        .host_mut::<HostState>()
-        .expect("Window bindings require HostState")
-        .window_message_slots
-        .get_or_insert(candidate)
-        .clone();
+    let slots = shared_slot(ctx, |state| &mut state.window_message_slots, candidate);
     let operation = args.get(1).cloned().unwrap_or(Value::Undefined);
     let post = ctx.new_native_fn_with_captures(
         "postMessage",
         1,
         |ctx, this, args, captures| {
             let source = ctx.script_caller_global();
-            let target = if matches!(this, Value::Null | Value::Undefined) {
+            let target = if matches!(this.kind(), ValueKind::Null | ValueKind::Undefined) {
                 ctx.global_this()
             } else {
                 this
             };
             let arguments = ctx.make_array(args.to_vec());
-            ctx.invoke(
-                captures[0].clone(),
-                Value::Undefined,
-                &[target, source, arguments],
-            )
+            ctx.invoke(captures[0], Value::Undefined, &[target, source, arguments])
         },
-        vec![operation],
+        &[operation],
     );
     Ok(ctx.make_array(vec![slots, post]))
 }
@@ -15528,11 +15678,18 @@ fn host_window_message_binding(
 /// self-hosted implementation is entered. In particular, otherWindow.setTimeout(boundNative)
 /// must retain the registering script's incumbent, not otherWindow or the native's own Realm.
 /// The operation receives (sourceGlobal, receiver, argumentsArray) privately.
-fn host_callback_api(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_callback_api<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let operation = args.first().cloned().unwrap_or(Value::Undefined);
     let name = host_arg_string(ctx, args, 1);
     let length = args.get(2).and_then(Value::as_num_opt).unwrap_or(0.) as usize;
-    let entry_settings = matches!(args.get(3), Some(Value::Bool(true)));
+    let entry_settings = matches!(
+        args.get(3).map(|value| value.kind()),
+        Some(ValueKind::Bool(true))
+    );
     // Engine-owned captures participate in cycle collection. Keeping the
     // self-hosted operation only in an opaque Rust closure would root its
     // entire Realm after iframe navigation (ECMA-262 #sec-liveness).
@@ -15541,25 +15698,29 @@ fn host_callback_api(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
         length,
         |ctx, this, args, captures| {
             let incumbent = ctx.script_caller_global();
-            let source = if matches!(captures[1], Value::Bool(true)) {
+            let source = if matches!(captures[1].kind(), ValueKind::Bool(true)) {
                 ctx.script_entry_global()
             } else {
-                incumbent.clone()
+                incumbent
             };
             let arguments = ctx.make_array(args.to_vec());
             ctx.invoke(
-                captures[0].clone(),
+                captures[0],
                 Value::Undefined,
                 &[source, this, arguments, incumbent],
             )
         },
-        vec![operation, Value::Bool(entry_settings)],
+        &[operation, Value::Bool(entry_settings)],
     ))
 }
 
 /// JavaScript-driven task fallback uses the same source boundary as the native event loop.
 /// This hook is captured privately and removed from the global during platform installation.
-fn host_invoke_callback(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_invoke_callback<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let callback = args.first().cloned().unwrap_or(Value::Undefined);
     let this = args.get(1).cloned().unwrap_or(Value::Undefined);
     let list = args.get(2).cloned().unwrap_or(Value::Undefined);
@@ -15571,7 +15732,8 @@ fn host_invoke_callback(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
     if !length.is_finite() || length < 0. || length.fract() != 0. || length > usize::MAX as f64 {
         return Err(ctx.make_error("RangeError", "invalid host callback argument list"));
     }
-    let mut arguments = Vec::with_capacity(length as usize);
+    // Each read can run author getters, which can collect: the list keeps what it read.
+    let mut arguments = ValueList::with_capacity(length as usize);
     for index in 0..length as usize {
         arguments.push(ctx.member_get(&list, &index.to_string())?);
     }
@@ -15589,7 +15751,7 @@ fn trust_js_registry_matches_canonical_boundary() -> bool {
     })
 }
 
-fn host_dom(ctx: &mut Ctx) -> Rc<RefCell<Dom>> {
+fn host_dom<'s>(ctx: &mut Ctx<'s>) -> Rc<RefCell<Dom>> {
     ctx.host_mut::<HostState>()
         .expect("HostState installed before any TRust JS host call")
         .dom
@@ -15597,7 +15759,7 @@ fn host_dom(ctx: &mut Ctx) -> Rc<RefCell<Dom>> {
 }
 
 /// Node id from a JS argument; `None` for null, undefined, non-numbers, negatives, and stale ids.
-fn host_arg_node(dom: &Dom, args: &[Value], index: usize) -> Option<usize> {
+fn host_arg_node<'s>(dom: &Dom, args: &[Value<'s>], index: usize) -> Option<usize> {
     let number = args.get(index)?.as_num_opt()?;
     let id = number as usize;
     (number.is_finite() && number >= 0.0 && number.fract() == 0.0 && dom.is_valid(id)).then_some(id)
@@ -15670,9 +15832,9 @@ fn environment_referrer_source(state: &mut HostState, context: u64) -> Option<ur
 }
 
 /// The request referrer and referrer policy a script fetch passed at `index` and `index + 1`.
-fn script_request_referrer(
-    ctx: &mut Ctx,
-    args: &[Value],
+fn script_request_referrer<'s>(
+    ctx: &mut Ctx<'s>,
+    args: &[Value<'s>],
     index: usize,
 ) -> (
     RequestReferrer,
@@ -15814,10 +15976,10 @@ fn node_accessible(state: &mut HostState, dom: &Dom, caller: u64, node: usize) -
 
 /// Bit `i` is set when the node id at `indices[i]` names a node the calling Realm may not
 /// access. A page with one Window Realm, and a worker, take the fast path.
-fn inaccessible_node_arguments(
-    ctx: &mut Ctx,
+fn inaccessible_node_arguments<'s>(
+    ctx: &mut Ctx<'s>,
     operation: &str,
-    args: &[Value],
+    args: &[Value<'s>],
     indices: &[usize],
 ) -> u32 {
     let caller = ctx.host_job_context();
@@ -15854,13 +16016,13 @@ enum NodeDenial {
     Throw,
 }
 
-fn guard_node_arguments(
-    ctx: &mut Ctx,
-    this: Value,
-    args: &[Value],
+fn guard_node_arguments<'s>(
+    ctx: &mut Ctx<'s>,
+    this: Value<'s>,
+    args: &[Value<'s>],
     (name, indices, denial): (&str, &[usize], NodeDenial),
     operation: NativeFn,
-) -> Result<Value, Value> {
+) -> Result<Value<'s>, Value<'s>> {
     let denied = inaccessible_node_arguments(ctx, name, args, indices);
     if denied == 0 {
         return operation(ctx, this, args);
@@ -15888,7 +16050,11 @@ fn guard_node_arguments(
 macro_rules! node_access_guards {
     ($($guard:ident = $operation:path, [$($index:literal),*], $denial:ident;)*) => {
         $(
-            fn $guard(ctx: &mut Ctx, this: Value, args: &[Value]) -> Result<Value, Value> {
+            fn $guard<'s>(
+                ctx: &mut Ctx<'s>,
+                this: Value<'s>,
+                args: &[Value<'s>],
+            ) -> Result<Value<'s>, Value<'s>> {
                 let guard = (stringify!($operation), &[$($index),*][..], NodeDenial::$denial);
                 guard_node_arguments(ctx, this, args, guard, $operation)
             }
@@ -15986,7 +16152,11 @@ node_access_guards! {
 
 /// Detaching a navigable's Document is its container's operation (HTML #destroy-a-child-
 /// navigable), so the embedder may detach a cross-origin child Document but nothing inside it.
-fn guarded_detach(ctx: &mut Ctx, this: Value, args: &[Value]) -> Result<Value, Value> {
+fn guarded_detach<'s>(
+    ctx: &mut Ctx<'s>,
+    this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let container = {
         let dom = host_dom(ctx);
         let dom = dom.borrow();
@@ -16013,13 +16183,13 @@ fn guarded_detach(ctx: &mut Ctx, this: Value, args: &[Value]) -> Result<Value, V
 /// Canvas and WebGL operations take a canvas element id, or zero for agent-wide operations
 /// (private slots, capability probes). Zero names a Document, never a canvas, so it is not a
 /// node argument here.
-fn guarded_canvas_operation(
-    ctx: &mut Ctx,
-    this: Value,
-    args: &[Value],
+fn guarded_canvas_operation<'s>(
+    ctx: &mut Ctx<'s>,
+    this: Value<'s>,
+    args: &[Value<'s>],
     name: &str,
     operation: NativeFn,
-) -> Result<Value, Value> {
+) -> Result<Value<'s>, Value<'s>> {
     // Identity 0 is a Document in every page's first arena and never a
     // node of a later one: the prelude's agent-wide argument.
     if args.first().and_then(Value::as_num_opt) == Some(0.0) {
@@ -16034,11 +16204,19 @@ fn guarded_canvas_operation(
     )
 }
 
-fn guarded_canvas_2d(ctx: &mut Ctx, this: Value, args: &[Value]) -> Result<Value, Value> {
+fn guarded_canvas_2d<'s>(
+    ctx: &mut Ctx<'s>,
+    this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     guarded_canvas_operation(ctx, this, args, "canvas_host::call", canvas_host::call)
 }
 
-fn guarded_webgl(ctx: &mut Ctx, this: Value, args: &[Value]) -> Result<Value, Value> {
+fn guarded_webgl<'s>(
+    ctx: &mut Ctx<'s>,
+    this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     // An OffscreenCanvas's context belongs to no Document.
     if webgl_host::is_offscreen_argument(args.first()) {
         return webgl_host::call(ctx, this, args);
@@ -16047,13 +16225,17 @@ fn guarded_webgl(ctx: &mut Ctx, this: Value, args: &[Value]) -> Result<Value, Va
 }
 
 /// Operations that implicitly address the top-level Document.
-fn top_document_accessible(ctx: &mut Ctx, operation: &str) -> bool {
+fn top_document_accessible<'s>(ctx: &mut Ctx<'s>, operation: &str) -> bool {
     let document = host_dom(ctx).borrow().document();
     let checked = [Value::Num(document as f64)];
     inaccessible_node_arguments(ctx, operation, &checked, &[0]) == 0
 }
 
-fn guarded_get_by_id(ctx: &mut Ctx, this: Value, args: &[Value]) -> Result<Value, Value> {
+fn guarded_get_by_id<'s>(
+    ctx: &mut Ctx<'s>,
+    this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     if !top_document_accessible(ctx, "host_get_by_id") {
         return Ok(Value::Null);
     }
@@ -16062,14 +16244,22 @@ fn guarded_get_by_id(ctx: &mut Ctx, this: Value, args: &[Value]) -> Result<Value
 
 /// HTML #system-focus of the arena's top-level traversable: the focus
 /// selectors match only while it has system focus (HTML #selector-focus).
-fn host_dom_system_focus(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_dom_system_focus<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let focused = args.first().is_some_and(|value| ctx.to_boolean(value));
     host_dom(ctx).borrow_mut().set_system_focus(focused);
     Ok(Value::Undefined)
 }
 
 /// HTML #the-title-element-2 of the Document node in argument 0.
-fn host_title_element(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_title_element<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let dom = host_dom(ctx);
     let dom = dom.borrow();
     Ok(host_arg_node(&dom, args, 0)
@@ -16078,17 +16268,25 @@ fn host_title_element(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Val
 }
 
 /// HTML #document.title on getting, for the Document node in argument 0.
-fn host_document_title(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_document_title<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let dom = host_dom(ctx);
     let dom = dom.borrow();
-    Ok(Value::from_engine_text(
+    Ok(ctx.string_from_engine_text(
         host_arg_node(&dom, args, 0)
             .map(|document| dom.document_title_of(document))
             .unwrap_or_default(),
     ))
 }
 
-fn guarded_doc_element(ctx: &mut Ctx, this: Value, args: &[Value]) -> Result<Value, Value> {
+fn guarded_doc_element<'s>(
+    ctx: &mut Ctx<'s>,
+    this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     if !top_document_accessible(ctx, "host_doc_element") {
         return Ok(Value::Null);
     }
@@ -16100,7 +16298,7 @@ fn guarded_doc_element(ctx: &mut Ctx, this: Value, args: &[Value]) -> Result<Val
 /// private-use characters round-trip exactly. Return such strings with
 /// `Value::from_engine_text`; convert with `trust_js::embed::engine_to_text` before treating them
 /// as Rust text (rendering, URLs, network, encoders). See `host_arg_usv` and `dom_text_in`.
-fn host_arg_string(ctx: &mut Ctx, args: &[Value], index: usize) -> String {
+fn host_arg_string<'s>(ctx: &mut Ctx<'s>, args: &[Value<'s>], index: usize) -> String {
     args.get(index)
         .and_then(|value| ctx.coerce_engine_text(value).ok())
         .map(|value| value.to_string())
@@ -16109,7 +16307,7 @@ fn host_arg_string(ctx: &mut Ctx, args: &[Value], index: usize) -> String {
 
 /// Web IDL USVString argument as Rust text: lone surrogates become U+FFFD. For URLs, network
 /// requests, cookies, encoders, script source and other consumers of scalar values.
-fn host_arg_usv(ctx: &mut Ctx, args: &[Value], index: usize) -> String {
+fn host_arg_usv<'s>(ctx: &mut Ctx<'s>, args: &[Value<'s>], index: usize) -> String {
     args.get(index)
         .and_then(|value| ctx.coerce_usv_string(value).ok())
         .unwrap_or_default()
@@ -16126,65 +16324,128 @@ pub(crate) fn dom_text_out(text: &str) -> std::borrow::Cow<'_, str> {
     trust_js::embed::engine_to_text(text)
 }
 
-fn host_id_value(id: Option<usize>) -> Value {
+/// The owner object a DOM registry lookup found, read into `ctx`'s scope while it lives. A
+/// collection that found it dead clears the handle before the registry's sweep forgets it.
+fn live_owner<'s>(ctx: &Ctx<'s>, owner: Option<WeakHandle>) -> Option<Value<'s>> {
+    owner?.upgrade(ctx).ok().flatten()
+}
+
+/// Record `owner`, an object, in the DOM registry as owning `nodes` (`DomGcRegistry::retain`);
+/// the registry names it weakly, and reports its edges to the collector.
+fn retain_dom_owner<'s>(
+    ctx: &mut Ctx<'s>,
+    owner: &Value<'s>,
+    nodes: Vec<usize>,
+    kind: DomGcOwnerKind,
+) {
+    let Some(object) = owner.as_obj() else {
+        return;
+    };
+    let value = hold_weakly(ctx, owner);
+    if let Some(state) = ctx.host_mut::<HostState>() {
+        state.dom_gc.retain(object.addr(), value, nodes, kind);
+    }
+}
+
+fn host_id_value<'s>(id: Option<usize>) -> Value<'s> {
     id.map_or(Value::Null, |id| Value::Num(id as f64))
 }
 
-fn host_ids_array(ctx: &mut Ctx, ids: Vec<usize>) -> Value {
+fn host_ids_array<'s>(ctx: &mut Ctx<'s>, ids: Vec<usize>) -> Value<'s> {
     let array = ctx.make_array(ids.iter().map(|&id| Value::Num(id as f64)).collect());
-    if let Some(state) = ctx.host_mut::<HostState>() {
-        state
-            .dom_gc
-            .retain(array.clone(), ids, DomGcOwnerKind::IdArray);
-    }
+    retain_dom_owner(ctx, &array, ids, DomGcOwnerKind::IdArray);
     array
 }
 
-fn host_register_dom_wrapper(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let Some(wrapper @ Value::Obj(_)) = args.get(1) else {
+fn host_register_dom_wrapper<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
+    let Some(wrapper) = args
+        .get(1)
+        .copied()
+        .filter(|value| value.as_obj().is_some())
+    else {
         return Ok(Value::Undefined);
     };
+    let identity = wrapper
+        .as_obj()
+        .map(|object| object.addr())
+        .unwrap_or_default();
+    let weak = hold_weakly(ctx, &wrapper);
     let state = ctx.host_mut::<HostState>().expect("DOM host");
-    let mut dom = state.dom.borrow_mut();
-    if let Some(node) = host_arg_node(&dom, args, 0) {
-        if native_wrapper_cache_enabled()
-            && let Some(entry) = state
-                .dom_gc
-                .wrappers
-                .get(&node)
-                .and_then(|identity| state.dom_gc.owners.get(identity))
-        {
-            return Ok(entry.value.clone());
-        }
-        if matches!(dom.node(node).data, NodeData::Document) {
-            if let Some(entry) = state
-                .dom_gc
-                .documents
-                .get(&node)
-                .and_then(|owner| state.dom_gc.owners.get(owner))
-            {
-                return Ok(entry.value.clone());
-            }
-            let Value::Obj(object) = wrapper else {
-                unreachable!()
-            };
-            state
-                .dom_gc
-                .documents
-                .insert(node, Rc::as_ptr(object) as usize);
-        }
+    let dom = state.dom.clone();
+    let mut dom = dom.borrow_mut();
+    let Some(node) = host_arg_node(&dom, args, 0) else {
+        return Ok(wrapper);
+    };
+    // The canonical wrapper already recorded for the node (a Document's is shared by the
+    // Window Realms it is adopted across), while it lives.
+    let existing = if native_wrapper_cache_enabled() {
         state
             .dom_gc
-            .retain(wrapper.clone(), vec![node], DomGcOwnerKind::Wrapper);
-        if native_wrapper_cache_enabled() {
-            state
-                .dom_gc
-                .wrappers
-                .insert(node, Rc::as_ptr(wrapper.as_obj().unwrap()) as usize);
-        }
-        dom.release_gc_allocation(node);
+            .wrappers
+            .get(&node)
+            .and_then(|identity| state.dom_gc.owners.get(identity))
+    } else {
+        None
     }
-    Ok(wrapper.clone())
+    .or_else(|| {
+        matches!(dom.node(node).data, NodeData::Document)
+            .then(|| {
+                state
+                    .dom_gc
+                    .documents
+                    .get(&node)
+                    .and_then(|owner| state.dom_gc.owners.get(owner))
+            })
+            .flatten()
+    })
+    .map(|entry| entry.value.clone());
+    if let Some(existing) = existing {
+        drop(dom);
+        if let Ok(Some(value)) = existing.upgrade(ctx) {
+            return Ok(value);
+        }
+        // A collection found the recorded wrapper dead and has yet to sweep the registry:
+        // record this one instead.
+        let state = ctx.host_mut::<HostState>().expect("DOM host");
+        let dom = state.dom.clone();
+        return Ok(register_dom_wrapper(
+            state,
+            &mut dom.borrow_mut(),
+            node,
+            identity,
+            weak,
+            wrapper,
+        ));
+    }
+    Ok(register_dom_wrapper(
+        state, &mut dom, node, identity, weak, wrapper,
+    ))
+}
+
+/// Record `wrapper` (whose address is `identity`) as the object representing `node`.
+fn register_dom_wrapper<'s>(
+    state: &mut HostState,
+    dom: &mut Dom,
+    node: usize,
+    identity: usize,
+    weak: WeakHandle,
+    wrapper: Value<'s>,
+) -> Value<'s> {
+    if matches!(dom.node(node).data, NodeData::Document) {
+        state.dom_gc.documents.insert(node, identity);
+    }
+    state
+        .dom_gc
+        .retain(identity, weak, vec![node], DomGcOwnerKind::Wrapper);
+    if native_wrapper_cache_enabled() {
+        state.dom_gc.wrappers.insert(node, identity);
+    }
+    dom.release_gc_allocation(node);
+    wrapper
 }
 
 fn native_wrapper_cache_enabled() -> bool {
@@ -16192,15 +16453,19 @@ fn native_wrapper_cache_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("TRUST_NATIVE_WRAPPERS").as_deref() != Ok("0"))
 }
 
-fn host_dom_wrapper_cache_enabled(
-    _ctx: &mut Ctx,
-    _this: Value,
-    _args: &[Value],
-) -> Result<Value, Value> {
+fn host_dom_wrapper_cache_enabled<'s>(
+    _ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    _args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     Ok(Value::Bool(native_wrapper_cache_enabled()))
 }
 
-fn host_cached_dom_wrapper(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_cached_dom_wrapper<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let state = ctx.host_mut::<HostState>().expect("DOM host");
     let Some(number) = args.first().and_then(Value::as_num_opt) else {
         return Ok(Value::Null);
@@ -16209,7 +16474,7 @@ fn host_cached_dom_wrapper(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resul
     if !number.is_finite() || number < 0. || node as f64 != number {
         return Ok(Value::Null);
     }
-    Ok(state
+    let owner = state
         .dom_gc
         .wrappers
         .get(&node)
@@ -16217,14 +16482,15 @@ fn host_cached_dom_wrapper(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resul
         .filter(|entry| {
             matches!(entry.kind, DomGcOwnerKind::Wrapper) && entry.nodes.as_slice() == [node]
         })
-        .map_or(Value::Null, |entry| entry.value.clone()))
+        .map(|entry| entry.value.clone());
+    Ok(live_owner(ctx, owner).unwrap_or(Value::Null))
 }
 
-fn host_dom_wrapper_cache_state(
-    ctx: &mut Ctx,
-    _this: Value,
-    _args: &[Value],
-) -> Result<Value, Value> {
+fn host_dom_wrapper_cache_state<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    _args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let state = ctx.host_mut::<HostState>().expect("DOM host");
     let dom = state.dom.borrow();
     let entries = state.dom_gc.wrappers.len();
@@ -16253,11 +16519,11 @@ fn native_dom_traversal_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("TRUST_NATIVE_DOM_TRAVERSAL").as_deref() != Ok("0"))
 }
 
-fn host_dom_traversal_enabled(
-    _ctx: &mut Ctx,
-    _this: Value,
-    _args: &[Value],
-) -> Result<Value, Value> {
+fn host_dom_traversal_enabled<'s>(
+    _ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    _args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     Ok(Value::Bool(native_dom_traversal_enabled()))
 }
 
@@ -16268,8 +16534,8 @@ fn host_dom_traversal_enabled(
 /// 8f182624 #dfn-attribute-getter requires the actual platform receiver.
 /// Whether `value` is an Attr platform object: its internal-slot record (the
 /// prelude's shared `internals` WeakMap) carries Attr state.
-fn is_attr_node(ctx: &mut Ctx, value: &Value) -> bool {
-    if !matches!(value, Value::Obj(_)) {
+fn is_attr_node<'s>(ctx: &mut Ctx<'s>, value: &Value<'s>) -> bool {
+    if !matches!(value.kind(), ValueKind::Obj(_)) {
         return false;
     }
     let Some(map) = ctx
@@ -16278,15 +16544,24 @@ fn is_attr_node(ctx: &mut Ctx, value: &Value) -> bool {
     else {
         return false;
     };
+    let map = held(ctx, &map);
     match ctx.weak_map_get(&map, value) {
-        Ok(record @ Value::Obj(_)) => {
-            matches!(ctx.member_get(&record, "attrNode"), Ok(Value::Obj(_)))
+        Ok(record) if record.as_obj().is_some() => {
+            matches!(
+                ctx.member_get(&record, "attrNode")
+                    .map(|value| value.kind()),
+                Ok(ValueKind::Obj(_))
+            )
         }
         _ => false,
     }
 }
 
-fn host_dom_relative(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_dom_relative<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let state = ctx.host_mut::<HostState>().expect("DOM host");
     let edge = args.get(1).and_then(Value::as_num_opt).unwrap_or(-1.0) as i32;
     let Some(id) = args
@@ -16364,14 +16639,17 @@ fn host_dom_relative(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
             };
         }
     }
-    Ok(target.map_or(Value::Null, |node| {
-        state
-            .dom_gc
-            .wrappers
-            .get(&node)
-            .and_then(|identity| state.dom_gc.owners.get(identity))
-            .map_or(Value::Num(node as f64), |entry| entry.value.clone())
-    }))
+    let Some(node) = target else {
+        return Ok(Value::Null);
+    };
+    let owner = state
+        .dom_gc
+        .wrappers
+        .get(&node)
+        .and_then(|identity| state.dom_gc.owners.get(identity))
+        .map(|entry| entry.value.clone());
+    drop(dom);
+    Ok(live_owner(ctx, owner).unwrap_or(Value::Num(node as f64)))
 }
 
 fn native_live_collections_enabled() -> bool {
@@ -16402,7 +16680,7 @@ fn arena_of_query(state: &HostState, key: &str) -> Rc<RefCell<Dom>> {
     }
 }
 
-fn live_collection_length(ctx: &Ctx, root: &Value, elements: bool) -> u32 {
+fn live_collection_length<'s>(ctx: &Ctx<'s>, root: &Value<'s>, elements: bool) -> u32 {
     let Some(state) = ctx.host::<HostState>() else {
         return 0;
     };
@@ -16415,26 +16693,31 @@ fn live_collection_length(ctx: &Ctx, root: &Value, elements: bool) -> u32 {
         .min(u32::MAX as usize) as u32
 }
 
-fn live_node_list_length(ctx: &Ctx, root: &Value) -> u32 {
+fn live_node_list_length<'s>(ctx: &Ctx<'s>, root: &Value<'s>) -> u32 {
     live_collection_length(ctx, root, false)
 }
 
-fn live_element_list_length(ctx: &Ctx, root: &Value) -> u32 {
+fn live_element_list_length<'s>(ctx: &Ctx<'s>, root: &Value<'s>) -> u32 {
     live_collection_length(ctx, root, true)
 }
 
-fn host_child_collection_length(
-    ctx: &mut Ctx,
-    _this: Value,
-    args: &[Value],
-) -> Result<Value, Value> {
+fn host_child_collection_length<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let root = args.first().unwrap_or(&Value::Undefined);
-    Ok(Value::Num(
-        live_collection_length(ctx, root, matches!(args.get(1), Some(Value::Bool(true)))) as f64,
-    ))
+    Ok(Value::Num(live_collection_length(
+        ctx,
+        root,
+        matches!(
+            args.get(1).map(|value| value.kind()),
+            Some(ValueKind::Bool(true))
+        ),
+    ) as f64))
 }
 
-fn live_element_list_names(ctx: &Ctx, root: &Value) -> Vec<String> {
+fn live_element_list_names<'s>(ctx: &Ctx<'s>, root: &Value<'s>) -> Vec<String> {
     let Some(state) = ctx.host::<HostState>() else {
         return Vec::new();
     };
@@ -16490,7 +16773,11 @@ fn collection_named_item(
 
 /// A collection member's canonical wrapper, creating it through the page's
 /// wrapper callback only when the node has none.
-fn collection_member_wrapper(ctx: &mut Ctx, member: usize, wrap: &Value) -> Result<Value, Value> {
+fn collection_member_wrapper<'s>(
+    ctx: &mut Ctx<'s>,
+    member: usize,
+    wrap: &Value<'s>,
+) -> Result<Value<'s>, Value<'s>> {
     let state = ctx.host::<HostState>().expect("DOM host");
     let cached = state
         .dom_gc
@@ -16498,34 +16785,39 @@ fn collection_member_wrapper(ctx: &mut Ctx, member: usize, wrap: &Value) -> Resu
         .get(&member)
         .and_then(|identity| state.dom_gc.owners.get(identity))
         .map(|entry| entry.value.clone());
-    if let Some(wrapper) = cached {
+    if let Some(wrapper) = live_owner(ctx, cached) {
         return Ok(wrapper);
     }
-    ctx.invoke(wrap.clone(), Value::Undefined, &[Value::Num(member as f64)])
+    ctx.invoke(*wrap, Value::Undefined, &[Value::Num(member as f64)])
 }
 
 /// Native membership never manufactures a JS ID array. Only a consumed node
 /// obtains a wrapper; its identity still belongs to the canonical mixed heap.
-fn live_child_collection_get(
-    ctx: &mut Ctx,
-    _this: Value,
-    args: &[Value],
-    captures: &[Value],
-) -> Result<Value, Value> {
-    let elements = matches!(captures.get(2), Some(Value::Bool(true)));
+fn live_child_collection_get<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+    captures: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
+    let elements = matches!(
+        captures.get(2).map(|value| value.kind()),
+        Some(ValueKind::Bool(true))
+    );
     let state = ctx.host::<HostState>().expect("DOM host");
     let Some(root) = state.dom_gc.node_identity(&captures[0]) else {
         return Ok(Value::Null);
     };
     let arena = arena_holding(state, root);
     let dom = arena.borrow();
-    let target = match args.first() {
-        Some(Value::Num(index)) if index.is_finite() && *index >= 0.0 && index.fract() == 0.0 => {
-            dom.child_collection_item(root, *index as usize, elements)
+    let target = match args.first().map(|value| value.kind()) {
+        Some(ValueKind::Num(index))
+            if index.is_finite() && index >= 0.0 && index.fract() == 0.0 =>
+        {
+            dom.child_collection_item(root, index as usize, elements)
         }
-        Some(Value::Str(name)) if elements && !name.is_empty() => {
+        Some(ValueKind::Str(name)) if elements && !name.as_engine_text().is_empty() => {
             // Attribute values are DOM engine text, like the payload (see `host_arg_string`).
-            collection_named_item(&dom, dom.child_iter(root), name.as_str())
+            collection_named_item(&dom, dom.child_iter(root), name.as_engine_text())
         }
         _ => None,
     };
@@ -16536,17 +16828,20 @@ fn live_child_collection_get(
     collection_member_wrapper(ctx, target, &captures[1])
 }
 
-fn host_install_live_collection(
-    ctx: &mut Ctx,
-    _this: Value,
-    args: &[Value],
-) -> Result<Value, Value> {
+fn host_install_live_collection<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     if !native_live_collections_enabled() {
         return Ok(Value::Bool(false));
     }
     let target = args.first().cloned().unwrap_or(Value::Undefined);
     let root = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let elements = matches!(args.get(2), Some(Value::Bool(true)));
+    let elements = matches!(
+        args.get(2).map(|value| value.kind()),
+        Some(ValueKind::Bool(true))
+    );
     let wrap = args.get(3).cloned().unwrap_or(Value::Undefined);
     if ctx
         .host::<HostState>()
@@ -16563,49 +16858,43 @@ fn host_install_live_collection(
         "collection item",
         1,
         live_child_collection_get,
-        vec![root.clone(), wrap, Value::Bool(elements)],
+        &[root, wrap, Value::Bool(elements)],
     );
     let length = if elements {
         live_element_list_length
     } else {
         live_node_list_length
     };
-    let named = elements.then(|| {
+    let named = elements.then_some({
         (
-            live_element_list_names as fn(&Ctx, &Value) -> Vec<String>,
-            getter.clone(),
+            live_element_list_names as trust_js::embed::IndexedNames,
+            getter,
         )
     });
-    ctx.install_live_readonly_indexed_properties(&target, root, length, getter.clone(), named)?;
+    ctx.install_live_readonly_indexed_properties(&target, root, length, getter, named)?;
     Ok(getter)
 }
 
 /// The members of the tag/class collection whose membership state is `key`.
-fn live_query_members(ctx: &Ctx, key: &Value) -> Option<Rc<[usize]>> {
-    let Value::Str(key) = key else {
-        return None;
-    };
+fn live_query_members<'s>(ctx: &Ctx<'s>, key: &Value<'s>) -> Option<Rc<[usize]>> {
+    let key = key.as_engine_text()?;
     let state = ctx.host::<HostState>()?;
-    Some(
-        arena_of_query(state, key.as_str())
-            .borrow()
-            .query_collection(key.as_str()),
-    )
+    Some(arena_of_query(state, key).borrow().query_collection(key))
 }
 
 /// The arena a live query collection's members are in.
-fn query_arena(ctx: &Ctx, key: &Value) -> Option<Rc<RefCell<Dom>>> {
-    let (Value::Str(key), Some(state)) = (key, ctx.host::<HostState>()) else {
+fn query_arena<'s>(ctx: &Ctx<'s>, key: &Value<'s>) -> Option<Rc<RefCell<Dom>>> {
+    let (Some(key), Some(state)) = (key.as_engine_text(), ctx.host::<HostState>()) else {
         return None;
     };
-    Some(arena_of_query(state, key.as_str()))
+    Some(arena_of_query(state, key))
 }
 
-fn live_query_length(ctx: &Ctx, key: &Value) -> u32 {
+fn live_query_length<'s>(ctx: &Ctx<'s>, key: &Value<'s>) -> u32 {
     live_query_members(ctx, key).map_or(0, |members| members.len().min(u32::MAX as usize) as u32)
 }
 
-fn live_query_names(ctx: &Ctx, key: &Value) -> Vec<String> {
+fn live_query_names<'s>(ctx: &Ctx<'s>, key: &Value<'s>) -> Vec<String> {
     let (Some(members), Some(arena)) = (live_query_members(ctx, key), query_arena(ctx, key)) else {
         return Vec::new();
     };
@@ -16614,22 +16903,28 @@ fn live_query_names(ctx: &Ctx, key: &Value) -> Vec<String> {
 
 /// Captures: membership key, wrapper callback, and the root wrapper, which
 /// keeps the root node (and with it the key's identity) alive with the view.
-fn live_query_collection_get(
-    ctx: &mut Ctx,
-    _this: Value,
-    args: &[Value],
-    captures: &[Value],
-) -> Result<Value, Value> {
+fn live_query_collection_get<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+    captures: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let Some(members) = live_query_members(ctx, &captures[0]) else {
         return Ok(Value::Null);
     };
-    let target = match args.first() {
-        Some(Value::Num(index)) if index.is_finite() && *index >= 0.0 && index.fract() == 0.0 => {
-            members.get(*index as usize).copied()
+    let target = match args.first().map(|value| value.kind()) {
+        Some(ValueKind::Num(index))
+            if index.is_finite() && index >= 0.0 && index.fract() == 0.0 =>
+        {
+            members.get(index as usize).copied()
         }
-        Some(Value::Str(name)) if !name.is_empty() => {
+        Some(ValueKind::Str(name)) if !name.as_engine_text().is_empty() => {
             let arena = query_arena(ctx, &captures[0]).expect("DOM host");
-            collection_named_item(&arena.borrow(), members.iter().copied(), name.as_str())
+            collection_named_item(
+                &arena.borrow(),
+                members.iter().copied(),
+                name.as_engine_text(),
+            )
         }
         _ => None,
     };
@@ -16639,12 +16934,12 @@ fn live_query_collection_get(
     collection_member_wrapper(ctx, target, &captures[1])
 }
 
-fn live_query_collection_length(
-    ctx: &mut Ctx,
-    _this: Value,
-    _args: &[Value],
-    captures: &[Value],
-) -> Result<Value, Value> {
+fn live_query_collection_length<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    _args: &[Value<'s>],
+    captures: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     Ok(Value::Num(live_query_length(ctx, &captures[0]) as f64))
 }
 
@@ -16654,22 +16949,25 @@ fn live_query_collection_length(
 /// the non-NS form, null for the null namespace) or whether a class query's
 /// root is a Document. Returns `[item getter, length function]`, or false when
 /// native collections are disabled.
-fn host_install_query_collection(
-    ctx: &mut Ctx,
-    _this: Value,
-    args: &[Value],
-) -> Result<Value, Value> {
+fn host_install_query_collection<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     if !native_live_collections_enabled() {
         return Ok(Value::Bool(false));
     }
     let target = args.first().cloned().unwrap_or(Value::Undefined);
     let root_wrapper = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let classes = matches!(args.get(2), Some(Value::Bool(true)));
+    let classes = matches!(
+        args.get(2).map(|value| value.kind()),
+        Some(ValueKind::Bool(true))
+    );
     let query = host_arg_string(ctx, args, 3);
-    let namespace = match args.get(4) {
+    let namespace = match args.get(4).map(|value| value.kind()) {
         _ if classes => None,
-        None | Some(Value::Undefined) => None,
-        Some(Value::Null) => Some(String::new()),
+        None | Some(ValueKind::Undefined) => None,
+        Some(ValueKind::Null) => Some(String::new()),
         _ => Some(host_arg_string(ctx, args, 4)),
     };
     let wrap = args.get(5).cloned().unwrap_or(Value::Undefined);
@@ -16685,7 +16983,10 @@ fn host_install_query_collection(
     let key = if classes {
         crate::dom::CollectionQuery::Class {
             names: &query,
-            document_root: matches!(args.get(4), Some(Value::Bool(true))),
+            document_root: matches!(
+                args.get(4).map(|value| value.kind()),
+                Some(ValueKind::Bool(true))
+            ),
         }
     } else {
         crate::dom::CollectionQuery::Tag {
@@ -16695,33 +16996,34 @@ fn host_install_query_collection(
     }
     .key(root);
     // The key carries DOM engine text and is read back as-is (see `host_arg_string`).
-    let key = Value::from_engine_text(key);
+    let key = ctx.string_from_engine_text(key);
     let getter = ctx.new_native_fn_with_captures(
         "collection item",
         1,
         live_query_collection_get,
-        vec![key.clone(), wrap, root_wrapper],
+        &[key, wrap, root_wrapper],
     );
     let length = ctx.new_native_fn_with_captures(
         "collection length",
         0,
         live_query_collection_length,
-        vec![key.clone()],
+        &[key],
     );
     ctx.install_live_readonly_indexed_properties(
         &target,
         key,
         live_query_length,
-        getter.clone(),
-        Some((
-            live_query_names as fn(&Ctx, &Value) -> Vec<String>,
-            getter.clone(),
-        )),
+        getter,
+        Some((live_query_names as trust_js::embed::IndexedNames, getter)),
     )?;
     Ok(ctx.make_array(vec![getter, length]))
 }
 
-fn host_node_identity(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_node_identity<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let state = ctx.host_mut::<HostState>().expect("DOM host");
     Ok(host_id_value(
         args.first()
@@ -16729,7 +17031,11 @@ fn host_node_identity(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Val
     ))
 }
 
-fn host_dom_observer_targets(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_dom_observer_targets<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let observer = args.first().cloned().unwrap_or(Value::Undefined);
     let array = args.get(1).cloned().unwrap_or(Value::Undefined);
     // The private prelude passes distinct node IDs. Read ordinary own numeric
@@ -16753,9 +17059,7 @@ fn host_dom_observer_targets(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Res
     nodes.retain(|node| state.dom.borrow().is_valid(*node));
     nodes.sort_unstable();
     nodes.dedup();
-    state
-        .dom_gc
-        .retain(observer, nodes, DomGcOwnerKind::Observer);
+    retain_dom_owner(ctx, &observer, nodes, DomGcOwnerKind::Observer);
     Ok(Value::Undefined)
 }
 
@@ -16777,14 +17081,14 @@ type HostFetchArgs = (
 /// user-selected files, which are read now against their snapshot state
 /// (File API #snapshot-state) within the request limit, so an upload is never
 /// copied into script memory.
-fn host_request_body(
-    ctx: &mut Ctx,
-    args: &[Value],
+fn host_request_body<'s>(
+    ctx: &mut Ctx<'s>,
+    args: &[Value<'s>],
     index: usize,
 ) -> Result<Option<Vec<u8>>, String> {
     let Some(value) = args
         .get(index)
-        .filter(|value| !matches!(value, Value::Null | Value::Undefined))
+        .filter(|value| !matches!(value.kind(), ValueKind::Null | ValueKind::Undefined))
         .cloned()
     else {
         return Ok(None);
@@ -16792,10 +17096,10 @@ fn host_request_body(
     if let Some(bytes) = ctx.buffer_source_bytes(&value, false) {
         return Ok(Some(bytes));
     }
-    if !matches!(value, Value::Obj(_)) {
+    if !matches!(value.kind(), ValueKind::Obj(_)) {
         return Ok(Some(host_latin1_bytes(ctx, args, index)));
     }
-    let number = |ctx: &mut Ctx, object: &Value, key: &str| {
+    let number = |ctx: &mut Ctx<'s>, object: &Value<'s>, key: &str| {
         ctx.member_get(object, key)
             .ok()
             .and_then(|value| value.as_num_opt())
@@ -16831,11 +17135,14 @@ fn host_request_body(
 /// argument 10 of `__http_fetch`/`__http_fetch_async`: XHR send() sets it when
 /// its upload object has event listeners, the Request constructor for a
 /// ReadableStream body.
-fn host_fetch_use_cors_preflight(args: &[Value]) -> bool {
-    matches!(args.get(10), Some(Value::Bool(true)))
+fn host_fetch_use_cors_preflight<'s>(args: &[Value<'s>]) -> bool {
+    matches!(
+        args.get(10).map(|value| value.kind()),
+        Some(ValueKind::Bool(true))
+    )
 }
 
-fn host_fetch_args(ctx: &mut Ctx, args: &[Value]) -> Result<HostFetchArgs, String> {
+fn host_fetch_args<'s>(ctx: &mut Ctx<'s>, args: &[Value<'s>]) -> Result<HostFetchArgs, String> {
     let target = host_arg_usv(ctx, args, 0);
     let mut method: String = host_arg_usv(ctx, args, 1)
         .chars()
@@ -16853,14 +17160,14 @@ fn host_fetch_args(ctx: &mut Ctx, args: &[Value]) -> Result<HostFetchArgs, Strin
     let body = host_request_body(ctx, args, 2)?;
     let content_type = args
         .get(3)
-        .filter(|value| !matches!(value, Value::Null | Value::Undefined))
+        .filter(|value| !matches!(value.kind(), ValueKind::Null | ValueKind::Undefined))
         .map(|_| host_arg_usv(ctx, args, 3));
     // BodyInit extraction already chose the inferred type. A null type is
     // significant for BufferSource and untyped Blob bodies (Fetch §5.2).
     let body = body.map(|bytes| (content_type.unwrap_or_default(), bytes));
     let headers = args
         .get(4)
-        .filter(|value| !matches!(value, Value::Null | Value::Undefined))
+        .filter(|value| !matches!(value.kind(), ValueKind::Null | ValueKind::Undefined))
         .map(|_| crate::js::parse_header_blob(&host_arg_usv(ctx, args, 4)))
         .unwrap_or_default();
     let policy = args.get(5).map(|_| {
@@ -16905,12 +17212,12 @@ fn prepare_host_request(
     )
 }
 
-fn request_client_url(ctx: &mut Ctx) -> url::Url {
+fn request_client_url<'s>(ctx: &mut Ctx<'s>) -> url::Url {
     let context = ctx.host_job_context();
     request_context_url(ctx, context)
 }
 
-fn request_context_url(ctx: &mut Ctx, context: u64) -> url::Url {
+fn request_context_url<'s>(ctx: &mut Ctx<'s>, context: u64) -> url::Url {
     let state = ctx
         .host_mut::<HostState>()
         .expect("request settings require HostState");
@@ -16921,7 +17228,7 @@ fn request_context_url(ctx: &mut Ctx, context: u64) -> url::Url {
         .clone()
 }
 
-fn request_cookie_context(ctx: &mut Ctx) -> crate::http::CookieContext {
+fn request_cookie_context<'s>(ctx: &mut Ctx<'s>) -> crate::http::CookieContext {
     let id = ctx.host_job_context();
     cookie_context_for_id(ctx, id)
 }
@@ -16989,7 +17296,7 @@ fn cookie_context_for_state(state: &mut HostState, id: u64) -> crate::http::Cook
     context
 }
 
-fn cookie_context_for_id(ctx: &mut Ctx, id: u64) -> crate::http::CookieContext {
+fn cookie_context_for_id<'s>(ctx: &mut Ctx<'s>, id: u64) -> crate::http::CookieContext {
     let state = ctx
         .host_mut::<HostState>()
         .expect("cookie settings require HostState");
@@ -17184,7 +17491,7 @@ fn trust_js_cached_result(response: &crate::http::CachedResp) -> TrustJsFetchRes
     })
 }
 
-fn host_fetch_result_value(ctx: &mut Ctx, result: TrustJsFetchResult) -> Value {
+fn host_fetch_result_value<'s>(ctx: &mut Ctx<'s>, result: TrustJsFetchResult) -> Value<'s> {
     let Some(TrustJsFetchData {
         status,
         content_type,
@@ -17213,14 +17520,14 @@ fn host_fetch_result_value(ctx: &mut Ctx, result: TrustJsFetchResult) -> Value {
         ) else {
             return Value::Null;
         };
-        Value::from_string(metadata)
+        ctx.string(metadata)
     } else {
         Value::Null
     };
     let text = if crate::js::response_body_is_binary(&content_type) {
         Value::Undefined
     } else {
-        Value::from_string(String::from_utf8_lossy(&body).into_owned())
+        ctx.string(String::from_utf8_lossy(&body).into_owned())
     };
     // Fetch Body is a byte sequence. An ordinary ArrayBuffer crosses the host boundary without
     // depending on the realm's typed-array view bookkeeping; the prelude turns it into a view at
@@ -17228,7 +17535,7 @@ fn host_fetch_result_value(ctx: &mut Ctx, result: TrustJsFetchResult) -> Value {
     // byte string only as an allocation-failure fallback.
     let bytes = ctx
         .make_array_buffer(&body)
-        .unwrap_or_else(|_| Value::from_string(body.iter().copied().map(char::from).collect()));
+        .unwrap_or_else(|_| ctx.string(body.iter().copied().map(char::from).collect()));
     // [status, Content-Type, text, bytes, headers, final URL, -, status
     // message]: Fetch's response URL list ends with the URL that answered
     // after redirects; the header list keeps its order and duplicates (Fetch
@@ -17237,15 +17544,15 @@ fn host_fetch_result_value(ctx: &mut Ctx, result: TrustJsFetchResult) -> Value {
     // result's referrer (`navigation_result_value`).
     ctx.make_array(vec![
         Value::Num(f64::from(status)),
-        Value::from_string(content_type),
+        ctx.string(content_type),
         text,
         bytes,
-        Value::from_string(headers),
-        Value::from_string(url),
+        ctx.string(headers),
+        ctx.string(url),
         Value::Undefined,
-        Value::from_string(status_text),
+        ctx.string(status_text),
         Value::Undefined, // streaming body id, installed by FetchHead
-        filter.map_or(Value::Null, Value::from_string),
+        filter.map_or(Value::Null, |filter| ctx.string(filter)),
         private,
     ])
 }
@@ -17282,7 +17589,7 @@ fn timed_fetch_result(
     (result, timing)
 }
 
-fn resource_initiator(ctx: &mut Ctx, args: &[Value]) -> &'static str {
+fn resource_initiator<'s>(ctx: &mut Ctx<'s>, args: &[Value<'s>]) -> &'static str {
     match host_arg_string(ctx, args, 7).as_str() {
         "fetch" => "fetch",
         "xmlhttprequest" => "xmlhttprequest",
@@ -17293,7 +17600,10 @@ fn resource_initiator(ctx: &mut Ctx, args: &[Value]) -> &'static str {
     }
 }
 
-fn request_web_options(ctx: &mut Ctx, args: &[Value]) -> crate::http::WebRequestOptions {
+fn request_web_options<'s>(
+    ctx: &mut Ctx<'s>,
+    args: &[Value<'s>],
+) -> crate::http::WebRequestOptions {
     crate::http::WebRequestOptions {
         cache: match host_arg_string(ctx, args, 9).as_str() {
             "no-store" => "no-store",
@@ -17309,12 +17619,15 @@ fn request_web_options(ctx: &mut Ctx, args: &[Value]) -> crate::http::WebRequest
             "low" => "low",
             _ => "auto",
         },
-        keepalive: matches!(args.get(11), Some(Value::Bool(true))),
+        keepalive: matches!(
+            args.get(11).map(|value| value.kind()),
+            Some(ValueKind::Bool(true))
+        ),
         ..Default::default()
     }
 }
 
-fn record_resource_timing(ctx: &mut Ctx, report: Option<TrustJsResourceTiming>) {
+fn record_resource_timing<'s>(ctx: &mut Ctx<'s>, report: Option<TrustJsResourceTiming>) {
     let Some(report) = report else { return };
     record_resource_timing_ref(ctx, &report);
 }
@@ -17330,23 +17643,22 @@ fn record_resource_timing_in(
     let Some(report) = report else {
         return Ok(());
     };
-    if context == engine.ctx().host_job_context() {
-        record_resource_timing_ref(engine.ctx(), &report);
+    if context == engine.host_job_context() {
+        engine.scope(|cx| record_resource_timing_ref(cx, &report));
         return Ok(());
     }
     let realm = engine
-        .ctx()
         .host_mut::<HostState>()
         .and_then(|state| state.window_realm(context));
     let Some(realm) = realm else { return Ok(()) };
     engine
         .with_embed_realm(&realm, move |engine| {
-            record_resource_timing_ref(engine.ctx(), &report);
+            engine.scope(|cx| record_resource_timing_ref(cx, &report));
         })
         .map_err(|_| String::from("resource timing Realm is unavailable"))
 }
 
-fn record_resource_timing_ref(ctx: &mut Ctx, report: &TrustJsResourceTiming) {
+fn record_resource_timing_ref<'s>(ctx: &mut Ctx<'s>, report: &TrustJsResourceTiming) {
     let data = report.data();
     // Resource Timing #marking-resource-timing creates the entry in the
     // initiating global, including WorkerGlobalScope (not its owner Window).
@@ -17359,7 +17671,11 @@ fn record_resource_timing_ref(ctx: &mut Ctx, report: &TrustJsResourceTiming) {
 
 /// XMLHttpRequest's synchronous flag uses HTML's pause semantics. The network future runs on the
 /// application runtime while only this page thread waits, avoiding a nested Tokio `block_on`.
-fn host_http_fetch(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_http_fetch<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let web = request_web_options(ctx, args);
     let started = crate::performance::now_ms();
     // A body whose selected file can no longer be read is a network error.
@@ -17427,7 +17743,7 @@ struct NavigationFetch {
     prefetched: Option<Option<crate::http::FetchResponseDetails>>,
 }
 
-fn prepare_navigation_fetch(ctx: &mut Ctx, args: &[Value]) -> Option<NavigationFetch> {
+fn prepare_navigation_fetch<'s>(ctx: &mut Ctx<'s>, args: &[Value<'s>]) -> Option<NavigationFetch> {
     use crate::referrer_policy::ReferrerPolicy;
     let target = host_arg_usv(ctx, args, 0);
     // An attribute navigation supplies the container's reflected policy;
@@ -17543,7 +17859,11 @@ fn prepare_navigation_fetch(ctx: &mut Ctx, args: &[Value]) -> Option<NavigationF
 
 /// A synchronous navigation fetch, for one-shot document transforms and a
 /// script's first read of a frame that has not been navigated yet.
-fn host_http_navigate(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_http_navigate<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let Some(navigation) = prepare_navigation_fetch(ctx, args) else {
         return Ok(Value::Null);
     };
@@ -17581,8 +17901,13 @@ fn host_http_navigate(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Val
 /// by a later task, so a slow frame server never blocks the parent's event
 /// loop (ad iframes held hanime.moe's page thread, and its clicks, for
 /// seconds). Resolves with the same record as `__http_navigate`, or null.
-fn host_http_navigate_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_http_navigate_async<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let (promise, resolve, _reject) = ctx.new_promise_with_resolvers();
+    let resolve_handle = hold(ctx, &resolve);
     let context = ctx.host_job_context();
     let navigation = prepare_navigation_fetch(ctx, args);
     let dispatch = navigation.and_then(|navigation| {
@@ -17595,7 +17920,7 @@ fn host_http_navigate_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
             id,
             TrustJsPendingFetch {
                 context,
-                resolve: resolve.clone(),
+                resolve: resolve_handle,
                 native_lease: None,
                 keepalive: false,
                 task: None,
@@ -17646,13 +17971,13 @@ fn host_http_navigate_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
     Ok(promise)
 }
 
-fn navigation_result_value(
-    ctx: &mut Ctx,
+fn navigation_result_value<'s>(
+    ctx: &mut Ctx<'s>,
     mut details: crate::http::FetchResponseDetails,
     node: Option<usize>,
     target: &str,
     destination: &str,
-) -> Result<Value, Value> {
+) -> Result<Value<'s>, Value<'s>> {
     let current = ctx.host::<HostState>().and_then(|state| {
         let context = match node {
             Some(node) => state
@@ -17707,29 +18032,28 @@ fn navigation_result_value(
     };
     let result = trust_js_fetch_result(details.response);
     let result = host_fetch_result_value(ctx, result);
-    ctx.member_set(&result, "5", Value::from_string(final_url))?;
-    ctx.member_set(&result, "6", Value::from_string(referrer))?;
+    ctx.member_set(&result, "5", ctx.string(final_url))?;
+    ctx.member_set(&result, "6", ctx.string(referrer))?;
     ctx.member_set(&result, "7", timing)?;
     ctx.member_set(&result, "8", resource_timing)?;
-    ctx.member_set(
-        &result,
-        "9",
-        Value::from_string(String::from(response_policy)),
-    )?;
-    ctx.member_set(&result, "10", Value::from_string(environment_origin))?;
+    ctx.member_set(&result, "9", ctx.string(String::from(response_policy)))?;
+    ctx.member_set(&result, "10", ctx.string(environment_origin))?;
     Ok(result)
 }
 
-fn host_navigation_timing_value(
-    ctx: &mut Ctx,
+fn host_navigation_timing_value<'s>(
+    ctx: &mut Ctx<'s>,
     timing: &crate::http::FetchTiming,
     url: &str,
-) -> Result<Value, Value> {
+) -> Result<Value<'s>, Value<'s>> {
     let data = timing.navigation_data(url);
     host_timing_data_value(ctx, &data)
 }
 
-fn host_timing_data_value(ctx: &mut Ctx, data: &serde_json::Value) -> Result<Value, Value> {
+fn host_timing_data_value<'s>(
+    ctx: &mut Ctx<'s>,
+    data: &serde_json::Value,
+) -> Result<Value<'s>, Value<'s>> {
     let object = ctx.new_object_with_proto(&Value::Null);
     // Closed native scalar record: no author getters, response header objects,
     // source evaluation, or public JSON.parse operation is involved.
@@ -17737,7 +18061,7 @@ fn host_timing_data_value(ctx: &mut Ctx, data: &serde_json::Value) -> Result<Val
         for (key, field) in fields {
             let value = match field {
                 serde_json::Value::Number(number) => Value::Num(number.as_f64().unwrap_or(0.0)),
-                serde_json::Value::String(text) => Value::from_string(text.clone()),
+                serde_json::Value::String(text) => ctx.string(text.clone()),
                 _ => Value::Null,
             };
             ctx.member_set(&object, key, value)?;
@@ -17746,7 +18070,7 @@ fn host_timing_data_value(ctx: &mut Ctx, data: &serde_json::Value) -> Result<Val
     Ok(object)
 }
 
-fn host_resource_timing_value(ctx: &mut Ctx, data: &serde_json::Value) -> Value {
+fn host_resource_timing_value<'s>(ctx: &mut Ctx<'s>, data: &serde_json::Value) -> Value<'s> {
     // Private, ownership-transferred scalar tuple, matching resourceNumbers /
     // resourceStrings in js_platform.js. The shared native privacy filter has
     // already coarsened timestamps and applied TAO/body/status restrictions.
@@ -17782,9 +18106,7 @@ fn host_resource_timing_value(ctx: &mut Ctx, data: &serde_json::Value) -> Value 
         "contentEncoding",
     ];
     let mut fields = Vec::with_capacity(26);
-    fields.push(Value::from_string(
-        data["name"].as_str().unwrap_or("").to_owned(),
-    ));
+    fields.push(ctx.string(data["name"].as_str().unwrap_or("").to_owned()));
     fields.extend(
         NUMBERS
             .iter()
@@ -17793,7 +18115,7 @@ fn host_resource_timing_value(ctx: &mut Ctx, data: &serde_json::Value) -> Value 
     fields.extend(
         STRINGS
             .iter()
-            .map(|name| Value::from_string(data[name].as_str().unwrap_or("").to_owned())),
+            .map(|name| ctx.string(data[name].as_str().unwrap_or("").to_owned())),
     );
     ctx.make_array(fields)
 }
@@ -17806,7 +18128,11 @@ enum AsyncFetchSource {
 /// Fetch API §5.6 creates and returns a Promise before Fetch runs in parallel. Only Send response
 /// data crosses the runtime channel; the resolving function remains rooted in the page realm and
 /// is invoked later when the browser selects the networking task.
-fn host_http_fetch_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_http_fetch_async<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let web = request_web_options(ctx, args);
     // A body whose selected file can no longer be read is a network error.
     let Ok((target, method, body, headers, policy)) = host_fetch_args(ctx, args) else {
@@ -17817,7 +18143,10 @@ fn host_http_fetch_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
     let initiator = resource_initiator(ctx, args);
     // The caller reads the response body as it arrives (Fetch
     // #concept-http-network-fetch); otherwise it needs the whole body at once.
-    let stream_body = matches!(args.get(8), Some(Value::Bool(true)));
+    let stream_body = matches!(
+        args.get(8).map(|value| value.kind()),
+        Some(ValueKind::Bool(true))
+    );
     // Fetch #concept-request-cache-mode: these modes never use a stored
     // response, including one the document's own loads put in the page cache.
     let bypass_cache = matches!(
@@ -17831,7 +18160,10 @@ fn host_http_fetch_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
         _ => crate::http::RedirectMode::Follow,
     };
     // Argument 11: the request's keepalive (Fetch #request-keepalive-flag).
-    let keepalive = matches!(args.get(11), Some(Value::Bool(true)));
+    let keepalive = matches!(
+        args.get(11).map(|value| value.kind()),
+        Some(ValueKind::Bool(true))
+    );
     // Arguments 12 and 13: the request's referrer and referrer policy.
     let (referrer, referrer_policy) = script_request_referrer(ctx, args, 12);
     let started = crate::performance::now_ms();
@@ -17847,6 +18179,7 @@ fn host_http_fetch_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
         );
     }
     let (promise, resolve, _reject) = ctx.new_promise_with_resolvers();
+    let resolve_handle = hold(ctx, &resolve);
     let context = ctx.host_job_context();
 
     let dispatch = {
@@ -17915,7 +18248,7 @@ fn host_http_fetch_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
                     id,
                     TrustJsPendingFetch {
                         context,
-                        resolve: resolve.clone(),
+                        resolve: resolve_handle,
                         native_lease: None,
                         keepalive,
                         task: None,
@@ -18111,7 +18444,7 @@ async fn stream_fetch_body(
     let _ = events.send(TrustJsHostTask::FetchBodyEnd { id, ok, timing });
 }
 
-fn body_stream_id(args: &[Value]) -> Option<usize> {
+fn body_stream_id<'s>(args: &[Value<'s>]) -> Option<usize> {
     args.first()
         .and_then(Value::as_num_opt)
         .and_then(|id| (id.is_finite() && id >= 0.0 && id.fract() == 0.0).then_some(id as usize))
@@ -18121,13 +18454,18 @@ fn body_stream_id(args: &[Value]) -> Option<usize> {
 /// a promise for the bytes buffered for fetch `id` (an ArrayBuffer), once there
 /// are any; `null` at the end of the body; `false` after a network error or
 /// when the transfer no longer exists.
-fn host_http_fetch_pull(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_http_fetch_pull<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     enum Ready {
         Bytes(Vec<u8>),
         End(bool),
-        Wait(Option<Value>),
+        Wait(Option<Handle>),
     }
     let (promise, resolve, _reject) = ctx.new_promise_with_resolvers();
+    let resolve_handle = hold(ctx, &resolve);
     let id = body_stream_id(args);
     let ready = match ctx
         .host_mut::<HostState>()
@@ -18147,7 +18485,7 @@ fn host_http_fetch_pull(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
                     network.body_streams.remove(&id);
                     Ready::End(ok)
                 }
-                None => Ready::Wait(stream.pull.replace(resolve.clone())),
+                None => Ready::Wait(stream.pull.replace(resolve_handle)),
             },
         },
     };
@@ -18162,6 +18500,7 @@ fn host_http_fetch_pull(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
         }
         // A stream has one pull in flight; a superseded one fails.
         Ready::Wait(Some(previous)) => {
+            let previous = held(ctx, &previous);
             ctx.invoke(previous, Value::Undefined, &[Value::Bool(false)])?;
         }
         Ready::Wait(None) => {}
@@ -18171,7 +18510,11 @@ fn host_http_fetch_pull(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
 
 /// Abort or terminate fetch `id`'s transfer: its body's stream was canceled,
 /// the fetch was aborted, or the stream was garbage collected.
-fn host_http_fetch_cancel(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_http_fetch_cancel<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let stream = ctx
         .host_mut::<HostState>()
         .and_then(|state| state.network.as_mut())
@@ -18180,6 +18523,7 @@ fn host_http_fetch_cancel(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result
     if let Some(mut stream) = stream {
         stream.flow.cancel();
         if let Some(pull) = stream.pull.take() {
+            let pull = held(ctx, &pull);
             ctx.invoke(pull, Value::Undefined, &[Value::Bool(false)])?;
         }
     }
@@ -18188,7 +18532,11 @@ fn host_http_fetch_cancel(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result
 
 /// HTML #dom-window-stop: "If this's navigable is null, then return" ran in
 /// the prelude; stop loading this Window's navigable.
-fn host_stop_loading(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+fn host_stop_loading<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    _args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let context = ctx.host_job_context();
     stop_loading_navigable(ctx, context);
     Ok(Value::Undefined)
@@ -18199,7 +18547,7 @@ fn host_stop_loading(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Val
 /// of that Document's event loop, from `window.stop()` or the user agent's
 /// stop for the top-level navigable (`PageCmd::StopLoading`). Returns whether
 /// anything was loading.
-fn stop_loading_navigable(ctx: &mut Ctx, context: u64) -> bool {
+fn stop_loading_navigable<'s>(ctx: &mut Ctx<'s>, context: u64) -> bool {
     // Step 2: TRust's ongoing navigation of this navigable is the one its
     // Window requested in the running task (the frontend starts it only after
     // the task), so setting the ongoing navigation to null discards that
@@ -18252,13 +18600,14 @@ fn descendant_contexts(state: &HostState, context: u64) -> Vec<u64> {
 }
 
 /// Call a platform-control operation of Window `context`'s Realm.
-fn call_trust_in_context(ctx: &mut Ctx, context: u64, name: &str) -> Option<Value> {
+fn call_trust_in_context<'s>(ctx: &mut Ctx<'s>, context: u64, name: &str) -> Option<Value<'s>> {
     if context == ctx.host_job_context() {
         return host_call_trust(ctx, name, &[]).ok();
     }
     let realm = ctx
         .host_mut::<HostState>()
         .and_then(|state| state.window_realm(context))?;
+    let realm = held(ctx, &realm);
     ctx.with_embed_realm(&realm, |realm_ctx| {
         host_call_trust(realm_ctx, name, &[]).ok()
     })
@@ -18268,7 +18617,7 @@ fn call_trust_in_context(ctx: &mut Ctx, context: u64, name: &str) -> Option<Valu
 
 /// HTML #abort-a-document for Window `context`'s Document, in a task of its
 /// event loop. Returns whether this canceled anything.
-fn abort_document(ctx: &mut Ctx, context: u64) -> bool {
+fn abort_document<'s>(ctx: &mut Ctx<'s>, context: u64) -> bool {
     if let Some(state) = ctx.host_mut::<HostState>() {
         state.pending_stylesheets.remove(&context);
     }
@@ -18307,7 +18656,7 @@ fn abort_document(ctx: &mut Ctx, context: u64) -> bool {
 /// consumer as a network failure. Response bodies still arriving stop. The
 /// top-level Document also cancels the browser's own subresource fetches and
 /// image requests (`PageCache::stop_loading`).
-fn abort_document_fetches(ctx: &mut Ctx, context: u64) -> bool {
+fn abort_document_fetches<'s>(ctx: &mut Ctx<'s>, context: u64) -> bool {
     let Some(state) = ctx.host_mut::<HostState>() else {
         return false;
     };
@@ -18344,6 +18693,7 @@ fn abort_document_fetches(ctx: &mut Ctx, context: u64) -> bool {
     for mut stream in streams {
         stream.flow.cancel();
         if let Some(pull) = stream.pull.take() {
+            let pull = held(ctx, &pull);
             let _ = ctx.invoke(pull, Value::Undefined, &[Value::Bool(false)]);
         }
     }
@@ -18353,7 +18703,8 @@ fn abort_document_fetches(ctx: &mut Ctx, context: u64) -> bool {
         }
         // A network error for a consumer that has not settled it already
         // (fetch, XMLHttpRequest and EventSource settled theirs as aborted).
-        let _ = ctx.invoke(pending.resolve, Value::Undefined, &[Value::Null]);
+        let resolve = held(ctx, &pending.resolve);
+        let _ = ctx.invoke(resolve, Value::Undefined, &[Value::Null]);
         drop(pending.native_lease);
     }
     canceled
@@ -18362,7 +18713,7 @@ fn abort_document_fetches(ctx: &mut Ctx, context: u64) -> bool {
 /// HTML #abort-a-document step 4 for the top-level Document: if it has an
 /// active parser, set its active parser was aborted to true and abort that
 /// parser (#abort-a-parser). Returns whether there was one.
-fn abort_active_parser(ctx: &mut Ctx) -> bool {
+fn abort_active_parser<'s>(ctx: &mut Ctx<'s>) -> bool {
     let (position, watermark) = {
         let Some(state) = ctx.host_mut::<HostState>() else {
             return false;
@@ -18406,28 +18757,20 @@ fn run_in_context_realm(
     engine: &mut trust_js::Engine,
     context: u64,
     label: &str,
-    run: impl FnOnce(&mut trust_js::Engine) -> Result<(), String>,
+    run: impl for<'s> FnOnce(&mut Ctx<'s>) -> Result<(), String>,
 ) -> Result<(), String> {
-    if context == engine.ctx().host_job_context() {
-        return run(engine);
+    if context == engine.host_job_context() {
+        return engine.scope(run);
     }
     let realm = engine
-        .ctx()
         .host_mut::<HostState>()
         .and_then(|state| state.window_realm(context));
     let Some(realm) = realm else {
         return Ok(());
     };
-    match engine.with_embed_realm(&realm, run) {
+    match engine.with_embed_realm(&realm, |engine| engine.scope(run)) {
         Ok(result) => result,
-        Err(error) => {
-            let message = engine
-                .ctx()
-                .coerce_string(&error)
-                .map(|message| message.to_string())
-                .unwrap_or_else(|_| String::from("unknown Window Realm"));
-            Err(format!("{label} Realm: {message}"))
-        }
+        Err(error) => Err(format!("{label} Realm: {error}")),
     }
 }
 
@@ -18436,7 +18779,6 @@ fn run_in_context_realm(
 fn settle_body_pull(engine: &mut trust_js::Engine, id: usize) -> Result<(), String> {
     let ready = {
         let Some(network) = engine
-            .ctx()
             .host_mut::<HostState>()
             .and_then(|state| state.network.as_mut())
         else {
@@ -18466,27 +18808,28 @@ fn settle_body_pull(engine: &mut trust_js::Engine, id: usize) -> Result<(), Stri
         }
     };
     let (context, pull, ready) = ready;
-    run_in_context_realm(engine, context, "fetch body task", move |engine| {
+    run_in_context_realm(engine, context, "fetch body task", move |cx| {
         let value = match ready {
-            Ok(bytes) => engine
-                .ctx()
-                .make_array_buffer(&bytes)
-                .unwrap_or(Value::Bool(false)),
+            Ok(bytes) => cx.make_array_buffer(&bytes).unwrap_or(Value::Bool(false)),
             Err(true) => Value::Null,
             Err(false) => Value::Bool(false),
         };
-        engine
-            .call_function_interruptible(&pull, Value::Undefined, &[value])
+        let pull = held(cx, &pull);
+        cx.call_function_interruptible(&pull, Value::Undefined, &[value])
             .map(|_| ())
-            .map_err(|error| describe_eval_error(engine, error, "fetch body task"))
+            .map_err(|error| describe_eval_error(cx, error, "fetch body task"))
     })
 }
 
-fn host_trust(ctx: &mut Ctx) -> Result<Value, Value> {
+fn host_trust<'s>(ctx: &mut Ctx<'s>) -> Result<Value<'s>, Value<'s>> {
     platform_control(ctx)
 }
 
-fn host_call_trust(ctx: &mut Ctx, name: &str, args: &[Value]) -> Result<Value, Value> {
+fn host_call_trust<'s>(
+    ctx: &mut Ctx<'s>,
+    name: &str,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let trust = host_trust(ctx)?;
     let function = ctx.member_get(&trust, name)?;
     ctx.invoke(function, trust, args)
@@ -18494,11 +18837,11 @@ fn host_call_trust(ctx: &mut Ctx, name: &str, args: &[Value]) -> Result<Value, V
 
 /// [`host_call_trust`] for a host task outside any native function, where a host interruption
 /// must stay distinct from a JavaScript throw.
-fn host_call_trust_interruptible(
-    ctx: &mut Ctx,
+fn host_call_trust_interruptible<'s>(
+    ctx: &mut Ctx<'s>,
     name: &str,
-    args: &[Value],
-) -> Result<Value, EvalError> {
+    args: &[Value<'s>],
+) -> Result<Value<'s>, EvalError<'s>> {
     let trust = host_trust(ctx).map_err(EvalError::Throw)?;
     let function = ctx.member_get(&trust, name).map_err(EvalError::Throw)?;
     ctx.invoke_interruptible(function, trust, args)
@@ -18506,7 +18849,11 @@ fn host_call_trust_interruptible(
 
 /// A host task's JavaScript failure as its error report: a throw is described; an interruption
 /// is reported unless it is a navigation or cancellation, which ends the task silently.
-fn host_task_failure(ctx: &mut Ctx, error: EvalError, label: &str) -> Result<(), String> {
+fn host_task_failure<'s>(
+    ctx: &mut Ctx<'s>,
+    error: EvalError<'s>,
+    label: &str,
+) -> Result<(), String> {
     match error {
         EvalError::Interrupted(
             trust_js::InterruptReason::UserNavigation | trust_js::InterruptReason::Cancelled,
@@ -18519,7 +18866,11 @@ fn host_task_failure(ctx: &mut Ctx, error: EvalError, label: &str) -> Result<(),
     }
 }
 
-fn host_allocate_job_context(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+fn host_allocate_job_context<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    _args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     const MAX_SAFE_INTEGER: u64 = (1_u64 << 53) - 1;
     let Some(state) = ctx.host_mut::<HostState>() else {
         return Err(ctx.make_error("InvalidStateError", "missing browser host state"));
@@ -18633,23 +18984,32 @@ fn platform_prelude_snapshot() -> Result<&'static [u8], String> {
 fn eval_platform_prelude(engine: &mut trust_js::Engine) -> Result<(), String> {
     let snapshot = platform_prelude_snapshot()?;
     #[cfg(test)]
-    let config = test_bootstrap_config(engine.ctx());
+    let config = engine.scope(|cx| {
+        let config = test_bootstrap_config(cx);
+        TrustValue::read(cx, config)
+    });
     eval_bootstrap_snapshot(engine, snapshot, "TRust platform prelude")?;
     // HTML #windowproxy-setprototypeof / #windowproxy-preventextensions:
     // initialization may set the Window prototype; author scripts may not
     // replace it or make the Window non-extensible afterward.
-    let global = engine.global_this();
-    if !engine.ctx().set_host_object_invariants(&global, true, true) {
+    let installed = engine.scope(|cx| {
+        let global = cx.global_this();
+        cx.set_host_object_invariants(&global, true, true)
+    });
+    if !installed {
         return Err("Unable to install Window object invariants".into());
     }
     #[cfg(test)]
-    expose_platform_internals_for_tests(engine.ctx(), false, config);
+    engine.scope(|cx| {
+        let config = config.value(cx);
+        expose_platform_internals_for_tests(cx, false, config)
+    });
     Ok(())
 }
 
 /// The configuration object a test fixture installed for the bootstrap to consume.
 #[cfg(test)]
-fn test_bootstrap_config(ctx: &mut Ctx) -> Value {
+fn test_bootstrap_config<'s>(ctx: &mut Ctx<'s>) -> Value<'s> {
     let global = ctx.global_this();
     ctx.member_get(&global, "__trust_cfg")
         .unwrap_or(Value::Undefined)
@@ -18671,7 +19031,7 @@ const TEST_EXPOSED_HOST_FUNCTIONS: &[&str] = &[
 /// engine whose test factory set `TestHooks::internals` republishes them, after the
 /// private bootstrap has removed the host boundary from the global.
 #[cfg(test)]
-fn expose_platform_internals_for_tests(ctx: &mut Ctx, worker: bool, config: Value) {
+fn expose_platform_internals_for_tests<'s>(ctx: &mut Ctx<'s>, worker: bool, config: Value<'s>) {
     if !ctx
         .host_mut::<HostState>()
         .is_some_and(|state| state.test_hooks.internals)
@@ -18686,7 +19046,7 @@ fn expose_platform_internals_for_tests(ctx: &mut Ctx, worker: bool, config: Valu
     if worker {
         return;
     }
-    if matches!(config, Value::Obj(_)) {
+    if matches!(config.kind(), ValueKind::Obj(_)) {
         let _ = ctx.member_set(&global, "__trust_cfg", config);
     }
     for &(name, len, host_fn) in TRUST_JS_HOST_FUNCTIONS {
@@ -18702,10 +19062,11 @@ fn expose_platform_internals_for_tests(ctx: &mut Ctx, worker: bool, config: Valu
     });
     let maps = ctx.host_mut::<HostState>().map(|state| {
         [
-            state.platform_nodes.clone().unwrap_or(Value::Undefined),
-            state.platform_internals.clone().unwrap_or(Value::Undefined),
+            state.platform_nodes.clone(),
+            state.platform_internals.clone(),
         ]
     });
+    let maps = maps.map(|maps| maps.map(|map| map.map_or(Value::Undefined, |map| held(ctx, &map))));
     if let (Some(maps), Ok(Ok(installer))) =
         (maps, ctx.eval_classic_snapshot_interruptible(accessors))
     {
@@ -18763,9 +19124,15 @@ fn eval_test_bootstrap(
     label: &str,
     worker: bool,
 ) -> Result<(), String> {
-    let config = test_bootstrap_config(engine.ctx());
+    let config = engine.scope(|cx| {
+        let config = test_bootstrap_config(cx);
+        TrustValue::read(cx, config)
+    });
     eval(engine, &crate::js::private_bootstrap(source), label)?;
-    expose_platform_internals_for_tests(engine.ctx(), worker, config);
+    engine.scope(|cx| {
+        let config = config.value(cx);
+        expose_platform_internals_for_tests(cx, worker, config)
+    });
     Ok(())
 }
 
@@ -18789,7 +19156,11 @@ fn worker_prelude_snapshot() -> Result<&'static [u8], String> {
 /// retaining the browsing context's WindowProxy identity. The native DOM arena
 /// remains shared, but author globals, intrinsics, platform prototypes, module
 /// maps, and promise-job settings belong to this newly-created Realm.
-fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_create_window_realm<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let context = args
         .first()
         .and_then(Value::as_num_opt)
@@ -18855,7 +19226,7 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
         .unwrap_or(0.0);
     let referrer = if args
         .get(8)
-        .is_some_and(|value| matches!(value, Value::Str(_)))
+        .is_some_and(|value| matches!(value.kind(), ValueKind::Str(_)))
     {
         host_arg_string(ctx, args, 8)
     } else {
@@ -18863,9 +19234,9 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
     };
     // Optional document metadata accompanies non-HTML navigations. Keep the
     // required host arity at nine for existing initial about:blank callers.
-    let content_type = match args.get(9) {
-        Some(value @ Value::Str(_)) => value.as_text().unwrap_or_default().into_owned(),
-        _ => String::from("text/html"),
+    let content_type = match args.get(9).and_then(|value| value.as_text()) {
+        Some(text) => text.into_owned(),
+        None => String::from("text/html"),
     };
     let navigation_timing = args.get(10).cloned().unwrap_or(Value::Null);
     let about_base_url = args.get(11).cloned().unwrap_or(Value::Null);
@@ -18883,6 +19254,7 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
     // cannot be swept before the new global is published.
     ctx.suspend_gc();
     let realm = ctx.create_embed_realm();
+    let realm_handle = hold(ctx, &realm);
     // The new environment's storage partition (`CookieContext::storage_partition`).
     let mut storage_partition = String::new();
     let mut environment_origin = parsed_url.origin().ascii_serialization();
@@ -18897,7 +19269,7 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
             .service_workers
             .prefetched_frames
             .take_restoring(frame_id);
-        state.window_realms.insert(context, realm.clone());
+        state.window_realms.insert(context, realm_handle.clone());
         // HTML #determining-the-origin: about:blank and about:srcdoc inherit their creator's
         // origin; a sandboxed browsing context without allow-same-origin gets a fresh opaque
         // origin; other URLs use their own (blob: URLs their creator's; data: a new opaque one).
@@ -19082,31 +19454,31 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
         realm_ctx.member_set(
             &config,
             "storagePartition",
-            Value::from_string(storage_partition.clone()),
+            realm_ctx.string(storage_partition.clone()),
         )?;
-        realm_ctx.member_set(&config, "url", Value::from_string(url.clone()))?;
+        realm_ctx.member_set(&config, "url", realm_ctx.string(url.clone()))?;
         realm_ctx.member_set(
             &config,
             "environmentOrigin",
-            Value::from_string(environment_origin.clone()),
+            realm_ctx.string(environment_origin.clone()),
         )?;
-        realm_ctx.member_set(&config, "referrer", Value::from_string(referrer.clone()))?;
-        realm_ctx.member_set(&config, "navigationTiming", navigation_timing.clone())?;
-        realm_ctx.member_set(&config, "aboutBaseURL", about_base_url.clone())?;
+        realm_ctx.member_set(&config, "referrer", realm_ctx.string(referrer.clone()))?;
+        realm_ctx.member_set(&config, "navigationTiming", navigation_timing)?;
+        realm_ctx.member_set(&config, "aboutBaseURL", about_base_url)?;
         realm_ctx.member_set(
             &config,
             "documentContentType",
-            Value::from_string(content_type.clone()),
+            realm_ctx.string(content_type.clone()),
         )?;
         realm_ctx.member_set(&config, "frameId", Value::Num(frame_id as f64))?;
         realm_ctx.member_set(&config, "hostSettingsContext", Value::Num(context as f64))?;
-        realm_ctx.member_set(&config, "frameElement", frame_element.clone())?;
-        realm_ctx.member_set(&config, "parentWindow", parent_window.clone())?;
-        realm_ctx.member_set(&config, "topWindow", top_window.clone())?;
+        realm_ctx.member_set(&config, "frameElement", frame_element)?;
+        realm_ctx.member_set(&config, "parentWindow", parent_window)?;
+        realm_ctx.member_set(&config, "topWindow", top_window)?;
         realm_ctx.member_set(&config, "agentTimeOffset", Value::Num(agent_time_offset))?;
         let global = realm_ctx.global_this();
         #[cfg(test)]
-        let config_for_tests = config.clone();
+        let config_for_tests = config;
         realm_ctx.member_set(&global, "__trust_cfg", config)?;
 
         // HTML §7.2.2/§7.5.1 create-a-new-browsing-context runs the platform bootstrap as a
@@ -19177,11 +19549,11 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
 /// Arguments: the creator Realm's configuration, its Window, the target
 /// name, whether a popup was requested, the Agent's time, and the creator
 /// Document's base URL.
-fn host_create_auxiliary_traversable(
-    ctx: &mut Ctx,
-    _this: Value,
-    args: &[Value],
-) -> Result<Value, Value> {
+fn host_create_auxiliary_traversable<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let context_created = crate::performance::now_ms();
     let document_clock = crate::performance::document_timing_data(
         None,
@@ -19193,7 +19565,10 @@ fn host_create_auxiliary_traversable(
     let source_config = args.first().cloned().unwrap_or(Value::Undefined);
     let opener = args.get(1).cloned().unwrap_or(Value::Undefined);
     let name = host_arg_string(ctx, args, 2);
-    let popup = matches!(args.get(3), Some(Value::Bool(true)));
+    let popup = matches!(
+        args.get(3).map(|value| value.kind()),
+        Some(ValueKind::Bool(true))
+    );
     let agent_time = args
         .get(4)
         .and_then(Value::as_num_opt)
@@ -19202,10 +19577,10 @@ fn host_create_auxiliary_traversable(
     let creator_base = host_arg_usv(ctx, args, 5);
     let creator_context = ctx.host_job_context();
     let creator_url = request_client_url(ctx);
-    let shed = match ctx.member_get(&source_config, "storageShed")? {
-        value @ Value::Num(_) => value.as_num_opt().unwrap_or(0.0) as u64,
-        _ => 0,
-    };
+    let shed = ctx
+        .member_get(&source_config, "storageShed")?
+        .as_num_opt()
+        .map_or(0, |shed| shed as u64);
     let snapshot = platform_prelude_snapshot().map_err(|error| {
         ctx.make_error(
             "SyntaxError",
@@ -19272,8 +19647,9 @@ fn host_create_auxiliary_traversable(
     // see a partially initialized set of intrinsics.
     ctx.suspend_gc();
     let realm = ctx.create_embed_realm();
+    let realm_handle = hold(ctx, &realm);
     if let Some(state) = ctx.host_mut::<HostState>() {
-        state.window_realms.insert(context, realm.clone());
+        state.window_realms.insert(context, realm_handle.clone());
     }
     let installed = ctx.with_embed_realm(&realm, |realm_ctx| {
         realm_ctx.set_host_job_context(context);
@@ -19306,39 +19682,35 @@ fn host_create_auxiliary_traversable(
         }
         // The frontend shows the new traversable at once.
         realm_ctx.member_set(&config, "hidden", Value::Bool(false))?;
-        realm_ctx.member_set(
-            &config,
-            "url",
-            Value::from_string("about:blank".to_string()),
-        )?;
+        realm_ctx.member_set(&config, "url", realm_ctx.string("about:blank".to_string()))?;
         realm_ctx.member_set(
             &config,
             "referrer",
-            Value::from_string(creator_url.to_string()),
+            realm_ctx.string(creator_url.to_string()),
         )?;
         let timing = host_timing_data_value(realm_ctx, &document_clock)?;
         realm_ctx.member_set(&config, "navigationTiming", timing)?;
         realm_ctx.member_set(
             &config,
             "aboutBaseURL",
-            Value::from_string(creator_base.clone()),
+            realm_ctx.string(creator_base.clone()),
         )?;
         realm_ctx.member_set(
             &config,
             "documentContentType",
-            Value::from_string("text/html".to_string()),
+            realm_ctx.string("text/html".to_string()),
         )?;
         realm_ctx.member_set(&config, "hostSettingsContext", Value::Num(context as f64))?;
         realm_ctx.member_set(&config, "agentTimeOffset", Value::Num(agent_time))?;
         realm_ctx.member_set(&config, "traversableId", Value::Num(f64::from(id.0)))?;
         realm_ctx.member_set(&config, "storageShed", Value::Num(storage_shed as f64))?;
-        realm_ctx.member_set(&config, "openerWindow", opener.clone())?;
-        realm_ctx.member_set(&config, "targetName", Value::from_string(name.clone()))?;
+        realm_ctx.member_set(&config, "openerWindow", opener)?;
+        realm_ctx.member_set(&config, "targetName", realm_ctx.string(name.clone()))?;
         realm_ctx.member_set(&config, "isPopup", Value::Bool(popup))?;
         realm_ctx.member_set(&config, "initialAboutBlank", Value::Bool(true))?;
         let global = realm_ctx.global_this();
         #[cfg(test)]
-        let config_for_tests = config.clone();
+        let config_for_tests = config;
         realm_ctx.member_set(&global, "__trust_cfg", config)?;
         match realm_ctx.eval_shared_classic_snapshot_interruptible(snapshot) {
             Ok(Ok(_)) => {
@@ -19392,11 +19764,19 @@ fn host_create_auxiliary_traversable(
 /// `__dom_top_document()`: the calling Realm's top-level traversable's
 /// Document (the arena's own Document), whose nodes the platform addresses
 /// as "the top-level Document".
-fn host_top_document(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+fn host_top_document<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    _args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     Ok(Value::Num(host_dom(ctx).borrow().document() as f64))
 }
 
-fn host_set_job_context(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_set_job_context<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let context = args
         .first()
         .and_then(Value::as_num_opt)
@@ -19406,7 +19786,11 @@ fn host_set_job_context(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
     Ok(Value::Undefined)
 }
 
-fn host_release_job_context(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_release_job_context<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let context = args
         .first()
         .and_then(Value::as_num_opt)
@@ -19421,15 +19805,19 @@ fn host_release_job_context(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
     Ok(Value::Bool(ctx.release_host_job_context(context)))
 }
 
-fn host_enter_job_context(ctx: &mut Ctx, context: u64) {
+fn host_enter_job_context<'s>(ctx: &mut Ctx<'s>, context: u64) {
     let _ = host_call_trust(ctx, "bindWindowSettings", &[Value::Num(context as f64)]);
 }
 
-fn host_leave_job_context(ctx: &mut Ctx) {
+fn host_leave_job_context<'s>(ctx: &mut Ctx<'s>) {
     let _ = host_call_trust(ctx, "restoreFrame", &[]);
 }
 
-fn host_resource_url(ctx: &mut Ctx, node_id: usize, fallback: Option<String>) -> Option<String> {
+fn host_resource_url<'s>(
+    ctx: &mut Ctx<'s>,
+    node_id: usize,
+    fallback: Option<String>,
+) -> Option<String> {
     host_call_trust(ctx, "resourceURL", &[Value::Num(node_id as f64)])
         .ok()
         .and_then(|value| ctx.coerce_string(&value).ok())
@@ -19438,7 +19826,7 @@ fn host_resource_url(ctx: &mut Ctx, node_id: usize, fallback: Option<String>) ->
         .or_else(|| fallback.filter(|value| !value.trim().is_empty()))
 }
 
-fn element_request_client_url(ctx: &mut Ctx, node: usize) -> url::Url {
+fn element_request_client_url<'s>(ctx: &mut Ctx<'s>, node: usize) -> url::Url {
     let context = host_call_trust(ctx, "resourceClientContext", &[Value::Num(node as f64)])
         .ok()
         .and_then(|value| value.as_num_opt())
@@ -19446,7 +19834,7 @@ fn element_request_client_url(ctx: &mut Ctx, node: usize) -> url::Url {
     request_context_url(ctx, context)
 }
 
-fn element_cookie_context(ctx: &mut Ctx, node: usize) -> crate::http::CookieContext {
+fn element_cookie_context<'s>(ctx: &mut Ctx<'s>, node: usize) -> crate::http::CookieContext {
     let id = host_call_trust(ctx, "resourceClientContext", &[Value::Num(node as f64)])
         .ok()
         .and_then(|v| v.as_num_opt())
@@ -19454,8 +19842,8 @@ fn element_cookie_context(ctx: &mut Ctx, node: usize) -> crate::http::CookieCont
     cookie_context_for_id(ctx, id)
 }
 
-fn prepare_element_request(
-    ctx: &mut Ctx,
+fn prepare_element_request<'s>(
+    ctx: &mut Ctx<'s>,
     node: usize,
     target: &str,
     destination: &'static str,
@@ -19513,7 +19901,11 @@ fn prepare_element_request(
 
 /// Parser-blocking nested scripts keep HTML's synchronous script ordering but
 /// fetch as script elements, not as an empty-destination script Fetch request.
-fn host_fetch_classic_script(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_fetch_classic_script<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let started = crate::performance::now_ms();
     let node = {
         let dom = host_dom(ctx);
@@ -19552,31 +19944,33 @@ fn host_fetch_classic_script(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Res
 /// script's URL and, for a parse error, its line, which locate the
 /// ErrorEvent when the exception carries no stack frame. Returns whether the
 /// exception was not handled (the caller then logs it).
-fn host_report_exception(
-    ctx: &mut Ctx,
-    exception: Value,
+fn host_report_exception<'s>(
+    ctx: &mut Ctx<'s>,
+    exception: Value<'s>,
     label: &str,
     muted: bool,
     location: Option<(&str, u32)>,
 ) -> bool {
     let (filename, lineno) = location.unwrap_or(("", 0));
-    match host_call_trust(
+    match (host_call_trust(
         ctx,
         "reportException",
         &[
             exception,
-            Value::from_string(label.to_string()),
+            ctx.string(label.to_string()),
             Value::Bool(muted),
-            Value::from_string(filename.to_string()),
+            ctx.string(filename.to_string()),
             Value::Num(f64::from(lineno)),
         ],
-    ) {
-        Ok(Value::Bool(not_handled)) => not_handled,
+    ))
+    .map(|value| value.kind())
+    {
+        Ok(ValueKind::Bool(not_handled)) => not_handled,
         _ => true,
     }
 }
 
-fn host_push_injected_error(ctx: &mut Ctx, message: impl Into<String>) {
+fn host_push_injected_error<'s>(ctx: &mut Ctx<'s>, message: impl Into<String>) {
     let Ok(trust) = host_trust(ctx) else {
         return;
     };
@@ -19586,17 +19980,17 @@ fn host_push_injected_error(ctx: &mut Ctx, message: impl Into<String>) {
     let Ok(push) = ctx.member_get(&errors, "push") else {
         return;
     };
-    let _ = ctx.invoke(push, errors, &[Value::from_string(message.into())]);
+    let _ = ctx.invoke(push, errors, &[ctx.string(message.into())]);
 }
 
-fn host_fire_script_event(ctx: &mut Ctx, node_id: usize, event_type: &str) {
+fn host_fire_script_event<'s>(ctx: &mut Ctx<'s>, node_id: usize, event_type: &str) {
     let _ = host_call_trust(ctx, "bindFrameForNode", &[Value::Num(node_id as f64)]);
     let _ = host_call_trust(
         ctx,
         "scriptEvent",
         &[
             Value::Num(node_id as f64),
-            Value::from_string(event_type.to_string()),
+            ctx.string(event_type.to_string()),
         ],
     );
     let _ = host_call_trust(ctx, "restoreFrame", &[]);
@@ -19636,7 +20030,7 @@ fn data_resource_result(url: &str) -> TrustJsResourceResult {
 /// blob URL entry (File API #blob-url-obtain-object, same partition only) and the response is
 /// the Blob's byte sequence with its Content-Length and Content-Type. A missing entry, another
 /// partition's entry or an unreadable selected file is a network error.
-fn blob_resource_result(ctx: &mut Ctx, node_id: usize, url: &str) -> TrustJsResourceResult {
+fn blob_resource_result<'s>(ctx: &mut Ctx<'s>, node_id: usize, url: &str) -> TrustJsResourceResult {
     let calling = ctx.host_job_context();
     let state = ctx.host_mut::<HostState>()?;
     let context = {
@@ -19667,8 +20061,8 @@ fn finish_stylesheet_load(state: &mut HostState, context: u64) {
     }
 }
 
-fn send_resource_completion(
-    ctx: &mut Ctx,
+fn send_resource_completion<'s>(
+    ctx: &mut Ctx<'s>,
     node_id: usize,
     name: String,
     kind: TrustJsResourceKind,
@@ -19741,7 +20135,11 @@ fn send_resource_completion(
 /// enters the document's map of preloaded resources; `error` fires at the
 /// element for a network error and `load` for any other response. Unlike
 /// style sheets and scripts, a preload does not delay the load event.
-fn host_preload_link(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_preload_link<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let (_, viewport, density) = host_layout_environment(ctx);
     let base = request_client_url(ctx);
     let (node_id, href, destination, type_matches) = {
@@ -19882,8 +20280,8 @@ fn preload_type_matches(type_: &str, destination: &str) -> bool {
 
 /// HTML #preload: fetch into the page's preload map without delaying the
 /// load event, then queue the element's `load`/`error` on its own Realm.
-fn spawn_preload_fetch(
-    ctx: &mut Ctx,
+fn spawn_preload_fetch<'s>(
+    ctx: &mut Ctx<'s>,
     node_id: usize,
     destination: &'static str,
     request: crate::http::Request,
@@ -19957,8 +20355,8 @@ fn spawn_preload_fetch(
     true
 }
 
-fn spawn_resource_fetch(
-    ctx: &mut Ctx,
+fn spawn_resource_fetch<'s>(
+    ctx: &mut Ctx<'s>,
     node_id: usize,
     kind: TrustJsResourceKind,
     request: crate::http::Request,
@@ -20165,13 +20563,18 @@ fn spawn_resource_fetch(
     true
 }
 
-fn queue_resource_error(ctx: &mut Ctx, node_id: usize, kind: TrustJsResourceKind, name: String) {
+fn queue_resource_error<'s>(
+    ctx: &mut Ctx<'s>,
+    node_id: usize,
+    kind: TrustJsResourceKind,
+    name: String,
+) {
     if !send_resource_completion(ctx, node_id, name, kind, None, true) {
         host_fire_script_event(ctx, node_id, "error");
     }
 }
 
-fn classic_current_script(ctx: &mut Ctx, node_id: usize) -> Value {
+fn classic_current_script<'s>(ctx: &mut Ctx<'s>, node_id: usize) -> Value<'s> {
     // HTML #execute-the-script-element snapshots null for a classic script
     // whose root is a shadow root, even if script later moves the element.
     if host_dom(ctx).borrow().in_shadow_tree(node_id) {
@@ -20181,7 +20584,7 @@ fn classic_current_script(ctx: &mut Ctx, node_id: usize) -> Value {
     }
 }
 
-fn host_eval_inline_classic(ctx: &mut Ctx, node_id: usize, name: &str, source: String) {
+fn host_eval_inline_classic<'s>(ctx: &mut Ctx<'s>, node_id: usize, name: &str, source: String) {
     let _ = host_call_trust(ctx, "bindFrameForNode", &[Value::Num(node_id as f64)]);
     let trust = host_trust(ctx).ok();
     let old_current = trust
@@ -20239,7 +20642,11 @@ fn host_eval_inline_classic(ctx: &mut Ctx, node_id: usize, name: &str, source: S
 /// HTML §8.1.4.4 "run a classic script": nested-document parser scripts are Script Records,
 /// not indirect eval code. This synchronous entry is safe from a native platform callback and
 /// retains the Realm's persistent global lexical environment across sibling script elements.
-fn host_run_classic_script(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_run_classic_script<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let node_id = {
         let dom = host_dom(ctx);
         let dom = dom.borrow();
@@ -20257,7 +20664,11 @@ fn host_run_classic_script(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resul
 
 /// `__dom_script_started(script)`: set the element's "already started" flag
 /// (HTML #already-started) when the prelude prepares it to run.
-fn host_script_started(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_script_started<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let dom = host_dom(ctx);
     let mut dom = dom.borrow_mut();
     if let Some(id) = host_arg_node(&dom, args, 0) {
@@ -20267,7 +20678,11 @@ fn host_script_started(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
 }
 
 /// `__dom_insertion_resources(node)`: see [`Dom::connected_insertion_resources`].
-fn host_insertion_resources(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_insertion_resources<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let ids = {
         let dom = host_dom(ctx);
         let dom = dom.borrow();
@@ -20281,7 +20696,11 @@ fn host_insertion_resources(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
 /// HTML §4.12.1.1 post-connection and prepare-the-script-element steps for scripts inserted
 /// through the live DOM. The prelude owns the already-started/type/connected gates; this host owns
 /// source acquisition and execution.
-fn host_run_injected_script(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_run_injected_script<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let (node_id, src, text, module) = {
         let dom = host_dom(ctx);
         let dom = dom.borrow();
@@ -20434,7 +20853,7 @@ fn host_run_injected_script(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
     Ok(Value::Undefined)
 }
 
-fn state_base(ctx: &mut Ctx) -> String {
+fn state_base<'s>(ctx: &mut Ctx<'s>) -> String {
     ctx.host_mut::<HostState>()
         .map(|state| state.base.to_string())
         .unwrap_or_else(|| String::from("about:blank"))
@@ -20442,11 +20861,11 @@ fn state_base(ctx: &mut Ctx) -> String {
 
 /// HTML stylesheet-link processing: fetching is parallel, while attaching the CSSStyleSheet and
 /// firing `load`/`error` occur in the later resource task.
-fn host_load_injected_stylesheet(
-    ctx: &mut Ctx,
-    _this: Value,
-    args: &[Value],
-) -> Result<Value, Value> {
+fn host_load_injected_stylesheet<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let (node_id, href) = {
         let dom = host_dom(ctx);
         let dom = dom.borrow();
@@ -20492,7 +20911,11 @@ fn host_load_injected_stylesheet(
 /// WebSockets §3.1 constructor boundary: the prelude performs Web IDL/URL/subprotocol
 /// validation synchronously; this host applies the page's private-network policy and starts the
 /// RFC 6455 connection in parallel. Protocol feedback returns as WebSocket-task-source work.
-fn host_ws_open(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_ws_open<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let target = host_arg_usv(ctx, args, 0);
     let protocols = host_arg_usv(ctx, args, 1);
     let Some(protocols) = crate::ws::parse_protocols(&protocols) else {
@@ -20545,14 +20968,23 @@ fn host_ws_open(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Va
 /// WebSockets §3.1 `send()`: queue one complete text or binary message without blocking the
 /// page thread. `bufferedAmount` is maintained in the prelude and decremented only by the later
 /// [`crate::ws::WsIn::Sent`] task after the transport accepts these application bytes.
-fn host_ws_send(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_ws_send<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let id = args
         .first()
         .and_then(Value::as_num_opt)
         .and_then(|id| (id.is_finite() && id >= 0.0 && id.fract() == 0.0).then_some(id as usize));
     // A binary message is a BufferSource copy of the Blob or buffer bytes.
     let message = match args.get(1) {
-        Some(value) if matches!(args.get(2), Some(Value::Bool(true))) => {
+        Some(value)
+            if matches!(
+                args.get(2).map(|value| value.kind()),
+                Some(ValueKind::Bool(true))
+            ) =>
+        {
             crate::ws::WsOut::Binary(ctx.buffer_source_bytes(value, true).unwrap_or_default())
         }
         _ => crate::ws::WsOut::Text(host_arg_usv(ctx, args, 1)),
@@ -20568,7 +21000,11 @@ fn host_ws_send(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Va
 /// WebSockets §3.1 `close()`: code zero is the boundary sentinel for an omitted status code,
 /// whose RFC 6455 Close frame has an empty body. Validation and the synchronous CLOSING state
 /// transition happen in the shared prelude before this non-blocking transport command.
-fn host_ws_close(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_ws_close<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let id = args
         .first()
         .and_then(Value::as_num_opt)
@@ -20618,7 +21054,11 @@ fn worker_cookie_context_for_script(
 
 /// HTML §10.2.6 `Worker()` construction: URL parsing is synchronous in the shared prelude; the
 /// worker realm, script fetch, and evaluation start in parallel on a dedicated agent thread.
-fn host_worker_spawn(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_worker_spawn<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let target = host_arg_usv(ctx, args, 0);
     // "shared:classic" / "shared:module" request a SharedWorkerGlobalScope.
     let requested = host_arg_string(ctx, args, 1);
@@ -20850,7 +21290,11 @@ fn spawn_trust_js_worker_thread(
 
 /// MessagePort post-message steps serialize in the sender's realm before this call; the wire
 /// snapshot is queued FIFO and deserialized only when the worker selects its message task.
-fn host_worker_post(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_worker_post<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let id = args
         .first()
         .and_then(Value::as_num_opt)
@@ -20872,7 +21316,11 @@ fn host_worker_post(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
 
 /// HTML §10.2.4 terminate-a-worker: discard queued messages and interrupt author code even when
 /// the worker is currently executing instead of parked on its inbox.
-fn host_worker_terminate(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_worker_terminate<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let id = args
         .first()
         .and_then(Value::as_num_opt)
@@ -20887,7 +21335,11 @@ fn host_worker_terminate(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
     Ok(Value::Undefined)
 }
 
-fn host_worker_self_post(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_worker_self_post<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let message = host_arg_string(ctx, args, 0);
     if let Some(worker) = ctx
         .host_mut::<HostState>()
@@ -20906,7 +21358,11 @@ fn host_worker_self_post(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
 /// ScriptEvaluation in the current Realm (global declarations and the global lexical scope
 /// persist), not indirect eval code. A parse failure is the SyntaxError to rethrow; an
 /// uncaught exception propagates to the caller, which reports or rethrows it.
-fn host_classic_script_run(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_classic_script_run<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let source = host_arg_usv(ctx, args, 0);
     let url = host_arg_string(ctx, args, 1);
     let origin = trust_js::SourceOrigin::new(&url);
@@ -20921,7 +21377,11 @@ fn host_classic_script_run(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resul
     }
 }
 
-fn host_worker_self_close(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+fn host_worker_self_close<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    _args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     if let Some(worker) = ctx
         .host_mut::<HostState>()
         .and_then(|state| state.worker_self.as_mut())
@@ -20940,7 +21400,7 @@ fn install_trust_js_worker_boundary(engine: &mut trust_js::Engine) {
     engine.define_global("__font_install", 3, font_loading_host::install);
     engine.define_global("__geometry_bind", 2, geometry_host::bind);
     engine.define_global("__message_port_binding", 3, message_port_host::call);
-    engine.ctx().op_state().register_gc::<HostState>();
+    engine.op_state().register_gc::<HostState>();
     engine.define_global("__image_data_slots", 1, host_image_data_slots);
     engine.define_global("__image_binding", 2, image_host::call);
     engine.define_global("__image_bitmap_binding", 3, image_bitmap_host::call);
@@ -21263,33 +21723,33 @@ fn eval_trust_js_worker_setup(
     source: &str,
     label: &str,
 ) -> Result<bool, String> {
-    match engine.eval_value_interruptible(source) {
+    engine.scope(|cx| match cx.eval_value_interruptible(source) {
         Err(error) => Err(format!(
             "{label} parse error at line {}: {}",
             error.line, error.message
         )),
-        Ok(Err(EvalError::Throw(error))) => Err(describe_throw(engine, error, label)),
+        Ok(Err(EvalError::Throw(error))) => Err(describe_throw(cx, error, label)),
         Ok(Err(EvalError::Interrupted(_))) => Ok(false),
         Ok(Ok(_)) => Ok(true),
-    }
+    })
 }
 
 fn eval_trust_js_worker_platform_setup(engine: &mut trust_js::Engine) -> Result<bool, String> {
     let snapshot = worker_prelude_snapshot()?;
     const LABEL: &str = "worker platform prelude";
-    match engine.eval_snapshot_value_interruptible(snapshot) {
+    engine.scope(|cx| match cx.eval_snapshot_value_interruptible(snapshot) {
         Err(error) => Err(format!(
             "{LABEL} parse error at line {}: {}",
             error.line, error.message
         )),
-        Ok(Err(EvalError::Throw(error))) => Err(describe_throw(engine, error, LABEL)),
+        Ok(Err(EvalError::Throw(error))) => Err(describe_throw(cx, error, LABEL)),
         Ok(Err(EvalError::Interrupted(_))) => Ok(false),
         Ok(Ok(_)) => {
             #[cfg(test)]
-            expose_platform_internals_for_tests(engine.ctx(), true, Value::Undefined);
+            expose_platform_internals_for_tests(cx, true, Value::Undefined);
             Ok(true)
         }
-    }
+    })
 }
 
 /// `label` is the worker script's URL, which its stack frames report.
@@ -21301,35 +21761,41 @@ fn eval_trust_js_worker_classic(
     id: usize,
 ) -> bool {
     let origin = trust_js::SourceOrigin::new(label);
-    match engine.eval_value_interruptible_with_origin(source, Some(&origin)) {
-        // HTML #run-a-worker: a script whose error to rethrow is a parse error
-        // fires a plain "error" event at the Worker object.
-        Err(error) => {
-            send_trust_js_worker_error(
-                events,
-                id,
-                format!(
-                    "\u{1}fail {label} parse error at line {}: {}",
-                    error.line, error.message
-                ),
-            );
-        }
-        // An uncaught exception is reported in the worker global first.
-        Ok(Err(EvalError::Throw(error))) => {
-            match trust_js_worker_internal_call(
-                engine,
-                "reportException",
-                std::slice::from_ref(&error),
-            ) {
-                Ok(_) => {}
-                Err(EvalError::Interrupted(_)) => return false,
-                Err(EvalError::Throw(_)) => {
-                    send_trust_js_worker_error(events, id, describe_throw(engine, error, label));
+    let completed = engine.scope(|cx| {
+        match cx.eval_value_interruptible_with_origin(source, Some(&origin)) {
+            // HTML #run-a-worker: a script whose error to rethrow is a parse error
+            // fires a plain "error" event at the Worker object.
+            Err(error) => {
+                send_trust_js_worker_error(
+                    events,
+                    id,
+                    format!(
+                        "\u{1}fail {label} parse error at line {}: {}",
+                        error.line, error.message
+                    ),
+                );
+            }
+            // An uncaught exception is reported in the worker global first.
+            Ok(Err(EvalError::Throw(error))) => {
+                match trust_js_worker_internal_call(
+                    cx,
+                    "reportException",
+                    std::slice::from_ref(&error),
+                ) {
+                    Ok(_) => {}
+                    Err(EvalError::Interrupted(_)) => return false,
+                    Err(EvalError::Throw(_)) => {
+                        send_trust_js_worker_error(events, id, describe_throw(cx, error, label));
+                    }
                 }
             }
+            Ok(Err(EvalError::Interrupted(_))) => return false,
+            Ok(Ok(_)) => {}
         }
-        Ok(Err(EvalError::Interrupted(_))) => return false,
-        Ok(Ok(_)) => {}
+        true
+    });
+    if !completed {
+        return false;
     }
     if engine.run_microtasks_interruptible().is_err() {
         return false;
@@ -21395,8 +21861,11 @@ fn eval_trust_js_worker_module(
             );
         }
         Ok(trust_js::ExecutionOutcome::Throw { name, message }) => {
-            let error = engine.ctx().make_error(&name, message.clone());
-            if trust_js_worker_internal_call(engine, "reportException", &[error]).is_err() {
+            let reported = engine.scope(|cx| {
+                let error = cx.make_error(&name, message.clone());
+                trust_js_worker_internal_call(cx, "reportException", &[error]).is_ok()
+            });
+            if !reported {
                 send_trust_js_worker_error(
                     events,
                     id,
@@ -21410,23 +21879,20 @@ fn eval_trust_js_worker_module(
     true
 }
 
-fn trust_js_worker_internal_call(
-    engine: &mut trust_js::Engine,
+fn trust_js_worker_internal_call<'s>(
+    ctx: &mut Ctx<'s>,
     name: &str,
-    args: &[Value],
-) -> Result<Value, EvalError> {
-    let worker = platform_control(engine.ctx()).map_err(EvalError::Throw)?;
-    let function = engine
-        .ctx()
-        .member_get(&worker, name)
-        .map_err(EvalError::Throw)?;
-    engine.call_function_interruptible(&function, worker, args)
+    args: &[Value<'s>],
+) -> Result<Value<'s>, EvalError<'s>> {
+    let worker = platform_control(ctx).map_err(EvalError::Throw)?;
+    let function = ctx.member_get(&worker, name).map_err(EvalError::Throw)?;
+    ctx.call_function_interruptible(&function, worker, args)
 }
 
 /// Rejection records grouped by the host settings context of their global, each group in
 /// rejection order (HTML #notify-about-rejected-promises runs per global).
-fn rejections_by_context(records: Vec<(u64, Value, Value)>) -> Vec<(u64, Vec<(Value, Value)>)> {
-    let mut groups: Vec<(u64, Vec<(Value, Value)>)> = Vec::new();
+fn rejections_by_context(records: Vec<(u64, Handle, Handle)>) -> Vec<(u64, Vec<(Handle, Handle)>)> {
+    let mut groups: Vec<(u64, Vec<(Handle, Handle)>)> = Vec::new();
     for (context, promise, reason) in records {
         match groups.iter_mut().find(|(group, _)| *group == context) {
             Some((_, list)) => list.push((promise, reason)),
@@ -21438,11 +21904,20 @@ fn rejections_by_context(records: Vec<(u64, Value, Value)>) -> Vec<(u64, Vec<(Va
 
 /// Whether `context` is the engine's active settings context or a live Window's.
 fn is_page_context(engine: &mut trust_js::Engine, context: u64) -> bool {
-    let ctx = engine.ctx();
-    context == ctx.host_job_context()
-        || ctx
+    context == engine.host_job_context()
+        || engine
             .host_mut::<HostState>()
             .is_some_and(|state| state.window_realm(context).is_some())
+}
+
+/// The `[promise, reason, …]` Array of rejection records, in `ctx`'s scope.
+fn rejection_pairs<'s>(ctx: &mut Ctx<'s>, list: &[(Handle, Handle)]) -> Value<'s> {
+    let mut pairs = ValueList::with_capacity(list.len() * 2);
+    for (promise, reason) in list {
+        pairs.push(held(ctx, promise));
+        pairs.push(held(ctx, reason));
+    }
+    pairs.into_array(ctx)
 }
 
 /// Hand `list` to the platform-control operation `method` (`notifyRejectedPromises` or
@@ -21453,30 +21928,28 @@ fn notify_rejections_in_context(
     engine: &mut trust_js::Engine,
     context: u64,
     method: &str,
-    list: Vec<(Value, Value)>,
+    list: Vec<(Handle, Handle)>,
 ) -> bool {
-    let pairs: Vec<Value> = list
-        .into_iter()
-        .flat_map(|(promise, reason)| [promise, reason])
-        .collect();
-    if context == engine.ctx().host_job_context() {
-        let list = engine.ctx().make_array(pairs);
-        return engine_call_trust_method(engine, method, &[list]).is_ok();
+    if context == engine.host_job_context() {
+        return engine.scope(|cx| {
+            let list = rejection_pairs(cx, &list);
+            engine_call_trust_method(cx, method, &[list]).is_ok()
+        });
     }
     let Some(realm) = engine
-        .ctx()
         .host_mut::<HostState>()
         .and_then(|state| state.window_realm(context))
     else {
         return false;
     };
-    engine
-        .ctx()
-        .with_embed_realm(&realm, |realm_ctx| {
-            let list = realm_ctx.make_array(pairs);
+    engine.scope(|cx| {
+        let realm = held(cx, &realm);
+        cx.with_embed_realm(&realm, |realm_ctx| {
+            let list = rejection_pairs(realm_ctx, &list);
             host_call_trust(realm_ctx, method, &[list]).is_ok()
         })
         .unwrap_or(false)
+    })
 }
 
 fn trust_js_worker_report_buffered_errors(
@@ -21486,88 +21959,97 @@ fn trust_js_worker_report_buffered_errors(
 ) -> bool {
     // HTML #notify-about-rejected-promises after the task's microtask checkpoint.
     let rejections = engine.take_unhandled_rejections_full();
-    if !rejections.is_empty() {
-        let pairs: Vec<Value> = rejections
-            .into_iter()
-            .flat_map(|(promise, reason)| [promise, reason])
-            .collect();
-        let list = engine.ctx().make_array(pairs);
-        if let Err(EvalError::Interrupted(_)) =
-            trust_js_worker_internal_call(engine, "notifyRejectedPromises", &[list])
-        {
-            return false;
+    engine.scope(|cx| {
+        if !rejections.is_empty() {
+            let list = rejection_pairs(cx, &rejections);
+            if let Err(EvalError::Interrupted(_)) =
+                trust_js_worker_internal_call(cx, "notifyRejectedPromises", &[list])
+            {
+                return false;
+            }
         }
-    }
-    // HostPromiseRejectionTracker "handle" for the outstanding rejected promises weak set.
-    let handled = engine.take_handled_rejections();
-    if !handled.is_empty() {
-        let pairs: Vec<Value> = handled
-            .into_iter()
-            .flat_map(|(promise, reason)| [promise, reason])
-            .collect();
-        let list = engine.ctx().make_array(pairs);
-        if let Err(EvalError::Interrupted(_)) =
-            trust_js_worker_internal_call(engine, "notifyHandledPromises", &[list])
-        {
-            return false;
+        // HostPromiseRejectionTracker "handle" for the outstanding rejected promises weak set.
+        let handled = cx.take_handled_rejections();
+        if !handled.is_empty() {
+            let list = rejection_pairs(cx, &handled);
+            if let Err(EvalError::Interrupted(_)) =
+                trust_js_worker_internal_call(cx, "notifyHandledPromises", &[list])
+            {
+                return false;
+            }
         }
-    }
-    match trust_js_worker_internal_call(engine, "takeConsole", &[]) {
-        Ok(value) => {
-            let lines = value_string(engine, &value);
-            if !lines.is_empty() {
-                let _ = events.send(TrustJsHostTask::Worker {
+        match trust_js_worker_internal_call(cx, "takeConsole", &[]) {
+            Ok(value) => {
+                let lines = value_string(cx, &value);
+                if !lines.is_empty() {
+                    let _ = events.send(TrustJsHostTask::Worker {
+                        id,
+                        event: crate::js::WorkerOut::Console(lines),
+                    });
+                }
+            }
+            Err(EvalError::Interrupted(_)) => return false,
+            Err(EvalError::Throw(_)) => {}
+        }
+        match trust_js_worker_internal_call(cx, "takeErrors", &[]) {
+            Ok(value) => {
+                let errors = value_string(cx, &value);
+                for error in errors.split('\u{1e}').filter(|error| !error.is_empty()) {
+                    send_trust_js_worker_error(events, id, error.to_string());
+                }
+                true
+            }
+            Err(EvalError::Interrupted(_)) => false,
+            Err(EvalError::Throw(error)) => {
+                send_trust_js_worker_error(
+                    events,
                     id,
-                    event: crate::js::WorkerOut::Console(lines),
-                });
+                    describe_throw(cx, error, "worker error reporting"),
+                );
+                true
             }
         }
-        Err(EvalError::Interrupted(_)) => return false,
-        Err(EvalError::Throw(_)) => {}
-    }
-    match trust_js_worker_internal_call(engine, "takeErrors", &[]) {
-        Ok(value) => {
-            let errors = value_string(engine, &value);
-            for error in errors.split('\u{1e}').filter(|error| !error.is_empty()) {
-                send_trust_js_worker_error(events, id, error.to_string());
-            }
-            true
-        }
-        Err(EvalError::Interrupted(_)) => false,
-        Err(EvalError::Throw(error)) => {
-            send_trust_js_worker_error(
-                events,
-                id,
-                describe_throw(engine, error, "worker error reporting"),
-            );
-            true
-        }
-    }
+    })
 }
 
 fn trust_js_worker_closed(engine: &mut trust_js::Engine) -> bool {
     engine
-        .ctx()
         .host_mut::<HostState>()
         .and_then(|state| state.worker_self.as_ref())
         .is_some_and(|worker| worker.closed)
 }
 
 fn trust_js_worker_deadline(engine: &mut trust_js::Engine) -> Option<f64> {
-    match trust_js_worker_internal_call(engine, "nextDeadline", &[]) {
-        Ok(Value::Num(deadline)) if deadline.is_finite() => Some(deadline),
-        _ => None,
-    }
+    engine.scope(|cx| {
+        match trust_js_worker_internal_call(cx, "nextDeadline", &[]).map(|value| value.kind()) {
+            Ok(ValueKind::Num(deadline)) if deadline.is_finite() => Some(deadline),
+            _ => None,
+        }
+    })
 }
 
 /// HTML #event-loop-processing-model (worker event loop): the next rendering
 /// opportunity of a DedicatedWorkerGlobalScope with animation frame
 /// callbacks (HTML #animationframeprovider).
 fn trust_js_worker_frame_deadline(engine: &mut trust_js::Engine) -> Option<f64> {
-    match trust_js_worker_internal_call(engine, "animationFrameDeadline", &[]) {
-        Ok(Value::Num(deadline)) if deadline.is_finite() => Some(deadline),
-        _ => None,
-    }
+    engine.scope(|cx| {
+        match trust_js_worker_internal_call(cx, "animationFrameDeadline", &[])
+            .map(|value| value.kind())
+        {
+            Ok(ValueKind::Num(deadline)) if deadline.is_finite() => Some(deadline),
+            _ => None,
+        }
+    })
+}
+
+/// Whether the worker loop's platform method `name` answers true.
+fn trust_js_worker_flag(engine: &mut trust_js::Engine, name: &str) -> bool {
+    engine.scope(|cx| {
+        matches!(
+            trust_js_worker_internal_call(cx, name, &[]).map(|value| value.kind()),
+            Ok(ValueKind::Bool(true))
+        )
+    })
 }
 
 /// "Update the rendering of that dedicated worker": run the context lost
@@ -21575,7 +22057,7 @@ fn trust_js_worker_frame_deadline(engine: &mut trust_js::Engine) -> Option<f64> 
 /// push changed bitmaps to their placeholder canvas elements. Returns false
 /// when the worker was interrupted.
 fn trust_js_worker_update_rendering(engine: &mut trust_js::Engine) -> bool {
-    let lost = engine.ctx().host_mut::<HostState>().is_some_and(|state| {
+    let lost = engine.host_mut::<HostState>().is_some_and(|state| {
         state.offscreen_canvases.values().any(|canvas| {
             let canvas = canvas.borrow();
             canvas.mode == crate::canvas_offscreen::Mode::TwoD
@@ -21586,32 +22068,37 @@ fn trust_js_worker_update_rendering(engine: &mut trust_js::Engine) -> bool {
         })
     });
     if lost {
-        if let Err(EvalError::Interrupted(_)) =
-            trust_js_worker_internal_call(engine, "runCanvasContextLost", &[])
-        {
+        let interrupted = engine.scope(|cx| {
+            matches!(
+                trust_js_worker_internal_call(cx, "runCanvasContextLost", &[]),
+                Err(EvalError::Interrupted(_))
+            )
+        });
+        if interrupted {
             return false;
         }
         if engine.run_microtasks_interruptible().is_err() {
             return false;
         }
     }
-    if canvas_host::placeholders_dirty(engine.ctx())
+    if engine.scope(canvas_host::placeholders_dirty)
         || engine
-            .ctx()
             .host_mut::<HostState>()
             .is_some_and(|state| !state.webgl.is_empty())
     {
-        webgl_host::publish(engine.ctx(), true, None);
-        canvas_host::push_placeholders(engine.ctx());
+        engine.scope(|cx| webgl_host::publish(cx, true, None));
+        engine.scope(canvas_host::push_placeholders);
     }
     true
 }
 
 fn trust_js_worker_now(engine: &mut trust_js::Engine) -> f64 {
-    match trust_js_worker_internal_call(engine, "now", &[]) {
-        Ok(Value::Num(now)) if now.is_finite() => now,
-        _ => 0.0,
-    }
+    engine.scope(|cx| {
+        match trust_js_worker_internal_call(cx, "now", &[]).map(|value| value.kind()) {
+            Ok(ValueKind::Num(now)) if now.is_finite() => now,
+            _ => 0.0,
+        }
+    })
 }
 
 /// One TRust JS realm per dedicated worker agent. No engine value crosses the thread boundary;
@@ -21716,7 +22203,6 @@ fn run_trust_js_worker(
     engine.set_wall_clock(move || engine_clock.now_ms());
     state.configure_module_loading(&mut engine);
     engine
-        .ctx()
         .op_state()
         .put_retained_memory_with_external_memory(state);
     install_trust_js_worker_boundary(&mut engine);
@@ -21795,20 +22281,18 @@ fn run_trust_js_worker(
         );
         return;
     };
-    if let Some(state) = engine.ctx().host_mut::<HostState>() {
+    if let Some(state) = engine.host_mut::<HostState>() {
         state.commit_worker_script_settings(&script);
     }
-    if trust_js_worker_internal_call(
-        &mut engine,
-        "scriptURL",
-        &[Value::from_string(script.url.to_string())],
-    )
-    .is_err()
-    {
+    let announced = engine.scope(|cx| {
+        let url = cx.string(script.url.to_string());
+        trust_js_worker_internal_call(cx, "scriptURL", &[url]).is_ok()
+    });
+    if !announced {
         return;
     }
     if launch.service.is_none()
-        && let Some(state) = engine.ctx().host_mut::<HostState>()
+        && let Some(state) = engine.host_mut::<HostState>()
     {
         state.service_workers.execution_ready(0);
     }
@@ -21846,28 +22330,37 @@ fn run_trust_js_worker(
                 Err(error) => Err(crate::service_worker::Error::type_error(error.message)),
             }
         } else {
-            match engine.eval_value_interruptible_with_origin(&script.source, Some(&origin)) {
-                Ok(Ok(_)) => Ok(()),
-                Err(error) => Err(crate::service_worker::Error::type_error(format!(
-                    "Service-worker parse error: {}",
-                    error.message
-                ))),
-                Ok(Err(EvalError::Throw(error))) => Err(crate::service_worker::Error::type_error(
-                    describe_throw(&mut engine, error, "service worker"),
-                )),
-                Ok(Err(EvalError::Interrupted(_))) => {
-                    Err(crate::service_worker::Error::type_error(
-                        "Service-worker startup was interrupted",
-                    ))
+            engine.scope(|cx| {
+                match cx.eval_value_interruptible_with_origin(&script.source, Some(&origin)) {
+                    Ok(Ok(_)) => Ok(()),
+                    Err(error) => Err(crate::service_worker::Error::type_error(format!(
+                        "Service-worker parse error: {}",
+                        error.message
+                    ))),
+                    Ok(Err(EvalError::Throw(error))) => {
+                        Err(crate::service_worker::Error::type_error(describe_throw(
+                            cx,
+                            error,
+                            "service worker",
+                        )))
+                    }
+                    Ok(Err(EvalError::Interrupted(_))) => {
+                        Err(crate::service_worker::Error::type_error(
+                            "Service-worker startup was interrupted",
+                        ))
+                    }
                 }
-            }
+            })
         };
         let continued = result.is_ok();
         if continued
             && service.worker.event_types.get().is_none()
-            && let Ok(value) = trust_js_worker_internal_call(&mut engine, "serviceTypes", &[])
-            && let Ok(types) =
-                serde_json::from_str::<Vec<String>>(&value_string(&mut engine, &value))
+            && let Some(types) = engine.scope(|cx| {
+                trust_js_worker_internal_call(cx, "serviceTypes", &[])
+                    .ok()
+                    .map(|value| value_string(cx, &value))
+            })
+            && let Ok(types) = serde_json::from_str::<Vec<String>>(&types)
         {
             let _ = service.worker.event_types.set(types);
         }
@@ -21884,12 +22377,11 @@ fn run_trust_js_worker(
             ),
             TrustJsWorkerKind::Module => {
                 let fetched = engine
-                    .ctx()
                     .host_mut::<HostState>()
                     .and_then(|state| state.network.as_ref())
                     .map(|network| network.fetched.clone())
                     .unwrap_or_default();
-                let environment = ModuleFetchEnvironment::of(engine.ctx(), 0);
+                let environment = engine.scope(|cx| ModuleFetchEnvironment::of(cx, 0));
                 eval_trust_js_worker_module(
                     &mut engine,
                     &script,
@@ -21957,22 +22449,10 @@ fn run_trust_js_worker(
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
             };
         }
-        let port_ready = matches!(
-            trust_js_worker_internal_call(&mut engine, "hasPortTask", &[]),
-            Ok(Value::Bool(true))
-        );
-        let bitmap_ready = matches!(
-            trust_js_worker_internal_call(&mut engine, "hasBitmapTask", &[]),
-            Ok(Value::Bool(true))
-        );
-        let performance_ready = matches!(
-            trust_js_worker_internal_call(&mut engine, "hasPerformanceTask", &[]),
-            Ok(Value::Bool(true))
-        );
-        let platform_ready = matches!(
-            trust_js_worker_internal_call(&mut engine, "hasPlatformTask", &[]),
-            Ok(Value::Bool(true))
-        );
+        let port_ready = trust_js_worker_flag(&mut engine, "hasPortTask");
+        let bitmap_ready = trust_js_worker_flag(&mut engine, "hasBitmapTask");
+        let performance_ready = trust_js_worker_flag(&mut engine, "hasPerformanceTask");
+        let platform_ready = trust_js_worker_flag(&mut engine, "hasPlatformTask");
         let checkpoint_ready = engine.has_pending_jobs();
         // Distinct task sources all make progress. A busy implicit worker port
         // must not starve transferred channels or an already-due timer.
@@ -22042,77 +22522,86 @@ fn run_trust_js_worker(
         if let Some(service) = &launch.service {
             service.prepare_task();
         }
-        let _ = trust_js_worker_internal_call(&mut engine, "advanceClock", &[Value::Num(now)]);
+        engine.scope(|cx| {
+            let _ = trust_js_worker_internal_call(cx, "advanceClock", &[Value::Num(now)]);
+        });
         let task_result = match task {
             WorkerTask::Command(TrustJsWorkerCtl::Terminate) => break,
-            WorkerTask::Command(TrustJsWorkerCtl::ServiceControl { id, op }) => {
-                trust_js_worker_internal_call(
-                    &mut engine,
-                    "serviceControl",
-                    &[Value::Num(id as f64), Value::from_string(op.to_string())],
-                )
-            }
-            WorkerTask::Command(TrustJsWorkerCtl::ServiceEvent { id, kind, init }) => {
-                let result = trust_js_worker_internal_call(
-                    &mut engine,
-                    "serviceEvent",
-                    &[
-                        Value::Num(id as f64),
-                        Value::from_string(kind.to_string()),
-                        Value::from_string(init.to_string()),
-                    ],
-                );
-                if result.is_err()
-                    && let Some(runtime) = launch
-                        .service
-                        .as_ref()
-                        .and_then(|scope| scope.runtime.upgrade())
-                {
-                    runtime.complete(id, false);
-                }
-                result
-            }
             WorkerTask::Command(TrustJsWorkerCtl::PortReady(pending)) => {
                 pending.store(false, std::sync::atomic::Ordering::Release);
-                Ok(Value::Undefined)
-            }
-            WorkerTask::Command(TrustJsWorkerCtl::Message(message)) => {
-                trust_js_worker_internal_call(
-                    &mut engine,
-                    "message",
-                    &[Value::from_engine_text(message)],
-                )
+                Ok(())
             }
             WorkerTask::Command(TrustJsWorkerCtl::HostTask(task)) => {
                 if let Err(error) = dispatch_host_task(&mut engine, *task) {
                     send_trust_js_worker_error(&events, launch.id, error);
                 }
-                Ok(Value::Undefined)
+                Ok(())
             }
-            WorkerTask::Port => trust_js_worker_internal_call(&mut engine, "runPortTask", &[]),
-            WorkerTask::Bitmap => trust_js_worker_internal_call(&mut engine, "runBitmapTask", &[]),
-            WorkerTask::Performance => {
-                trust_js_worker_internal_call(&mut engine, "runPerformanceTask", &[])
-            }
-            WorkerTask::Platform => {
-                trust_js_worker_internal_call(&mut engine, "runPlatformTask", &[])
-            }
-            WorkerTask::Timer => {
-                trust_js_worker_internal_call(&mut engine, "tick", &[Value::Num(now)])
-            }
-            WorkerTask::Frame => {
-                trust_js_worker_internal_call(&mut engine, "runAnimationFrames", &[Value::Num(now)])
-            }
-            WorkerTask::Checkpoint => Ok(Value::Undefined),
+            WorkerTask::Checkpoint => Ok(()),
+            task => engine.scope(|cx| {
+                let result = match task {
+                    WorkerTask::Command(TrustJsWorkerCtl::ServiceControl { id, op }) => {
+                        let op = cx.string(op.to_string());
+                        trust_js_worker_internal_call(
+                            cx,
+                            "serviceControl",
+                            &[Value::Num(id as f64), op],
+                        )
+                    }
+                    WorkerTask::Command(TrustJsWorkerCtl::ServiceEvent { id, kind, init }) => {
+                        let kind = cx.string(kind.to_string());
+                        let init = cx.string(init.to_string());
+                        let result = trust_js_worker_internal_call(
+                            cx,
+                            "serviceEvent",
+                            &[Value::Num(id as f64), kind, init],
+                        );
+                        if result.is_err()
+                            && let Some(runtime) = launch
+                                .service
+                                .as_ref()
+                                .and_then(|scope| scope.runtime.upgrade())
+                        {
+                            runtime.complete(id, false);
+                        }
+                        result
+                    }
+                    WorkerTask::Command(TrustJsWorkerCtl::Message(message)) => {
+                        let message = cx.string_from_engine_text(message);
+                        trust_js_worker_internal_call(cx, "message", &[message])
+                    }
+                    WorkerTask::Port => trust_js_worker_internal_call(cx, "runPortTask", &[]),
+                    WorkerTask::Bitmap => trust_js_worker_internal_call(cx, "runBitmapTask", &[]),
+                    WorkerTask::Performance => {
+                        trust_js_worker_internal_call(cx, "runPerformanceTask", &[])
+                    }
+                    WorkerTask::Platform => {
+                        trust_js_worker_internal_call(cx, "runPlatformTask", &[])
+                    }
+                    WorkerTask::Timer => {
+                        trust_js_worker_internal_call(cx, "tick", &[Value::Num(now)])
+                    }
+                    WorkerTask::Frame => {
+                        trust_js_worker_internal_call(cx, "runAnimationFrames", &[Value::Num(now)])
+                    }
+                    WorkerTask::Command(
+                        TrustJsWorkerCtl::Terminate
+                        | TrustJsWorkerCtl::PortReady(_)
+                        | TrustJsWorkerCtl::HostTask(_),
+                    )
+                    | WorkerTask::Checkpoint => Ok(Value::Undefined),
+                };
+                result
+                    .map(|_| ())
+                    .map_err(|error| TaskError::read(cx, error, "worker task"))
+            }),
         };
         match task_result {
-            Ok(_) => {}
-            Err(EvalError::Interrupted(_)) => break,
-            Err(EvalError::Throw(error)) => send_trust_js_worker_error(
-                &events,
-                launch.id,
-                describe_throw(&mut engine, error, "worker task"),
-            ),
+            Ok(()) => {}
+            Err(TaskError::Interrupted(..)) => break,
+            Err(TaskError::Thrown(message)) => {
+                send_trust_js_worker_error(&events, launch.id, message)
+            }
         }
         if engine.run_microtasks_interruptible().is_err()
             || !trust_js_worker_report_buffered_errors(&mut engine, &events, launch.id)
@@ -22125,11 +22614,11 @@ fn run_trust_js_worker(
 }
 
 fn install_context_module_loader(engine: &mut trust_js::Engine, context: u64) {
-    let import_map = context_import_map(engine.ctx(), context);
-    let page = request_context_url(engine.ctx(), context);
-    let cookie_context = cookie_context_for_id(engine.ctx(), context);
-    let environment = ModuleFetchEnvironment::of(engine.ctx(), context);
-    let work = engine.ctx().host_mut::<HostState>().and_then(|state| {
+    let import_map = engine.scope(|cx| context_import_map(cx, context));
+    let page = engine.scope(|cx| request_context_url(cx, context));
+    let cookie_context = engine.scope(|cx| cookie_context_for_id(cx, context));
+    let environment = engine.scope(|cx| ModuleFetchEnvironment::of(cx, context));
+    let work = engine.host_mut::<HostState>().and_then(|state| {
         state
             .network
             .as_ref()
@@ -22153,7 +22642,7 @@ fn install_context_module_loader(engine: &mut trust_js::Engine, context: u64) {
     }
 }
 
-fn context_import_map(ctx: &mut Ctx, context: u64) -> crate::import_maps::Handle {
+fn context_import_map<'s>(ctx: &mut Ctx<'s>, context: u64) -> crate::import_maps::Handle {
     ctx.host_mut::<HostState>()
         .expect("module host state")
         .import_maps
@@ -22535,25 +23024,22 @@ fn begin_dynamic_module_fetch(
 }
 
 fn speculate_engine_imports(engine: &mut trust_js::Engine, base: &url::Url, body: &[u8]) {
-    if request_cookie_context(engine.ctx()).cross_site_ancestor {
+    if engine.scope(request_cookie_context).cross_site_ancestor {
         return;
     }
-    let context = engine.ctx().host_job_context();
+    let context = engine.host_job_context();
     let service_worker = engine
-        .ctx()
         .host::<HostState>()
         .and_then(|s| service_worker_host::fetch::for_context(s, context));
-    let Some((page, handle, cache, fetched)) =
-        engine.ctx().host_mut::<HostState>().and_then(|state| {
-            let network = state.network.as_ref()?;
-            Some((
-                state.base.clone(),
-                network.handle.clone(),
-                network.cache.clone(),
-                network.fetched.clone(),
-            ))
-        })
-    else {
+    let Some((page, handle, cache, fetched)) = engine.host_mut::<HostState>().and_then(|state| {
+        let network = state.network.as_ref()?;
+        Some((
+            state.base.clone(),
+            network.handle.clone(),
+            network.cache.clone(),
+            network.fetched.clone(),
+        ))
+    }) else {
         return;
     };
     speculate_module_imports(
@@ -22698,14 +23184,14 @@ pub(crate) fn speculate_module_graph(
 }
 
 fn push_engine_error(engine: &mut trust_js::Engine, message: String) {
-    host_push_injected_error(engine.ctx(), message);
+    engine.scope(|cx| host_push_injected_error(cx, message));
 }
 
 /// HTML #muted-errors: a classic script's errors are muted when its response
 /// was CORS-cross-origin, i.e. an HTTP(S) or file script of another origin
 /// fetched without a `crossorigin` attribute (a CORS-mode fetch that failed
 /// its check never runs). data: and blob: responses are basic, not opaque.
-fn classic_script_errors_muted(ctx: &mut Ctx, node_id: usize, url: &str) -> bool {
+fn classic_script_errors_muted<'s>(ctx: &mut Ctx<'s>, node_id: usize, url: &str) -> bool {
     let Ok(script) = url::Url::parse(url) else {
         return false;
     };
@@ -22737,7 +23223,7 @@ fn classic_script_errors_muted(ctx: &mut Ctx, node_id: usize, url: &str) -> bool
 }
 
 fn fire_engine_script_event(engine: &mut trust_js::Engine, node_id: usize, event_type: &str) {
-    host_fire_script_event(engine.ctx(), node_id, event_type);
+    engine.scope(|cx| host_fire_script_event(cx, node_id, event_type));
 }
 
 /// HTML's run-a-module-script completion steps wait for the module's evaluation promise, including
@@ -22745,10 +23231,14 @@ fn fire_engine_script_event(engine: &mut trust_js::Engine, node_id: usize, event
 /// parser-inserted module evaluation. Each reaction runs during the owning realm's microtask
 /// checkpoint and performs the element's success/failure steps exactly once.
 fn track_module_evaluation(engine: &mut trust_js::Engine, node_id: usize, name: &str) -> bool {
-    let Some(promise) = engine.module_evaluation_promise(name) else {
+    engine.scope(|ctx| track_module_evaluation_in(ctx, node_id, name))
+}
+
+fn track_module_evaluation_in<'s>(ctx: &mut Ctx<'s>, node_id: usize, name: &str) -> bool {
+    let Some(promise) = ctx.module_evaluation_promise(name) else {
         return false;
     };
-    if let Some(state) = engine.ctx().host_mut::<HostState>() {
+    if let Some(state) = ctx.host_mut::<HostState>() {
         state.pending_resources += 1;
         state.pending_module_evaluations += 1;
         state.dom_gc.start_resource(node_id);
@@ -22756,10 +23246,10 @@ fn track_module_evaluation(engine: &mut trust_js::Engine, node_id: usize, name: 
         return false;
     }
 
-    let fulfilled = engine.ctx().new_native_fn(
+    let fulfilled = ctx.new_native_fn(
         "",
         0,
-        Rc::new(move |ctx, _this, _args| {
+        move |ctx, _this, _args| {
             let _lease = ctx
                 .host_mut::<HostState>()
                 .map(|state| state.dom_gc.resource_lease(node_id));
@@ -22770,13 +23260,14 @@ fn track_module_evaluation(engine: &mut trust_js::Engine, node_id: usize, name: 
             }
             host_fire_script_event(ctx, node_id, "load");
             Ok(Value::Undefined)
-        }),
+        },
+        trust_js::embed::NativeCaptures::None,
     );
     let failed_name = name.to_string();
-    let rejected = engine.ctx().new_native_fn(
+    let rejected = ctx.new_native_fn(
         "",
         1,
-        Rc::new(move |ctx, _this, args| {
+        move |ctx, _this, args| {
             let _lease = ctx
                 .host_mut::<HostState>()
                 .map(|state| state.dom_gc.resource_lease(node_id));
@@ -22789,7 +23280,7 @@ fn track_module_evaluation(engine: &mut trust_js::Engine, node_id: usize, name: 
             // #execute-the-script-element then fires load at an external
             // script, whose fetch and parse succeeded.
             let exception = args.first().cloned().unwrap_or(Value::Undefined);
-            if host_report_exception(ctx, exception.clone(), &failed_name, false, None) {
+            if host_report_exception(ctx, exception, &failed_name, false, None) {
                 let reason = ctx
                     .coerce_string(&exception)
                     .map(|value| value.to_string())
@@ -22801,19 +23292,15 @@ fn track_module_evaluation(engine: &mut trust_js::Engine, node_id: usize, name: 
                 host_fire_script_event(ctx, node_id, "load");
             }
             Ok(Value::Undefined)
-        }),
+        },
+        trust_js::embed::NativeCaptures::None,
     );
-    let attached = engine
-        .ctx()
+    let attached = ctx
         .member_get(&promise, "then")
         .map_err(EvalError::Throw)
-        .and_then(|then| {
-            engine
-                .ctx()
-                .invoke_interruptible(then, promise, &[fulfilled, rejected])
-        })
+        .and_then(|then| ctx.invoke_interruptible(then, promise, &[fulfilled, rejected]))
         .is_ok();
-    if !attached && let Some(state) = engine.ctx().host_mut::<HostState>() {
+    if !attached && let Some(state) = ctx.host_mut::<HostState>() {
         state.pending_resources = state.pending_resources.saturating_sub(1);
         state.pending_module_evaluations = state.pending_module_evaluations.saturating_sub(1);
         state.dom_gc.finish_resource(node_id);
@@ -22830,84 +23317,75 @@ fn run_injected_classic_task(
     url: &str,
     source: &str,
 ) -> Result<(), String> {
-    let trust = host_trust(engine.ctx()).map_err(|_| "read the platform control".to_string())?;
-    let document_base = state_base(engine.ctx());
-    // HTML #prepare-the-script-element: a fetched classic script's base URL is its URL; an
-    // inline one's is its node document's document base URL. TRust JS keeps it as the referrer of
-    // the script's import() calls, including later ones from functions the script created.
-    let script_base = if name == url {
-        name.to_string()
-    } else {
-        host_call_trust_interruptible(
-            engine.ctx(),
-            "resourceBaseURL",
-            &[Value::Num(node_id as f64)],
-        )
-        .ok()
-        .and_then(|base| engine.ctx().coerce_string(&base).ok())
-        .map_or_else(|| document_base.clone(), |base| base.to_string())
-    };
+    let bases = engine.scope(|cx| {
+        host_trust(cx).map_err(|_| "read the platform control".to_string())?;
+        let document_base = state_base(cx);
+        // HTML #prepare-the-script-element: a fetched classic script's base URL is its URL; an
+        // inline one's is its node document's document base URL. TRust JS keeps it as the
+        // referrer of the script's import() calls, including later ones from functions the
+        // script created.
+        let script_base = if name == url {
+            name.to_string()
+        } else {
+            host_call_trust_interruptible(cx, "resourceBaseURL", &[Value::Num(node_id as f64)])
+                .ok()
+                .and_then(|base| cx.coerce_string(&base).ok())
+                .map_or_else(|| document_base.clone(), |base| base.to_string())
+        };
+        Ok::<_, String>((document_base, script_base))
+    });
+    let (document_base, script_base) = bases?;
     engine.set_import_base(&script_base);
-    let old_current = engine
-        .ctx()
-        .member_get(&trust, "currentScript")
-        .unwrap_or(Value::Null);
-    let _ = host_call_trust(
-        engine.ctx(),
-        "bindFrameForNode",
-        &[Value::Num(node_id as f64)],
-    );
-    let current = classic_current_script(engine.ctx(), node_id);
-    let _ = engine.ctx().member_set(&trust, "currentScript", current);
-    let origin = trust_js::SourceOrigin::new(url);
-    let evaluated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        engine.eval_value_interruptible_with_origin(source, Some(&origin))
-    }));
-    let muted = classic_script_errors_muted(engine.ctx(), node_id, url);
-    match evaluated {
-        Ok(Ok(Ok(_))) => {}
-        Ok(Ok(Err(EvalError::Throw(error)))) => {
-            if host_report_exception(engine.ctx(), error.clone(), name, muted, Some((url, 0))) {
-                let message = describe_throw(engine, error, name);
-                push_engine_error(engine, message);
+    let checkpoint = engine.scope(|cx| {
+        let trust = host_trust(cx).map_err(|_| "read the platform control".to_string())?;
+        let old_current = cx
+            .member_get(&trust, "currentScript")
+            .unwrap_or(Value::Null);
+        let _ = host_call_trust(cx, "bindFrameForNode", &[Value::Num(node_id as f64)]);
+        let current = classic_current_script(cx, node_id);
+        let _ = cx.member_set(&trust, "currentScript", current);
+        let origin = trust_js::SourceOrigin::new(url);
+        let evaluated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cx.eval_value_interruptible_with_origin(source, Some(&origin))
+        }));
+        let muted = classic_script_errors_muted(cx, node_id, url);
+        match evaluated {
+            Ok(Ok(Ok(_))) => {}
+            Ok(Ok(Err(EvalError::Throw(error)))) => {
+                if host_report_exception(cx, error, name, muted, Some((url, 0))) {
+                    let message = describe_throw(cx, error, name);
+                    host_push_injected_error(cx, message);
+                }
             }
-        }
-        Ok(Ok(Err(error))) => {
-            let message = describe_eval_error(engine, error, name);
-            push_engine_error(engine, message);
-        }
-        Ok(Err(error)) => {
-            let syntax_error = engine
-                .ctx()
-                .make_error("SyntaxError", error.message.clone());
-            if host_report_exception(
-                engine.ctx(),
-                syntax_error,
-                name,
-                muted,
-                Some((url, error.line)),
-            ) {
-                push_engine_error(
-                    engine,
-                    format!(
-                        "{name} parse error at line {}: {}",
-                        error.line, error.message
-                    ),
-                );
+            Ok(Ok(Err(error))) => {
+                let message = describe_eval_error(cx, error, name);
+                host_push_injected_error(cx, message);
             }
+            Ok(Err(error)) => {
+                let syntax_error = cx.make_error("SyntaxError", error.message.clone());
+                if host_report_exception(cx, syntax_error, name, muted, Some((url, error.line))) {
+                    host_push_injected_error(
+                        cx,
+                        format!(
+                            "{name} parse error at line {}: {}",
+                            error.line, error.message
+                        ),
+                    );
+                }
+            }
+            Err(_) => host_push_injected_error(cx, format!("{name}: TRust JS engine panic")),
         }
-        Err(_) => push_engine_error(engine, format!("{name}: TRust JS engine panic")),
-    }
-    // HTML clean-up after running script performs a checkpoint once the script stack is empty.
-    let checkpoint = engine
-        .run_microtasks_interruptible()
-        .map_err(|reason| format!("{name} microtasks interrupted: {}", reason.message()));
-    let _ = engine
-        .ctx()
-        .member_set(&trust, "currentScript", old_current);
-    let _ = host_call_trust(engine.ctx(), "restoreFrame", &[]);
+        // HTML clean-up after running script performs a checkpoint once the script stack is
+        // empty.
+        let checkpoint = cx
+            .run_microtasks_interruptible()
+            .map_err(|reason| format!("{name} microtasks interrupted: {}", reason.message()));
+        let _ = cx.member_set(&trust, "currentScript", old_current);
+        let _ = host_call_trust(cx, "restoreFrame", &[]);
+        Ok::<_, String>(checkpoint)
+    });
     engine.set_import_base(&document_base);
-    checkpoint
+    checkpoint?
 }
 
 fn run_injected_module_task(
@@ -22916,19 +23394,18 @@ fn run_injected_module_task(
     name: &str,
     source: &str,
 ) -> Result<(), String> {
-    let context = host_call_trust(
-        engine.ctx(),
-        "resourceClientContext",
-        &[Value::Num(node_id as f64)],
-    )
-    .ok()
-    .and_then(|v| v.as_num_opt())
-    .unwrap_or(0.) as u64;
-    let import_map = context_import_map(engine.ctx(), context);
-    let cookie_context = element_cookie_context(engine.ctx(), node_id);
-    let client = element_request_client_url(engine.ctx(), node_id);
-    let environment = ModuleFetchEnvironment::of(engine.ctx(), context);
-    let snapshot = engine.ctx().host_mut::<HostState>().and_then(|state| {
+    let context = engine
+        .scope(|cx| {
+            host_call_trust(cx, "resourceClientContext", &[Value::Num(node_id as f64)])
+                .ok()
+                .and_then(|v| v.as_num_opt())
+        })
+        .unwrap_or(0.) as u64;
+    let import_map = engine.scope(|cx| context_import_map(cx, context));
+    let cookie_context = engine.scope(|cx| element_cookie_context(cx, node_id));
+    let client = engine.scope(|cx| element_request_client_url(cx, node_id));
+    let environment = engine.scope(|cx| ModuleFetchEnvironment::of(cx, context));
+    let snapshot = engine.host_mut::<HostState>().and_then(|state| {
         let network = state.network.as_ref()?;
         Some((
             client,
@@ -22942,11 +23419,9 @@ fn run_injected_module_task(
     // global, so enter the script element's owning frame for evaluation and
     // the immediately-following microtask checkpoint. This is the module
     // counterpart of `run_injected_classic_task` above.
-    let _ = host_call_trust(
-        engine.ctx(),
-        "bindFrameForNode",
-        &[Value::Num(node_id as f64)],
-    );
+    engine.scope(|cx| {
+        let _ = host_call_trust(cx, "bindFrameForNode", &[Value::Num(node_id as f64)]);
+    });
     let result = (|| {
         let evaluated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             if let Some((page, handle, cache, fetched)) = snapshot {
@@ -23010,7 +23485,9 @@ fn run_injected_module_task(
         }
         Ok(())
     })();
-    let _ = host_call_trust(engine.ctx(), "restoreFrame", &[]);
+    engine.scope(|cx| {
+        let _ = host_call_trust(cx, "restoreFrame", &[]);
+    });
     result
 }
 
@@ -23023,7 +23500,6 @@ fn element_fallback_encoding(
     node: usize,
 ) -> &'static encoding_rs::Encoding {
     let dom = engine
-        .ctx()
         .host_mut::<HostState>()
         .expect("HostState installed before resource dispatch")
         .dom
@@ -23080,10 +23556,11 @@ fn run_resource_task(
                 if crate::http::module_script_response_allowed(status, &content_type) =>
             {
                 let import_base = url::Url::parse(&name)
-                    .unwrap_or_else(|_| url::Url::parse(&state_base(engine.ctx())).unwrap());
-                let context = engine.ctx().host_job_context();
-                let map = context_import_map(engine.ctx(), context);
-                let metadata = host_dom(engine.ctx())
+                    .unwrap_or_else(|_| url::Url::parse(&engine.scope(state_base)).unwrap());
+                let context = engine.host_job_context();
+                let map = engine.scope(|cx| context_import_map(cx, context));
+                let metadata = engine
+                    .scope(host_dom)
                     .borrow()
                     .attr(node_id, "integrity")
                     .filter(|s| !s.is_empty())
@@ -23103,7 +23580,7 @@ fn run_resource_task(
                 run_injected_module_task(engine, node_id, &name, &source)?;
             }
             _ => {
-                if let Some(state) = engine.ctx().host_mut::<HostState>() {
+                if let Some(state) = engine.host_mut::<HostState>() {
                     state.modules_skipped += 1;
                 }
                 fire_engine_script_event(engine, node_id, "error");
@@ -23136,7 +23613,6 @@ fn run_resource_task(
                     |sheet| *sheet,
                 );
                 let dom = engine
-                    .ctx()
                     .host_mut::<HostState>()
                     .expect("HostState installed before resource dispatch")
                     .dom
@@ -23183,67 +23659,69 @@ fn dispatch_websocket_task(
     id: usize,
     event: crate::ws::WsIn,
 ) -> Result<(), String> {
-    let mut args = vec![
-        Value::Num(id as f64),
-        Value::Undefined,
-        Value::from_string(String::new()),
-        Value::Bool(false),
-        Value::Num(0.0),
-        Value::from_string(String::new()),
-        Value::Bool(false),
-        Value::Bool(false),
-        Value::from_string(String::new()),
-        Value::from_string(String::new()),
-    ];
-    match event {
-        crate::ws::WsIn::Open {
-            protocol,
-            extensions,
-        } => {
-            args[1] = Value::from_string(String::from("open"));
-            args[8] = Value::from_string(protocol);
-            args[9] = Value::from_string(extensions);
-        }
-        crate::ws::WsIn::Text(message) => {
-            args[1] = Value::from_string(String::from("message"));
-            args[2] = Value::from_string(message);
-        }
-        crate::ws::WsIn::Binary(bytes) => {
-            args[1] = Value::from_string(String::from("message"));
-            args[2] = engine
-                .ctx()
-                .make_array_buffer(&bytes)
-                .map_err(|_| String::from("WebSocket task: message too large"))?;
-            args[3] = Value::Bool(true);
-        }
-        crate::ws::WsIn::Sent(bytes) => {
-            args[1] = Value::from_string(String::from("drain"));
-            args[4] = Value::Num(bytes as f64);
-        }
-        crate::ws::WsIn::Closed {
-            code,
-            reason,
-            was_clean,
-            failed,
-        } => {
-            if let Some(sockets) = engine
-                .ctx()
-                .host_mut::<HostState>()
-                .and_then(|state| state.websockets.as_mut())
-            {
-                sockets.sockets.remove(&id);
+    if matches!(event, crate::ws::WsIn::Closed { .. })
+        && let Some(sockets) = engine
+            .host_mut::<HostState>()
+            .and_then(|state| state.websockets.as_mut())
+    {
+        sockets.sockets.remove(&id);
+    }
+    engine.scope(|cx| {
+        let empty = cx.str("");
+        let mut args = [
+            Value::Num(id as f64),
+            Value::Undefined,
+            empty,
+            Value::Bool(false),
+            Value::Num(0.0),
+            empty,
+            Value::Bool(false),
+            Value::Bool(false),
+            empty,
+            empty,
+        ];
+        match event {
+            crate::ws::WsIn::Open {
+                protocol,
+                extensions,
+            } => {
+                args[1] = cx.str("open");
+                args[8] = cx.string(protocol);
+                args[9] = cx.string(extensions);
             }
-            args[1] = Value::from_string(String::from("close"));
-            args[4] = Value::Num(f64::from(code));
-            args[5] = Value::from_string(reason);
-            args[6] = Value::Bool(was_clean);
-            args[7] = Value::Bool(failed);
+            crate::ws::WsIn::Text(message) => {
+                args[1] = cx.str("message");
+                args[2] = cx.string(message);
+            }
+            crate::ws::WsIn::Binary(bytes) => {
+                args[1] = cx.str("message");
+                args[2] = cx
+                    .make_array_buffer(&bytes)
+                    .map_err(|_| String::from("WebSocket task: message too large"))?;
+                args[3] = Value::Bool(true);
+            }
+            crate::ws::WsIn::Sent(bytes) => {
+                args[1] = cx.str("drain");
+                args[4] = Value::Num(bytes as f64);
+            }
+            crate::ws::WsIn::Closed {
+                code,
+                reason,
+                was_clean,
+                failed,
+            } => {
+                args[1] = cx.str("close");
+                args[4] = Value::Num(f64::from(code));
+                args[5] = cx.string(reason);
+                args[6] = Value::Bool(was_clean);
+                args[7] = Value::Bool(failed);
+            }
         }
-    }
-    match host_call_trust_interruptible(engine.ctx(), "wsEvent", &args) {
-        Ok(_) => Ok(()),
-        Err(error) => host_task_failure(engine.ctx(), error, "WebSocket task"),
-    }
+        match host_call_trust_interruptible(cx, "wsEvent", &args) {
+            Ok(_) => Ok(()),
+            Err(error) => host_task_failure(cx, error, "WebSocket task"),
+        }
+    })
 }
 
 /// Run the engine-owned portion of one selected host task. The caller performs the HTML event
@@ -23252,10 +23730,9 @@ fn dispatch_websocket_task(
 fn settle_network_task(
     engine: &mut trust_js::Engine,
     id: usize,
-    value: impl FnOnce(&mut Ctx) -> Value,
+    value: impl for<'s> FnOnce(&mut Ctx<'s>) -> Value<'s>,
 ) -> Result<(), String> {
     let pending = engine
-        .ctx()
         .host_mut::<HostState>()
         .and_then(|state| state.network.as_mut())
         .and_then(|network| network.pending_fetches.remove(&id));
@@ -23264,26 +23741,16 @@ fn settle_network_task(
     };
     let context = pending.context;
     let native_lease = pending.native_lease;
-    let run = move |engine: &mut trust_js::Engine| {
+    let resolve = pending.resolve;
+    // A Replaced or inactive Document's task does not run.
+    run_in_context_realm(engine, context, "image networking task", move |cx| {
         let _native_lease = native_lease;
-        let value = value(engine.ctx());
-        engine
-            .call_function_interruptible(&pending.resolve, Value::Undefined, &[value])
+        let value = value(cx);
+        let resolve = held(cx, &resolve);
+        cx.call_function_interruptible(&resolve, Value::Undefined, &[value])
             .map(|_| ())
-            .map_err(|error| describe_eval_error(engine, error, "image networking task"))
-    };
-    if context == engine.ctx().host_job_context() {
-        return run(engine);
-    }
-    let realm = engine
-        .ctx()
-        .host_mut::<HostState>()
-        .and_then(|state| state.window_realm(context));
-    let Some(realm) = realm else { return Ok(()) }; // Replaced/inactive Document.
-    match engine.with_embed_realm(&realm, run) {
-        Ok(result) => result,
-        Err(_) => Err(String::from("image networking task Realm is unavailable")),
-    }
+            .map_err(|error| describe_eval_error(cx, error, "image networking task"))
+    })
 }
 
 /// The top-level traversable a host task belongs to, when its content
@@ -23355,14 +23822,11 @@ fn dispatch_host_task(engine: &mut trust_js::Engine, task: TrustJsHostTask) -> R
             timing,
         } => {
             record_resource_timing_in(engine, context, timing)?;
-            run_in_context_realm(engine, context, "private response end", |engine| {
-                host_call_trust(
-                    engine.ctx(),
-                    "privateResponseEnded",
-                    &[Value::from_string(token)],
-                )
-                .map(|_| ())
-                .map_err(|_| "private response end failed".to_string())
+            run_in_context_realm(engine, context, "private response end", |cx| {
+                let token = cx.string(token);
+                host_call_trust(cx, "privateResponseEnded", &[token])
+                    .map(|_| ())
+                    .map_err(|_| "private response end failed".to_string())
             })?;
         }
         TrustJsHostTask::PrivateResponseReady { id, ok } => {
@@ -23377,7 +23841,6 @@ fn dispatch_host_task(engine: &mut trust_js::Engine, task: TrustJsHostTask) -> R
         TrustJsHostTask::WebAudio(task) => webaudio_host::dispatch(engine, task)?,
         TrustJsHostTask::CanvasFrame { node } => {
             let dom = engine
-                .ctx()
                 .host_mut::<HostState>()
                 .expect("HostState installed before host tasks")
                 .dom
@@ -23387,18 +23850,17 @@ fn dispatch_host_task(engine: &mut trust_js::Engine, task: TrustJsHostTask) -> R
         TrustJsHostTask::SvgResourceDone => {
             // The next rendering opportunity resolves the references again,
             // in whichever traversable's Documents make them.
-            if let Some(state) = engine.ctx().host_mut::<HostState>() {
+            if let Some(state) = engine.host_mut::<HostState>() {
                 for dom in state.arenas() {
                     dom.borrow_mut().resource_changed();
                 }
             }
         }
         TrustJsHostTask::FontUse { .. } => {
-            if let Some(state) = engine.ctx().host::<HostState>() {
+            if let Some(state) = engine.host::<HostState>() {
                 state.dom.borrow_mut().advance_font_display();
             }
             let contexts = engine
-                .ctx()
                 .host::<HostState>()
                 .map(|state| {
                     let selected = state.traversables.selected;
@@ -23412,13 +23874,13 @@ fn dispatch_host_task(engine: &mut trust_js::Engine, task: TrustJsHostTask) -> R
                 })
                 .unwrap_or_default();
             for context in contexts {
-                run_in_context_realm(engine, context, "font use", |engine| {
-                    host_call_trust(engine.ctx(), "refreshFontSources", &[])
+                run_in_context_realm(engine, context, "font use", |cx| {
+                    host_call_trust(cx, "refreshFontSources", &[])
                         .map(|_| ())
                         .map_err(|_| String::from("font discovery failed"))
                 })?;
             }
-            if let Some(state) = engine.ctx().host::<HostState>() {
+            if let Some(state) = engine.host::<HostState>() {
                 state.install_font_demand_waker();
             }
         }
@@ -23430,7 +23892,7 @@ fn dispatch_host_task(engine: &mut trust_js::Engine, task: TrustJsHostTask) -> R
             bytes,
             ..
         } => {
-            if let Some(state) = engine.ctx().host_mut::<HostState>() {
+            if let Some(state) = engine.host_mut::<HostState>() {
                 state.pending_fonts = state.pending_fonts.saturating_sub(1);
                 if let (Some(source), Some(bytes)) = (&source, &bytes) {
                     state.dom.borrow_mut().install_document_font(
@@ -23440,21 +23902,16 @@ fn dispatch_host_task(engine: &mut trust_js::Engine, task: TrustJsHostTask) -> R
                     );
                 }
             }
-            run_in_context_realm(engine, context, "font loading", |engine| {
+            run_in_context_realm(engine, context, "font loading", |cx| {
                 let value = match bytes {
-                    Some(bytes) => engine
-                        .ctx()
+                    Some(bytes) => cx
                         .make_array_buffer(&bytes)
                         .map_err(|_| String::from("font buffer allocation failed"))?,
                     None => Value::Bool(false),
                 };
-                host_call_trust(
-                    engine.ctx(),
-                    "fontFaceLoaded",
-                    &[Value::Num(request as f64), value],
-                )
-                .map(|_| ())
-                .map_err(|_| String::from("font loading completion failed"))
+                host_call_trust(cx, "fontFaceLoaded", &[Value::Num(request as f64), value])
+                    .map(|_| ())
+                    .map_err(|_| String::from("font loading completion failed"))
             })?;
         }
         TrustJsHostTask::FontDone {
@@ -23463,11 +23920,10 @@ fn dispatch_host_task(engine: &mut trust_js::Engine, task: TrustJsHostTask) -> R
             bytes,
             ..
         } => {
-            if let Some(state) = engine.ctx().host_mut::<HostState>() {
+            if let Some(state) = engine.host_mut::<HostState>() {
                 state.pending_fonts = state.pending_fonts.saturating_sub(1);
             }
             let dom = engine
-                .ctx()
                 .host_mut::<HostState>()
                 .expect("HostState installed before host tasks")
                 .dom
@@ -23478,7 +23934,6 @@ fn dispatch_host_task(engine: &mut trust_js::Engine, task: TrustJsHostTask) -> R
         TrustJsHostTask::StyleImportsDone { url, sheets, .. } => {
             let dom = {
                 let state = engine
-                    .ctx()
                     .host_mut::<HostState>()
                     .expect("HostState installed before host tasks");
                 state.in_flight_imports.remove(&url);
@@ -23495,10 +23950,12 @@ fn dispatch_host_task(engine: &mut trust_js::Engine, task: TrustJsHostTask) -> R
             dom.borrow_mut().attach_imported_sheets(sheets);
             // CSSImportRule.styleSheet: the rules waiting for these sheets
             // associate them and hand the cascade their rules.
-            let _ = host_call_trust(engine.ctx(), "styleImportsArrived", &[]);
+            engine.scope(|cx| {
+                let _ = host_call_trust(cx, "styleImportsArrived", &[]);
+            });
         }
         TrustJsHostTask::ParserResourceTiming { timing, .. } => {
-            record_resource_timing_ref(engine.ctx(), &timing);
+            engine.scope(|cx| record_resource_timing_ref(cx, &timing));
         }
         TrustJsHostTask::ImageDone {
             id,
@@ -23516,7 +23973,7 @@ fn dispatch_host_task(engine: &mut trust_js::Engine, task: TrustJsHostTask) -> R
             size,
             document_svg,
         } => {
-            if let Some(state) = engine.ctx().host_mut::<HostState>() {
+            if let Some(state) = engine.host_mut::<HostState>() {
                 state.pending_document_images = state.pending_document_images.saturating_sub(1);
                 // The document learns a stylesheet image's natural dimensions
                 // from its own request (CSS Images 3 #default-sizing); the next
@@ -23550,7 +24007,6 @@ fn dispatch_host_task(engine: &mut trust_js::Engine, task: TrustJsHostTask) -> R
         }
         TrustJsHostTask::FetchHead { id, result, flow } => {
             let pending = engine
-                .ctx()
                 .host_mut::<HostState>()
                 .and_then(|state| state.network.as_mut())
                 .and_then(|network| network.pending_fetches.remove(&id));
@@ -23559,9 +24015,8 @@ fn dispatch_host_task(engine: &mut trust_js::Engine, task: TrustJsHostTask) -> R
                 return Ok(());
             };
             let context = pending.context;
-            let realm_active = context == engine.ctx().host_job_context()
+            let realm_active = context == engine.host_job_context()
                 || engine
-                    .ctx()
                     .host_mut::<HostState>()
                     .is_some_and(|state| state.window_realms.contains_key(&context));
             if !realm_active {
@@ -23569,7 +24024,6 @@ fn dispatch_host_task(engine: &mut trust_js::Engine, task: TrustJsHostTask) -> R
                 return Ok(());
             }
             if let Some(network) = engine
-                .ctx()
                 .host_mut::<HostState>()
                 .and_then(|state| state.network.as_mut())
             {
@@ -23585,25 +24039,22 @@ fn dispatch_host_task(engine: &mut trust_js::Engine, task: TrustJsHostTask) -> R
                 );
             }
             let resolve = pending.resolve;
-            run_in_context_realm(engine, context, "fetch task", move |engine| {
-                let value = host_fetch_result_value(engine.ctx(), result);
-                if matches!(value, Value::Obj(_)) {
+            run_in_context_realm(engine, context, "fetch task", move |cx| {
+                let value = host_fetch_result_value(cx, result);
+                if matches!(value.kind(), ValueKind::Obj(_)) {
                     // The body is read from the network buffer: element 8 is
                     // the fetch id the body's stream pulls with.
-                    engine
-                        .ctx()
-                        .member_set(&value, "8", Value::Num(id as f64))
+                    cx.member_set(&value, "8", Value::Num(id as f64))
                         .map_err(|_| String::from("fetch task: response record"))?;
                 }
-                engine
-                    .call_function_interruptible(&resolve, Value::Undefined, &[value])
+                let resolve = held(cx, &resolve);
+                cx.call_function_interruptible(&resolve, Value::Undefined, &[value])
                     .map(|_| ())
-                    .map_err(|error| describe_eval_error(engine, error, "fetch networking task"))
+                    .map_err(|error| describe_eval_error(cx, error, "fetch networking task"))
             })?;
         }
         TrustJsHostTask::FetchBodyChunk { id, bytes } => {
             let Some(network) = engine
-                .ctx()
                 .host_mut::<HostState>()
                 .and_then(|state| state.network.as_mut())
             else {
@@ -23622,7 +24073,6 @@ fn dispatch_host_task(engine: &mut trust_js::Engine, task: TrustJsHostTask) -> R
         TrustJsHostTask::FetchBodyEnd { id, ok, timing } => {
             let context = {
                 let Some(network) = engine
-                    .ctx()
                     .host_mut::<HostState>()
                     .and_then(|state| state.network.as_mut())
                 else {
@@ -23634,15 +24084,14 @@ fn dispatch_host_task(engine: &mut trust_js::Engine, task: TrustJsHostTask) -> R
                 stream.end = Some(ok);
                 stream.context
             };
-            run_in_context_realm(engine, context, "fetch task", move |engine| {
-                record_resource_timing(engine.ctx(), timing);
+            run_in_context_realm(engine, context, "fetch task", move |cx| {
+                record_resource_timing(cx, timing);
                 Ok(())
             })?;
             settle_body_pull(engine, id)?;
         }
         TrustJsHostTask::FetchDone { id, result, timing } => {
             let pending = engine
-                .ctx()
                 .host_mut::<HostState>()
                 .and_then(|state| state.network.as_mut())
                 .and_then(|network| network.pending_fetches.remove(&id));
@@ -23656,39 +24105,16 @@ fn dispatch_host_task(engine: &mut trust_js::Engine, task: TrustJsHostTask) -> R
             // object's relevant global, including its ArrayBuffer intrinsics.
             let context = pending.context;
             let resolve = pending.resolve;
-            let run = move |engine: &mut trust_js::Engine| {
-                record_resource_timing(engine.ctx(), timing);
-                let value = host_fetch_result_value(engine.ctx(), result);
-                engine
-                    .call_function_interruptible(&resolve, Value::Undefined, &[value])
-                    .map_err(|error| describe_eval_error(engine, error, "fetch networking task"))
-            };
-            if context == engine.ctx().host_job_context() {
-                run(engine)?;
-            } else {
-                let realm = engine
-                    .ctx()
-                    .host_mut::<HostState>()
-                    .and_then(|state| state.window_realm(context));
-                let Some(realm) = realm else {
-                    // A task associated with a no-longer-active Document is
-                    // not runnable on the Window event loop.
-                    return Ok(());
-                };
-                match engine.with_embed_realm(&realm, run) {
-                    Ok(result) => {
-                        result?;
-                    }
-                    Err(error) => {
-                        let message = engine
-                            .ctx()
-                            .coerce_string(&error)
-                            .map(|message| message.to_string())
-                            .unwrap_or_else(|_| String::from("unknown Window Realm"));
-                        return Err(format!("fetch task Realm: {message}"));
-                    }
-                }
-            }
+            // A task associated with a no-longer-active Document is not runnable on the Window
+            // event loop.
+            run_in_context_realm(engine, context, "fetch task", move |cx| {
+                record_resource_timing(cx, timing);
+                let value = host_fetch_result_value(cx, result);
+                let resolve = held(cx, &resolve);
+                cx.call_function_interruptible(&resolve, Value::Undefined, &[value])
+                    .map(|_| ())
+                    .map_err(|error| describe_eval_error(cx, error, "fetch networking task"))
+            })?;
         }
         TrustJsHostTask::ResourceDone {
             context,
@@ -23703,10 +24129,9 @@ fn dispatch_host_task(engine: &mut trust_js::Engine, task: TrustJsHostTask) -> R
             ..
         } => {
             let _lease = engine
-                .ctx()
                 .host_mut::<HostState>()
                 .map(|state| state.dom_gc.resource_lease(node_id));
-            if let Some(state) = engine.ctx().host_mut::<HostState>() {
+            if let Some(state) = engine.host_mut::<HostState>() {
                 if kind.is_stylesheet() {
                     finish_stylesheet_load(state, context);
                 }
@@ -23725,12 +24150,11 @@ fn dispatch_host_task(engine: &mut trust_js::Engine, task: TrustJsHostTask) -> R
             // the environment-settings token captured at preparation time;
             // dispatching through the actor's root Realm would fire load/error
             // against the wrong Realm-local listener registry.
-            if context == engine.ctx().host_job_context() {
-                record_resource_timing(engine.ctx(), timing);
+            if context == engine.host_job_context() {
+                engine.scope(|cx| record_resource_timing(cx, timing));
                 run_resource_task(engine, node_id, name, kind, result, text, sheet, external)?;
             } else {
                 let realm = engine
-                    .ctx()
                     .host_mut::<HostState>()
                     .and_then(|state| state.window_realm(context));
                 let Some(realm) = realm else {
@@ -23740,17 +24164,12 @@ fn dispatch_host_task(engine: &mut trust_js::Engine, task: TrustJsHostTask) -> R
                     return Ok(());
                 };
                 match engine.with_embed_realm(&realm, move |engine| {
-                    record_resource_timing(engine.ctx(), timing);
+                    engine.scope(|cx| record_resource_timing(cx, timing));
                     run_resource_task(engine, node_id, name, kind, result, text, sheet, external)
                 }) {
                     Ok(result) => result?,
                     Err(error) => {
-                        let message = engine
-                            .ctx()
-                            .coerce_string(&error)
-                            .map(|message| message.to_string())
-                            .unwrap_or_else(|_| String::from("unknown Window Realm"));
-                        return Err(format!("resource task Realm: {message}"));
+                        return Err(format!("resource task Realm: {error}"));
                     }
                 }
             }
@@ -23769,13 +24188,10 @@ fn dispatch_host_task(engine: &mut trust_js::Engine, task: TrustJsHostTask) -> R
                     crate::http::trace_ms()
                 );
             }
-            let cookie_context = cookie_context_for_id(engine.ctx(), context);
-            let page = request_context_url(engine.ctx(), context);
-            let environment = ModuleFetchEnvironment::of(engine.ctx(), context);
-            let state = engine
-                .ctx()
-                .host_mut::<HostState>()
-                .expect("module host state");
+            let cookie_context = engine.scope(|cx| cookie_context_for_id(cx, context));
+            let page = engine.scope(|cx| request_context_url(cx, context));
+            let environment = engine.scope(|cx| ModuleFetchEnvironment::of(cx, context));
+            let state = engine.host_mut::<HostState>().expect("module host state");
             if let Some(events) = state.task_events.clone() {
                 let loader = TrustJsDynamicModuleLoader {
                     context,
@@ -23808,7 +24224,7 @@ fn dispatch_host_task(engine: &mut trust_js::Engine, task: TrustJsHostTask) -> R
             request_id,
             result,
         } => {
-            if let Some(state) = engine.ctx().host_mut::<HostState>() {
+            if let Some(state) = engine.host_mut::<HostState>() {
                 state.pending_dynamic_modules.update(
                     std::sync::atomic::Ordering::Relaxed,
                     std::sync::atomic::Ordering::Relaxed,
@@ -23818,7 +24234,6 @@ fn dispatch_host_task(engine: &mut trust_js::Engine, task: TrustJsHostTask) -> R
             install_context_module_loader(engine, context);
             let _ = engine.finish_dynamic_module_load(request_id, result);
             let top_context = engine
-                .ctx()
                 .host_mut::<HostState>()
                 .map_or(0, |state| state.top_context);
             install_context_module_loader(engine, top_context);
@@ -23832,13 +24247,12 @@ fn dispatch_host_task(engine: &mut trust_js::Engine, task: TrustJsHostTask) -> R
                 crate::js::WorkerOut::Error(message) => ("workerError", message),
                 crate::js::WorkerOut::Console(lines) => ("workerConsole", lines),
             };
-            dispatch_trust_js_worker_task(engine, id, name, Value::from_engine_text(payload))?;
+            dispatch_trust_js_worker_task(engine, id, name, TrustValue::Str(payload))?;
         }
         TrustJsHostTask::WorkerExited { id } => {
             let result =
-                dispatch_trust_js_worker_task(engine, id, "workerExited", Value::Undefined);
+                dispatch_trust_js_worker_task(engine, id, "workerExited", TrustValue::Undefined);
             if let Some(workers) = engine
-                .ctx()
                 .host_mut::<HostState>()
                 .and_then(|state| state.workers.as_mut())
             {
@@ -23849,8 +24263,8 @@ fn dispatch_host_task(engine: &mut trust_js::Engine, task: TrustJsHostTask) -> R
         }
         TrustJsHostTask::AbortDocument { context } => {
             // A navigable whose Document is no longer active has none to abort.
-            run_in_context_realm(engine, context, "abort document", move |engine| {
-                abort_document(engine.ctx(), context);
+            run_in_context_realm(engine, context, "abort document", move |cx| {
+                abort_document(cx, context);
                 Ok(())
             })?;
         }
@@ -23862,10 +24276,9 @@ fn dispatch_trust_js_worker_task(
     engine: &mut trust_js::Engine,
     id: usize,
     name: &str,
-    payload: Value,
+    payload: TrustValue,
 ) -> Result<(), String> {
     let context = engine
-        .ctx()
         .host_mut::<HostState>()
         .and_then(|state| state.workers.as_ref())
         .and_then(|workers| workers.workers.get(&id))
@@ -23873,29 +24286,31 @@ fn dispatch_trust_js_worker_task(
     let Some(context) = context else {
         return Ok(());
     };
-    let run = move |engine: &mut trust_js::Engine| match host_call_trust_interruptible(
-        engine.ctx(),
-        name,
-        &[Value::Num(id as f64), payload],
-    ) {
-        Ok(_) => Ok(()),
-        Err(error) => host_task_failure(engine.ctx(), error, "Worker task"),
+    let run = move |cx: &mut Ctx<'_>| {
+        let payload = payload.value(cx);
+        match host_call_trust_interruptible(cx, name, &[Value::Num(id as f64), payload]) {
+            Ok(_) => Ok(()),
+            Err(error) => host_task_failure(cx, error, "Worker task"),
+        }
     };
-    if context == engine.ctx().host_job_context() {
-        run(engine)
+    if context == engine.host_job_context() {
+        engine.scope(run)
     } else {
         let realm = engine
-            .ctx()
             .host_mut::<HostState>()
             .and_then(|state| state.window_realm(context));
         let Some(realm) = realm else { return Ok(()) };
         engine
-            .with_embed_realm(&realm, run)
+            .with_embed_realm(&realm, |engine| engine.scope(run))
             .map_err(|_| String::from("Worker task Realm is unavailable"))?
     }
 }
 
-fn host_create_element(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_create_element<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let tag = host_arg_string(ctx, args, 0);
     let dom = host_dom(ctx);
     let mut dom = dom.borrow_mut();
@@ -23905,7 +24320,11 @@ fn host_create_element(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
     Ok(host_id_value(Some(id)))
 }
 
-fn host_create_element_ns(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_create_element_ns<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let namespace = host_arg_string(ctx, args, 0);
     let prefix = host_arg_string(ctx, args, 1);
     let local_name = host_arg_string(ctx, args, 2);
@@ -23921,7 +24340,11 @@ fn host_create_element_ns(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result
     Ok(host_id_value(Some(id)))
 }
 
-fn host_create_text(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_create_text<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let text = host_arg_string(ctx, args, 0);
     let dom = host_dom(ctx);
     let mut dom = dom.borrow_mut();
@@ -23931,7 +24354,11 @@ fn host_create_text(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
     Ok(host_id_value(Some(id)))
 }
 
-fn host_create_fragment(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_create_fragment<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let dom = host_dom(ctx);
     let mut dom = dom.borrow_mut();
     let document = host_creation_document(&dom, args, 0);
@@ -23943,11 +24370,15 @@ fn host_create_fragment(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
 /// HTML fragment parsing and `DOMParser` use distinct algorithms. This operation deliberately uses
 /// HTML's full document parsing algorithm and transplants its `html`/`head`/`body` tree into the
 /// page arena; fragment parsing is exposed by the later inner-HTML boundary slice.
-fn host_parse_document(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_parse_document<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let html = host_arg_string(ctx, args, 0);
     let content_type = args
         .get(1)
-        .filter(|value| !matches!(value, Value::Undefined))
+        .filter(|value| !matches!(value.kind(), ValueKind::Undefined))
         .map(|_| host_arg_string(ctx, args, 1))
         .unwrap_or_else(|| "text/html".into());
     // XHR #document-response step 8 sets the decoded document's encoding;
@@ -23956,7 +24387,10 @@ fn host_parse_document(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
     let dom = host_dom(ctx);
     // A fourth argument true: Document.parseHTMLUnsafe()'s document, which
     // allows declarative shadow roots.
-    let declarative = matches!(args.get(3), Some(Value::Bool(true)));
+    let declarative = matches!(
+        args.get(3).map(|value| value.kind()),
+        Some(ValueKind::Bool(true))
+    );
     let id = if content_type == "text/html" {
         dom.borrow_mut()
             .parse_document_into_with(&html, declarative)
@@ -23971,13 +24405,13 @@ fn host_parse_document(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
 }
 
 /// An encoding name (or label) argument; absent or unknown means UTF-8.
-fn host_arg_encoding(
-    ctx: &mut Ctx,
-    args: &[Value],
+fn host_arg_encoding<'s>(
+    ctx: &mut Ctx<'s>,
+    args: &[Value<'s>],
     index: usize,
 ) -> &'static encoding_rs::Encoding {
-    match args.get(index) {
-        Some(Value::Str(_)) => {
+    match args.get(index).map(|value| value.kind()) {
+        Some(ValueKind::Str(_)) => {
             encoding_rs::Encoding::for_label(host_arg_string(ctx, args, index).as_bytes())
                 .unwrap_or(encoding_rs::UTF_8)
         }
@@ -23986,37 +24420,45 @@ fn host_arg_encoding(
 }
 
 /// DOM #dom-document-characterset: the name of a document's encoding.
-fn host_document_encoding(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_document_encoding<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let dom = host_dom(ctx);
     let dom = dom.borrow();
     let encoding =
         host_arg_node(&dom, args, 0).map_or(encoding_rs::UTF_8, |id| dom.document_encoding(id));
-    Ok(Value::from_engine_text(encoding.name()))
+    Ok(ctx.string_from_engine_text(encoding.name()))
 }
 
 /// Decoded document text and its encoding's name, as a two-element array.
-fn host_decoded_document(
-    ctx: &mut Ctx,
+fn host_decoded_document<'s>(
+    ctx: &mut Ctx<'s>,
     decoded: crate::document_encoding::DecodedDocument,
-) -> Value {
+) -> Value<'s> {
     ctx.make_array(vec![
-        Value::from_string(decoded.text),
-        Value::from_engine_text(decoded.encoding.name()),
+        ctx.string(decoded.text),
+        ctx.string_from_engine_text(decoded.encoding.name()),
     ])
 }
 
 /// HTML #read-html, #read-xml and #read-text for a nested navigable's
 /// response: (bytes, Content-Type, response URL, container Document's
 /// encoding name when same origin, or null) → [text, encoding name].
-fn host_document_decode(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_document_decode<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let bytes = args
         .first()
         .and_then(|value| ctx.buffer_source_bytes(value, true))
         .ok_or_else(|| ctx.make_error("TypeError", "Document body is not a BufferSource"))?;
     let content_type = host_arg_string(ctx, args, 1);
     let url = host_arg_usv(ctx, args, 2);
-    let container = match args.get(3) {
-        Some(Value::Str(_)) => {
+    let container = match args.get(3).map(|value| value.kind()) {
+        Some(ValueKind::Str(_)) => {
             encoding_rs::Encoding::for_label(host_arg_string(ctx, args, 3).as_bytes())
         }
         _ => None,
@@ -24038,16 +24480,23 @@ fn host_document_decode(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
 /// name]. With `html`, #document-response step 5 for an HTML document (the
 /// final encoding's label, else the prescan, else UTF-8); otherwise
 /// #text-response's Encoding #decode with the label's fallback encoding.
-fn host_xhr_decode(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_xhr_decode<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let bytes = args
         .first()
         .and_then(|value| ctx.buffer_source_bytes(value, true))
         .ok_or_else(|| ctx.make_error("TypeError", "Response body is not a BufferSource"))?;
-    let label = match args.get(1) {
-        Some(Value::Str(_)) => Some(host_arg_string(ctx, args, 1)),
+    let label = match args.get(1).map(|value| value.kind()) {
+        Some(ValueKind::Str(_)) => Some(host_arg_string(ctx, args, 1)),
         _ => None,
     };
-    let decoded = if matches!(args.get(2), Some(Value::Bool(true))) {
+    let decoded = if matches!(
+        args.get(2).map(|value| value.kind()),
+        Some(ValueKind::Bool(true))
+    ) {
         crate::document_encoding::decode_xhr_html(&bytes, label.as_deref())
     } else {
         crate::document_encoding::decode_with_label(&bytes, label.as_deref())
@@ -24060,15 +24509,19 @@ fn host_xhr_decode(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
 /// character reference in data/annotation state"): (text after the U+0026,
 /// additional allowed character or null) → [code units consumed, characters],
 /// or null when nothing is consumed and the ampersand stays literal.
-fn host_html_char_ref(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_html_char_ref<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let input = host_arg_string(ctx, args, 0);
-    let additional = match args.get(1) {
-        Some(Value::Str(_)) => host_arg_string(ctx, args, 1).chars().next(),
+    let additional = match args.get(1).map(|value| value.kind()) {
+        Some(ValueKind::Str(_)) => host_arg_string(ctx, args, 1).chars().next(),
         _ => None,
     };
     Ok(match consume_character_reference(&input, additional) {
         Some((consumed, text)) => {
-            ctx.make_array(vec![Value::Num(consumed as f64), Value::from_string(text)])
+            ctx.make_array(vec![Value::Num(consumed as f64), ctx.string(text)])
         }
         None => Value::Null,
     })
@@ -24140,24 +24593,36 @@ fn consume_character_reference(input: &str, additional: Option<char>) -> Option<
     Some((consumed, text))
 }
 
-fn host_create_document(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_create_document<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let content_type = host_arg_string(ctx, args, 0);
     let id = host_dom(ctx).borrow_mut().create_document(&content_type);
     Ok(host_id_value(Some(id)))
 }
 
-fn host_document_content_type(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_document_content_type<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let dom = host_dom(ctx);
     let dom = dom.borrow();
     let content_type = host_arg_node(&dom, args, 0)
         .map(|id| dom.document_content_type(id))
         .unwrap_or("text/html");
-    Ok(Value::from_engine_text(content_type))
+    Ok(ctx.string_from_engine_text(content_type))
 }
 
 /// Whether the Document is an inert template contents owner document (HTML
 /// #appropriate-template-contents-owner-document): its URL is about:blank.
-fn host_template_document(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_template_document<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let dom = host_dom(ctx);
     let dom = dom.borrow();
     Ok(Value::Bool(
@@ -24165,7 +24630,11 @@ fn host_template_document(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result
     ))
 }
 
-fn host_document_quirks(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_document_quirks<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let dom = host_dom(ctx);
     let dom = dom.borrow();
     Ok(Value::Bool(host_arg_node(&dom, args, 0).is_some_and(
@@ -24173,17 +24642,21 @@ fn host_document_quirks(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
     )))
 }
 
-fn host_pi_target(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_pi_target<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let dom = host_dom(ctx);
     let dom = dom.borrow();
     let target = match host_arg_node(&dom, args, 0).map(|id| &dom.node(id).data) {
         Some(NodeData::ProcessingInstruction { target, .. }) => target.as_str(),
         _ => "",
     };
-    Ok(Value::from_engine_text(target))
+    Ok(ctx.string_from_engine_text(target))
 }
 
-fn host_creation_document(dom: &Dom, args: &[Value], index: usize) -> usize {
+fn host_creation_document<'s>(dom: &Dom, args: &[Value<'s>], index: usize) -> usize {
     host_arg_node(dom, args, index)
         .filter(|&id| matches!(dom.node(id).data, NodeData::Document))
         .unwrap_or(dom.document())
@@ -24191,7 +24664,11 @@ fn host_creation_document(dom: &Dom, args: &[Value], index: usize) -> usize {
 
 /// DOM #dom-domimplementation-createdocumenttype: a new doctype whose node
 /// document is the creation document (argument 3).
-fn host_create_doctype(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_create_doctype<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let name = host_arg_string(ctx, args, 0);
     let public_id = host_arg_string(ctx, args, 1);
     let system_id = host_arg_string(ctx, args, 2);
@@ -24206,7 +24683,11 @@ fn host_create_doctype(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
 /// DOM #dom-documenttype-name, #dom-documenttype-publicid and
 /// #dom-documenttype-systemid: `[name, publicId, systemId]`, or `null` for
 /// any other node.
-fn host_doctype(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_doctype<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let dom = host_dom(ctx);
     let info = {
         let dom = dom.borrow();
@@ -24216,15 +24697,19 @@ fn host_doctype(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Va
     };
     Ok(match info {
         Some(info) => ctx.make_array(vec![
-            Value::from_engine_text(info.name),
-            Value::from_engine_text(info.public_id),
-            Value::from_engine_text(info.system_id),
+            ctx.string_from_engine_text(info.name),
+            ctx.string_from_engine_text(info.public_id),
+            ctx.string_from_engine_text(info.system_id),
         ]),
         None => Value::Null,
     })
 }
 
-fn host_create_comment(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_create_comment<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let text = host_arg_string(ctx, args, 0);
     let dom = host_dom(ctx);
     let mut dom = dom.borrow_mut();
@@ -24236,7 +24721,11 @@ fn host_create_comment(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
 
 /// DOM #dom-document-createcdatasection; the prelude rejects HTML documents
 /// and data containing "]]>" first.
-fn host_create_cdata(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_create_cdata<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let data = host_arg_string(ctx, args, 0);
     let dom = host_dom(ctx);
     let mut dom = dom.borrow_mut();
@@ -24248,11 +24737,11 @@ fn host_create_cdata(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
 
 /// DOM #dom-document-createprocessinginstruction; the prelude validates the
 /// target and data first.
-fn host_create_processing_instruction(
-    ctx: &mut Ctx,
-    _this: Value,
-    args: &[Value],
-) -> Result<Value, Value> {
+fn host_create_processing_instruction<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let target = host_arg_string(ctx, args, 0);
     let data = host_arg_string(ctx, args, 1);
     let dom = host_dom(ctx);
@@ -24268,7 +24757,7 @@ fn host_create_processing_instruction(
 /// DOM #concept-node-pre-insert / #concept-node-append after
 /// #concept-node-ensure-pre-insertion-validity: true once inserted, false for
 /// a HierarchyRequestError and -1 for a NotFoundError (nothing mutated).
-fn pre_insert_result(result: Result<(), crate::dom::PreInsertError>) -> Value {
+fn pre_insert_result<'s>(result: Result<(), crate::dom::PreInsertError>) -> Value<'s> {
     match result {
         Ok(()) => Value::Bool(true),
         Err(crate::dom::PreInsertError::HierarchyRequest) => Value::Bool(false),
@@ -24280,9 +24769,9 @@ fn pre_insert_result(result: Result<(), crate::dom::PreInsertError>) -> Value {
 /// traversable's arena of the browsing context group holds it, with that
 /// arena. Inserting or adopting such a node adopts it across the arenas
 /// (`Dom::transplant_subtree`), keeping its identity.
-fn foreign_node_argument(
-    ctx: &mut Ctx,
-    args: &[Value],
+fn foreign_node_argument<'s>(
+    ctx: &mut Ctx<'s>,
+    args: &[Value<'s>],
     index: usize,
 ) -> Option<(usize, Rc<RefCell<Dom>>)> {
     if !SEVERAL_TRAVERSABLES.with(Cell::get) {
@@ -24290,7 +24779,7 @@ fn foreign_node_argument(
     }
     let state = ctx.host_mut::<HostState>()?;
     let node = match args.get(index)? {
-        value @ Value::Obj(_) => state.dom_gc.node_identity(value),
+        value if value.as_obj().is_some() => state.dom_gc.node_identity(value),
         value => value
             .as_num_opt()
             .filter(|number| number.is_finite() && *number >= 0.0 && number.fract() == 0.0)
@@ -24343,7 +24832,7 @@ fn adopt_foreign_insertion(
 
 /// Media elements that moved to another traversable's Document of the
 /// group play on there, heard as that traversable's mute says.
-fn follow_moved_media(ctx: &mut Ctx) {
+fn follow_moved_media<'s>(ctx: &mut Ctx<'s>) {
     if let Some(state) = ctx.host_mut::<HostState>()
         && !state.muted_traversables.is_empty()
     {
@@ -24351,7 +24840,11 @@ fn follow_moved_media(ctx: &mut Ctx) {
     }
 }
 
-fn host_append(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_append<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let foreign = foreign_node_argument(ctx, args, 1);
     let moved = foreign.is_some();
     let dom = host_dom(ctx);
@@ -24392,7 +24885,11 @@ fn host_append(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Val
 /// 2 and 3 only validate, as modes 0 and 1 would: a DocumentFragment's
 /// children are inserted one by one by the caller. Mode 4 only validates,
 /// excluding every child (DOM #dom-parentnode-replacechildren).
-fn host_insert_before(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_insert_before<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let foreign = foreign_node_argument(ctx, args, 1);
     let dom = host_dom(ctx);
     let mut dom = dom.borrow_mut();
@@ -24447,7 +24944,11 @@ fn host_insert_before(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Val
     Ok(Value::Bool(true))
 }
 
-fn host_detach(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_detach<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let dom = host_dom(ctx);
     let mut dom = dom.borrow_mut();
     if let Some(id) = host_arg_node(&dom, args, 0) {
@@ -24456,18 +24957,22 @@ fn host_detach(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Val
     Ok(Value::Undefined)
 }
 
-fn host_owner_document(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    if let Some(value @ Value::Obj(_)) = args.first() {
+fn host_owner_document<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
+    if let Some(value) = args.first().filter(|value| value.as_obj().is_some()) {
         let state = ctx.host_mut::<HostState>().expect("DOM host");
         let document = state
             .dom_gc
             .node_identity(value)
             .and_then(|node| state.dom.borrow().owner_document(node));
-        return Ok(document
+        let owner = document
             .and_then(|node| state.dom_gc.documents.get(&node))
             .and_then(|owner| state.dom_gc.owners.get(owner))
-            .map(|entry| entry.value.clone())
-            .unwrap_or_else(|| host_id_value(document)));
+            .map(|entry| entry.value.clone());
+        return Ok(live_owner(ctx, owner).unwrap_or_else(|| host_id_value(document)));
     }
     let dom = host_dom(ctx);
     let dom = dom.borrow();
@@ -24478,7 +24983,11 @@ fn host_owner_document(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
 
 /// DOM Standard §4.5's adopt algorithm. Negative values are an internal result enum interpreted by
 /// the prelude, which exposes the required Web IDL exceptions and custom-element reactions.
-fn host_adopt(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_adopt<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let foreign = foreign_node_argument(ctx, args, 1);
     let moved = foreign.is_some();
     let dom = host_dom(ctx);
@@ -24516,7 +25025,11 @@ fn host_adopt(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Valu
     Ok(Value::Num(result))
 }
 
-fn host_parent(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_parent<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let dom = host_dom(ctx);
     let dom = dom.borrow();
     Ok(host_id_value(host_arg_node(&dom, args, 0).and_then(|id| {
@@ -24526,7 +25039,11 @@ fn host_parent(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Val
     })))
 }
 
-fn host_form_owner(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_form_owner<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let dom = host_dom(ctx);
     let dom = dom.borrow();
     Ok(host_id_value(
@@ -24534,7 +25051,11 @@ fn host_form_owner(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
     ))
 }
 
-fn host_form_named_items(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_form_named_items<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let handle = host_dom(ctx);
     let dom = handle.borrow();
     let mut items = Vec::new();
@@ -24549,15 +25070,19 @@ fn host_form_named_items(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
             items.extend([
                 Value::Num(node as f64),
                 Value::Bool(image),
-                Value::from_engine_text(id.to_owned()),
-                Value::from_engine_text(name.to_owned()),
+                ctx.string_from_engine_text(id.to_owned()),
+                ctx.string_from_engine_text(name.to_owned()),
             ]);
         }
     }
     Ok(ctx.make_array(items))
 }
 
-fn host_window_named_items(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_window_named_items<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     #[cfg(test)]
     if let Some(state) = ctx.host_mut::<HostState>() {
         state.test_hooks.window_named_exports += 1;
@@ -24570,8 +25095,8 @@ fn host_window_named_items(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resul
             items.extend([
                 Value::Num(node as f64),
                 Value::Bool(frame),
-                Value::from_engine_text(id.to_owned()),
-                Value::from_engine_text(name.to_owned()),
+                ctx.string_from_engine_text(id.to_owned()),
+                ctx.string_from_engine_text(name.to_owned()),
             ]);
         }
     }
@@ -24581,7 +25106,11 @@ fn host_window_named_items(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resul
 /// HTML child-navigable ownership crosses DOM shadow-root/host links. It
 /// must not depend on which Realm has already constructed a wrapper for the
 /// root, or whether the shadow root is exposed to author JavaScript.
-fn host_frame_owner(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_frame_owner<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let dom = host_dom(ctx);
     let dom = dom.borrow();
     Ok(host_id_value(
@@ -24589,7 +25118,11 @@ fn host_frame_owner(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
     ))
 }
 
-fn host_frame_document(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_frame_document<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let dom = host_dom(ctx);
     let dom = dom.borrow();
     Ok(host_id_value(
@@ -24597,7 +25130,11 @@ fn host_frame_document(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
     ))
 }
 
-fn host_is_connected(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_is_connected<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let dom = host_dom(ctx);
     let dom = dom.borrow();
     Ok(Value::Bool(
@@ -24608,7 +25145,11 @@ fn host_is_connected(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
 /// Batch the current connectedness of deferred static-NodeList results. The
 /// IDs originate in a native query array, but validate every value because the
 /// host functions are also visible to page JavaScript.
-fn host_connected_many(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_connected_many<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let Some(array) = args.first().cloned() else {
         return Ok(ctx.make_array(Vec::new()));
     };
@@ -24637,13 +25178,21 @@ fn host_connected_many(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
     Ok(ctx.make_array(values))
 }
 
-fn host_dom_epoch(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+fn host_dom_epoch<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    _args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let dom = host_dom(ctx);
     let epoch = dom.borrow().epoch();
     Ok(Value::Num(epoch as f64))
 }
 
-fn host_window_names_epoch(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+fn host_window_names_epoch<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    _args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let dom = host_dom(ctx);
     let epoch = dom.borrow().window_names_epoch();
     Ok(Value::Num(epoch as f64))
@@ -24651,11 +25200,11 @@ fn host_window_names_epoch(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Resu
 
 /// Install TRust JS's native Web IDL indexed-property internal methods on a freshly-created
 /// platform object.
-fn host_install_readonly_indexed(
-    ctx: &mut Ctx,
-    _this: Value,
-    args: &[Value],
-) -> Result<Value, Value> {
+fn host_install_readonly_indexed<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let target = args.first().cloned().unwrap_or(Value::Undefined);
     let length = args
         .get(1)
@@ -24673,7 +25222,11 @@ fn host_install_readonly_indexed(
     Ok(Value::Bool(true))
 }
 
-fn host_contains(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_contains<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let dom = host_dom(ctx);
     let dom = dom.borrow();
     let contains = match (host_arg_node(&dom, args, 0), host_arg_node(&dom, args, 1)) {
@@ -24697,10 +25250,14 @@ fn host_contains(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, V
 
 /// HTML #scroll-to-the-fragment-identifier's target element update for the
 /// calling Realm's Document (argument 1; the top-level Document if absent).
-fn host_fragment_target(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_fragment_target<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let fragment = args
         .first()
-        .filter(|v| !matches!(v, Value::Undefined | Value::Null))
+        .filter(|v| !matches!(v.kind(), ValueKind::Undefined | ValueKind::Null))
         .map(|_| host_arg_string(ctx, args, 0));
     let dom = host_dom(ctx);
     let document = args
@@ -24714,7 +25271,11 @@ fn host_fragment_target(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
     Ok(target.map_or(Value::Null, |node| Value::Num(node as f64)))
 }
 
-fn host_set_hover(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_set_hover<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let target = args
         .first()
         .and_then(Value::as_num_opt)
@@ -24725,7 +25286,11 @@ fn host_set_hover(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
     Ok(Value::Bool(affected))
 }
 
-fn host_focus(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_focus<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let dom = host_dom(ctx);
     let mut dom = dom.borrow_mut();
     let Some(document) = host_arg_node(&dom, args, 0) else {
@@ -24740,7 +25305,11 @@ fn host_focus(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Valu
         .map_or(Value::Null, |node| Value::Num(node as f64)))
 }
 
-fn host_children(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_children<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let dom = host_dom(ctx);
     let ids = {
         let dom = dom.borrow();
@@ -24756,7 +25325,11 @@ fn host_children(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, V
 }
 
 /// DOM Standard §4.2.2.4 assigned-nodes lookup for `HTMLSlotElement.assignedNodes()`.
-fn host_slot_assigned(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_slot_assigned<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let dom = host_dom(ctx);
     let ids = {
         let dom = dom.borrow();
@@ -24770,7 +25343,11 @@ fn host_slot_assigned(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Val
 /// DOM Standard §4.2.2.3 assigned-slot lookup. Unlike the public
 /// `assignedSlot` getter, this internal primitive intentionally returns slots
 /// in closed roots: Node's event-parent algorithm must traverse them.
-fn host_assigned_slot(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_assigned_slot<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let dom = host_dom(ctx);
     let dom = dom.borrow();
     Ok(host_id_value(
@@ -24782,7 +25359,11 @@ fn host_assigned_slot(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Val
 /// (Element or Text) arguments as distinct node ids. Returns whether a slot
 /// change was signalled, in which case the platform queues a mutation
 /// observer microtask (DOM #signal-a-slot-change).
-fn host_slot_assign(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_slot_assign<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let array = args.get(1).cloned().unwrap_or(Value::Undefined);
     let limit = ctx
         .host_mut::<HostState>()
@@ -24810,8 +25391,15 @@ fn host_slot_assign(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
 /// `__dom_slot_check(node, childrenChanged)`: the slot-assignment steps of a
 /// completed tree or attribute mutation at `node` (see
 /// `Dom::slot_mutation_check`). Returns whether a slot change was signalled.
-fn host_slot_check(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let children_changed = matches!(args.get(1), Some(Value::Bool(true)));
+fn host_slot_check<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
+    let children_changed = matches!(
+        args.get(1).map(|value| value.kind()),
+        Some(ValueKind::Bool(true))
+    );
     let dom = host_dom(ctx);
     let mut dom = dom.borrow_mut();
     let signalled = host_arg_node(&dom, args, 0)
@@ -24829,7 +25417,11 @@ fn host_slot_check(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
 /// focusNode, focusOffset)` returns `[text, segment rows, [placeholder,
 /// offset, …], [anchor offset, focus offset]]`. A null anchor or focus maps
 /// no point. Elements' `display` values are the resolved ones script reads.
-fn host_editable_model(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_editable_model<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     sync_css_transitions(ctx);
     let (host, points) = {
         let dom = host_dom(ctx);
@@ -24879,16 +25471,12 @@ fn host_editable_model(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
             .collect(),
     );
     let result = ctx.make_array(vec![
-        Value::from_engine_text(model.text),
+        ctx.string_from_engine_text(model.text),
         segments,
         placeholders,
         points,
     ]);
-    if let Some(state) = ctx.host_mut::<HostState>() {
-        state
-            .dom_gc
-            .retain(result.clone(), ids, DomGcOwnerKind::IdArray);
-    }
+    retain_dom_owner(ctx, &result, ids, DomGcOwnerKind::IdArray);
     Ok(result)
 }
 
@@ -24903,14 +25491,21 @@ fn host_editable_model(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
 /// null; `("parsed", document)` returns the autofocus elements in the
 /// accessible Document's document tree in tree order (those its parser
 /// inserted before its Realm ran).
-fn host_autofocus(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_autofocus<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let op = host_arg_string(ctx, args, 0);
     let caller = ctx.host_job_context();
     let state = ctx.host_mut::<HostState>().expect("DOM host");
     let handle = state.dom.clone();
     let ids = match op.as_str() {
         "record" => {
-            let recording = matches!(args.get(1), Some(Value::Bool(true)));
+            let recording = matches!(
+                args.get(1).map(|value| value.kind()),
+                Some(ValueKind::Bool(true))
+            );
             handle.borrow_mut().set_autofocus_recording(recording);
             return Ok(Value::Undefined);
         }
@@ -24946,15 +25541,15 @@ fn host_autofocus(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
         return Ok(Value::Null);
     }
     let array = ctx.make_array(ids.iter().map(|&id| Value::Num(id as f64)).collect());
-    if let Some(state) = ctx.host_mut::<HostState>() {
-        state
-            .dom_gc
-            .retain(array.clone(), ids, DomGcOwnerKind::IdArray);
-    }
+    retain_dom_owner(ctx, &array, ids, DomGcOwnerKind::IdArray);
     Ok(array)
 }
 
-fn host_track_changes(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+fn host_track_changes<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    _args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let caller = ctx.host_job_context();
     let state = ctx.host_mut::<HostState>().expect("DOM host");
     let handle = state.dom.clone();
@@ -24991,16 +25586,19 @@ fn host_track_changes(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Va
         ids.extend([track, media]);
     }
     let array = ctx.make_array(values);
-    if let Some(state) = ctx.host_mut::<HostState>() {
-        state
-            .dom_gc
-            .retain(array.clone(), ids, DomGcOwnerKind::IdArray);
-    }
+    retain_dom_owner(ctx, &array, ids, DomGcOwnerKind::IdArray);
     Ok(array)
 }
 
-fn host_slot_signals(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let take = matches!(args.first(), Some(Value::Bool(true)));
+fn host_slot_signals<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
+    let take = matches!(
+        args.first().map(|value| value.kind()),
+        Some(ValueKind::Bool(true))
+    );
     let caller = ctx.host_job_context();
     let state = ctx.host_mut::<HostState>().expect("DOM host");
     let handle = state.dom.clone();
@@ -25030,9 +25628,19 @@ fn host_slot_signals(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
 /// foreignChild, checkOnly)` validates (steps 1–6) and, unless `checkOnly`,
 /// relocates the node. The result is `__dom_insert_before`'s: true, false for
 /// a HierarchyRequestError, -1 for a NotFoundError.
-fn host_move_before(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let foreign_child = matches!(args.get(3), Some(Value::Bool(true)));
-    let check_only = matches!(args.get(4), Some(Value::Bool(true)));
+fn host_move_before<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
+    let foreign_child = matches!(
+        args.get(3).map(|value| value.kind()),
+        Some(ValueKind::Bool(true))
+    );
+    let check_only = matches!(
+        args.get(4).map(|value| value.kind()),
+        Some(ValueKind::Bool(true))
+    );
     let dom = host_dom(ctx);
     let mut dom = dom.borrow_mut();
     let (Some(parent), Some(node)) = (host_arg_node(&dom, args, 0), host_arg_node(&dom, args, 1))
@@ -25043,7 +25651,11 @@ fn host_move_before(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
     };
     let child = host_arg_node(&dom, args, 2);
     let foreign_child = foreign_child
-        || (child.is_none() && !matches!(args.get(2), None | Some(Value::Null | Value::Undefined)));
+        || (child.is_none()
+            && !matches!(
+                args.get(2).map(|value| value.kind()),
+                None | Some(ValueKind::Null | ValueKind::Undefined)
+            ));
     if let Err(error) = dom.ensure_move_validity(node, parent, child, foreign_child) {
         return Ok(pre_insert_result(Err(error)));
     }
@@ -25056,7 +25668,7 @@ fn host_move_before(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
 
 /// A custom element registry crossing the boundary: null, 0 for the node
 /// document's global registry, or a scoped registry's positive number.
-fn registry_value(registry: CustomElementRegistryRef) -> Value {
+fn registry_value<'s>(registry: CustomElementRegistryRef) -> Value<'s> {
     match registry {
         CustomElementRegistryRef::Null => Value::Null,
         CustomElementRegistryRef::Global => Value::Num(0.0),
@@ -25065,9 +25677,11 @@ fn registry_value(registry: CustomElementRegistryRef) -> Value {
 }
 
 /// The inverse of `registry_value`; None for any other value.
-fn registry_arg(value: Option<&Value>) -> Option<CustomElementRegistryRef> {
+fn registry_arg<'s>(value: Option<&Value<'s>>) -> Option<CustomElementRegistryRef> {
     match value {
-        Some(Value::Null) => Some(CustomElementRegistryRef::Null),
+        Some(value) if matches!(value.kind(), ValueKind::Null) => {
+            Some(CustomElementRegistryRef::Null)
+        }
         Some(value) => {
             let number = value.as_num_opt()?;
             if number == 0.0 {
@@ -25092,7 +25706,11 @@ fn registry_arg(value: Option<&Value>) -> Option<CustomElementRegistryRef> {
 /// "initialize" (HTML #dom-customelementregistry-initialize steps 2–4,
 /// returning the candidates to try to upgrade) or "live" (the scoped
 /// registry numbers nodes still use).
-fn host_custom_registry(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_custom_registry<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let op = host_arg_string(ctx, args, 0);
     let dom = host_dom(ctx);
     match op.as_str() {
@@ -25136,7 +25754,11 @@ fn host_custom_registry(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
     }
 }
 
-fn host_next(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_next<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let dom = host_dom(ctx);
     let dom = dom.borrow();
     Ok(host_id_value(
@@ -25144,7 +25766,11 @@ fn host_next(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value
     ))
 }
 
-fn host_prev(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_prev<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let dom = host_dom(ctx);
     let dom = dom.borrow();
     Ok(host_id_value(
@@ -25152,7 +25778,11 @@ fn host_prev(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value
     ))
 }
 
-fn host_clock_set(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_clock_set<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let epoch_ms = match args.first() {
         Some(value) => ctx.coerce_number(value)?,
         None => f64::NAN,
@@ -25163,7 +25793,11 @@ fn host_clock_set(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
     Ok(Value::Undefined)
 }
 
-fn host_clock_now(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+fn host_clock_now<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    _args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     Ok(Value::Num(
         ctx.host_mut::<HostState>()
             .map(|state| state.clock.now_ms())
@@ -25171,7 +25805,11 @@ fn host_clock_now(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value,
     ))
 }
 
-fn host_node_type(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_node_type<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let dom = host_dom(ctx);
     let dom = dom.borrow();
     let node_type = match host_arg_node(&dom, args, 0).map(|id| &dom.node(id).data) {
@@ -25188,12 +25826,16 @@ fn host_node_type(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
     Ok(Value::Num(node_type as f64))
 }
 
-fn host_tag(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_tag<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let dom = host_dom(ctx);
     let dom = dom.borrow();
     Ok(
         match host_arg_node(&dom, args, 0).and_then(|id| dom.tag_name(id)) {
-            Some(tag) => Value::from_engine_text(tag.to_owned()),
+            Some(tag) => ctx.string_from_engine_text(tag.to_owned()),
             None => Value::Null,
         },
     )
@@ -25201,7 +25843,11 @@ fn host_tag(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value>
 
 /// Whether an element's `tagName` is its HTML-uppercased qualified name
 /// (DOM #dom-element-tagname): see [`Dom::is_html_element_in_html_document`].
-fn host_html_uppercased(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_html_uppercased<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let dom = host_dom(ctx);
     let dom = dom.borrow();
     Ok(Value::Bool(host_arg_node(&dom, args, 0).is_some_and(
@@ -25209,18 +25855,26 @@ fn host_html_uppercased(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
     )))
 }
 
-fn host_namespace(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_namespace<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let dom = host_dom(ctx);
     let dom = dom.borrow();
     Ok(
         match host_arg_node(&dom, args, 0).and_then(|id| dom.namespace_uri(id)) {
-            Some(namespace) => Value::from_engine_text(namespace.to_owned()),
+            Some(namespace) => ctx.string_from_engine_text(namespace.to_owned()),
             None => Value::Null,
         },
     )
 }
 
-fn host_element_name(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_element_name<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let dom = host_dom(ctx);
     let dom = dom.borrow();
     let Some(id) = host_arg_node(&dom, args, 0) else {
@@ -25230,29 +25884,37 @@ fn host_element_name(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
         return Ok(Value::Null);
     };
     Ok(ctx.make_array(vec![
-        Value::from_engine_text(local_name.to_owned()),
+        ctx.string_from_engine_text(local_name.to_owned()),
         dom.namespace_uri(id)
-            .map(|namespace| Value::from_engine_text(namespace.to_owned()))
+            .map(|namespace| ctx.string_from_engine_text(namespace.to_owned()))
             .unwrap_or(Value::Null),
         dom.namespace_prefix(id)
-            .map(|prefix| Value::from_engine_text(prefix.to_owned()))
+            .map(|prefix| ctx.string_from_engine_text(prefix.to_owned()))
             .unwrap_or(Value::Null),
     ]))
 }
 
-fn host_get_attr(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_get_attr<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let name = host_arg_string(ctx, args, 1);
     let dom = host_dom(ctx);
     let dom = dom.borrow();
     Ok(
         match host_arg_node(&dom, args, 0).and_then(|id| dom.get_attribute(id, &name)) {
-            Some(value) => Value::from_engine_text(value.to_owned()),
+            Some(value) => ctx.string_from_engine_text(value.to_owned()),
             None => Value::Null,
         },
     )
 }
 
-fn host_input(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_input<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let op = host_arg_string(ctx, args, 1);
     let arg = args.get(2).cloned().unwrap_or(Value::Undefined);
     let dom = host_dom(ctx);
@@ -25292,7 +25954,7 @@ fn host_input(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Valu
     // HTML #designMode: a Document's design mode enabled flag.
     if op == "design-mode" {
         if let Some(document) = host_arg_node(&dom, args, 0) {
-            dom.set_design_mode(document, matches!(arg, Value::Bool(true)));
+            dom.set_design_mode(document, matches!(arg.kind(), ValueKind::Bool(true)));
         }
         return Ok(Value::Undefined);
     }
@@ -25303,8 +25965,8 @@ fn host_input(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Valu
         drop(dom);
         let text = host_arg_string(ctx, args, 2);
         return Ok(match crate::dom::text_node_directionality(&text) {
-            Some(true) => Value::from_engine_text(String::from("rtl")),
-            Some(false) => Value::from_engine_text(String::from("ltr")),
+            Some(true) => ctx.string_from_engine_text(String::from("rtl")),
+            Some(false) => ctx.string_from_engine_text(String::from("ltr")),
             None => Value::Null,
         });
     }
@@ -25328,7 +25990,7 @@ fn host_input(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Valu
         let Some(id) = host_arg_node(&dom, args, 0).filter(|id| dom.tag_name(*id).is_some()) else {
             return Ok(Value::Null);
         };
-        let on = matches!(arg, Value::Bool(true));
+        let on = matches!(arg.kind(), ValueKind::Bool(true));
         return Ok(match op.as_str() {
             "constraint-validity" => Value::Num(f64::from(dom.validity_flags(id))),
             "will-validate" => Value::Bool(dom.will_validate(id)),
@@ -25388,25 +26050,25 @@ fn host_input(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Valu
             return Ok(Value::Null);
         };
         if op == "form-associated" {
-            dom.set_form_associated_custom_element(id, matches!(arg, Value::Bool(true)));
+            dom.set_form_associated_custom_element(id, matches!(arg.kind(), ValueKind::Bool(true)));
             return Ok(Value::Undefined);
         }
         if op == "is-value-get" {
             return Ok(dom.is_value_of(id).map_or(Value::Null, |value| {
-                Value::from_engine_text(value.to_owned())
+                ctx.string_from_engine_text(value.to_owned())
             }));
         }
         if op == "is-value" {
-            let value = match &arg {
-                Value::Null | Value::Undefined => None,
+            let value = match arg.kind() {
+                ValueKind::Null | ValueKind::Undefined => None,
                 _ => Some(host_arg_string(ctx, args, 2)),
             };
             dom.set_is_value(id, value.as_deref());
             return Ok(Value::Undefined);
         }
         if op == "custom-defined" {
-            let defined = match &arg {
-                Value::Bool(defined) => Some(*defined),
+            let defined = match arg.kind() {
+                ValueKind::Bool(defined) => Some(defined),
                 _ => None,
             };
             dom.set_custom_element_defined(id, defined);
@@ -25463,9 +26125,9 @@ fn host_input(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Valu
             host_dom(ctx).borrow_mut().set_input_files(id, names),
         ));
     }
-    let flag = |ctx: &mut Ctx, index: usize| -> Option<bool> {
-        match ctx.member_get(&arg, &index.to_string()).ok()? {
-            Value::Bool(value) => Some(value),
+    let flag = |ctx: &mut Ctx<'s>, index: usize| -> Option<bool> {
+        match ctx.member_get(&arg, &index.to_string()).ok()?.kind() {
+            ValueKind::Bool(value) => Some(value),
             _ => None,
         }
     };
@@ -25481,7 +26143,7 @@ fn host_input(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Valu
         ("checked-reset", Some("input")) => return Ok(Value::Bool(dom.reset_checkedness(id))),
         ("indeterminate-get", Some("input")) => return Ok(Value::Bool(dom.indeterminate(id))),
         ("indeterminate-set", Some("input")) => {
-            dom.set_indeterminate(id, matches!(arg, Value::Bool(true)));
+            dom.set_indeterminate(id, matches!(arg.kind(), ValueKind::Bool(true)));
             return Ok(Value::Undefined);
         }
         ("selected-get", Some("option")) => return Ok(Value::Bool(dom.option_selectedness(id))),
@@ -25504,12 +26166,12 @@ fn host_input(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Valu
             return Ok(host_ids_array(ctx, options));
         }
         ("raw-get", Some("textarea")) => {
-            return Ok(Value::from_engine_text(dom.textarea_api_value(id)));
+            return Ok(ctx.string_from_engine_text(dom.textarea_api_value(id)));
         }
         ("raw-dirty", Some("textarea")) => return Ok(Value::Bool(dom.textarea_dirty(id))),
         ("raw-set", Some("textarea")) => {
-            let value = match &arg {
-                Value::Null | Value::Undefined => None,
+            let value = match arg.kind() {
+                ValueKind::Null | ValueKind::Undefined => None,
                 _ => Some(host_arg_string(ctx, args, 2)),
             };
             return Ok(Value::Bool(
@@ -25547,8 +26209,8 @@ fn host_input(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Valu
             ))
         }
         _ if dom.tag_name(id) != Some("input") => Value::Null,
-        "type" => Value::from_engine_text(dom.input_type(id)),
-        "get" => Value::from_engine_text(dom.input_value(id)),
+        "type" => ctx.string_from_engine_text(dom.input_type(id)),
+        "get" => ctx.string_from_engine_text(dom.input_value(id)),
         "set" | "user" => {
             let value = host_arg_string(ctx, args, 2);
             Value::Bool(dom.set_input_value(id, &value, op == "user"))
@@ -25574,7 +26236,11 @@ fn host_input(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Valu
     })
 }
 
-fn host_set_attr(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_set_attr<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let name = host_arg_string(ctx, args, 1);
     let value = host_arg_string(ctx, args, 2);
     let dom = host_dom(ctx);
@@ -25585,7 +26251,11 @@ fn host_set_attr(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, V
     Ok(Value::Undefined)
 }
 
-fn host_remove_attr(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_remove_attr<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let name = host_arg_string(ctx, args, 1);
     let dom = host_dom(ctx);
     let mut dom = dom.borrow_mut();
@@ -25601,10 +26271,15 @@ fn host_remove_attr(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
 /// (#concept-element-attributes-remove-by-namespace) or "entries" (each
 /// attribute's namespace, prefix and local name, flattened). Null namespace or
 /// prefix arguments are the null namespace and no prefix.
-fn host_attr_ns(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_attr_ns<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let op = host_arg_string(ctx, args, 1);
-    let optional = |ctx: &mut Ctx, index: usize| match args.get(index) {
-        None | Some(Value::Null | Value::Undefined) => None,
+    let optional = |ctx: &mut Ctx<'s>, index: usize| match args.get(index).map(|value| value.kind())
+    {
+        None | Some(ValueKind::Null | ValueKind::Undefined) => None,
         Some(_) => Some(host_arg_string(ctx, args, index)),
     };
     let namespace = optional(ctx, 2);
@@ -25615,7 +26290,7 @@ fn host_attr_ns(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Va
             let dom = dom.borrow();
             Ok(host_arg_node(&dom, args, 0)
                 .and_then(|id| dom.get_attribute_ns(id, namespace.as_deref(), &local))
-                .map(|value| Value::from_engine_text(value.to_owned()))
+                .map(|value| ctx.string_from_engine_text(value.to_owned()))
                 .unwrap_or(Value::Null))
         }
         "set" => {
@@ -25644,7 +26319,7 @@ fn host_attr_ns(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Va
                             .flat_map(|(namespace, prefix, local)| {
                                 let text = |value: Option<&str>| {
                                     value.map_or(Value::Null, |value| {
-                                        Value::from_engine_text(value.to_owned())
+                                        ctx.string_from_engine_text(value.to_owned())
                                     })
                                 };
                                 [text(namespace), text(prefix), text(Some(local))]
@@ -25659,7 +26334,11 @@ fn host_attr_ns(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Va
     }
 }
 
-fn host_attr_names(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_attr_names<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let dom = host_dom(ctx);
     let names = {
         let dom = dom.borrow();
@@ -25667,10 +26346,14 @@ fn host_attr_names(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
             .map(|id| dom.attr_names(id))
             .unwrap_or_default()
     };
-    Ok(ctx.make_array(names.into_iter().map(Value::from_string).collect()))
+    Ok(ctx.make_array(names.into_iter().map(|text| ctx.string(text)).collect()))
 }
 
-fn host_text(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_text<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let dom = host_dom(ctx);
     let dom = dom.borrow();
     let text = host_arg_node(&dom, args, 0)
@@ -25680,10 +26363,14 @@ fn host_text(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value
                 .unwrap_or_else(|| dom.text_content(id))
         })
         .unwrap_or_default();
-    Ok(Value::from_engine_text(text))
+    Ok(ctx.string_from_engine_text(text))
 }
 
-fn host_set_text(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_set_text<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let text = host_arg_string(ctx, args, 1);
     let dom = host_dom(ctx);
     let mut dom = dom.borrow_mut();
@@ -25700,27 +26387,32 @@ fn host_set_text(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, V
 /// HTML #fragment-serializing-algorithm-steps with require well-formed true:
 /// the HTML serializer in an HTML document, else the XML serialization (null
 /// when it would not be well-formed; the prelude throws InvalidStateError).
-fn fragment_serialization(
+fn fragment_serialization<'s>(
+    ctx: &Ctx<'s>,
     dom: &Dom,
     id: crate::dom::NodeId,
     html: impl FnOnce() -> String,
     xml: impl FnOnce() -> Result<String, crate::dom::NotWellFormed>,
-) -> Value {
+) -> Value<'s> {
     let document = dom.owner_document(id).unwrap_or(id);
     if dom.document_content_type(document) == "text/html" {
-        Value::from_engine_text(html())
+        ctx.string_from_engine_text(html())
     } else {
-        xml().map_or(Value::Null, Value::from_engine_text)
+        xml().map_or(Value::Null, |text| ctx.string_from_engine_text(text))
     }
 }
 
-fn host_inner_html(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_inner_html<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     // getHTML(): `(node, serializableShadowRoots, shadowRootIds)`.
     if let Some(serializable) = args
         .get(1)
-        .filter(|value| !matches!(value, Value::Undefined))
+        .filter(|value| !matches!(value.kind(), ValueKind::Undefined))
     {
-        let serializable = matches!(serializable, Value::Bool(true));
+        let serializable = matches!(serializable.kind(), ValueKind::Bool(true));
         let roots_value = args.get(2).cloned().unwrap_or(Value::Undefined);
         let length = ctx
             .member_get(&roots_value, "length")
@@ -25743,30 +26435,35 @@ fn host_inner_html(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
         let markup = host_arg_node(&dom, args, 0)
             .map(|id| dom.html_with_shadow_roots(id, serializable, roots))
             .unwrap_or_default();
-        return Ok(Value::from_engine_text(markup));
+        return Ok(ctx.string_from_engine_text(markup));
     }
     let dom = host_dom(ctx);
     let dom = dom.borrow();
     Ok(match host_arg_node(&dom, args, 0) {
         Some(id) => fragment_serialization(
+            ctx,
             &dom,
             id,
             || dom.inner_html(id),
             || dom.xml_fragment_serialization(id, true),
         ),
-        None => Value::from_engine_text(String::new()),
+        None => ctx.string_from_engine_text(String::new()),
     })
 }
 
 /// HTML #dom-xmlserializer-serializetostring: the XML serialization of the
 /// node given require well-formed false.
-fn host_xml_serialize(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_xml_serialize<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let dom = host_dom(ctx);
     let dom = dom.borrow();
     let markup = host_arg_node(&dom, args, 0)
         .and_then(|id| dom.xml_serialization(id, false).ok())
         .unwrap_or_default();
-    Ok(Value::from_engine_text(markup))
+    Ok(ctx.string_from_engine_text(markup))
 }
 
 /// HTML §13.5 fragment parsing with the target element as the context. Template markup is directed
@@ -25777,9 +26474,16 @@ fn host_xml_serialize(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Val
 /// passes its own). It returns false, without mutating, when an XML
 /// document's markup is not well-formed (a SyntaxError); `checkOnly`
 /// validates without replacing.
-fn host_set_inner_html(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_set_inner_html<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let html = host_arg_string(ctx, args, 1);
-    let check_only = matches!(args.get(2), Some(Value::Bool(true)));
+    let check_only = matches!(
+        args.get(2).map(|value| value.kind()),
+        Some(ValueKind::Bool(true))
+    );
     let dom = host_dom(ctx);
     let mut dom = dom.borrow_mut();
     if let Some(id) = host_arg_node(&dom, args, 0) {
@@ -25788,8 +26492,8 @@ fn host_set_inner_html(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
         // Range.createContextualFragment(), the given context element (a new
         // body element of the node document without one), whose custom
         // element registry the parsed elements receive.
-        let (context, registry_source) = match args.get(3) {
-            None | Some(Value::Undefined) => (Some(id), id),
+        let (context, registry_source) = match args.get(3).map(|value| value.kind()) {
+            None | Some(ValueKind::Undefined) => (Some(id), id),
             Some(_) => {
                 let context = host_arg_node(&dom, args, 3);
                 let source = context
@@ -25804,7 +26508,10 @@ fn host_set_inner_html(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
         // operation removes the old children and inserts the parsed fragment.
         // A fifth argument true: setHTMLUnsafe(), whose fragment parse allows
         // declarative shadow roots (HTML #unsafely-set-html).
-        let declarative = matches!(args.get(4), Some(Value::Bool(true)));
+        let declarative = matches!(
+            args.get(4).map(|value| value.kind()),
+            Some(ValueKind::Bool(true))
+        );
         let Some(nodes) =
             dom.fragment_parse_from(id, registry_source, context, &html, check_only, declarative)
         else {
@@ -25819,26 +26526,38 @@ fn host_set_inner_html(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
 
 /// HTML #dom-element-outerhtml: fragment serializing a fictional parent
 /// whose only child is the element.
-fn host_outer_html(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_outer_html<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let dom = host_dom(ctx);
     let dom = dom.borrow();
     Ok(match host_arg_node(&dom, args, 0) {
         Some(id) => fragment_serialization(
+            ctx,
             &dom,
             id,
             || dom.serialize_js(id),
             || dom.xml_serialization(id, true),
         ),
-        None => Value::from_engine_text(String::new()),
+        None => ctx.string_from_engine_text(String::new()),
     })
 }
 
 /// `__dom_insert_adjacent(node, position, markup, checkOnly)`: false, without
 /// mutating, when an XML document's markup is not well-formed.
-fn host_insert_adjacent(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_insert_adjacent<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let position = host_arg_string(ctx, args, 1);
     let html = host_arg_string(ctx, args, 2);
-    let check_only = matches!(args.get(3), Some(Value::Bool(true)));
+    let check_only = matches!(
+        args.get(3).map(|value| value.kind()),
+        Some(ValueKind::Bool(true))
+    );
     let dom = host_dom(ctx);
     let mut dom = dom.borrow_mut();
     let Some(id) = host_arg_node(&dom, args, 0) else {
@@ -25897,11 +26616,15 @@ fn host_insert_adjacent(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
     Ok(Value::Bool(true))
 }
 
-fn host_elements_by_tag(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_elements_by_tag<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let name = host_arg_string(ctx, args, 1);
-    let namespace = match args.get(2) {
-        None | Some(Value::Undefined) => None,
-        Some(Value::Null) => Some(String::new()),
+    let namespace = match args.get(2).map(|value| value.kind()) {
+        None | Some(ValueKind::Undefined) => None,
+        Some(ValueKind::Null) => Some(String::new()),
         _ => Some(host_arg_string(ctx, args, 2)),
     };
     let dom = host_dom(ctx);
@@ -25920,9 +26643,16 @@ fn host_elements_by_tag(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
     Ok(ctx.make_array(vec![ids, Value::Num(epoch as f64), Value::Bool(connected)]))
 }
 
-fn host_elements_by_class(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_elements_by_class<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let names = host_arg_string(ctx, args, 1);
-    let document_root = matches!(args.get(2), Some(Value::Bool(true)));
+    let document_root = matches!(
+        args.get(2).map(|value| value.kind()),
+        Some(ValueKind::Bool(true))
+    );
     let dom = host_dom(ctx);
     let (ids, epoch, connected) = {
         let dom = dom.borrow();
@@ -25939,9 +26669,16 @@ fn host_elements_by_class(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result
     Ok(ctx.make_array(vec![ids, Value::Num(epoch as f64), Value::Bool(connected)]))
 }
 
-fn host_query(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_query<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let selector = host_arg_string(ctx, args, 1);
-    let first_only = matches!(args.get(2), Some(Value::Bool(true)));
+    let first_only = matches!(
+        args.get(2).map(|value| value.kind()),
+        Some(ValueKind::Bool(true))
+    );
     let Some(selector) = SelectorList::parse_cached(&selector) else {
         return Ok(Value::Null);
     };
@@ -25964,7 +26701,11 @@ fn host_query(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Valu
     }
 }
 
-fn host_matches(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_matches<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let selector = host_arg_string(ctx, args, 1);
     let Some(selector) = SelectorList::parse_cached(&selector) else {
         return Ok(Value::Null);
@@ -25975,7 +26716,11 @@ fn host_matches(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Va
     Ok(Value::Bool(matches))
 }
 
-fn host_get_by_id(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_get_by_id<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let target = host_arg_string(ctx, args, 0);
     let dom = host_dom(ctx);
     let dom = dom.borrow();
@@ -25987,7 +26732,11 @@ fn host_get_by_id(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
 
 /// HTML #upgrade-particular-elements-within-a-document's candidates:
 /// `__dom_upgrade_candidates(document, localName, registry)`.
-fn host_upgrade_candidates(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_upgrade_candidates<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let name = host_arg_string(ctx, args, 1).to_ascii_lowercase();
     let registry = registry_arg(args.get(2)).unwrap_or(CustomElementRegistryRef::Global);
     let dom = host_dom(ctx);
@@ -26003,8 +26752,15 @@ fn host_upgrade_candidates(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resul
 /// `__dom_ce_candidates(root, withRegistries)`: the custom element
 /// candidates of `root`'s composed subtree; with `withRegistries`, each id is
 /// followed by its custom element registry (see `registry_value`).
-fn host_ce_candidates(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let with_registries = matches!(args.get(1), Some(Value::Bool(true)));
+fn host_ce_candidates<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
+    let with_registries = matches!(
+        args.get(1).map(|value| value.kind()),
+        Some(ValueKind::Bool(true))
+    );
     let dom = host_dom(ctx);
     if with_registries {
         let pairs = {
@@ -26020,11 +26776,7 @@ fn host_ce_candidates(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Val
             values.push(registry_value(registry));
         }
         let array = ctx.make_array(values);
-        if let Some(state) = ctx.host_mut::<HostState>() {
-            state
-                .dom_gc
-                .retain(array.clone(), ids, DomGcOwnerKind::IdArray);
-        }
+        retain_dom_owner(ctx, &array, ids, DomGcOwnerKind::IdArray);
         return Ok(array);
     }
     let ids = {
@@ -26040,7 +26792,11 @@ fn host_ce_candidates(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Val
 /// given an event-listener list, or `null` when there are none. Connecting or disconnecting a
 /// subtree changes listener discovery (click and hover targets) only for those wrappers, so every
 /// other node needs no per-node work on insertion or removal.
-fn host_listener_subtree(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_listener_subtree<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let state = ctx.host_mut::<HostState>().expect("DOM host");
     if state.dom_gc.listener_nodes.is_empty() {
         return Ok(Value::Null);
@@ -26065,7 +26821,11 @@ fn host_listener_subtree(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
 }
 
 /// Record that the node's wrapper now owns an event-listener list (see `host_listener_subtree`).
-fn host_note_listener_node(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_note_listener_node<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let state = ctx.host_mut::<HostState>().expect("DOM host");
     let node = host_arg_node(&state.dom.borrow(), args, 0);
     if let Some(node) = node {
@@ -26077,7 +26837,11 @@ fn host_note_listener_node(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resul
 /// Whether `root`'s shadow-including inclusive subtree holds an iframe or frame element, so the
 /// navigable insertion/removal steps have work to do. An unknown node answers true: the caller
 /// then takes its general path.
-fn host_has_frames(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_has_frames<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let dom = host_dom(ctx);
     let dom = dom.borrow();
     Ok(Value::Bool(host_arg_node(&dom, args, 0).is_none_or(
@@ -26092,7 +26856,11 @@ fn host_has_frames(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
 /// 8/16/32 the node is a `script`, `link` or `base` element, 64 form-state controls, and 128 a
 /// track element parent change is journaled. One crossing replaces a query per step for the
 /// common insertion. An unknown node or parent answers every bit.
-fn host_insertion_effects(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_insertion_effects<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let state = ctx.host_mut::<HostState>().expect("DOM host");
     let dom = state.dom.borrow();
     let (Some(node), Some(parent)) = (host_arg_node(&dom, args, 0), host_arg_node(&dom, args, 1))
@@ -26152,7 +26920,11 @@ fn host_insertion_effects(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result
 /// (see `host_has_frames`), 2 a listener-bearing node, 4 the parent can change slot assignment,
 /// 8 form-state controls, and 16 a track element parent change is journaled. An unknown node or
 /// parent answers every bit.
-fn host_removal_effects(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_removal_effects<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let state = ctx.host_mut::<HostState>().expect("DOM host");
     let dom = state.dom.borrow();
     let (Some(node), Some(parent)) = (host_arg_node(&dom, args, 0), host_arg_node(&dom, args, 1))
@@ -26213,7 +26985,11 @@ fn subtree_has_listener_node(
 
 /// Whether a tree mutation at the node can change slot assignment (DOM #signal-a-slot-change).
 /// An unknown node answers true: the caller then takes its general path.
-fn host_slot_scope(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_slot_scope<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let dom = host_dom(ctx);
     let dom = dom.borrow();
     Ok(Value::Bool(
@@ -26225,7 +27001,11 @@ fn host_slot_scope(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
 /// shadow-including tree order (DOM #concept-shadow-including-tree-order).
 /// Filter in the canonical arena so scheduling does not allocate/iterate a
 /// JavaScript entry for every unrelated node after each input/DOM mutation.
-fn host_rendering_frames(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_rendering_frames<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let dom = host_dom(ctx);
     let ids = {
         let dom = dom.borrow();
@@ -26239,8 +27019,15 @@ fn host_rendering_frames(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
 }
 
 /// DOM §4.4 cloneNode, including HTML template contents via the shared arena clone algorithm.
-fn host_clone(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let deep = matches!(args.get(1), Some(Value::Bool(true)));
+fn host_clone<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
+    let deep = matches!(
+        args.get(1).map(|value| value.kind()),
+        Some(ValueKind::Bool(true))
+    );
     let dom = host_dom(ctx);
     let mut dom = dom.borrow_mut();
     // `__dom_clone(node, deep, document, fallbackRegistry)`: importNode()
@@ -26262,7 +27049,7 @@ fn host_clone(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Valu
         && document.is_none()
         && let Some(target) = args
             .get(2)
-            .filter(|value| !matches!(value, Value::Null | Value::Undefined))
+            .filter(|value| !matches!(value.kind(), ValueKind::Null | ValueKind::Undefined))
     {
         adopt_copy_into(ctx, target, copy);
     }
@@ -26272,7 +27059,7 @@ fn host_clone(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Valu
 /// importNode() into `document`, a Document of another traversable of the
 /// group: `copy`, made in the selected arena, moves to that Document's arena,
 /// which adopts it (DOM #concept-node-clone with document set to it).
-fn adopt_copy_into(ctx: &mut Ctx, document: &Value, copy: usize) {
+fn adopt_copy_into<'s>(ctx: &mut Ctx<'s>, document: &Value<'s>, copy: usize) {
     if !SEVERAL_TRAVERSABLES.with(Cell::get) {
         return;
     }
@@ -26280,7 +27067,7 @@ fn adopt_copy_into(ctx: &mut Ctx, document: &Value, copy: usize) {
         return;
     };
     let document = match document {
-        value @ Value::Obj(_) => state.dom_gc.node_identity(value),
+        value if value.as_obj().is_some() => state.dom_gc.node_identity(value),
         value => value
             .as_num_opt()
             .filter(|number| number.is_finite() && *number >= 0.0 && number.fract() == 0.0)
@@ -26305,7 +27092,11 @@ fn adopt_copy_into(ctx: &mut Ctx, document: &Value, copy: usize) {
     }
 }
 
-fn host_doc_element(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+fn host_doc_element<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    _args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let dom = host_dom(ctx);
     let dom = dom.borrow();
     Ok(host_id_value(
@@ -26334,7 +27125,7 @@ fn is_all_named_element(dom: &Dom, node: usize) -> bool {
 /// HTML #dom-htmlallcollection supported property names: every member's
 /// non-empty ID and every "all"-named member's non-empty name, in tree order,
 /// later duplicates ignored, an element's ID before its name.
-fn live_all_names(ctx: &Ctx, key: &Value) -> Vec<String> {
+fn live_all_names<'s>(ctx: &Ctx<'s>, key: &Value<'s>) -> Vec<String> {
     let (Some(members), Some(arena)) = (live_query_members(ctx, key), query_arena(ctx, key)) else {
         return Vec::new();
     };
@@ -26361,12 +27152,12 @@ fn live_all_names(ctx: &Ctx, key: &Value) -> Vec<String> {
 /// HTML #concept-get-all-named: the members, in tree order, whose ID is the
 /// name, or that are "all"-named elements with that name attribute. Returns
 /// their node IDs for the platform to wrap.
-fn live_all_named_ids(
-    ctx: &mut Ctx,
-    _this: Value,
-    args: &[Value],
-    captures: &[Value],
-) -> Result<Value, Value> {
+fn live_all_named_ids<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+    captures: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let name = host_arg_string(ctx, args, 0);
     let ids = match (
         live_query_members(ctx, &captures[0]),
@@ -26396,7 +27187,11 @@ fn live_all_named_ids(
 /// Document's descendant elements in tree order), the named getter `named`
 /// and the legacy caller `caller`. Returns `[collection, length function,
 /// all-named ID function]`.
-fn host_html_all_collection(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_html_all_collection<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let arg = |index: usize| args.get(index).cloned().unwrap_or(Value::Undefined);
     let (prototype, document, wrap, named, caller) = (arg(0), arg(1), arg(2), arg(3), arg(4));
     let root = ctx
@@ -26415,34 +27210,42 @@ fn host_html_all_collection(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
         namespace: None,
     }
     .key(root);
-    let key = Value::from_engine_text(key);
+    let key = ctx.string_from_engine_text(key);
     let getter = ctx.new_native_fn_with_captures(
         "collection item",
         1,
         live_query_collection_get,
-        vec![key.clone(), wrap, document],
+        &[key, wrap, document],
     );
     let length = ctx.new_native_fn_with_captures(
         "collection length",
         0,
         live_query_collection_length,
-        vec![key.clone()],
+        &[key],
     );
-    let named_ids =
-        ctx.new_native_fn_with_captures("all named", 1, live_all_named_ids, vec![key.clone()]);
+    let named_ids = ctx.new_native_fn_with_captures("all named", 1, live_all_named_ids, &[key]);
     let collection = ctx.make_html_all_collection(
         &prototype,
         key,
         live_query_length,
         getter,
-        (live_all_names as fn(&Ctx, &Value) -> Vec<String>, named),
+        (live_all_names as trust_js::embed::IndexedNames, named),
         caller,
     )?;
     Ok(ctx.make_array(vec![collection, length, named_ids]))
 }
 
-fn host_attach_shadow(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let flag = |index| matches!(args.get(index), Some(Value::Bool(true)));
+fn host_attach_shadow<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
+    let flag = |index: usize| {
+        matches!(
+            args.get(index).map(|value| value.kind()),
+            Some(ValueKind::Bool(true))
+        )
+    };
     let options = crate::dom::shadow::ShadowRootData {
         closed: flag(1),
         delegates_focus: flag(2),
@@ -26470,7 +27273,11 @@ fn host_attach_shadow(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Val
     Ok(host_id_value(root))
 }
 
-fn host_shadow_info(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_shadow_info<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let dom = host_dom(ctx);
     let dom = dom.borrow();
     let Some((host, data)) = host_arg_node(&dom, args, 0).and_then(|id| dom.shadow_info(id)) else {
@@ -26486,7 +27293,11 @@ fn host_shadow_info(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
     ]))
 }
 
-fn host_shadow_root(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_shadow_root<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let dom = host_dom(ctx);
     let dom = dom.borrow();
     Ok(host_id_value(
@@ -26494,7 +27305,11 @@ fn host_shadow_root(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
     ))
 }
 
-fn host_adopt_styles(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_adopt_styles<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let css = host_arg_string(ctx, args, 1);
     let dom = host_dom(ctx);
     let mut dom = dom.borrow_mut();
@@ -26504,19 +27319,27 @@ fn host_adopt_styles(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
     Ok(Value::Undefined)
 }
 
-fn host_css_parse(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_css_parse<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let css = host_arg_string(ctx, args, 0);
-    let quirks = matches!(args.get(1), Some(Value::Bool(true)));
-    Ok(Value::from_engine_text(crate::dom::parse_cssom_json(
-        &css, quirks,
-    )))
+    let quirks = matches!(
+        args.get(1).map(|value| value.kind()),
+        Some(ValueKind::Bool(true))
+    );
+    Ok(ctx.string_from_engine_text(crate::dom::parse_cssom_json(&css, quirks)))
 }
 
 /// CSSOM #dom-window-getcomputedstyle / CSS Conditional 5 #container-lengths:
 /// the first observed registered container length may occur on a hidden node,
 /// after an earlier geometry transaction had no reason to collect containers.
 /// Discover that dependency, settle it, and expose the computed value.
-fn read_layout_dependent_style<R>(ctx: &mut Ctx, read: impl Fn(&crate::dom::Dom) -> R) -> R {
+fn read_layout_dependent_style<'s, R>(
+    ctx: &mut Ctx<'s>,
+    read: impl Fn(&crate::dom::Dom) -> R,
+) -> R {
     let dom = host_dom(ctx);
     if dom.borrow().style_depends_on_layout() {
         let _ = ensure_host_geom_cache(ctx, "computed-container-query");
@@ -26533,7 +27356,11 @@ fn read_layout_dependent_style<R>(ctx: &mut Ctx, read: impl Fn(&crate::dom::Dom)
     value
 }
 
-fn host_css_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_css_style<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let op = host_arg_string(ctx, args, 0);
     let text = host_arg_string(ctx, args, 1);
     let extra = host_arg_string(ctx, args, 2);
@@ -26553,7 +27380,10 @@ fn host_css_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
         let source = host_dom(ctx)
             .borrow()
             .imported_sheet_source(&text, document);
-        return Ok(source.map_or_else(|| Value::from_engine_text("null"), Value::from_string));
+        return Ok(source.map_or_else(
+            || ctx.string_from_engine_text("null"),
+            |text| ctx.string(text),
+        ));
     }
     // HTML #critical-subresources (see `dom::style_load`): how far
     // obtaining the sheet of import URL `text` got.
@@ -26571,7 +27401,7 @@ fn host_css_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
             crate::dom::ImportState::Failed => "failed",
             crate::dom::ImportState::Unrequested => "unrequested",
         };
-        return Ok(Value::from_string(format!("\"{keyword}\"")));
+        return Ok(ctx.string(format!("\"{keyword}\"")));
     }
     // Whether the critical subresources of the style sheet that element
     // `extra` (a style or link element) has from its source are complete:
@@ -26590,7 +27420,7 @@ fn host_css_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
             .map_or(crate::dom::CriticalSubresources::Complete, |owner| {
                 dom.critical_subresources(owner, &|url| in_flight.contains(url))
             });
-        return Ok(Value::from_string(format!("\"{}\"", state.keyword())));
+        return Ok(ctx.string(format!("\"{}\"", state.keyword())));
     }
     // HTML #update-a-style-block: `text` "on" starts recording style block
     // updates; otherwise the calling Realm takes those of its Documents'
@@ -26602,10 +27432,10 @@ fn host_css_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
         let mut dom = handle.borrow_mut();
         if text == "on" {
             dom.set_style_load_recording(true);
-            return Ok(Value::from_engine_text("null"));
+            return Ok(ctx.string_from_engine_text("null"));
         }
         if !dom.has_style_block_updates() {
-            return Ok(Value::from_engine_text("[]"));
+            return Ok(ctx.string_from_engine_text("[]"));
         }
         let all = dom.take_style_block_updates();
         let mine = if state.window_realms.is_empty() {
@@ -26617,9 +27447,7 @@ fn host_css_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
             dom.restore_style_block_updates(others);
             mine
         };
-        return Ok(Value::from_string(
-            serde_json::to_string(&mine).unwrap_or_else(|_| String::from("[]")),
-        ));
+        return Ok(ctx.string(serde_json::to_string(&mine).unwrap_or_else(|_| String::from("[]"))));
     }
     // A CSSOM-inserted @import whose sheet no fetch obtained yet: `text` is
     // the absolute URL and `extra` the owner node of the importing sheet.
@@ -26632,7 +27460,7 @@ fn host_css_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
             .filter(|&id| dom.is_valid(id))
             .unwrap_or(dom.document());
         dom.request_import(owner, &text);
-        return Ok(Value::from_engine_text("null"));
+        return Ok(ctx.string_from_engine_text("null"));
     }
     // execCommand #inline-formatting-commands: CSS Color 4 components of a
     // `<color>` ([r, g, b, alpha] with alpha in 0..=255, or null), and
@@ -26642,15 +27470,15 @@ fn host_css_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
             Some(crate::render::PaintColor::Rgba(r, g, b, a)) => format!("[{r},{g},{b},{a}]"),
             _ => String::from("null"),
         };
-        return Ok(Value::from_string(json));
+        return Ok(ctx.string(json));
     }
     // CSS Font Loading 3 #fontface-interface: a FontFace attribute parsed
     // as its @font-face descriptor `text`, serialized, or null.
     if op == "font-face-descriptor" {
         let value = crate::dom::font_face_descriptor(&text, &extra);
-        return Ok(Value::from_string(
-            serde_json::to_string(&value).unwrap_or_else(|_| String::from("null")),
-        ));
+        return Ok(
+            ctx.string(serde_json::to_string(&value).unwrap_or_else(|_| String::from("null")))
+        );
     }
     if op == "legacy-color" || op == "legacy-font-size" {
         let value = if op == "legacy-color" {
@@ -26658,9 +27486,9 @@ fn host_css_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
         } else {
             crate::dom::legacy_font_size_value(&text).map(str::to_owned)
         };
-        return Ok(Value::from_string(
-            serde_json::to_string(&value).unwrap_or_else(|_| String::from("null")),
-        ));
+        return Ok(
+            ctx.string(serde_json::to_string(&value).unwrap_or_else(|_| String::from("null")))
+        );
     }
     if op == "adopted-sheets" {
         if let (Ok(scope), Ok(sheets)) = (
@@ -26675,7 +27503,7 @@ fn host_css_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
                     .collect(),
             );
         }
-        return Ok(Value::from_engine_text("null"));
+        return Ok(ctx.string_from_engine_text("null"));
     }
     if matches!(op.as_str(), "computed-names" | "computed-pseudo") {
         let value = read_layout_dependent_style(ctx, |dom| {
@@ -26723,7 +27551,7 @@ fn host_css_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
                 serde_json::Value::Null
             }
         });
-        return Ok(Value::from_engine_text(value.to_string()));
+        return Ok(ctx.string_from_engine_text(value.to_string()));
     }
     if op == "register-property" {
         let result = match (
@@ -26742,9 +27570,7 @@ fn host_css_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
             }
             _ => Err("SyntaxError"),
         };
-        return Ok(Value::from_engine_text(
-            serde_json::to_string(&result.err()).unwrap(),
-        ));
+        return Ok(ctx.string_from_engine_text(serde_json::to_string(&result.err()).unwrap()));
     }
     if op == "inline-write" {
         // `extra` is `[serialization, declarations]`: the prelude's single
@@ -26757,14 +27583,16 @@ fn host_css_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
             let mut dom = dom.borrow_mut();
             dom.set_cssom_inline_serialized(id, declarations, serialized);
         }
-        return Ok(Value::from_engine_text("null".to_string()));
+        return Ok(ctx.string_from_engine_text("null".to_string()));
     }
-    Ok(Value::from_engine_text(
-        crate::dom::cssom::operation(&op, &text, &extra).to_string(),
-    ))
+    Ok(ctx.string_from_engine_text(crate::dom::cssom::operation(&op, &text, &extra).to_string()))
 }
 
-fn host_css_sheet(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_css_sheet<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let update = host_arg_string(ctx, args, 1);
     let dom = host_dom(ctx);
     let mut dom = dom.borrow_mut();
@@ -26776,21 +27604,33 @@ fn host_css_sheet(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
     }
     Ok(dom
         .cssom_sheet_source(id)
-        .map(Value::from_string)
+        .map(|text| ctx.string(text))
         .unwrap_or(Value::Null))
 }
 
-fn host_css_supports_selector(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_css_supports_selector<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let selector = host_arg_string(ctx, args, 0);
     Ok(Value::Bool(crate::dom::selector_parses(&selector)))
 }
 
-fn host_css_supports_color(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_css_supports_color<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let value = host_arg_string(ctx, args, 0);
     Ok(Value::Bool(crate::dom::supports_color_value(&value)))
 }
 
-fn host_template_content(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_template_content<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let dom = host_dom(ctx);
     let dom = dom.borrow();
     Ok(host_id_value(
@@ -26803,17 +27643,21 @@ fn host_template_content(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
 /// `__url_parse(url, base, encoding?)`: the URL parser, given an optional
 /// base and an optional query encoding (an encoding name, for HTML
 /// #encoding-parsing-a-url). Without an encoding the query is UTF-8.
-fn host_url_parse(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_url_parse<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let href = match args.first() {
         Some(value) => ctx.coerce_string(value)?.to_string(),
         None => "undefined".to_string(),
     };
-    let base = match args.get(1) {
-        None | Some(Value::Null | Value::Undefined) => None,
+    let base = match args.get(1).filter(|value| !value.is_nullish()) {
+        None => None,
         Some(value) => Some(ctx.coerce_string(value)?.to_string()),
     };
-    let encoding = match args.get(2) {
-        None | Some(Value::Null | Value::Undefined) => encoding_rs::UTF_8,
+    let encoding = match args.get(2).filter(|value| !value.is_nullish()) {
+        None => encoding_rs::UTF_8,
         Some(value) => crate::form_encoding::encoding_for_label(ctx.coerce_string(value)?.as_ref())
             .unwrap_or(encoding_rs::UTF_8),
     };
@@ -26842,7 +27686,11 @@ fn host_url_parse(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
 ///   or `{"type": "nodes", "value": [...]}` whose items are `[0, node]`,
 ///   `[1, element, namespace, localName]` or `[2, element, prefix]` for a
 ///   namespace node, or `{"error": [name, message]}`.
-fn host_xpath(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_xpath<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     use crate::dom::xpath::{XNode, XPathConversion, XPathError, XPathExpression, XValue};
     let op = host_arg_string(ctx, args, 0);
     let source = host_arg_string(ctx, args, 1);
@@ -26932,7 +27780,7 @@ fn host_xpath(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Valu
         }
         _ => serde_json::Value::Null,
     };
-    Ok(Value::from_string(result.to_string()))
+    Ok(ctx.string(result.to_string()))
 }
 
 /// A number for JSON, whose numbers cannot be NaN or infinite: those travel
@@ -26954,24 +27802,28 @@ fn number_json(number: f64) -> serde_json::Value {
 ///   a binary string.
 /// - "urlencoded": URL #string-percent-encode-after-encoding with the
 ///   `application/x-www-form-urlencoded` percent-encode set.
-fn host_form_encode(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_form_encode<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let mode = host_arg_string(ctx, args, 0);
     let label = host_arg_string(ctx, args, 2);
     let encoding = crate::form_encoding::encoding_for_label(&label).unwrap_or(encoding_rs::UTF_8);
     match mode.as_str() {
         "pick" => {
-            let accept = match args.get(1) {
-                None | Some(Value::Null | Value::Undefined) => None,
+            let accept = match args.get(1).map(|value| value.kind()) {
+                None | Some(ValueKind::Null | ValueKind::Undefined) => None,
                 Some(_) => Some(host_arg_string(ctx, args, 1)),
             };
             let chosen =
                 crate::form_encoding::form_submission_encoding(accept.as_deref(), encoding);
-            Ok(Value::from_engine_text(chosen.name()))
+            Ok(ctx.string_from_engine_text(chosen.name()))
         }
         "html" => {
             let text = host_arg_usv(ctx, args, 1);
             let bytes = crate::form_encoding::encode_html(&text, encoding);
-            Ok(Value::from_string(
+            Ok(ctx.string(
                 bytes
                     .iter()
                     .map(|&byte| char::from(byte))
@@ -26980,15 +27832,17 @@ fn host_form_encode(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
         }
         "urlencoded" => {
             let text = host_arg_usv(ctx, args, 1);
-            Ok(Value::from_string(
-                crate::form_encoding::form_urlencode_after_encoding(encoding, &text),
-            ))
+            Ok(
+                ctx.string(crate::form_encoding::form_urlencode_after_encoding(
+                    encoding, &text,
+                )),
+            )
         }
         _ => Ok(Value::Null),
     }
 }
 
-fn host_url_parts(ctx: &Ctx, url: &url::Url) -> Value {
+fn host_url_parts<'s>(ctx: &Ctx<'s>, url: &url::Url) -> Value<'s> {
     // URL Standard #urlutils-members (local whatwg/url@55d6699), through the
     // `url` crate's WHATWG API getters: search and hash are empty for an empty
     // query or fragment, and host carries a non-default port.
@@ -27009,7 +27863,7 @@ fn host_url_parts(ctx: &Ctx, url: &url::Url) -> Value {
     ctx.make_array(
         parts
             .into_iter()
-            .map(|part| Value::from_string(part.to_string()))
+            .map(|part| ctx.string(part.to_string()))
             .collect(),
     )
 }
@@ -27033,7 +27887,11 @@ fn url_origin_serialization(url: &url::Url) -> String {
 /// API (`url::quirks`), which runs each component's state-override parse.
 /// Setter validation failures are silent no-ops; only an invalid starting URL
 /// or an unknown internal component name returns null.
-fn host_url_set(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_url_set<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     use url::quirks;
     let href = host_arg_usv(ctx, args, 0);
     let component = host_arg_usv(ctx, args, 1);
@@ -27085,7 +27943,7 @@ fn host_url_set(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Va
     Ok(host_url_parts(ctx, &url))
 }
 
-fn host_layout_environment(ctx: &mut Ctx) -> (url::Url, crate::layout2::Viewport, f32) {
+fn host_layout_environment<'s>(ctx: &mut Ctx<'s>) -> (url::Url, crate::layout2::Viewport, f32) {
     let state = ctx
         .host_mut::<HostState>()
         .expect("HostState installed before any TRust JS host call");
@@ -27099,11 +27957,11 @@ fn host_layout_environment(ctx: &mut Ctx) -> (url::Url, crate::layout2::Viewport
 /// One current fragment transaction for CSSOM, observers and rendering. DOM,
 /// resources/viewport (explicit invalidation), and activation metadata all
 /// participate in freshness. Paint is a later, independently lazy consumer.
-fn sync_css_transitions(ctx: &mut Ctx) {
+fn sync_css_transitions<'s>(ctx: &mut Ctx<'s>) {
     sync_css_transitions_for(ctx, true);
 }
 
-fn sync_css_transitions_for(ctx: &mut Ctx, geometry_read: bool) {
+fn sync_css_transitions_for<'s>(ctx: &mut Ctx<'s>, geometry_read: bool) {
     let (dom, seconds, origin_ms, viewport, base) = {
         let state = ctx.host_mut::<HostState>().expect("DOM host");
         (
@@ -27135,37 +27993,44 @@ fn sync_css_transitions_for(ctx: &mut Ctx, geometry_read: bool) {
     }
 }
 
-fn host_transition_events(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+fn host_transition_events<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    _args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     sync_css_transitions_for(ctx, false);
     let events = host_dom(ctx).borrow_mut().take_css_transition_events();
-    Ok(Value::from_engine_text(
-        serde_json::to_string(&events).unwrap(),
-    ))
+    Ok(ctx.string_from_engine_text(serde_json::to_string(&events).unwrap()))
 }
 
 /// CSS Animations 2 #event-dispatch for this rendering update's sample.
-fn host_animation_events(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+fn host_animation_events<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    _args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     sync_css_transitions_for(ctx, false);
     let events = host_dom(ctx).borrow_mut().take_css_animation_events();
-    Ok(Value::from_engine_text(
-        serde_json::to_string(&events).unwrap(),
-    ))
+    Ok(ctx.string_from_engine_text(serde_json::to_string(&events).unwrap()))
 }
 
-fn ensure_host_geom_cache(ctx: &mut Ctx, reason: &'static str) -> Rc<RefCell<TrustJsGeomCache>> {
+fn ensure_host_geom_cache<'s>(
+    ctx: &mut Ctx<'s>,
+    reason: &'static str,
+) -> Rc<RefCell<TrustJsGeomCache>> {
     ensure_host_geometry(ctx, reason, None)
 }
 
-fn ensure_host_geometry(
-    ctx: &mut Ctx,
+fn ensure_host_geometry<'s>(
+    ctx: &mut Ctx<'s>,
     reason: &'static str,
     requested_box: Option<crate::dom::NodeId>,
 ) -> Rc<RefCell<TrustJsGeomCache>> {
     ensure_host_geometry_for(ctx, reason, requested_box, true)
 }
 
-fn ensure_host_geometry_for(
-    ctx: &mut Ctx,
+fn ensure_host_geometry_for<'s>(
+    ctx: &mut Ctx<'s>,
     reason: &'static str,
     requested_box: Option<crate::dom::NodeId>,
     geometry_read: bool,
@@ -27311,7 +28176,7 @@ fn project_scrolling_areas(cache: &Rc<RefCell<TrustJsGeomCache>>, dom: &Dom) {
     cached.scrolling_areas_current = true;
 }
 
-fn ensure_host_hit_test_cache(ctx: &mut Ctx) -> Rc<RefCell<TrustJsGeomCache>> {
+fn ensure_host_hit_test_cache<'s>(ctx: &mut Ctx<'s>) -> Rc<RefCell<TrustJsGeomCache>> {
     let cache = ensure_host_geom_cache(ctx, "elements-from-point");
     let top_key = top_hit_key(ctx);
     let (dom, base, viewport, images) = {
@@ -27375,7 +28240,7 @@ fn resample_hit_test_scroll(cached: &mut TrustJsGeomCache, dom: &Dom) {
 /// The retained hit-testing paint for a top-level `elementsFromPoint`, when
 /// only nested Documents changed since it was produced. Samples CSS
 /// animations first, as the geometry transaction would.
-fn reusable_top_hit_test_cache(ctx: &mut Ctx) -> Option<Rc<RefCell<TrustJsGeomCache>>> {
+fn reusable_top_hit_test_cache<'s>(ctx: &mut Ctx<'s>) -> Option<Rc<RefCell<TrustJsGeomCache>>> {
     sync_css_transitions(ctx);
     let key = top_hit_key(ctx);
     let (cache, dom) = {
@@ -27396,7 +28261,11 @@ fn reusable_top_hit_test_cache(ctx: &mut Ctx) -> Option<Rc<RefCell<TrustJsGeomCa
 /// CSSOM View §5 `elementsFromPoint()`: return paint-ordered arena node ids.
 /// The JavaScript binding performs WebIDL conversion, viewport bounds checks,
 /// wrapper conversion, and the required root-element fallback.
-fn host_elements_from_point(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_elements_from_point<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let document = host_dom(ctx).borrow().document();
     let scope = args
         .first()
@@ -27467,7 +28336,11 @@ fn host_elements_from_point(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
     Ok(ctx.make_array(nodes))
 }
 
-fn host_resolved_grid_tracks(ctx: &mut Ctx, args: &[Value], columns: bool) -> Option<String> {
+fn host_resolved_grid_tracks<'s>(
+    ctx: &mut Ctx<'s>,
+    args: &[Value<'s>],
+    columns: bool,
+) -> Option<String> {
     let cache = ensure_host_geom_cache(ctx, "computed-grid-tracks");
     let id = {
         let dom = host_dom(ctx);
@@ -27511,7 +28384,11 @@ fn host_resolved_grid_tracks(ctx: &mut Ctx, args: &[Value], columns: bool) -> Op
     )
 }
 
-fn host_resolved_box_size(ctx: &mut Ctx, args: &[Value], width: bool) -> Option<String> {
+fn host_resolved_box_size<'s>(
+    ctx: &mut Ctx<'s>,
+    args: &[Value<'s>],
+    width: bool,
+) -> Option<String> {
     let cache = ensure_host_geom_cache(ctx, "computed-box-size");
     let id = {
         let dom = host_dom(ctx);
@@ -27531,7 +28408,11 @@ fn host_resolved_box_size(ctx: &mut Ctx, args: &[Value], width: bool) -> Option<
 /// CSSOM #resolved-values for margins, padding and insets whose used values depend on layout
 /// (`Dom::cssom_needs_used_value`), from the retained fragments of a complete layout. `None`
 /// leaves every other read to the cascade without a geometry flush.
-fn host_resolved_used_value(ctx: &mut Ctx, args: &[Value], name: &str) -> Option<String> {
+fn host_resolved_used_value<'s>(
+    ctx: &mut Ctx<'s>,
+    args: &[Value<'s>],
+    name: &str,
+) -> Option<String> {
     let id = {
         let dom = host_dom(ctx);
         let dom = dom.borrow();
@@ -27547,7 +28428,11 @@ fn host_resolved_used_value(ctx: &mut Ctx, args: &[Value], name: &str) -> Option
 
 /// CSSOM §7.2/§9 resolved-value backing. Grid track lists are used values captured by the same
 /// layout pass; all other properties come from the canonical DOM cascade.
-fn host_computed_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_computed_style<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     sync_css_transitions(ctx);
     let name = host_arg_string(ctx, args, 1);
     {
@@ -27560,35 +28445,37 @@ fn host_computed_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
     if (name == "width" || name == "height")
         && let Some(value) = host_resolved_box_size(ctx, args, name == "width")
     {
-        return Ok(Value::from_engine_text(value));
+        return Ok(ctx.string_from_engine_text(value));
     }
     if (name == "grid-template-columns" || name == "grid-template-rows")
         && let Some(value) = host_resolved_grid_tracks(ctx, args, name == "grid-template-columns")
     {
-        return Ok(Value::from_engine_text(value));
+        return Ok(ctx.string_from_engine_text(value));
     }
     if let Some(value) = host_resolved_used_value(ctx, args, &name) {
-        return Ok(Value::from_engine_text(value));
+        return Ok(ctx.string_from_engine_text(value));
     }
-    Ok(read_layout_dependent_style(
+    let serialized = read_layout_dependent_style(
         ctx,
         // CSSOM #serialize-a-css-component-value, as written for custom
         // properties (`Dom::cssom_serialize_resolved`).
-        |dom| match host_arg_node(dom, args, 0)
-            .and_then(|id| Some((id, dom.cssom_resolved_value(id, &name)?)))
-        {
-            Some((id, value)) => {
-                Value::from_engine_text(dom.cssom_serialize_resolved(id, &name, &value))
-            }
-            None => Value::Null,
+        |dom| {
+            host_arg_node(dom, args, 0)
+                .and_then(|id| Some((id, dom.cssom_resolved_value(id, &name)?)))
+                .map(|(id, value)| dom.cssom_serialize_resolved(id, &name, &value).to_string())
         },
-    ))
+    );
+    Ok(serialized.map_or(Value::Null, |text| ctx.string_from_engine_text(text)))
 }
 
 /// HTML #rendered-text-collection-steps applies the same CSS Text mappings
 /// as layout. Batch adjacent text so inline boundaries preserve word/case
 /// context, and check every node against the authorized root's Document.
-fn host_text_transform(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_text_transform<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let records =
         serde_json::from_str::<Vec<(Option<usize>, String, bool)>>(&host_arg_string(ctx, args, 1))
             .unwrap_or_default();
@@ -27638,10 +28525,14 @@ fn host_text_transform(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
                 .into_owned()
         })
         .collect();
-    Ok(Value::from_string(serde_json::to_string(&result).unwrap()))
+    Ok(ctx.string(serde_json::to_string(&result).unwrap()))
 }
 
-fn host_offset_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_offset_style<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     Ok(Value::Num(read_layout_dependent_style(ctx, |dom| {
         host_arg_node(dom, args, 0).map_or(0.0, |id| f64::from(dom.cssom_offset_style(id)))
     })))
@@ -27650,7 +28541,11 @@ fn host_offset_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
 /// CSSOM View §4.1: parse and evaluate the media query list against the document environment.
 /// `__match_media(query, width?, height?, screenWidth?, screenHeight?)`:
 /// a child navigable passes its own viewport and the web-exposed screen area.
-fn host_match_media(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_match_media<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let query = host_arg_string(ctx, args, 0);
     let size = |index: usize| {
         args.get(index)
@@ -27672,24 +28567,32 @@ fn host_match_media(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
 }
 
 /// HTML §4.8.4 exposes the absolute URL of the selected current image request.
-fn host_image_current_src(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_image_current_src<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let (_, viewport, density) = host_layout_environment(ctx);
     let base = request_client_url(ctx);
     let dom = host_dom(ctx);
     let dom = dom.borrow();
     let Some(id) = host_arg_node(&dom, args, 0) else {
-        return Ok(Value::from_string(String::new()));
+        return Ok(ctx.string(String::new()));
     };
     Ok(
         crate::responsive_image::select(&dom, id, &base, viewport, density).map_or_else(
-            || Value::from_string(String::new()),
-            |selected| Value::from_string(selected.source),
+            || ctx.string(String::new()),
+            |selected| ctx.string(selected.source),
         ),
     )
 }
 
 /// CSSOM View §6 bounding-box backing, sourced directly from canonical layout fragments.
-fn host_rect(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_rect<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     // Sample before the lazy rectangle fast path tests cache freshness.
     sync_css_transitions(ctx);
     let dom_handle = host_dom(ctx);
@@ -27716,8 +28619,10 @@ fn host_rect(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value
         // A nested Document's node also projects its container's content-box
         // origin; viewport requests and tables retain the complete projection.
         let requested_box = id.filter(|&id| {
-            !matches!(args.get(1), Some(Value::Bool(true)))
-                && !matches!(dom.tag_name(id), Some("iframe" | "frame"))
+            !matches!(
+                args.get(1).map(|value| value.kind()),
+                Some(ValueKind::Bool(true))
+            ) && !matches!(dom.tag_name(id), Some("iframe" | "frame"))
                 && !dom
                     .computed_value_resolved(id, "display")
                     .is_some_and(|display| display.contains("table"))
@@ -27800,7 +28705,10 @@ fn host_rect(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value
     };
     let rect = id.and_then(|id| {
         let cached = cache.borrow();
-        let mut rect = if matches!(args.get(1), Some(Value::Bool(true))) {
+        let mut rect = if matches!(
+            args.get(1).map(|value| value.kind()),
+            Some(ValueKind::Bool(true))
+        ) {
             let viewport = cached.frame_viewports.get(&id)?;
             crate::layout2::PxRect {
                 left: f64::from(viewport.x),
@@ -27836,7 +28744,10 @@ fn host_rect(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value
                 }
             },
         );
-        if !matches!(args.get(1), Some(Value::Bool(true))) {
+        if !matches!(
+            args.get(1).map(|value| value.kind()),
+            Some(ValueKind::Bool(true))
+        ) {
             rect.left += f64::from(scroll_offset.x);
             rect.top += f64::from(scroll_offset.y);
         }
@@ -27870,7 +28781,11 @@ fn host_rect(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value
 
 /// CSSOM View §6: sizes and borders come from untransformed layout fragments;
 /// only mutable scroll offsets come from canonical DOM state.
-fn host_scroll_get(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_scroll_get<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let which = args.get(1).and_then(Value::as_num_opt).unwrap_or(0.0) as u8;
     // 4–7: clientHeight/Width/Top/Left; 8/9: the unrounded used top/left
     // border widths that place offsetTop/offsetLeft's padding edge, null
@@ -27948,7 +28863,11 @@ fn host_scroll_get(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
     })
 }
 
-fn host_scroll_set(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_scroll_set<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let top = args.get(1).and_then(Value::as_num_opt).unwrap_or(0.0);
     let left = args.get(2).and_then(Value::as_num_opt).unwrap_or(0.0);
     let cache = ensure_host_geom_cache(ctx, "scroll-position");
@@ -27996,7 +28915,11 @@ fn host_scroll_set(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
 /// Materialize the JavaScript side of an already-loaded native Document.
 /// SW #service-worker-client-concept / #client-id associate identity with
 /// its environment, not with whether the frontend currently keeps an actor.
-fn host_resume_frame(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_resume_frame<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let resumed = {
         let dom = host_dom(ctx);
         let dom = dom.borrow();
@@ -28031,24 +28954,24 @@ fn host_resume_frame(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
     );
     let timing = host_timing_data_value(ctx, &data)?;
     Ok(ctx.make_array(vec![
-        Value::from_string(resumed.url.to_string()),
-        Value::from_string(resumed.markup),
-        Value::from_string(resumed.base.to_string()),
-        Value::from_string(resumed.encoding.name().into()),
-        Value::from_string(resumed.referrer),
-        Value::from_string(resumed.policy.as_str().into()),
-        Value::from_string(origin.ascii_serialization()),
+        ctx.string(resumed.url.to_string()),
+        ctx.string(resumed.markup),
+        ctx.string(resumed.base.to_string()),
+        ctx.string(resumed.encoding.name().into()),
+        ctx.string(resumed.referrer),
+        ctx.string(resumed.policy.as_str().into()),
+        ctx.string(origin.ascii_serialization()),
         timing,
     ]))
 }
 
 /// HTML #link-type-stylesheet: restore the completed parser resource state
 /// of an existing native Document without fetching or dispatching it again.
-fn host_parsed_style_resources(
-    ctx: &mut Ctx,
-    _this: Value,
-    args: &[Value],
-) -> Result<Value, Value> {
+fn host_parsed_style_resources<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let resources = {
         let dom = host_dom(ctx);
         let dom = dom.borrow();
@@ -28075,7 +28998,11 @@ fn host_parsed_style_resources(
 
 /// HTML's iframe processing installs a parsed nested document and resolves its URLs at the frame
 /// boundary through the canonical `Dom::install_frame_document` operation.
-fn host_load_frame(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_load_frame<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let html = host_arg_string(ctx, args, 1);
     let base = host_arg_string(ctx, args, 2);
     // HTML #documentEncoding: the encoding the markup was decoded with.
@@ -28085,10 +29012,10 @@ fn host_load_frame(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
     // The fourth argument selects the document loader (HTML #loading-a-document):
     // true for a text document, an XML MIME type for an XML document, and
     // otherwise an HTML document.
-    let xml_type = match args.get(3) {
-        Some(value @ Value::Str(_)) => value.as_text().map(|text| text.into_owned()),
-        _ => None,
-    };
+    let xml_type = args
+        .get(3)
+        .and_then(|value| value.as_text())
+        .map(|text| text.into_owned());
     if let Some(frame) = host_arg_node(&dom, args, 0) {
         if let Some(content_type) = xml_type {
             dom.install_frame_xml_document(
@@ -28097,7 +29024,10 @@ fn host_load_frame(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
                 &base,
                 &content_type,
             );
-        } else if matches!(args.get(3), Some(Value::Bool(true))) {
+        } else if matches!(
+            args.get(3).map(|value| value.kind()),
+            Some(ValueKind::Bool(true))
+        ) {
             dom.install_frame_text_document(frame, &html, &base);
         } else {
             dom.install_frame_document(frame, &html, &base);
@@ -28115,7 +29045,11 @@ fn host_load_frame(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
     Ok(Value::Undefined)
 }
 
-fn host_media_failed(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_media_failed<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let base = ctx
         .host_mut::<HostState>()
         .expect("media host state")
@@ -28124,7 +29058,10 @@ fn host_media_failed(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
     let dom = host_dom(ctx);
     let dom = dom.borrow();
     if let Some(node) = host_arg_node(&dom, args, 0) {
-        if matches!(args.get(1), Some(Value::Bool(true))) {
+        if matches!(
+            args.get(1).map(|value| value.kind()),
+            Some(ValueKind::Bool(true))
+        ) {
             dom.remember_media(node, &base);
         } else {
             dom.forget_media(node);
@@ -28133,7 +29070,7 @@ fn host_media_failed(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
     Ok(Value::Undefined)
 }
 
-fn document_cookie_url(ctx: &mut Ctx, args: &[Value]) -> Option<url::Url> {
+fn document_cookie_url<'s>(ctx: &mut Ctx<'s>, args: &[Value<'s>]) -> Option<url::Url> {
     let id = args.first()?.as_num_opt()? as usize;
     let context_id = args.get(1)?.as_num_opt()? as u64;
     let url = url::Url::parse(&host_arg_usv(ctx, args, 2)).ok()?;
@@ -28183,12 +29120,20 @@ fn document_cookie_url(ctx: &mut Ctx, args: &[Value]) -> Option<url::Url> {
         .map(|_| url)
 }
 
-fn host_cookie_get(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_cookie_get<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let value = document_cookie_url(ctx, args)
         .map_or_else(String::new, |page| crate::http::cookies_for_js(&page));
-    Ok(Value::from_string(value))
+    Ok(ctx.string(value))
 }
-fn host_cookie_set(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_cookie_set<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let line = host_arg_usv(ctx, args, 3);
     if let Some(page) = document_cookie_url(ctx, args) {
         crate::http::set_cookie_from_js(&page, &line);
@@ -28197,7 +29142,11 @@ fn host_cookie_set(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
     }
     Ok(Value::Undefined)
 }
-fn host_storage_allowed(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_storage_allowed<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let id = args
         .first()
         .and_then(Value::as_num_opt)
@@ -28210,7 +29159,10 @@ fn host_storage_allowed(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
     })))
 }
 
-fn host_storage_bucket(ctx: &mut Ctx, args: &[Value]) -> (crate::js::WebStorage, String) {
+fn host_storage_bucket<'s>(
+    ctx: &mut Ctx<'s>,
+    args: &[Value<'s>],
+) -> (crate::js::WebStorage, String) {
     // The platform bootstrap binds this private key to the Storage object's
     // checked origin (Storage #storage-keys). Re-deriving it from state.base
     // exposed the top page's bucket to every child and changed retained API
@@ -28222,19 +29174,27 @@ fn host_storage_bucket(ctx: &mut Ctx, args: &[Value]) -> (crate::js::WebStorage,
     (state.storage.clone(), bucket)
 }
 
-fn host_storage_get(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_storage_get<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let key = host_arg_string(ctx, args, 1);
     let (storage, bucket) = host_storage_bucket(ctx, args);
     let storage = storage.lock().unwrap();
     Ok(
         match storage.get(&bucket).and_then(|bucket| bucket.get(&key)) {
-            Some(value) => Value::from_engine_text(value.clone()),
+            Some(value) => ctx.string_from_engine_text(value.clone()),
             None => Value::Null,
         },
     )
 }
 
-fn host_storage_set(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_storage_set<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let key = host_arg_string(ctx, args, 1);
     let value = host_arg_string(ctx, args, 2);
     let (storage, bucket) = host_storage_bucket(ctx, args);
@@ -28271,11 +29231,15 @@ fn host_storage_set(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
 /// and Cache Storage platform blocks write each commit with it, so that an agent's read-modify-write
 /// of a serialized database or request response list is atomic against every other agent sharing
 /// the storage shed (IndexedDB #commit-transaction, Service Workers #batch-cache-operations-algorithm).
-fn host_storage_cas(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_storage_cas<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let key = host_arg_string(ctx, args, 1);
     let expected = args
         .get(2)
-        .filter(|value| !matches!(value, Value::Null | Value::Undefined))
+        .filter(|value| !matches!(value.kind(), ValueKind::Null | ValueKind::Undefined))
         .map(|_| host_arg_string(ctx, args, 2));
     let value = host_arg_string(ctx, args, 3);
     let (storage, bucket) = host_storage_bucket(ctx, args);
@@ -28300,13 +29264,17 @@ fn host_storage_cas(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
     if let Err(name) =
         private_response_host::cache_commit(&storage_owner, &bucket, &key, &value, cache_bytes)
     {
-        return Ok(Value::from_string(name.to_string()));
+        return Ok(ctx.string(name.to_string()));
     }
     storage.entry(bucket).or_default().insert(key, value);
     Ok(Value::Bool(true))
 }
 
-fn host_storage_remove(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_storage_remove<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let key = host_arg_string(ctx, args, 1);
     let (storage, bucket) = host_storage_bucket(ctx, args);
     if let Some(values) = storage.lock().unwrap().get_mut(&bucket) {
@@ -28316,7 +29284,11 @@ fn host_storage_remove(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
     Ok(Value::Undefined)
 }
 
-fn host_storage_clear(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_storage_clear<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let (storage, bucket) = host_storage_bucket(ctx, args);
     let mut storage = storage.lock().unwrap();
     storage.remove(&bucket);
@@ -28324,7 +29296,11 @@ fn host_storage_clear(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Val
     Ok(Value::Undefined)
 }
 
-fn host_storage_key(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_storage_key<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let index = args.get(1).and_then(Value::as_num_opt).unwrap_or(-1.0);
     let (storage, bucket) = host_storage_bucket(ctx, args);
     let storage = storage.lock().unwrap();
@@ -28335,10 +29311,14 @@ fn host_storage_key(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
                 .and_then(|bucket| bucket.keys().nth(index as usize).cloned())
         })
         .flatten();
-    Ok(key.map_or(Value::Null, Value::from_string))
+    Ok(key.map_or(Value::Null, |text| ctx.string(text)))
 }
 
-fn host_storage_len(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_storage_len<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let (storage, bucket) = host_storage_bucket(ctx, args);
     let len = storage
         .lock()
@@ -28351,12 +29331,17 @@ fn host_storage_len(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
 /// Clipboard API #dom-clipboard-writetext / #dom-clipboard-write, after the prelude's permission
 /// check: queue `text` for the frontend's system clipboard. `settle` is called with the
 /// frontend's answer and settles the operation's promise in its own Realm.
-fn host_clipboard_write(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_clipboard_write<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let text = host_arg_usv(ctx, args, 0);
     let settle = args.get(1).cloned().unwrap_or(Value::Undefined);
     if !settle.is_callable() {
         return Err(ctx.make_error("TypeError", "clipboard writes require a settle callback"));
     }
+    let settle = hold(ctx, &settle);
     let Some(state) = ctx.host_mut::<HostState>() else {
         return Err(ctx.make_error("InvalidStateError", "missing browser host state"));
     };
@@ -28371,7 +29356,11 @@ fn host_clipboard_write(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
 /// range, associated with a new one, or had a boundary point mutated
 /// (Selection API §2, where `selectionchange` is scheduled). The frontend
 /// paints the selection the next report describes.
-fn host_selection_changed(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+fn host_selection_changed<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    _args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     if let Some(state) = ctx.host_mut::<HostState>() {
         state.selection_dirty = true;
     }
@@ -28380,13 +29369,17 @@ fn host_selection_changed(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Resul
 
 /// `__dom_user_select(node)`: CSS UI 4 #content-selection's used value of
 /// `user-select` on an element, or on a Text node's parent element.
-fn host_user_select(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_user_select<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let dom = host_dom(ctx);
     let dom = dom.borrow();
     let Some(id) = host_arg_node(&dom, args, 0) else {
         return Ok(Value::Null);
     };
-    Ok(Value::from_engine_text(match dom.user_select(id) {
+    Ok(ctx.string_from_engine_text(match dom.user_select(id) {
         crate::dom::UserSelect::Text => "text",
         crate::dom::UserSelect::None => "none",
         crate::dom::UserSelect::Contain => "contain",
@@ -28396,7 +29389,11 @@ fn host_user_select(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
 
 /// `__context_menu_result(show)`: Pointer Events #maybe-show-context-menu
 /// dispatched `contextmenu`; `show` when it was not canceled.
-fn host_context_menu_result(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_context_menu_result<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let show = args.first().is_some_and(|value| ctx.to_boolean(value));
     if let Some(state) = ctx.host_mut::<HostState>() {
         state.context_menus.push(show);
@@ -28408,9 +29405,16 @@ fn host_context_menu_result(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
 /// viewport resize of the top-level traversable, which belongs to the
 /// frontend. The frontend answers with `PageCmd::FullscreenResult` once the
 /// page has the resized viewport.
-fn host_fullscreen_frontend(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_fullscreen_frontend<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let request = args.first().and_then(Value::as_num_opt).unwrap_or(0.0);
-    let enter = matches!(args.get(1), Some(Value::Bool(true)));
+    let enter = matches!(
+        args.get(1).map(|value| value.kind()),
+        Some(ValueKind::Bool(true))
+    );
     if let Some(state) = ctx.host_mut::<HostState>() {
         let request = if request.is_finite() && request >= 0.0 {
             request as u64
@@ -28424,11 +29428,16 @@ fn host_fullscreen_frontend(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
 
 /// Deliver a frontend's answer to a clipboard write request. This runs as a host task, outside
 /// any native function, so a host interruption stays distinct from a throw.
-fn settle_clipboard_request(ctx: &mut Ctx, request: u64, ok: bool) -> Result<(), EvalError> {
+fn settle_clipboard_request<'s>(
+    ctx: &mut Ctx<'s>,
+    request: u64,
+    ok: bool,
+) -> Result<(), EvalError<'s>> {
     let settle = ctx
         .host_mut::<HostState>()
         .and_then(|state| state.clipboard_settlers.remove(&request));
     if let Some(settle) = settle {
+        let settle = held(ctx, &settle);
         ctx.invoke_interruptible(settle, Value::Undefined, &[Value::Bool(ok)])?;
     }
     Ok(())
@@ -28438,7 +29447,7 @@ fn settle_clipboard_request(ctx: &mut Ctx, request: u64, ok: bool) -> Result<(),
 struct FilePickerSettler {
     /// Platform callback, in the control's Realm, that receives the chosen file records or
     /// `null` for a dismissed prompt.
-    settle: Value,
+    settle: Handle,
     multiple: bool,
     directory: bool,
 }
@@ -28446,7 +29455,11 @@ struct FilePickerSettler {
 /// HTML #show-the-picker,-if-applicable step 5, after the prelude checked transient activation
 /// and mutability: ask the frontend to display a file prompt for a File Upload control.
 /// Arguments: the `accept` attribute value, `multiple`, `webkitdirectory` and the settle callback.
-fn host_file_picker(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_file_picker<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let accept = host_arg_usv(ctx, args, 0);
     let multiple = args.get(1).is_some_and(|value| ctx.to_boolean(value));
     let directory = args.get(2).is_some_and(|value| ctx.to_boolean(value));
@@ -28454,6 +29467,7 @@ fn host_file_picker(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
     if !settle.is_callable() {
         return Err(ctx.make_error("TypeError", "file pickers require a settle callback"));
     }
+    let settle = hold(ctx, &settle);
     let Some(state) = ctx.host_mut::<HostState>() else {
         return Err(ctx.make_error("InvalidStateError", "missing browser host state"));
     };
@@ -28480,10 +29494,10 @@ fn host_file_picker(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
 
 /// Register user-chosen files and describe them for the prelude as
 /// `[id, name, type, size, lastModified | null, relativePath, isDirectory]` records.
-fn user_file_records(
-    ctx: &mut Ctx,
+fn user_file_records<'s>(
+    ctx: &mut Ctx<'s>,
     files: &[crate::file_select::SelectedFile],
-) -> Result<Value, String> {
+) -> Result<Value<'s>, String> {
     let mut ids = Vec::with_capacity(files.len());
     {
         let state = ctx
@@ -28497,12 +29511,12 @@ fn user_file_records(
     for (file, id) in files.iter().zip(ids) {
         records.push(ctx.make_array(vec![
             Value::Num(id as f64),
-            Value::from_string(file.name.clone()),
-            Value::from_string(file.mime.clone()),
+            ctx.string(file.name.clone()),
+            ctx.string(file.mime.clone()),
             Value::Num(file.size as f64),
             file.last_modified
                 .map_or(Value::Null, |ms| Value::Num(ms as f64)),
-            Value::from_string(file.relative_path.clone()),
+            ctx.string(file.relative_path.clone()),
             Value::Bool(file.directory),
         ]));
     }
@@ -28512,11 +29526,11 @@ fn user_file_records(
 /// Deliver a frontend's file prompt answer. A dismissed prompt settles with `null`; chosen paths
 /// are snapshotted (File API #file-section), registered as readable, and settle the control's
 /// selection. Without `multiple` at most one file is kept (HTML #file-upload-state).
-fn settle_file_picker_request(
-    ctx: &mut Ctx,
+fn settle_file_picker_request<'s>(
+    ctx: &mut Ctx<'s>,
     request: u64,
     files: Option<Vec<std::path::PathBuf>>,
-) -> Result<Option<String>, EvalError> {
+) -> Result<Option<String>, EvalError<'s>> {
     let Some(settler) = ctx
         .host_mut::<HostState>()
         .and_then(|state| state.file_picker_settlers.remove(&request))
@@ -28541,14 +29555,19 @@ fn settle_file_picker_request(
             }
         }
     };
-    ctx.invoke_interruptible(settler.settle, Value::Undefined, &[records])?;
+    let settle = held(ctx, &settler.settle);
+    ctx.invoke_interruptible(settle, Value::Undefined, &[records])?;
     Ok(trouble)
 }
 
 /// File API #blob-section reads of a user-selected file's bytes `start..end`: a byte string (one
 /// code unit per byte, the prelude's Blob byte form), or `[DOMException name, message]` when the
 /// file cannot be read as it was snapshotted.
-fn host_file_read(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_file_read<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let number = |index: usize| {
         args.get(index)
             .and_then(|value| value.as_num_opt())
@@ -28565,12 +29584,10 @@ fn host_file_read(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
             )))
         });
     match result {
-        Ok(bytes) => Ok(Value::from_string(
-            bytes.into_iter().map(char::from).collect::<String>(),
-        )),
+        Ok(bytes) => Ok(ctx.string(bytes.into_iter().map(char::from).collect::<String>())),
         Err(error) => Ok(ctx.make_array(vec![
-            Value::from_string(error.dom_exception_name().to_string()),
-            Value::from_string(error.message().to_string()),
+            ctx.string(error.dom_exception_name().to_string()),
+            ctx.string(error.message().to_string()),
         ])),
     }
 }
@@ -28578,7 +29595,11 @@ fn host_file_read(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
 /// File and Directory Entries API #html-forms: a dropped directory selects, for a
 /// `webkitdirectory` control, every file below it. Only directories the user dropped (already
 /// registered) can be expanded; returns file records or `[DOMException name, message]`.
-fn host_file_expand(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_file_expand<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let id = args
         .first()
         .and_then(|value| value.as_num_opt())
@@ -28594,8 +29615,8 @@ fn host_file_expand(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
     match result.and_then(|files| user_file_records(ctx, &files)) {
         Ok(records) => Ok(records),
         Err(error) => Ok(ctx.make_array(vec![
-            Value::from_string(String::from("NotReadableError")),
-            Value::from_string(error),
+            ctx.string(String::from("NotReadableError")),
+            ctx.string(error),
         ])),
     }
 }
@@ -28604,7 +29625,11 @@ fn host_file_expand(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
 /// of a directory the user dropped (or of one listed below it), each registered as readable and
 /// described as a file record; `[DOMException name, message]` when the directory is gone or was
 /// never selected. Only directories already registered can be listed.
-fn host_file_list(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_file_list<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let id = args
         .first()
         .and_then(|value| value.as_num_opt())
@@ -28620,8 +29645,8 @@ fn host_file_list(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
     match result.and_then(|files| user_file_records(ctx, &files)) {
         Ok(records) => Ok(records),
         Err(error) => Ok(ctx.make_array(vec![
-            Value::from_string(String::from("NotFoundError")),
-            Value::from_string(error),
+            ctx.string(String::from("NotFoundError")),
+            ctx.string(error),
         ])),
     }
 }
@@ -28638,7 +29663,11 @@ const CACHE_STORAGE_QUOTA: usize = 64 * 1024 * 1024;
 /// platform prelude), whose shelf is separate from the origin's own. Each bottle is measured as
 /// its endpoint enforces its quota, and the quota is the sum of those endpoint quotas,
 /// independent of the device's free space.
-fn host_storage_manager(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_storage_manager<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     if host_arg_usv(ctx, args, 0) != "estimate" {
         return Ok(Value::Undefined);
     }
@@ -28681,7 +29710,7 @@ fn host_storage_manager(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
     Ok(ctx.make_array(vec![Value::Num(usage as f64), Value::Num(quota as f64)]))
 }
 
-fn host_latin1_bytes(ctx: &mut Ctx, args: &[Value], index: usize) -> Vec<u8> {
+fn host_latin1_bytes<'s>(ctx: &mut Ctx<'s>, args: &[Value<'s>], index: usize) -> Vec<u8> {
     if let Some(bytes) = args
         .get(index)
         .and_then(|value| ctx.buffer_source_bytes(value, false))
@@ -28707,7 +29736,7 @@ fn blob_storage_key(origin: &url::Origin) -> String {
 }
 
 /// The current settings object's environment, origin serialization and storage key.
-fn blob_environment(ctx: &mut Ctx) -> (crate::blob_url_store::Environment, String, String) {
+fn blob_environment<'s>(ctx: &mut Ctx<'s>) -> (crate::blob_url_store::Environment, String, String) {
     let realm = ctx.host_job_context();
     let state = ctx
         .host_mut::<HostState>()
@@ -28732,7 +29761,11 @@ fn blob_environment(ctx: &mut Ctx) -> (crate::blob_url_store::Environment, Strin
 /// "resolve" returns `[type, origin, leaves]` for #blob-url-resolve and
 /// #blob-url-obtain-object (a file range becomes this agent's own selected-file id), or null,
 /// and "revoke" runs #dfn-revokeObjectURL steps 3-7. The bootstrap captures this binding.
-fn host_blob_url(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_blob_url<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let op = host_arg_string(ctx, args, 0);
     let url = host_arg_usv(ctx, args, 1);
     let (environment, origin, storage_key) = blob_environment(ctx);
@@ -28792,9 +29825,10 @@ fn host_blob_url(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, V
             let mut leaves = Vec::with_capacity(entry.parts.len());
             for part in &entry.parts {
                 match part {
+                    // The buffer itself: reading a view's `buffer` would run a getter that
+                    // page script can replace.
                     crate::blob_url_store::BlobPart::Bytes(bytes) => {
-                        let view = ctx.make_uint8array(bytes)?;
-                        leaves.push(ctx.member_get(&view, "buffer")?);
+                        leaves.push(ctx.make_array_buffer(bytes)?);
                     }
                     crate::blob_url_store::BlobPart::File(range) => {
                         let registered = ctx
@@ -28814,8 +29848,8 @@ fn host_blob_url(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, V
             }
             let leaves = ctx.make_array(leaves);
             Ok(ctx.make_array(vec![
-                Value::from_string(entry.content_type.clone()),
-                Value::from_string(entry.origin.clone()),
+                ctx.string(entry.content_type.clone()),
+                ctx.string(entry.origin.clone()),
                 leaves,
             ]))
         }
@@ -28869,7 +29903,11 @@ fn host_blob_url(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, V
 
 /// `__promise_is_handled(promise)`: the promise's [[PromiseIsHandled]] (undefined for anything
 /// else), which HTML #notify-about-rejected-promises reads when its task runs.
-fn host_promise_is_handled(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_promise_is_handled<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let promise = args.first().cloned().unwrap_or(Value::Undefined);
     Ok(ctx
         .promise_is_handled(&promise)
@@ -28880,11 +29918,11 @@ fn host_promise_is_handled(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resul
 /// promise that is still unhandled to the settings object's outstanding rejected promises weak
 /// set (HTML #notify-about-rejected-promises). The engine holds the set weakly and reports a
 /// later handler through `take_handled_rejections`.
-fn host_promise_mark_outstanding(
-    ctx: &mut Ctx,
-    _this: Value,
-    args: &[Value],
-) -> Result<Value, Value> {
+fn host_promise_mark_outstanding<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let promise = args.first().cloned().unwrap_or(Value::Undefined);
     Ok(Value::Bool(ctx.add_outstanding_rejection(&promise)))
 }
@@ -28894,7 +29932,11 @@ fn host_promise_mark_outstanding(
 /// gives their jobs null job settings (HTML HostEnqueuePromiseJob with a null Realm), so a
 /// stream created in a since-discarded Document still completes, and no author-visible
 /// `then` or species lookup is involved.
-fn host_promise_react(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_promise_react<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let argument = |index: usize| args.get(index).cloned().unwrap_or(Value::Undefined);
     ctx.react_to_promise(&argument(0), argument(1), argument(2))
 }
@@ -28902,21 +29944,29 @@ fn host_promise_react(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Val
 /// `__promise_resolved_with(value)`: Web IDL "a promise resolved with" for the platform's own
 /// steps. Adopting a thenable's state is a job with null job settings, like the reactions of
 /// `__promise_react`.
-fn host_promise_resolved_with(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_promise_resolved_with<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let value = args.first().cloned().unwrap_or(Value::Undefined);
     Ok(ctx.promise_resolved_with(value))
 }
 
-fn host_resolved_promise(ctx: &mut Ctx, value: Value) -> Result<Value, Value> {
+fn host_resolved_promise<'s>(ctx: &mut Ctx<'s>, value: Value<'s>) -> Result<Value<'s>, Value<'s>> {
     let global = ctx.global_this();
     let promise = ctx.member_get(&global, "Promise")?;
     let resolve = ctx.member_get(&promise, "resolve")?;
-    ctx.invoke(resolve, promise.clone(), &[value])
+    ctx.invoke(resolve, promise, &[value])
 }
 
 /// Web Crypto §14.3.5 copies the `BufferSource` bytes before digesting and resolves the returned
 /// promise with a realm-local `ArrayBuffer` containing the digest.
-fn host_crypto_sha256_digest(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_crypto_sha256_digest<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     use sha2::Digest as _;
 
     let input = args
@@ -28924,13 +29974,16 @@ fn host_crypto_sha256_digest(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Res
         .and_then(|value| ctx.buffer_source_bytes(value, false))
         .unwrap_or_default();
     let digest = sha2::Sha256::digest(input);
-    let view = ctx.make_uint8array(&digest)?;
-    let buffer = ctx.member_get(&view, "buffer")?;
+    let buffer = ctx.make_array_buffer(&digest)?;
     host_resolved_promise(ctx, buffer)
 }
 
 /// Native SHA family: do not run SHA-384/512's rounds as interpreted BigInts.
-fn host_crypto_digest(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_crypto_digest<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     use sha2::Digest as _;
     let name = host_arg_string(ctx, args, 0);
     let input = args
@@ -28944,14 +29997,17 @@ fn host_crypto_digest(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Val
         "SHA-512" => sha2::Sha512::digest(&input).to_vec(),
         _ => return Err(ctx.make_error("NotSupportedError", "Unsupported digest")),
     };
-    let view = ctx.make_uint8array(&bytes)?;
-    let buffer = ctx.member_get(&view, "buffer")?;
+    let buffer = ctx.make_array_buffer(&bytes)?;
     host_resolved_promise(ctx, buffer)
 }
 
 /// Web Crypto #Crypto-method-getRandomValues / #hmac-operations-generate-key.
 /// OS entropy, never Math.random. The API layer validates the receiving view.
-fn host_crypto_random_bytes(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_crypto_random_bytes<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let length = args
         .first()
         .and_then(Value::as_num_opt)
@@ -28968,57 +30024,68 @@ fn host_crypto_random_bytes(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
     ctx.make_uint8array(&bytes)
 }
 
-fn crypto_member(ctx: &mut Ctx, list: &Value, index: usize) -> Value {
+fn crypto_member<'s>(ctx: &mut Ctx<'s>, list: &Value<'s>, index: usize) -> Value<'s> {
     ctx.member_get(list, &index.to_string())
         .unwrap_or(Value::Undefined)
 }
 
 /// A copied byte argument; `undefined` means an absent optional member.
-fn crypto_bytes(ctx: &mut Ctx, list: &Value, index: usize) -> Result<Option<Vec<u8>>, Value> {
-    match crypto_member(ctx, list, index) {
-        Value::Undefined => Ok(None),
-        value => ctx
-            .buffer_source_bytes(&value, false)
-            .map(Some)
-            .ok_or_else(|| ctx.make_error("TypeError", "Web Crypto operand is not a byte buffer")),
+fn crypto_bytes<'s>(
+    ctx: &mut Ctx<'s>,
+    list: &Value<'s>,
+    index: usize,
+) -> Result<Option<Vec<u8>>, Value<'s>> {
+    let value = crypto_member(ctx, list, index);
+    if value.is_undefined() {
+        return Ok(None);
     }
+    ctx.buffer_source_bytes(&value, false)
+        .map(Some)
+        .ok_or_else(|| ctx.make_error("TypeError", "Web Crypto operand is not a byte buffer"))
 }
 
-fn crypto_required(ctx: &mut Ctx, list: &Value, index: usize) -> Result<Vec<u8>, Value> {
+fn crypto_required<'s>(
+    ctx: &mut Ctx<'s>,
+    list: &Value<'s>,
+    index: usize,
+) -> Result<Vec<u8>, Value<'s>> {
     crypto_bytes(ctx, list, index)?
         .ok_or_else(|| ctx.make_error("TypeError", "missing Web Crypto operand"))
 }
 
-fn crypto_text(ctx: &mut Ctx, list: &Value, index: usize) -> String {
+fn crypto_text<'s>(ctx: &mut Ctx<'s>, list: &Value<'s>, index: usize) -> String {
     let value = crypto_member(ctx, list, index);
     ctx.coerce_usv_string(&value).unwrap_or_default()
 }
 
-fn crypto_number(ctx: &mut Ctx, list: &Value, index: usize) -> f64 {
+fn crypto_number<'s>(ctx: &mut Ctx<'s>, list: &Value<'s>, index: usize) -> f64 {
     crypto_member(ctx, list, index)
         .as_num_opt()
         .unwrap_or(f64::NAN)
 }
 
-fn crypto_flag(ctx: &mut Ctx, list: &Value, index: usize) -> bool {
-    matches!(crypto_member(ctx, list, index), Value::Bool(true))
+fn crypto_flag<'s>(ctx: &mut Ctx<'s>, list: &Value<'s>, index: usize) -> bool {
+    matches!(
+        (crypto_member(ctx, list, index)).kind(),
+        ValueKind::Bool(true)
+    )
 }
 
-fn crypto_buffer(ctx: &mut Ctx, bytes: &[u8]) -> Result<Value, Value> {
+fn crypto_buffer<'s>(ctx: &mut Ctx<'s>, bytes: &[u8]) -> Result<Value<'s>, Value<'s>> {
     ctx.make_array_buffer(bytes)
 }
 
 /// [handle, private, modulusLength, publicExponent, namedCurve] for the
 /// prelude's CryptoKey construction.
-fn crypto_material(
-    ctx: &mut Ctx,
+fn crypto_material<'s>(
+    ctx: &mut Ctx<'s>,
     material: &crate::crypto::keys::KeyMaterial,
-) -> Result<Value, Value> {
+) -> Result<Value<'s>, Value<'s>> {
     let der = ctx.make_uint8array(&material.der)?;
     let exponent = ctx.make_uint8array(&material.public_exponent)?;
-    let curve = material.curve.map_or(Value::Null, |curve| {
-        Value::from_string(curve.name().to_string())
-    });
+    let curve = material
+        .curve
+        .map_or(Value::Null, |curve| ctx.string(curve.name().to_string()));
     Ok(ctx.make_array(vec![
         der,
         Value::Bool(material.private),
@@ -29034,20 +30101,24 @@ fn crypto_material(
 /// copies. `args` is (operation, [operands…]). A step that throws returns the
 /// DOMException name as a string, which the prelude throws in its own Realm
 /// (TRust JS owns only ECMAScript errors); no successful result is a string.
-fn host_crypto_operation(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_crypto_operation<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     use crate::crypto::keys::{self, Curve, Failure, Family, Hash, RsaPrivateJwk, Scheme};
     let operation = host_arg_string(ctx, args, 0);
     let list = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let fail = |failure: Failure| Ok(Value::from_string(failure.name().to_string()));
-    let hash_at = |ctx: &mut Ctx, index: usize| {
+    let fail = |ctx: &mut Ctx<'s>, failure: Failure| Ok(ctx.string(failure.name().to_string()));
+    let hash_at = |ctx: &mut Ctx<'s>, index: usize| {
         let name = crypto_text(ctx, &list, index);
         Hash::from_name(&name).ok_or_else(|| ctx.make_error("TypeError", "unregistered digest"))
     };
-    let family_at = |ctx: &mut Ctx, index: usize| {
+    let family_at = |ctx: &mut Ctx<'s>, index: usize| {
         let name = crypto_text(ctx, &list, index);
         Family::from_name(&name).ok_or_else(|| ctx.make_error("TypeError", "unknown key family"))
     };
-    let length_at = |ctx: &mut Ctx, index: usize| {
+    let length_at = |ctx: &mut Ctx<'s>, index: usize| {
         let value = crypto_number(ctx, &list, index);
         if value.is_finite() && value >= 0.0 && value.fract() == 0.0 && value <= f64::from(u32::MAX)
         {
@@ -29063,7 +30134,7 @@ fn host_crypto_operation(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
             let data = crypto_required(ctx, &list, 1)?;
             match hash.digest(&data) {
                 Ok(digest) => crypto_buffer(ctx, &digest),
-                Err(failure) => fail(failure),
+                Err(failure) => fail(ctx, failure),
             }
         }
         // #hmac-operations-sign / #hmac-operations-verify. RustCrypto
@@ -29108,7 +30179,7 @@ fn host_crypto_operation(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
             };
             match crate::crypto::aes_ctr_crypt(&key, &counter, bits, &data) {
                 Some(output) => crypto_buffer(ctx, &output),
-                None => fail(Failure::Operation),
+                None => fail(ctx, Failure::Operation),
             }
         }
         // #aes-gcm-operations: ciphertext is C ‖ T; decryption releases
@@ -29127,7 +30198,7 @@ fn host_crypto_operation(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
             };
             match crate::crypto::aes_gcm_crypt(&key, &iv, &additional, tag, &data, decrypt) {
                 Some(output) => crypto_buffer(ctx, &output),
-                None => fail(Failure::Operation),
+                None => fail(ctx, Failure::Operation),
             }
         }
         "aes-cbc" => {
@@ -29137,7 +30208,7 @@ fn host_crypto_operation(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
             let decrypt = crypto_flag(ctx, &list, 3);
             match keys::aes_cbc(&key, &iv, &data, decrypt) {
                 Ok(output) => crypto_buffer(ctx, &output),
-                Err(failure) => fail(failure),
+                Err(failure) => fail(ctx, failure),
             }
         }
         "aes-kw" => {
@@ -29146,7 +30217,7 @@ fn host_crypto_operation(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
             let unwrap = crypto_flag(ctx, &list, 2);
             match keys::aes_kw(&key, &data, unwrap) {
                 Ok(output) => crypto_buffer(ctx, &output),
-                Err(failure) => fail(failure),
+                Err(failure) => fail(ctx, failure),
             }
         }
         "hkdf" => {
@@ -29157,7 +30228,7 @@ fn host_crypto_operation(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
             let length = length_at(ctx, 4)?;
             match keys::hkdf(hash, &key, &salt, &info, length) {
                 Ok(output) => crypto_buffer(ctx, &output),
-                Err(failure) => fail(failure),
+                Err(failure) => fail(ctx, failure),
             }
         }
         "pbkdf2" => {
@@ -29168,7 +30239,7 @@ fn host_crypto_operation(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
             let length = length_at(ctx, 4)?;
             match keys::pbkdf2(hash, &password, &salt, iterations, length) {
                 Ok(output) => crypto_buffer(ctx, &output),
-                Err(failure) => fail(failure),
+                Err(failure) => fail(ctx, failure),
             }
         }
         "generate" => {
@@ -29182,7 +30253,7 @@ fn host_crypto_operation(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
                     let public = crypto_material(ctx, &public)?;
                     Ok(ctx.make_array(vec![private, public]))
                 }
-                Err(failure) => fail(failure),
+                Err(failure) => fail(ctx, failure),
             }
         }
         "import" => {
@@ -29198,7 +30269,7 @@ fn host_crypto_operation(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
             };
             match imported {
                 Ok(material) => crypto_material(ctx, &material),
-                Err(failure) => fail(failure),
+                Err(failure) => fail(ctx, failure),
             }
         }
         "import-jwk" => {
@@ -29236,7 +30307,7 @@ fn host_crypto_operation(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
             };
             match imported {
                 Ok(material) => crypto_material(ctx, &material),
-                Err(failure) => fail(failure),
+                Err(failure) => fail(ctx, failure),
             }
         }
         "export-jwk" => {
@@ -29251,7 +30322,7 @@ fn host_crypto_operation(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
                     }
                     Ok(ctx.make_array(values))
                 }
-                Err(failure) => fail(failure),
+                Err(failure) => fail(ctx, failure),
             }
         }
         "export-raw" => {
@@ -29259,7 +30330,7 @@ fn host_crypto_operation(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
             let der = crypto_required(ctx, &list, 1)?;
             match keys::raw_public(family, &der) {
                 Ok(raw) => crypto_buffer(ctx, &raw),
-                Err(failure) => fail(failure),
+                Err(failure) => fail(ctx, failure),
             }
         }
         "sign" | "verify" => {
@@ -29280,7 +30351,7 @@ fn host_crypto_operation(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
             if operation == "sign" {
                 match keys::sign(scheme, &der, &data) {
                     Ok(signature) => crypto_buffer(ctx, &signature),
-                    Err(failure) => fail(failure),
+                    Err(failure) => fail(ctx, failure),
                 }
             } else {
                 let signature = crypto_required(ctx, &list, 5)?;
@@ -29295,7 +30366,7 @@ fn host_crypto_operation(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
             let decrypt = crypto_flag(ctx, &list, 4);
             match keys::rsa_oaep(&der, hash, &label, &data, decrypt) {
                 Ok(output) => crypto_buffer(ctx, &output),
-                Err(failure) => fail(failure),
+                Err(failure) => fail(ctx, failure),
             }
         }
         "derive" => {
@@ -29304,7 +30375,7 @@ fn host_crypto_operation(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
             let public = crypto_required(ctx, &list, 2)?;
             match keys::derive(family, &private, &public) {
                 Ok(secret) => crypto_buffer(ctx, &secret),
-                Err(failure) => fail(failure),
+                Err(failure) => fail(ctx, failure),
             }
         }
         _ => Err(ctx.make_error("TypeError", "unknown Web Crypto operation")),
@@ -29314,10 +30385,14 @@ fn host_crypto_operation(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
 /// Compression Standard #compression-stream and #decompression-stream contexts:
 /// ("compress" | "decompress", format) → handle; ("write", handle, bytes, finish) →
 /// [Uint8Array output, failed]; ("free", handle). The constructor validated the format.
-fn host_compression_context(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_compression_context<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let operation = host_arg_string(ctx, args, 0);
-    let handle = |value: Option<&Value>| match value {
-        Some(Value::Num(number)) if *number >= 1.0 && *number <= u32::MAX as f64 => *number as u32,
+    let handle = |value: Option<&Value>| match value.map(|value| value.kind()) {
+        Some(ValueKind::Num(number)) if number >= 1.0 && number <= u32::MAX as f64 => number as u32,
         _ => 0,
     };
     match operation.as_str() {
@@ -29337,7 +30412,10 @@ fn host_compression_context(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
                 .get(2)
                 .and_then(|value| ctx.buffer_source_bytes(value, false))
                 .ok_or_else(|| ctx.make_error("TypeError", "The chunk must be a BufferSource"))?;
-            let finish = matches!(args.get(3), Some(Value::Bool(true)));
+            let finish = matches!(
+                args.get(3).map(|value| value.kind()),
+                Some(ValueKind::Bool(true))
+            );
             let output = ctx
                 .host_mut::<HostState>()
                 .and_then(|state| state.compression.write(id, &input, finish));
@@ -29362,7 +30440,11 @@ fn host_compression_context(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
 
 /// Encoding §7.4 UTF-8 encode: the Web IDL `USVString` conversion has already replaced lone
 /// surrogates before the host call, and the result is a fresh realm-local `Uint8Array`.
-fn host_text_encode(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_text_encode<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let text = host_arg_usv(ctx, args, 0);
     ctx.make_uint8array(text.as_bytes())
 }
@@ -29374,24 +30456,37 @@ fn host_text_encode(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
 /// property read and string allocation for every response byte.
 /// Encoding #dom-textdecoder step 1-2: the lowercased name of a label's
 /// encoding, or null for failure and replacement.
-fn host_text_encoding_name(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_text_encoding_name<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let label = host_arg_string(ctx, args, 0);
     Ok(text_decoder_host::encoding_name(&label)
-        .map(Value::from_string)
+        .map(|text| ctx.string(text))
         .unwrap_or(Value::Null))
 }
 
 /// Encoding #dom-textdecoder-decode for every encoding except UTF-8:
 /// (name, bytes, stream, fatal, ignoreBOM, handle) → [text, handle, failed].
-fn host_text_decode(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_text_decode<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let name = host_arg_string(ctx, args, 0);
     let bytes = args
         .get(1)
         .and_then(|value| ctx.buffer_source_bytes(value, true))
         .ok_or_else(|| ctx.make_error("TypeError", "Text is not an attached BufferSource"))?;
-    let flag = |index: usize| matches!(args.get(index), Some(Value::Bool(true)));
-    let handle = match args.get(5) {
-        Some(Value::Num(number)) if *number >= 0.0 && *number <= u32::MAX as f64 => *number as u32,
+    let flag = |index: usize| {
+        matches!(
+            args.get(index).map(|value| value.kind()),
+            Some(ValueKind::Bool(true))
+        )
+    };
+    let handle = match args.get(5).map(|value| value.kind()) {
+        Some(ValueKind::Num(number)) if number >= 0.0 && number <= u32::MAX as f64 => number as u32,
         _ => 0,
     };
     let decoded = ctx
@@ -29403,19 +30498,29 @@ fn host_text_decode(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
     // Decoded text is Rust text: `Value::from_string` keeps U+10F800..=U+10FFFF
     // characters (possible from UTF-16 and gb18030) as characters.
     Ok(ctx.make_array(vec![
-        Value::from_string(decoded.text),
+        ctx.string(decoded.text),
         Value::Num(f64::from(decoded.handle)),
         Value::Bool(decoded.failed),
     ]))
 }
 
-fn host_text_decode_utf8(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_text_decode_utf8<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let bytes = args
         .first()
         .and_then(|value| ctx.buffer_source_bytes(value, true))
         .ok_or_else(|| ctx.make_error("TypeError", "Text is not an attached BufferSource"))?;
-    let stream = matches!(args.get(1), Some(Value::Bool(true)));
-    let fatal = matches!(args.get(2), Some(Value::Bool(true)));
+    let stream = matches!(
+        args.get(1).map(|value| value.kind()),
+        Some(ValueKind::Bool(true))
+    );
+    let fatal = matches!(
+        args.get(2).map(|value| value.kind()),
+        Some(ValueKind::Bool(true))
+    );
     let mut remaining = bytes.as_slice();
     let mut output = String::new();
     let mut failed = false;
@@ -29446,23 +30551,23 @@ fn host_text_decode_utf8(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
     }
     if remaining.is_empty() && !failed {
         // The common complete-response path needs no state tuple or byte view.
-        return Ok(Value::from_string(output));
+        return Ok(ctx.string(output));
     }
     // TextDecoder.decode throws before serializing on a fatal error. Preserve
     // its unconsumed I/O queue so a later streaming call can resume correctly.
     let pending = ctx.make_uint8array(remaining)?;
-    Ok(ctx.make_array(vec![
-        Value::from_string(output),
-        pending,
-        Value::Bool(failed),
-    ]))
+    Ok(ctx.make_array(vec![ctx.string(output), pending, Value::Bool(failed)]))
 }
 
 /// Fetch #concept-bodyinit-extract: take a byte-exact snapshot of a BufferSource,
 /// including a view's offset and length, without reading author properties or
 /// converting binary data into a JavaScript string. Web IDL excludes shared,
 /// detached, and out-of-bounds buffers from this union.
-fn host_body_buffer(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_body_buffer<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let bytes = args
         .first()
         .and_then(|value| ctx.buffer_source_bytes(value, false))
@@ -29474,15 +30579,19 @@ fn host_body_buffer(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
 /// Inspect engine-owned Error data without [[Get]]/ToPrimitive; other objects
 /// remain opaque in this noninteractive console. In particular, proxies and
 /// authored Error name/message/stack accessors must never run while printing.
-fn host_console_inspect(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_console_inspect<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let value = args.first().unwrap_or(&Value::Undefined);
-    if !matches!(value, Value::Obj(_)) {
+    if !matches!(value.kind(), ValueKind::Obj(_)) {
         return Ok(Value::Null);
     }
     if let Some(diagnostic) = ctx.error_diagnostic(value) {
-        return Ok(Value::from_string(diagnostic));
+        return Ok(ctx.string(diagnostic));
     }
-    Ok(Value::str(if value.is_callable() {
+    Ok(ctx.str(if value.is_callable() {
         "[Function]"
     } else {
         "[Object]"
@@ -29491,11 +30600,18 @@ fn host_console_inspect(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
 
 /// HTML #atob and Infra #forgiving-base64. `null` is an internal invalid-input
 /// sentinel; the JS binding throws the invoking Realm's DOMException.
-fn host_base64_convert(_ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let Some(Value::Str(text)) = args.first() else {
+fn host_base64_convert<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
+    let Some(text) = args.first().and_then(|value| value.as_engine_text()) else {
         return Ok(Value::Null);
     };
-    if matches!(args.get(1), Some(Value::Bool(true))) {
+    if matches!(
+        args.get(1).map(|value| value.kind()),
+        Some(ValueKind::Bool(true))
+    ) {
         // Binary strings are Latin-1 code points, NOT UTF-8 encoded text.
         // Surrogates and every other non-byte code point must be rejected.
         let bytes: Option<Vec<u8>> = text
@@ -29503,7 +30619,7 @@ fn host_base64_convert(_ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
             .map(|ch| u8::try_from(ch as u32).ok())
             .collect();
         return Ok(bytes.map_or(Value::Null, |bytes| {
-            Value::from_string(crate::img::base64_encode(&bytes))
+            ctx.string(crate::img::base64_encode(&bytes))
         }));
     }
     let mut data: Vec<u8> = text
@@ -29541,20 +30657,24 @@ fn host_base64_convert(_ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
         }
     }
     // Infra deliberately discards non-zero trailing bits (YR decodes to a).
-    Ok(Value::from_string(output))
+    Ok(ctx.string(output))
 }
 
 /// `__dom_popover(node[, showing])`: optionally set the popover visibility
 /// state (adding the element to, or removing it from, the top layer), then
 /// return whether it is showing.
-fn host_dom_popover(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_dom_popover<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let dom = host_dom(ctx);
     let mut dom = dom.borrow_mut();
     let Some(id) = host_arg_node(&dom, args, 0) else {
         return Ok(Value::Bool(false));
     };
-    if let Some(Value::Bool(open)) = args.get(1) {
-        dom.set_popover_open(id, *open);
+    if let Some(ValueKind::Bool(open)) = args.get(1).map(|value| value.kind()) {
+        dom.set_popover_open(id, open);
     }
     Ok(Value::Bool(dom.is_popover_showing(id)))
 }
@@ -29562,31 +30682,39 @@ fn host_dom_popover(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
 /// `__dom_marquee(node, running, now)`: HTML #dom-marquee-start /
 /// #dom-marquee-stop at document-timeline time `now` (seconds). The pause
 /// clock is arena state, so pages never see or forge it as an attribute.
-fn host_dom_marquee(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_dom_marquee<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let dom = host_dom(ctx);
     let mut dom = dom.borrow_mut();
-    if let (Some(id), Some(Value::Bool(running)), Some(now)) = (
+    if let (Some(id), Some(ValueKind::Bool(running)), Some(now)) = (
         host_arg_node(&dom, args, 0),
-        args.get(1),
+        args.get(1).map(|value| value.kind()),
         args.get(2).and_then(Value::as_num_opt),
     ) && now.is_finite()
         && dom.tag_name(id) == Some("marquee")
     {
-        dom.set_marquee_running(id, *running, now as f32);
+        dom.set_marquee_running(id, running, now as f32);
     }
     Ok(Value::Undefined)
 }
 
 /// `__dom_dialog_modal(node[, modal])`: optionally set a dialog's "is modal"
 /// flag, then return it. The arena owns the flag so removal and `:modal` agree.
-fn host_dom_dialog_modal(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_dom_dialog_modal<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let dom = host_dom(ctx);
     let mut dom = dom.borrow_mut();
     let Some(id) = host_arg_node(&dom, args, 0) else {
         return Ok(Value::Bool(false));
     };
-    if let Some(Value::Bool(modal)) = args.get(1) {
-        dom.set_dialog_modal(id, *modal);
+    if let Some(ValueKind::Bool(modal)) = args.get(1).map(|value| value.kind()) {
+        dom.set_dialog_modal(id, modal);
     }
     Ok(Value::Bool(dom.is_modal(id)))
 }
@@ -29594,21 +30722,29 @@ fn host_dom_dialog_modal(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
 /// `__dom_fullscreen(node[, flag])`: optionally run Fullscreen API
 /// #fullscreen-an-element / #unfullscreen-an-element on the arena state
 /// (fullscreen flag plus top-layer membership), then return the flag.
-fn host_dom_fullscreen(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_dom_fullscreen<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let dom = host_dom(ctx);
     let mut dom = dom.borrow_mut();
     let Some(id) = host_arg_node(&dom, args, 0) else {
         return Ok(Value::Bool(false));
     };
-    if let Some(Value::Bool(fullscreen)) = args.get(1) {
-        dom.set_fullscreen_flag(id, *fullscreen);
+    if let Some(ValueKind::Bool(fullscreen)) = args.get(1).map(|value| value.kind()) {
+        dom.set_fullscreen_flag(id, fullscreen);
     }
     Ok(Value::Bool(dom.has_fullscreen_flag(id)))
 }
 
 /// `__dom_top_layer(document)`: the document's top layer (CSS Position 4
 /// #top-layer), in order.
-fn host_dom_top_layer(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_dom_top_layer<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let dom = host_dom(ctx);
     let ids = {
         let dom = dom.borrow();
@@ -29622,11 +30758,11 @@ fn host_dom_top_layer(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Val
 /// `__dom_top_layer_removals()`: the elements whose removal from their
 /// document cleared their top-layer state since the last call, so script can
 /// finish their removing steps (close watchers, fullscreen events).
-fn host_dom_top_layer_removals(
-    ctx: &mut Ctx,
-    _this: Value,
-    _args: &[Value],
-) -> Result<Value, Value> {
+fn host_dom_top_layer_removals<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    _args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let dom = host_dom(ctx);
     let ids = dom.borrow_mut().take_top_layer_removals();
     Ok(host_ids_array(ctx, ids))
@@ -29634,7 +30770,11 @@ fn host_dom_top_layer_removals(
 
 /// `__dom_open_dialogs(document)`: the connected open `dialog` elements of
 /// `document`, in shadow-including tree order (see `Dom::open_dialogs`).
-fn host_dom_open_dialogs(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_dom_open_dialogs<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let dom = host_dom(ctx);
     let ids = {
         let dom = dom.borrow();
@@ -29647,7 +30787,11 @@ fn host_dom_open_dialogs(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
 
 /// `__dom_inert(node)`: HTML #inert-subtrees, including the inertness of a
 /// document blocked by a modal dialog.
-fn host_dom_inert(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn host_dom_inert<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let dom = host_dom(ctx);
     let dom = dom.borrow();
     Ok(Value::Bool(
@@ -29656,7 +30800,7 @@ fn host_dom_inert(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
 }
 
 fn eval(engine: &mut trust_js::Engine, source: &str, label: &str) -> Result<(), String> {
-    eval_value(engine, source, label).map(|_| ())
+    engine.scope(|cx| eval_value(cx, source, label).map(|_| ()))
 }
 
 fn eval_main_page_diagnostic_init(
@@ -29669,57 +30813,83 @@ fn eval_main_page_diagnostic_init(
     };
     // The callback exists only as a lexical initializer parameter, never a Window property.
     // An installed closure can retain it, but ordinary author code acquires no global host API.
-    let reporter = main_page_diagnostic_reporter(engine);
     let initializer = format!("(function(__trustDiagnosticReport){{\n{source}\n}})");
-    let result =
-        eval_value(engine, &initializer, "TRust main-page diagnostic init").and_then(|function| {
-            engine
-                .call_function_interruptible(&function, Value::Undefined, &[reporter])
-                .map_err(|error| {
-                    describe_eval_error(engine, error, "TRust main-page diagnostic init")
-                })
-        });
+    let result = engine.scope(|cx| {
+        let reporter = main_page_diagnostic_reporter(cx);
+        let function = eval_value(cx, &initializer, "TRust main-page diagnostic init")?;
+        cx.call_function_interruptible(&function, Value::Undefined, &[reporter])
+            .map(|_| ())
+            .map_err(|error| describe_eval_error(cx, error, "TRust main-page diagnostic init"))
+    });
     // A failed diagnostic is reported, but does not skip the document's author scripts.
     if let Err(error) = result {
         errors.push(error);
     }
 }
 
-fn main_page_diagnostic_reporter(engine: &mut trust_js::Engine) -> Value {
+fn main_page_diagnostic_reporter<'s>(ctx: &mut Ctx<'s>) -> Value<'s> {
     const MAX_REPORT_BYTES: usize = 4 * 1024 * 1024;
+    fn error<'t>(
+        ctx: &mut Ctx<'t>,
+        reported: &Cell<bool>,
+        message: &str,
+    ) -> Result<Value<'t>, Value<'t>> {
+        if !reported.replace(true) {
+            eprintln!("trust-js: diagnostic error: {message}");
+        }
+        Err(ctx.make_error("TypeError", message))
+    }
     let attempted = Cell::new(false);
     let error_reported = Cell::new(false);
-    engine.ctx().new_native_fn(
+    ctx.new_native_fn(
         "diagnosticReport",
         1,
-        Rc::new(move |ctx, _, args| {
-            let error = |ctx: &mut Ctx, message: &str| {
-                if !error_reported.replace(true) {
-                    eprintln!("trust-js: diagnostic error: {message}");
-                }
-                Err(ctx.make_error("TypeError", message))
-            };
+        move |ctx, _, args| {
             if attempted.replace(true) {
-                return error(ctx, "diagnostic report may be submitted only once");
+                return error(
+                    ctx,
+                    &error_reported,
+                    "diagnostic report may be submitted only once",
+                );
             }
-            let [Value::Str(text)] = args else {
-                return error(ctx, "diagnostic report requires one JSON object string");
+            let text = match args {
+                [value] => value.as_engine_text(),
+                _ => None,
+            };
+            let Some(text) = text else {
+                return error(
+                    ctx,
+                    &error_reported,
+                    "diagnostic report requires one JSON object string",
+                );
             };
             if text.len() > MAX_REPORT_BYTES {
-                return error(ctx, "diagnostic report exceeds the 4 MiB limit");
+                return error(
+                    ctx,
+                    &error_reported,
+                    "diagnostic report exceeds the 4 MiB limit",
+                );
             }
-            let Ok(value @ serde_json::Value::Object(_)) = serde_json::from_str(text.as_ref())
-            else {
-                return error(ctx, "diagnostic report is not a valid JSON object");
+            let Ok(value @ serde_json::Value::Object(_)) = serde_json::from_str(text) else {
+                return error(
+                    ctx,
+                    &error_reported,
+                    "diagnostic report is not a valid JSON object",
+                );
             };
             // Canonical serialization keeps this exactly one line, even if input had whitespace.
             let encoded = serde_json::to_string(&value).expect("JSON values serialize");
             if encoded.len() > MAX_REPORT_BYTES {
-                return error(ctx, "diagnostic report exceeds the 4 MiB limit");
+                return error(
+                    ctx,
+                    &error_reported,
+                    "diagnostic report exceeds the 4 MiB limit",
+                );
             }
             eprintln!("trust-js: diagnostic: {encoded}");
             Ok(Value::Undefined)
-        }),
+        },
+        trust_js::embed::NativeCaptures::None,
     )
 }
 
@@ -29731,47 +30901,94 @@ fn eval_bootstrap_snapshot(
     snapshot: &'static [u8],
     label: &str,
 ) -> Result<(), String> {
-    match engine.eval_shared_snapshot_value_interruptible(snapshot) {
-        Err(error) => Err(format!(
-            "{label} parse error at line {}: {}",
-            error.line, error.message
-        )),
-        Ok(Err(error)) => Err(describe_eval_error(engine, error, label)),
-        Ok(Ok(_)) => Ok(()),
-    }
+    engine.scope(
+        |cx| match cx.eval_shared_snapshot_value_interruptible(snapshot) {
+            Err(error) => Err(format!(
+                "{label} parse error at line {}: {}",
+                error.line, error.message
+            )),
+            Ok(Err(error)) => Err(describe_eval_error(cx, error, label)),
+            Ok(Ok(_)) => Ok(()),
+        },
+    )
 }
 
-fn eval_value(engine: &mut trust_js::Engine, source: &str, label: &str) -> Result<Value, String> {
-    match engine.eval_value_interruptible(source) {
+/// `eval_value` for tests that drive an engine directly: the completion, read out of its scope.
+#[cfg(test)]
+fn eval_test_value(
+    engine: &mut trust_js::Engine,
+    source: &str,
+    label: &str,
+) -> Result<TrustValue, String> {
+    engine.scope(|cx| eval_value(cx, source, label).map(|value| TrustValue::read(cx, value)))
+}
+
+/// `dispatch_timer_task_to` for tests that drive an engine directly.
+#[cfg(test)]
+fn test_dispatch_timer(
+    engine: &mut trust_js::Engine,
+    deadline: f64,
+    label: &str,
+) -> Result<bool, String> {
+    engine.scope(|cx| {
+        dispatch_timer_task_to(cx, deadline).map_err(|error| describe_eval_error(cx, error, label))
+    })
+}
+
+/// `value_string` of a test's value, outside any scope.
+#[cfg(test)]
+fn test_value_string(engine: &mut trust_js::Engine, value: &TrustValue) -> String {
+    engine.scope(|cx| {
+        let value = value.value(cx);
+        value_string(cx, &value)
+    })
+}
+
+/// `engine_call_trust_method` for tests that drive an engine directly; a throw or an
+/// interruption is its description.
+#[cfg(test)]
+fn engine_test_call(
+    engine: &mut trust_js::Engine,
+    name: &str,
+    args: &[TrustValue],
+) -> Result<TrustValue, String> {
+    engine.scope(|cx| {
+        let args = TrustValue::values(cx, args);
+        engine_call_trust_method(cx, name, &args)
+            .map(|value| TrustValue::read(cx, value))
+            .map_err(|error| describe_eval_error(cx, error, name))
+    })
+}
+
+fn eval_value<'s>(ctx: &mut Ctx<'s>, source: &str, label: &str) -> Result<Value<'s>, String> {
+    match ctx.eval_value_interruptible(source) {
         Err(error) => Err(format!(
             "{label} parse error at line {}: {}",
             error.line, error.message
         )),
-        Ok(Err(error)) => Err(describe_eval_error(engine, error, label)),
+        Ok(Err(error)) => Err(describe_eval_error(ctx, error, label)),
         Ok(Ok(value)) => Ok(value),
     }
 }
 
-fn describe_eval_error(engine: &mut trust_js::Engine, error: EvalError, label: &str) -> String {
+fn describe_eval_error<'s>(ctx: &mut Ctx<'s>, error: EvalError<'s>, label: &str) -> String {
     match error {
-        EvalError::Throw(thrown) => describe_throw(engine, thrown, label),
+        EvalError::Throw(thrown) => describe_throw(ctx, thrown, label),
         EvalError::Interrupted(reason) => format!("{label} interrupted: {}", reason.message()),
     }
 }
 
-fn describe_throw(engine: &mut trust_js::Engine, thrown: Value, label: &str) -> String {
-    let rendered = value_string(engine, &thrown);
-    let name = engine
-        .ctx()
+fn describe_throw<'s>(ctx: &mut Ctx<'s>, thrown: Value<'s>, label: &str) -> String {
+    let rendered = value_string(ctx, &thrown);
+    let name = ctx
         .get_member(&thrown, "name")
         .ok()
-        .map(|value| value_string(engine, &value))
+        .map(|value| value_string(ctx, &value))
         .filter(|name| !name.is_empty() && name != "undefined");
-    let message = engine
-        .ctx()
+    let message = ctx
         .get_member(&thrown, "message")
         .ok()
-        .map(|value| value_string(engine, &value))
+        .map(|value| value_string(ctx, &value))
         .filter(|message| !message.is_empty() && message != "undefined");
     match (name, message) {
         (Some(name), Some(message)) => format!("{label} threw {name}: {message}"),
@@ -29779,10 +30996,8 @@ fn describe_throw(engine: &mut trust_js::Engine, thrown: Value, label: &str) -> 
     }
 }
 
-fn value_string(engine: &mut trust_js::Engine, value: &Value) -> String {
-    engine
-        .ctx()
-        .coerce_string(value)
+fn value_string<'s>(ctx: &mut Ctx<'s>, value: &Value<'s>) -> String {
+    ctx.coerce_string(value)
         .map(|string| string.to_string())
         .unwrap_or_else(|_| format!("<{}>", value.type_of()))
 }
@@ -29849,47 +31064,36 @@ mod tests {
     #[test]
     fn main_page_diagnostic_report_is_bounded_one_shot_and_has_no_global_binding() {
         let mut engine = trust_js::Engine::new();
-        let reporter = main_page_diagnostic_reporter(&mut engine);
-        assert!(
-            engine
-                .call_function(
-                    &reporter,
-                    Value::Undefined,
-                    &[Value::from_string("{\n\"complete\": true\n}".to_owned())]
-                )
-                .is_ok()
-        );
-        assert!(
-            engine
-                .call_function(
-                    &reporter,
-                    Value::Undefined,
-                    &[Value::from_string("{}".to_owned())]
-                )
-                .is_err()
-        );
-        for argument in [
-            Value::Num(3.0),
-            Value::from_string("[1]".to_owned()),
-            Value::from_string("{".to_owned()),
-            Value::from_string("x".repeat(4 * 1024 * 1024 + 1)),
-        ] {
-            let reporter = main_page_diagnostic_reporter(&mut engine);
+        engine.scope(|cx| {
+            let reporter = main_page_diagnostic_reporter(cx);
+            let report = cx.str("{\n\"complete\": true\n}");
             assert!(
-                engine
-                    .call_function(&reporter, Value::Undefined, &[argument])
+                cx.call_function(&reporter, Value::Undefined, &[report])
+                    .is_ok()
+            );
+            let report = cx.str("{}");
+            assert!(
+                cx.call_function(&reporter, Value::Undefined, &[report])
                     .is_err()
             );
-            assert!(
-                engine
-                    .call_function(
-                        &reporter,
-                        Value::Undefined,
-                        &[Value::from_string("{}".to_owned())]
-                    )
-                    .is_err()
-            );
-        }
+            for argument in [
+                Value::Num(3.0),
+                cx.str("[1]"),
+                cx.str("{"),
+                cx.string("x".repeat(4 * 1024 * 1024 + 1)),
+            ] {
+                let reporter = main_page_diagnostic_reporter(cx);
+                assert!(
+                    cx.call_function(&reporter, Value::Undefined, &[argument])
+                        .is_err()
+                );
+                let report = cx.str("{}");
+                assert!(
+                    cx.call_function(&reporter, Value::Undefined, &[report])
+                        .is_err()
+                );
+            }
+        });
         assert_eq!(
             string_value(&mut engine, "typeof __trustDiagnosticReport"),
             "undefined"
@@ -30475,12 +31679,7 @@ mod tests {
                 "400,500"
             );
             let passes = crate::layout2::layout_pass_count();
-            let cache = engine
-                .ctx()
-                .host_mut::<HostState>()
-                .unwrap()
-                .geom_cache
-                .clone();
+            let cache = engine.host_mut::<HostState>().unwrap().geom_cache.clone();
             let commands = cache.borrow().paint.as_ref().unwrap().primitives.as_ptr();
             assert_eq!(
                 string_value(
@@ -30671,17 +31870,12 @@ mod tests {
             "120"
         );
         {
-            let cache = engine
-                .ctx()
-                .host_mut::<HostState>()
-                .unwrap()
-                .geom_cache
-                .borrow();
+            let cache = engine.host_mut::<HostState>().unwrap().geom_cache.borrow();
             assert!(!cache.complete_geometry);
             assert_eq!(cache.boxes.len(), 1);
             assert!(cache.scrolling_areas.is_empty());
         }
-        let cache = ensure_host_geom_cache(engine.ctx(), "test-repeat");
+        let cache = engine.scope(|cx| ensure_host_geom_cache(cx, "test-repeat"));
         assert!(cache.borrow().complete_geometry);
         assert_eq!(crate::layout2::layout_pass_count(), start + 1);
         assert!(
@@ -30849,7 +32043,7 @@ mod tests {
             (None, "20"),
         ] {
             {
-                let state = engine.ctx().host_mut::<HostState>().unwrap();
+                let state = engine.host_mut::<HostState>().unwrap();
                 if let Some(size) = size {
                     state.images.borrow_mut().insert(source.clone(), size);
                 } else {
@@ -30868,7 +32062,7 @@ mod tests {
                 ),
                 height
             );
-            let cache = ensure_host_geom_cache(engine.ctx(), "image-completion-test");
+            let cache = engine.scope(|cx| ensure_host_geom_cache(cx, "image-completion-test"));
             assert!(
                 cache.borrow().paint.is_none(),
                 "old hit-test geometry survived a resource update"
@@ -30923,7 +32117,7 @@ mod tests {
             )
         };
         let first = color(&mut engine);
-        let cache = ensure_host_geom_cache(engine.ctx(), "before frame");
+        let cache = engine.scope(|cx| ensure_host_geom_cache(cx, "before frame"));
         let fragments = cache.borrow().fragments.clone().unwrap();
         let _ = dom.borrow_mut().take_dirty();
         let _ = dom.borrow_mut().take_css_animation_updates();
@@ -30949,7 +32143,7 @@ mod tests {
         // A color frame repaints: neither the DOM nor geometry changed.
         assert_eq!(dom.borrow_mut().take_css_animation_updates(), (true, false));
         assert!(!dom.borrow_mut().take_dirty());
-        ensure_host_geom_cache(engine.ctx(), "after frame");
+        engine.scope(|cx| ensure_host_geom_cache(cx, "after frame"));
         assert!(std::sync::Arc::ptr_eq(
             &fragments,
             cache.borrow().fragments.as_ref().unwrap()
@@ -30987,7 +32181,7 @@ mod tests {
             &mut engine,
             "document.getElementById('box').style.height='100px';getComputedStyle(document.getElementById('box')).height",
         );
-        let sample = CssAnimationSample::new(engine.ctx());
+        let sample = engine.scope(CssAnimationSample::new);
         let before = string_value(
             &mut engine,
             "document.getElementById('box').getBoundingClientRect().height",
@@ -31171,12 +32365,7 @@ mod tests {
         )));
         let mut engine =
             configured_engine(HostState::new(dom, Rc::new(RealmClock::new())), DEFAULT_URL);
-        let cache = engine
-            .ctx()
-            .host_mut::<HostState>()
-            .unwrap()
-            .geom_cache
-            .clone();
+        let cache = engine.host_mut::<HostState>().unwrap().geom_cache.clone();
         assert_eq!(
             string_value(
                 &mut engine,
@@ -31232,12 +32421,7 @@ mod tests {
             "40"
         );
         assert_eq!(crate::layout2::layout_pass_count(), start + 1);
-        let cache = engine
-            .ctx()
-            .host_mut::<HostState>()
-            .unwrap()
-            .geom_cache
-            .clone();
+        let cache = engine.host_mut::<HostState>().unwrap().geom_cache.clone();
         assert_eq!(
             string_value(
                 &mut engine,
@@ -31321,12 +32505,7 @@ mod tests {
             "[90,30,200,100,30,40,3,4,0,0]"
         );
         assert_eq!(crate::layout2::layout_pass_count(), start + 1);
-        let cache = engine
-            .ctx()
-            .host_mut::<HostState>()
-            .unwrap()
-            .geom_cache
-            .clone();
+        let cache = engine.host_mut::<HostState>().unwrap().geom_cache.clone();
         assert!(!cache.borrow().complete_geometry);
         assert_eq!(cache.borrow().boxes.len(), 3);
         assert_eq!(
@@ -31431,7 +32610,7 @@ mod tests {
             DEFAULT_URL,
         );
         let canvas = dom.borrow().get_by_id("c").unwrap();
-        let cache = ensure_host_geom_cache(engine.ctx(), "before drawing");
+        let cache = engine.scope(|cx| ensure_host_geom_cache(cx, "before drawing"));
         let fragments = cache.borrow().fragments.clone().unwrap();
         let _ = dom.borrow_mut().take_dirty();
         let _ = dom.borrow_mut().take_dirty_targets();
@@ -31453,7 +32632,7 @@ mod tests {
             dom.borrow_mut().take_dirty_targets(),
             Some(vec![(canvas, crate::dom::DirtyKind::Paint)])
         );
-        ensure_host_geom_cache(engine.ctx(), "after drawing");
+        engine.scope(|cx| ensure_host_geom_cache(cx, "after drawing"));
         assert!(
             Arc::ptr_eq(&fragments, cache.borrow().fragments.as_ref().unwrap()),
             "bitmap updates must reuse the established fragment geometry"
@@ -31496,7 +32675,7 @@ mod tests {
             HostState::new(dom.clone(), Rc::new(RealmClock::new())),
             DEFAULT_URL,
         );
-        let cache = ensure_host_geom_cache(engine.ctx(), "initial");
+        let cache = engine.scope(|cx| ensure_host_geom_cache(cx, "initial"));
         let initial = cache.borrow().fragments.clone().unwrap();
         let epoch = dom.borrow().epoch();
         let link = dom.borrow().get_by_id("link").unwrap();
@@ -31507,7 +32686,7 @@ mod tests {
             epoch,
             "presentation metadata is not a DOM mutation"
         );
-        ensure_host_geom_cache(engine.ctx(), "activation");
+        engine.scope(|cx| ensure_host_geom_cache(cx, "activation"));
         assert!(!Arc::ptr_eq(
             &initial,
             cache.borrow().fragments.as_ref().unwrap()
@@ -31515,20 +32694,20 @@ mod tests {
         let activated = cache.borrow().fragments.clone().unwrap();
         dom.borrow_mut()
             .set_render_clickables([link].into_iter().collect(), true);
-        ensure_host_geom_cache(engine.ctx(), "same-activation");
+        engine.scope(|cx| ensure_host_geom_cache(cx, "same-activation"));
         assert!(Arc::ptr_eq(
             &activated,
             cache.borrow().fragments.as_ref().unwrap()
         ));
         {
-            let state = engine.ctx().host_mut::<HostState>().unwrap();
+            let state = engine.host_mut::<HostState>().unwrap();
             state
                 .images
                 .borrow_mut()
                 .insert("https://example.com/image.png".into(), (320, 180));
             state.geom_cache.borrow_mut().epoch = u64::MAX;
         }
-        ensure_host_geom_cache(engine.ctx(), "image-size");
+        engine.scope(|cx| ensure_host_geom_cache(cx, "image-size"));
         assert!(!Arc::ptr_eq(
             &activated,
             cache.borrow().fragments.as_ref().unwrap()
@@ -31558,7 +32737,8 @@ mod tests {
             "first"
         );
         let passes = crate::layout2::layout_pass_count();
-        let hit_storage = ensure_host_hit_test_cache(engine.ctx())
+        let hit_storage = engine
+            .scope(ensure_host_hit_test_cache)
             .borrow()
             .hit_index
             .as_ref()
@@ -31578,7 +32758,8 @@ mod tests {
             "scroll must refresh hit-test paint, not relayout"
         );
         assert_eq!(
-            ensure_host_hit_test_cache(engine.ctx())
+            engine
+                .scope(ensure_host_hit_test_cache)
                 .borrow()
                 .hit_index
                 .as_ref()
@@ -31691,7 +32872,6 @@ mod tests {
     #[derive(Default)]
     struct HostRetainedProbe {
         allocations: usize,
-        values: Vec<Value>,
         opaque: usize,
         unavailable: usize,
     }
@@ -31699,10 +32879,6 @@ mod tests {
     impl HostRetainedMemoryVisitor for HostRetainedProbe {
         fn allocation(&mut self, _allocation: RetainedManagedAllocation) {
             self.allocations += 1;
-        }
-
-        fn value(&mut self, value: &Value) {
-            self.values.push(value.clone());
         }
 
         fn opaque_storage(&mut self) {
@@ -31715,18 +32891,23 @@ mod tests {
     }
 
     #[test]
-    fn host_state_retained_inventory_is_exhaustive_and_keeps_value_roots() {
+    fn host_state_retained_inventory_is_exhaustive() {
+        // The JavaScript values the host keeps are handles, which the engine's memory
+        // snapshot counts itself; the reporter describes the host's own allocations.
+        let mut engine = trust_js::Engine::new();
         let mut state = HostState::new(
             Rc::new(RefCell::new(Dom::new())),
             Rc::new(RealmClock::new()),
         );
-        state.window_realms.insert(7, Value::Num(19.0));
+        let realm = engine.scope(|cx| {
+            let global = cx.global_this();
+            hold(cx, &global)
+        });
+        state.window_realms.insert(7, realm);
         let mut probe = HostRetainedProbe::default();
         state.scan_retained_memory(&mut probe);
 
         assert!(probe.allocations >= 8);
-        assert_eq!(probe.values.len(), 1);
-        assert_eq!(probe.values[0].as_num_opt(), Some(19.0));
         assert!(probe.opaque >= 1);
         assert_eq!(probe.unavailable, 0);
     }
@@ -31792,7 +32973,7 @@ mod tests {
         // due at whole seconds of the agent clock, in their nominal order.
         let mut engine = platform_engine();
         let number = |engine: &mut trust_js::Engine, source: &str| {
-            eval_value(engine, source, "timer probe")
+            eval_test_value(engine, source, "timer probe")
                 .unwrap()
                 .as_num_opt()
                 .unwrap()
@@ -31829,14 +33010,14 @@ mod tests {
         // Both still fire, in their nominal order.
         eval(&mut engine, "__trust.setTimerThrottleFrom(0)", "throttle").unwrap();
         for _ in 0..4 {
-            let Some(deadline) = eval_value(&mut engine, "__trust.nextDeadline()", "deadline")
+            let Some(deadline) = eval_test_value(&mut engine, "__trust.nextDeadline()", "deadline")
                 .unwrap()
                 .as_num_opt()
                 .filter(|n| n.is_finite())
             else {
                 break;
             };
-            if engine_call_trust_method(&mut engine, "tickTo", &[Value::Num(deadline)]).is_err() {
+            if engine_test_call(&mut engine, "tickTo", &[TrustValue::Num(deadline)]).is_err() {
                 panic!("a timer failed");
             }
         }
@@ -31849,7 +33030,7 @@ mod tests {
         // is not heard, so it no longer keeps a hidden page's timers on time.
         let mut engine = platform_engine();
         let number = |engine: &mut trust_js::Engine, source: &str| {
-            eval_value(engine, source, "timer probe")
+            eval_test_value(engine, source, "timer probe")
                 .unwrap()
                 .as_num_opt()
                 .unwrap()
@@ -32292,7 +33473,6 @@ mod tests {
         let mut engine = platform_engine_with_body();
         let written = |engine: &mut trust_js::Engine| {
             engine
-                .ctx()
                 .host_mut::<HostState>()
                 .map(|state| std::mem::take(&mut state.clipboard_requests))
                 .unwrap()
@@ -32339,7 +33519,6 @@ mod tests {
         let mut engine = platform_engine_with_body();
         let results = |engine: &mut trust_js::Engine| {
             engine
-                .ctx()
                 .host_mut::<HostState>()
                 .map(|state| std::mem::take(&mut state.context_menus))
                 .unwrap()
@@ -33081,13 +34260,8 @@ mod tests {
             ),
             "Hello-ǲUNGLE|ASSB|İＳＴＡＮＢＵＬ|ℎ|aßb|aßb"
         );
-        let written = std::mem::take(
-            &mut engine
-                .ctx()
-                .host_mut::<HostState>()
-                .unwrap()
-                .clipboard_requests,
-        );
+        let written =
+            std::mem::take(&mut engine.host_mut::<HostState>().unwrap().clipboard_requests);
         assert_eq!(
             written
                 .into_iter()
@@ -33471,10 +34645,10 @@ mod tests {
             "MediaQueryList|true|(max-width: 400px)|false|function|TypeError|x|true|1|screen, print"
         );
         assert!(
-            engine_call_trust_method(
+            engine_test_call(
                 &mut engine,
                 "setViewport",
-                &[Value::Num(300.0), Value::Num(200.0)]
+                &[TrustValue::Num(300.0), TrustValue::Num(200.0)]
             )
             .is_ok()
         );
@@ -34090,7 +35264,6 @@ mod tests {
         let mut engine = trust_js::Engine::new();
         engine.set_wall_clock(move || clock.now_ms());
         engine
-            .ctx()
             .op_state()
             .put_retained_memory_with_external_memory(state);
         install_trust_js_worker_boundary(&mut engine);
@@ -34129,7 +35302,6 @@ mod tests {
             )
             .unwrap();
             let channels = worker
-                .ctx()
                 .host_mut::<HostState>()
                 .unwrap()
                 .message_ports
@@ -35024,7 +36196,6 @@ mod tests {
                 "0,0,0,0"
             );
             engine
-                .ctx()
                 .host_mut::<HostState>()
                 .unwrap()
                 .screen_position
@@ -35035,7 +36206,6 @@ mod tests {
                 "{tier:?}"
             );
             engine
-                .ctx()
                 .host_mut::<HostState>()
                 .unwrap()
                 .screen_position
@@ -36533,12 +37703,11 @@ mod tests {
             // Worker replies arrive as host tasks; port messages as platform
             // tasks.
             if matches!(
-                engine_call_trust_method(&mut engine, "hasPlatformTask", &[]),
-                Ok(Value::Bool(true))
+                engine_test_call(&mut engine, "hasPlatformTask", &[]),
+                Ok(TrustValue::Bool(true))
             ) {
-                engine_call_trust_method(&mut engine, "runPlatformTask", &[]).unwrap_or_else(
-                    |error| panic!("{}", describe_eval_error(&mut engine, error, "worker task")),
-                );
+                engine_test_call(&mut engine, "runPlatformTask", &[])
+                    .unwrap_or_else(|error| panic!("{}", error));
             } else if let Ok(Some(task)) = runtime.block_on(async {
                 tokio::time::timeout(Duration::from_millis(200), task_rx.recv()).await
             }) {
@@ -37068,17 +38237,10 @@ mod tests {
                     .unwrap();
                 }
                 {
-                    let state = engine.ctx().host_mut::<HostState>().unwrap();
+                    let state = engine.host_mut::<HostState>().unwrap();
                     assert_eq!(state.window_realms.len(), 1);
-                    retired.push(Rc::downgrade(
-                        state
-                            .window_realms
-                            .values()
-                            .next()
-                            .unwrap()
-                            .as_obj()
-                            .unwrap(),
-                    ));
+                    let window = state.window_realms.values().next().unwrap();
+                    retired.push(window.downgrade().expect("a live Window Realm"));
                 }
                 eval(
                     &mut engine,
@@ -37092,22 +38254,17 @@ mod tests {
                 engine.collect_garbage_at_idle();
             }
             assert!(
-                retired[0].upgrade().is_some(),
+                !retired[0].is_cleared(),
                 "{tier:?}: borrowed Range lost its Realm"
             );
             for (index, window) in retired.iter().enumerate().skip(1) {
                 assert!(
-                    window.upgrade().is_none(),
+                    window.is_cleared(),
                     "{tier:?}: range registry kept retired Realm {index} alive"
                 );
             }
             assert_eq!(
-                engine
-                    .ctx()
-                    .host_mut::<HostState>()
-                    .unwrap()
-                    .live_ranges
-                    .len(),
+                engine.host_mut::<HostState>().unwrap().live_ranges.len(),
                 1,
                 "{tier:?}: collection retained dead native Range metadata"
             );
@@ -37147,18 +38304,10 @@ mod tests {
                 engine.collect_garbage_at_idle();
             }
             assert!(
-                retired[0].upgrade().is_none(),
+                retired[0].is_cleared(),
                 "{tier:?}: released Range kept its Realm"
             );
-            assert_eq!(
-                engine
-                    .ctx()
-                    .host_mut::<HostState>()
-                    .unwrap()
-                    .live_ranges
-                    .len(),
-                0
-            );
+            assert_eq!(engine.host_mut::<HostState>().unwrap().live_ranges.len(), 0);
             assert_eq!(string_value(&mut engine, "__trust.takeErrors()"), "");
         }
     }
@@ -38102,28 +39251,25 @@ mod tests {
             {
                 continue;
             }
-            match engine.eval_value_interruptible(&source) {
+            engine.scope(|cx| match cx.eval_value_interruptible(&source) {
                 Ok(Err(EvalError::Throw(error))) => {
-                    let stack = engine
-                        .ctx()
-                        .get_member(&error, "stack")
-                        .unwrap_or(Value::Undefined);
+                    let stack = cx.get_member(&error, "stack").unwrap_or(Value::Undefined);
                     eprintln!(
                         "script {index}: {}\n{}",
-                        value_string(&mut engine, &error),
-                        value_string(&mut engine, &stack)
+                        value_string(cx, &error),
+                        value_string(cx, &stack)
                     );
                 }
                 Ok(Ok(_)) => eprintln!("script {index}: completed"),
                 Ok(Err(error)) => eprintln!(
                     "script {index}: {}",
-                    describe_eval_error(&mut engine, error, "diagnostic")
+                    describe_eval_error(cx, error, "script")
                 ),
                 Err(error) => eprintln!(
                     "script {index}: parse error {}:{}",
                     error.line, error.message
                 ),
-            }
+            });
         }
     }
 
@@ -38630,7 +39776,6 @@ mod tests {
             "true||rejected:TypeError|error|true|resolved|change:player:truetrue|true|true|true|true|true|true|change:player:truetrue||false|exit:TypeError"
         );
         let requests = engine
-            .ctx()
             .host_mut::<HostState>()
             .map(|state| std::mem::take(&mut state.fullscreen_requests))
             .unwrap();
@@ -39079,7 +40224,7 @@ mod tests {
         )
         .unwrap();
         for _ in 0..3 {
-            engine.ctx().collect_garbage_for_host();
+            engine.scope(|cx| cx.collect_garbage_for_host());
         }
         assert_eq!(
             string_value(
@@ -39127,7 +40272,6 @@ mod tests {
         engine.set_wall_clock(move || engine_clock.now_ms());
         state.configure_module_loading(&mut engine);
         engine
-            .ctx()
             .op_state()
             .put_retained_memory_with_external_memory(state);
         install_host_boundary(&mut engine);
@@ -39225,22 +40369,33 @@ mod tests {
             });
     }
 
-    fn call_trust_method(engine: &mut trust_js::Engine, name: &str, args: &[Value]) -> Value {
-        let trust = platform_control(engine.ctx())
-            .unwrap_or_else(|_| panic!("read the platform control object"));
-        let method = engine
-            .ctx()
-            .get_member(&trust, name)
-            .unwrap_or_else(|_| panic!("read __trust.{name}"));
-        match engine.call_function_interruptible(&method, trust, args) {
-            Ok(value) => value,
-            Err(error) => panic!("{}", describe_eval_error(engine, error, name)),
-        }
+    fn call_trust_method(
+        engine: &mut trust_js::Engine,
+        name: &str,
+        args: &[TrustValue],
+    ) -> TrustValue {
+        engine.scope(|cx| {
+            let args = TrustValue::values(cx, args);
+            let trust =
+                platform_control(cx).unwrap_or_else(|_| panic!("read the platform control object"));
+            let method = cx
+                .get_member(&trust, name)
+                .unwrap_or_else(|_| panic!("read __trust.{name}"));
+            match cx.call_function_interruptible(&method, trust, &args) {
+                Ok(value) => TrustValue::read(cx, value),
+                Err(error) => panic!("{}", describe_eval_error(cx, error, name)),
+            }
+        })
     }
 
     pub(super) fn string_value(engine: &mut trust_js::Engine, expression: &str) -> String {
-        let value = eval_value(engine, expression, expression).unwrap();
-        value_string(engine, &value)
+        engine.scope(|cx| scoped_string_value(cx, expression))
+    }
+
+    /// `string_value` in a scope, such as a Window Realm's.
+    pub(super) fn scoped_string_value(cx: &mut Ctx<'_>, expression: &str) -> String {
+        let value = eval_value(cx, expression, expression).unwrap();
+        value_string(cx, &value)
     }
 
     async fn read_test_client_frame(stream: &mut tokio::net::TcpStream) -> (u8, Vec<u8>) {
@@ -39342,7 +40497,7 @@ mod tests {
             DEFAULT_URL,
         );
         for &(name, length, _) in TRUST_JS_HOST_FUNCTIONS {
-            let actual = eval_value(&mut engine, &format!("{name}.length"), name).unwrap();
+            let actual = eval_test_value(&mut engine, &format!("{name}.length"), name).unwrap();
             assert_eq!(actual.as_num_opt(), Some(length as f64), "{name}.length");
         }
     }
@@ -39399,12 +40554,7 @@ mod tests {
             ),
             DEFAULT_URL,
         );
-        engine
-            .ctx()
-            .host_mut::<HostState>()
-            .unwrap()
-            .test_hooks
-            .internals = false;
+        engine.host_mut::<HostState>().unwrap().test_hooks.internals = false;
         eval_platform_prelude(&mut engine).unwrap();
         let probe = author_global_internals_probe();
         assert_eq!(
@@ -39445,7 +40595,12 @@ mod tests {
             "the private platform still serves same-origin author code"
         );
         // The native host keeps its retained handle to each Realm's control object.
-        assert!(matches!(platform_control(engine.ctx()), Ok(Value::Obj(_))));
+        assert!(engine.scope(|cx| {
+            matches!(
+                platform_control(cx).map(|value| value.kind()),
+                Ok(ValueKind::Obj(_))
+            )
+        }));
 
         let mut worker = worker_platform_engine_with(false);
         assert_eq!(
@@ -39461,7 +40616,12 @@ mod tests {
             addEventListener('probe', listener); dispatchEvent(new Event('probe')); return seen; })()";
         assert_eq!(string_value(&mut worker, caller_probe), "null", "worker");
         assert_eq!(string_value(&mut engine, caller_probe), "null", "Window");
-        assert!(matches!(platform_control(worker.ctx()), Ok(Value::Obj(_))));
+        assert!(worker.scope(|cx| {
+            matches!(
+                platform_control(cx).map(|value| value.kind()),
+                Ok(ValueKind::Obj(_))
+            )
+        }));
     }
 
     /// A production-configured top-level Window: no test internals are republished.
@@ -39473,12 +40633,7 @@ mod tests {
             ),
             url,
         );
-        engine
-            .ctx()
-            .host_mut::<HostState>()
-            .unwrap()
-            .test_hooks
-            .internals = false;
+        engine.host_mut::<HostState>().unwrap().test_hooks.internals = false;
         eval_platform_prelude(&mut engine).unwrap();
         engine
     }
@@ -39504,7 +40659,7 @@ mod tests {
         .unwrap();
         call_trust_method(&mut engine, "hydrateFrames", &[]);
         let child = {
-            let state = engine.ctx().host_mut::<HostState>().unwrap();
+            let state = engine.host_mut::<HostState>().unwrap();
             let newest = *state
                 .window_realms
                 .keys()
@@ -39512,19 +40667,21 @@ mod tests {
                 .expect("child Window Realm");
             state.window_realms[&newest].clone()
         };
-        let mut read = |object: &Value, name: &str| {
-            engine
-                .ctx()
-                .member_get(object, name)
+        fn read<'s>(cx: &mut Ctx<'s>, object: &Value<'s>, name: &str) -> Value<'s> {
+            cx.member_get(object, name)
                 .unwrap_or_else(|_| panic!("read {name}"))
-        };
-        let child_document = read(&child, "document");
-        let child_secret = read(&child_document, "documentElement");
-        let outer = read(&child_secret, "outerHTML");
-        assert!(
-            value_string(&mut engine, &outer).contains("CROSS-ORIGIN-SECRET"),
-            "the child Realm loaded its own document"
-        );
+        }
+        let (child_document, child_secret) = engine.scope(|cx| {
+            let child = held(cx, &child);
+            let document = read(cx, &child, "document");
+            let secret = read(cx, &document, "documentElement");
+            let outer = read(cx, &secret, "outerHTML");
+            assert!(
+                value_string(cx, &outer).contains("CROSS-ORIGIN-SECRET"),
+                "the child Realm loaded its own document"
+            );
+            (hold(cx, &document), hold(cx, &secret))
+        });
         assert_eq!(
             string_value(
                 &mut engine,
@@ -39567,22 +40724,20 @@ mod tests {
             "reachability probe",
         )
         .unwrap();
-        let global = engine.global_this();
-        let reaches = engine
-            .ctx()
-            .member_get(&global, "reaches")
-            .unwrap_or_else(|_| panic!("read reaches"));
-        let reached = engine
-            .call_function(
-                &reaches,
-                Value::Undefined,
-                &[child, child_document, child_secret],
-            )
-            .unwrap_or_else(|_| panic!("reachability probe threw"));
-        assert!(
-            matches!(reached, Value::Bool(false)),
-            "child Realm reachable"
-        );
+        let unreached = engine.scope(|cx| {
+            let global = cx.global_this();
+            let reaches = read(cx, &global, "reaches");
+            let secrets = [
+                held(cx, &child),
+                held(cx, &child_document),
+                held(cx, &child_secret),
+            ];
+            let reached = cx
+                .call_function(&reaches, Value::Undefined, &secrets)
+                .unwrap_or_else(|_| panic!("reachability probe threw"));
+            matches!(reached.kind(), ValueKind::Bool(false))
+        });
+        assert!(unreached, "child Realm reachable");
     }
 
     #[test]
@@ -39608,7 +40763,7 @@ mod tests {
         .unwrap_or_else(|_| panic!("host operation threw"));
         call_trust_method(&mut engine, "hydrateFrames", &[]);
         let (frames, documents, realms) = {
-            let state = engine.ctx().host_mut::<HostState>().unwrap();
+            let state = engine.host_mut::<HostState>().unwrap();
             let dom = state.dom.clone();
             let dom = dom.borrow();
             let frames: Vec<usize> = dom
@@ -39619,62 +40774,53 @@ mod tests {
                 .iter()
                 .map(|&frame| dom.frame_document(frame).expect("child Document"))
                 .collect();
-            let realms: Vec<Value> = frames
+            let realms: Vec<Handle> = frames
                 .iter()
                 .map(|frame| state.window_realms[&state.frame_contexts[frame]].clone())
                 .collect();
             (frames, documents, realms)
         };
-        let id = |node: usize| Value::Num(node as f64);
+        fn id<'s>(node: usize) -> Value<'s> {
+            Value::Num(node as f64)
+        }
         let serialize = |engine: &mut trust_js::Engine, node: usize| {
-            let value = guarded_outer_html(engine.ctx(), Value::Undefined, &[id(node)])
-                .unwrap_or_else(|_| panic!("outerHTML threw"));
-            value_string(engine, &value)
+            engine.scope(|cx| {
+                let value = guarded_outer_html(cx, Value::Undefined, &[id(node)])
+                    .unwrap_or_else(|_| panic!("outerHTML threw"));
+                value_string(cx, &value)
+            })
         };
         // The embedding Window cannot read its cross-origin child's Document...
         assert!(!serialize(&mut engine, documents[0]).contains("CROSS-SECRET"));
         // ...but reads a same-origin child's, and administers both containers.
         assert!(serialize(&mut engine, documents[1]).contains("SAME-TEXT"));
-        let src = guarded_get_attr(
-            engine.ctx(),
-            Value::Undefined,
-            &[id(frames[0]), Value::from_string("src".into())],
-        )
-        .unwrap_or_else(|_| panic!("host operation threw"));
-        assert!(value_string(&mut engine, &src).starts_with("data:"));
+        let src = engine.scope(|cx| {
+            let name = cx.str("src");
+            let src = guarded_get_attr(cx, Value::Undefined, &[id(frames[0]), name])
+                .unwrap_or_else(|_| panic!("host operation threw"));
+            value_string(cx, &src)
+        });
+        assert!(src.starts_with("data:"));
 
         let cross_reads = engine
             .with_embed_realm(&realms[0], |engine| {
                 let top = serialize(engine, DOCUMENT);
                 let own = serialize(engine, documents[0]);
                 let sibling = serialize(engine, documents[1]);
-                let container = guarded_get_attr(
-                    engine.ctx(),
-                    Value::Undefined,
-                    &[id(frames[0]), Value::from_string("src".into())],
-                )
-                .unwrap_or_else(|_| panic!("host operation threw"));
-                let container = value_string(engine, &container);
-                let created = guarded_create_element(
-                    engine.ctx(),
-                    Value::Undefined,
-                    &[Value::from_string("p".into()), id(DOCUMENT)],
-                )
-                .is_err();
-                let by_id = guarded_get_by_id(
-                    engine.ctx(),
-                    Value::Undefined,
-                    &[Value::from_string("x".into())],
-                )
-                .unwrap_or_else(|_| panic!("host operation threw"));
-                (
-                    top,
-                    own,
-                    sibling,
-                    container,
-                    created,
-                    matches!(by_id, Value::Null),
-                )
+                let (container, created, by_id) = engine.scope(|cx| {
+                    let name = cx.str("src");
+                    let container = guarded_get_attr(cx, Value::Undefined, &[id(frames[0]), name])
+                        .unwrap_or_else(|_| panic!("host operation threw"));
+                    let container = value_string(cx, &container);
+                    let tag = cx.str("p");
+                    let created =
+                        guarded_create_element(cx, Value::Undefined, &[tag, id(DOCUMENT)]).is_err();
+                    let element_id = cx.str("x");
+                    let by_id = guarded_get_by_id(cx, Value::Undefined, &[element_id])
+                        .unwrap_or_else(|_| panic!("host operation threw"));
+                    (container, created, matches!(by_id.kind(), ValueKind::Null))
+                });
+                (top, own, sibling, container, created, by_id)
             })
             .unwrap_or_else(|_| panic!("enter the cross-origin child Realm"));
         assert!(
@@ -39710,16 +40856,18 @@ mod tests {
         // The embedder may detach the cross-origin child Document (destroying the navigable),
         // but not a node inside it.
         let inner = {
-            let state = engine.ctx().host_mut::<HostState>().unwrap();
+            let state = engine.host_mut::<HostState>().unwrap();
             let dom = state.dom.borrow();
             dom.descendants(documents[0])
                 .find(|&node| dom.tag_name(node) == Some("p"))
                 .expect("child paragraph")
         };
-        assert!(guarded_detach(engine.ctx(), Value::Undefined, &[id(inner)]).is_ok());
+        assert!(engine.scope(|cx| guarded_detach(cx, Value::Undefined, &[id(inner)]).is_ok()));
         assert!(serialize_native(&mut engine, documents[0]).contains("CROSS-SECRET"));
-        assert!(guarded_detach(engine.ctx(), Value::Undefined, &[id(documents[0])]).is_ok());
-        let state = engine.ctx().host_mut::<HostState>().unwrap();
+        assert!(
+            engine.scope(|cx| guarded_detach(cx, Value::Undefined, &[id(documents[0])]).is_ok())
+        );
+        let state = engine.host_mut::<HostState>().unwrap();
         assert_eq!(state.dom.borrow().node(documents[0]).parent, None);
     }
 
@@ -39752,8 +40900,8 @@ mod tests {
         )
         .unwrap();
         call_trust_method(&mut engine, "hydrateFrames", &[]);
-        let realms: Vec<Value> = {
-            let state = engine.ctx().host_mut::<HostState>().unwrap();
+        let realms: Vec<Handle> = {
+            let state = engine.host_mut::<HostState>().unwrap();
             let dom = state.dom.clone();
             let dom = dom.borrow();
             dom.descendants(DOCUMENT)
@@ -39776,7 +40924,7 @@ mod tests {
             attempt('post', () => (parent.postMessage('hello', '*'), 'sent'));
             return result.join(' ');
         })()"#;
-        let run = |engine: &mut trust_js::Engine, realm: &Value| {
+        let run = |engine: &mut trust_js::Engine, realm: &Handle| {
             engine
                 .with_embed_realm(realm, |engine| string_value(engine, probe))
                 .unwrap_or_else(|_| panic!("enter child Realm"))
@@ -39811,7 +40959,7 @@ mod tests {
     }
 
     fn serialize_native(engine: &mut trust_js::Engine, node: usize) -> String {
-        let state = engine.ctx().host_mut::<HostState>().unwrap();
+        let state = engine.host_mut::<HostState>().unwrap();
         state.dom.borrow().serialize_js(node)
     }
 
@@ -40084,22 +41232,20 @@ mod tests {
                         "messages",
                     )
                     .unwrap();
-                    let next = eval_value(&mut engine, "__trust.nextDeadline()", "timer deadline")
-                        .unwrap();
+                    let next =
+                        eval_test_value(&mut engine, "__trust.nextDeadline()", "timer deadline")
+                            .unwrap();
                     let Some(deadline) = next.as_num_opt().filter(|n| n.is_finite()) else {
                         break;
                     };
                     let dispatched = if native_tasks {
-                        dispatch_timer_task_to(&mut engine, deadline).map(|_| ())
+                        test_dispatch_timer(&mut engine, deadline, "timer task").map(|_| ())
                     } else {
-                        engine_call_trust_method(&mut engine, "tickTo", &[Value::Num(deadline)])
+                        engine_test_call(&mut engine, "tickTo", &[TrustValue::Num(deadline)])
                             .map(|_| ())
                     };
                     if let Err(error) = dispatched {
-                        panic!(
-                            "{}",
-                            describe_eval_error(&mut engine, error, "callback-context timer")
-                        );
+                        panic!("{}", error);
                     }
                 }
                 assert_eq!(
@@ -40205,17 +41351,17 @@ mod tests {
             let mut engine = platform_engine();
             engine.set_tier(tier);
             engine.set_tier_threshold(0);
-            let value = eval_value(
+            let value = eval_test_value(
                 &mut engine,
                 include_str!("fixtures/window_messages.mjs"),
                 "Window postMessage",
             )
             .unwrap();
             assert!(
-                matches!(value, Value::Str(ref text) if text.as_ref() == "window-messages-ok"),
+                value.as_engine_text() == Some("window-messages-ok"),
                 "{tier:?}"
             );
-            engine.ctx().collect_garbage_for_host();
+            engine.scope(|cx| cx.collect_garbage_for_host());
             assert_eq!(
                 string_value(
                     &mut engine,
@@ -40404,13 +41550,8 @@ mod tests {
                 "exec-command-ok",
                 "{tier:?}"
             );
-            let requests = std::mem::take(
-                &mut engine
-                    .ctx()
-                    .host_mut::<HostState>()
-                    .unwrap()
-                    .clipboard_requests,
-            );
+            let requests =
+                std::mem::take(&mut engine.host_mut::<HostState>().unwrap().clipboard_requests);
             assert_eq!(
                 requests
                     .iter()
@@ -40954,7 +42095,7 @@ mod tests {
             run_microtask_checkpoint(&mut engine);
             std::thread::sleep(Duration::from_millis(50));
             pump_audio_until(&mut engine, &mut tasks, "true", 1);
-            engine.ctx().collect_garbage_for_host();
+            engine.scope(|cx| cx.collect_garbage_for_host());
             assert_eq!(
                 string_value(
                     &mut engine,
@@ -41036,7 +42177,6 @@ mod tests {
         engine.set_wall_clock(move || clock.now_ms());
         state.configure_module_loading(&mut engine);
         engine
-            .ctx()
             .op_state()
             .put_retained_memory_with_external_memory(state);
         install_host_boundary(&mut engine);
@@ -41069,7 +42209,7 @@ mod tests {
             }
             if matches!(
                 call_trust_method(&mut engine, "hasPlatformTask", &[]),
-                Value::Bool(true)
+                TrustValue::Bool(true)
             ) {
                 call_trust_method(&mut engine, "runPlatformTask", &[]);
             } else {
@@ -41576,7 +42716,7 @@ mod tests {
                 "media tasks",
             )
             .unwrap();
-            let dom = host_dom(engine.ctx());
+            let dom = engine.scope(host_dom);
             let dom = dom.borrow();
             let player = dom.get_by_id("player").unwrap();
             assert_eq!(
@@ -41662,14 +42802,14 @@ mod tests {
             let mut engine = platform_engine();
             engine.set_tier(tier);
             engine.set_tier_threshold(0);
-            let value = eval_value(
+            let value = eval_test_value(
                 &mut engine,
                 include_str!("fixtures/canvas_gradients.mjs"),
                 "canvas gradient conformance",
             )
             .unwrap();
             assert!(
-                matches!(value, Value::Str(ref s) if s.as_ref() == "canvas-gradients-ok"),
+                value.as_engine_text() == Some("canvas-gradients-ok"),
                 "{tier:?}"
             );
         }
@@ -41681,14 +42821,14 @@ mod tests {
             let mut engine = platform_engine();
             engine.set_tier(tier);
             engine.set_tier_threshold(0);
-            let value = eval_value(
+            let value = eval_test_value(
                 &mut engine,
                 include_str!("fixtures/canvas_patterns.mjs"),
                 "canvas pattern conformance",
             )
             .unwrap();
             assert_eq!(
-                value_string(&mut engine, &value),
+                test_value_string(&mut engine, &value),
                 "canvas-patterns-ok",
                 "{tier:?}"
             );
@@ -41762,14 +42902,14 @@ mod tests {
             let mut engine = platform_engine();
             engine.set_tier(tier);
             engine.set_tier_threshold(0);
-            let value = eval_value(
+            let value = eval_test_value(
                 &mut engine,
                 include_str!("fixtures/canvas_shadows.mjs"),
                 "canvas shadow conformance",
             )
             .unwrap();
             assert!(
-                matches!(value, Value::Str(ref s) if s.as_ref() == "canvas-shadows-ok"),
+                value.as_engine_text() == Some("canvas-shadows-ok"),
                 "{tier:?}"
             );
         }
@@ -41781,16 +42921,13 @@ mod tests {
             let mut engine = platform_engine();
             engine.set_tier(tier);
             engine.set_tier_threshold(0);
-            let value = eval_value(
+            let value = eval_test_value(
                 &mut engine,
                 include_str!("fixtures/canvas_text.mjs"),
                 "canvas text conformance",
             )
             .unwrap();
-            assert!(
-                matches!(value, Value::Str(ref s) if s.as_ref() == "canvas-text-ok"),
-                "{tier:?}"
-            );
+            assert!(value.as_engine_text() == Some("canvas-text-ok"), "{tier:?}");
         }
     }
 
@@ -41940,7 +43077,6 @@ mod tests {
         .unwrap();
         let live = |engine: &mut trust_js::Engine| {
             engine
-                .ctx()
                 .host_mut::<HostState>()
                 .unwrap()
                 .offscreen_canvases
@@ -41961,14 +43097,14 @@ mod tests {
             let mut engine = platform_engine();
             engine.set_tier(tier);
             engine.set_tier_threshold(0);
-            let value = eval_value(
+            let value = eval_test_value(
                 &mut engine,
                 include_str!("fixtures/canvas_text_styles.mjs"),
                 "canvas text drawing styles",
             )
             .unwrap();
             assert_eq!(
-                value_string(&mut engine, &value),
+                test_value_string(&mut engine, &value),
                 "canvas-text-styles-ok",
                 "{tier:?}"
             );
@@ -41980,7 +43116,7 @@ mod tests {
         // HTML #dom-offscreencanvas: a Window's OffscreenCanvas inherits its
         // document element's directionality; a worker's is "ltr".
         let mut engine = platform_engine();
-        let result = eval_value(
+        let result = eval_test_value(
             &mut engine,
             r#"
             const html = document.createElement('html'); html.setAttribute('dir', 'rtl');
@@ -41995,9 +43131,9 @@ mod tests {
             "OffscreenCanvas inherited direction",
         )
         .unwrap();
-        assert_eq!(value_string(&mut engine, &result), "true");
+        assert_eq!(test_value_string(&mut engine, &result), "true");
         let mut worker = worker_platform_engine();
-        let result = eval_value(
+        let result = eval_test_value(
             &mut worker,
             r#"
             const c = new OffscreenCanvas(10, 10).getContext('2d');
@@ -42008,7 +43144,7 @@ mod tests {
             "worker OffscreenCanvas direction",
         )
         .unwrap();
-        assert_eq!(value_string(&mut worker, &result), "true");
+        assert_eq!(test_value_string(&mut worker, &result), "true");
     }
 
     #[test]
@@ -42017,14 +43153,14 @@ mod tests {
             let mut engine = platform_engine();
             engine.set_tier(tier);
             engine.set_tier_threshold(0);
-            let value = eval_value(
+            let value = eval_test_value(
                 &mut engine,
                 include_str!("fixtures/canvas_filters.mjs"),
                 "canvas filters",
             )
             .unwrap();
             assert_eq!(
-                value_string(&mut engine, &value),
+                test_value_string(&mut engine, &value),
                 "canvas-filters-ok",
                 "{tier:?}"
             );
@@ -42032,7 +43168,7 @@ mod tests {
         // A worker has no document: a url() reference cannot resolve, so the
         // whole chain is ignored.
         let mut worker = worker_platform_engine();
-        let result = eval_value(
+        let result = eval_test_value(
             &mut worker,
             r#"
             const c = new OffscreenCanvas(4, 4).getContext('2d');
@@ -42045,7 +43181,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            value_string(&mut worker, &result),
+            test_value_string(&mut worker, &result),
             "255,0,0,255|0,255,255,255"
         );
     }
@@ -42065,10 +43201,9 @@ mod tests {
                 return Array.from(c.getImageData(1, 1, 1, 1).data).join();
             })()
         "#;
-        let before = eval_value(&mut engine, draw, "unloaded external filter").unwrap();
-        assert_eq!(value_string(&mut engine, &before), "255,0,0,255");
+        let before = eval_test_value(&mut engine, draw, "unloaded external filter").unwrap();
+        assert_eq!(test_value_string(&mut engine, &before), "255,0,0,255");
         let requests = engine
-            .ctx()
             .host_mut::<HostState>()
             .unwrap()
             .dom
@@ -42089,8 +43224,8 @@ mod tests {
                 </filter></svg>"#,
             ))),
         );
-        let after = eval_value(&mut engine, draw, "loaded external filter").unwrap();
-        assert_eq!(value_string(&mut engine, &after), "0,0,255,255");
+        let after = eval_test_value(&mut engine, draw, "loaded external filter").unwrap();
+        assert_eq!(test_value_string(&mut engine, &after), "0,0,255,255");
     }
 
     #[test]
@@ -42103,7 +43238,7 @@ mod tests {
             let mut engine = platform_engine();
             engine.set_tier(tier);
             engine.set_tier_threshold(0);
-            let value = eval_value(
+            let value = eval_test_value(
                 &mut engine,
                 r#"
                 (function () {
@@ -42142,14 +43277,14 @@ mod tests {
             )
             .unwrap();
             assert_eq!(
-                value_string(&mut engine, &value),
+                test_value_string(&mut engine, &value),
                 "placeholder-ok",
                 "{tier:?}"
             );
             // Before the rendering update the placeholder shows its blank bitmap.
             let probe = "(() => { const c = document.createElement('canvas'); c.width = 6; c.height = 4; const x = c.getContext('2d'); x.drawImage(placeholderCanvas, 0, 0); return Array.from(x.getImageData(2, 2, 1, 1).data).join(); })()";
             assert_eq!(string_value(&mut engine, probe), "0,0,0,0");
-            canvas_host::push_placeholders(engine.ctx());
+            engine.scope(canvas_host::push_placeholders);
             assert_eq!(string_value(&mut engine, probe), "0,255,0,255", "{tier:?}");
             // A resize commits new natural dimensions at the next update.
             eval(
@@ -42158,7 +43293,7 @@ mod tests {
                 "resize the OffscreenCanvas",
             )
             .unwrap();
-            canvas_host::push_placeholders(engine.ctx());
+            engine.scope(canvas_host::push_placeholders);
             assert_eq!(
                 string_value(
                     &mut engine,
@@ -42171,7 +43306,7 @@ mod tests {
                 "true"
             );
             // bitmaprenderer: the element's bitmap is the ImageBitmap's.
-            let value = eval_value(
+            let value = eval_test_value(
                 &mut engine,
                 r#"
                 (async () => {
@@ -42190,7 +43325,7 @@ mod tests {
                 "bitmaprenderer element",
             )
             .unwrap();
-            assert_eq!(value_string(&mut engine, &value), "pending");
+            assert_eq!(test_value_string(&mut engine, &value), "pending");
             run_canvas_tasks(&mut engine, false, "typeof bitmapRendered === 'string'");
             assert_eq!(
                 string_value(&mut engine, "bitmapRendered"),
@@ -42430,7 +43565,7 @@ mod tests {
                 };
                 engine.set_tier(tier);
                 engine.set_tier_threshold(0);
-                let value = eval_value(
+                let value = eval_test_value(
                     &mut engine,
                     r#"
                     (() => {
@@ -42458,7 +43593,7 @@ mod tests {
                 )
                 .unwrap();
                 assert_eq!(
-                    value_string(&mut engine, &value),
+                    test_value_string(&mut engine, &value),
                     "0,255,0,255|0,255,0,255|true|true|true|4|0,255,0,255|0,0,0,0|8",
                     "{tier:?} worker={worker}"
                 );
@@ -42473,14 +43608,14 @@ mod tests {
             let mut engine = platform_engine();
             engine.set_tier(tier);
             engine.set_tier_threshold(0);
-            let value = eval_value(
+            let value = eval_test_value(
                 &mut engine,
                 include_str!("fixtures/webgl_pixels.mjs"),
                 "WebGL pixels",
             )
             .unwrap();
             assert!(
-                matches!(value, Value::Str(ref text) if text.as_ref() == "webgl-pixels-ok"),
+                value.as_engine_text() == Some("webgl-pixels-ok"),
                 "{tier:?}"
             );
             for _ in 0..4 {
@@ -42503,7 +43638,7 @@ mod tests {
         // type) and OpenGL ES 2.0 §3.8.2 (texture completeness): draws reuse
         // what they validated until the uniforms, buffers or textures change.
         let mut engine = platform_engine();
-        let value = eval_value(
+        let value = eval_test_value(
             &mut engine,
             r#"(() => {
                 const c = document.createElement('canvas'); c.width = c.height = 4;
@@ -42551,7 +43686,7 @@ mod tests {
             "WebGL cached validation",
         )
         .unwrap();
-        assert_eq!(value_string(&mut engine, &value), "ok");
+        assert_eq!(test_value_string(&mut engine, &value), "ok");
     }
 
     #[test]
@@ -42693,7 +43828,7 @@ mod tests {
                 check(converted===1,'null scalar location still converts');
                 check(gl.getError()===gl.NO_ERROR,'final error');
             "#, "WebGL numeric list conversion").unwrap();
-            engine.ctx().collect_garbage_for_host();
+            engine.scope(|cx| cx.collect_garbage_for_host());
             eval(&mut engine, r#"
                 const order=[];
                 const convert=n=>({valueOf(){order.push(n);return n;}});
@@ -42720,17 +43855,14 @@ mod tests {
             let mut engine = platform_engine();
             engine.set_tier(tier);
             engine.set_tier_threshold(0);
-            let value = eval_value(
+            let value = eval_test_value(
                 &mut engine,
                 include_str!("fixtures/webgl_vertex_arrays.mjs"),
                 "WebGL vertex arrays",
             )
             .unwrap();
-            assert!(
-                matches!(value, Value::Str(ref s) if s.as_ref() == "vao-ok"),
-                "{tier:?}"
-            );
-            engine.ctx().collect_garbage_for_host();
+            assert!(value.as_engine_text() == Some("vao-ok"), "{tier:?}");
+            engine.scope(|cx| cx.collect_garbage_for_host());
             assert_eq!(
                 string_value(&mut engine, "vertexArrayAfterGC()"),
                 "vao-gc-ok",
@@ -42745,10 +43877,10 @@ mod tests {
         let mut engine = platform_engine();
         eval(&mut engine,"const c=document.createElement('canvas');c.width=2;c.height=2;const gl=c.getContext('webgl');gl.clearColor(1,0,0,1);gl.clear(gl.COLOR_BUFFER_BIT);","draw frame").unwrap();
         let (id, dom) = {
-            let state = engine.ctx().host_mut::<HostState>().unwrap();
+            let state = engine.host_mut::<HostState>().unwrap();
             (*state.webgl.keys().next().unwrap(), state.dom.clone())
         };
-        webgl_host::publish(engine.ctx(), true, None);
+        engine.scope(|cx| webgl_host::publish(cx, true, None));
         let first = dom.borrow().canvas_image(id).unwrap();
         assert_eq!(&first.image.rgba[..4], &[255, 0, 0, 255]);
         assert_eq!(
@@ -42758,7 +43890,7 @@ mod tests {
             ),
             "0,0,0,0"
         );
-        webgl_host::publish(engine.ctx(), true, None);
+        engine.scope(|cx| webgl_host::publish(cx, true, None));
         let second = dom.borrow().canvas_image(id).unwrap();
         assert_eq!(
             first, second,
@@ -42766,7 +43898,7 @@ mod tests {
         );
         assert_eq!(&second.image.rgba[..4], &[255, 0, 0, 255]);
         eval(&mut engine, "c.width=2;", "resize canvas").unwrap();
-        webgl_host::publish(engine.ctx(), true, None);
+        engine.scope(|cx| webgl_host::publish(cx, true, None));
         assert_eq!(
             &dom.borrow().canvas_image(id).unwrap().image.rgba[..4],
             &[0, 0, 0, 0]
@@ -42779,24 +43911,24 @@ mod tests {
             let mut engine = platform_engine();
             engine.set_tier(tier);
             engine.set_tier_threshold(0);
-            let value = eval_value(
+            let value = eval_test_value(
                 &mut engine,
                 include_str!("fixtures/canvas_pixels.mjs"),
                 "canvas pixels",
             )
             .unwrap();
             assert!(
-                matches!(value, Value::Str(ref text) if text.as_ref() == "canvas-pixels-ok"),
+                value.as_engine_text() == Some("canvas-pixels-ok"),
                 "{tier:?}"
             );
-            let value = eval_value(
+            let value = eval_test_value(
                 &mut engine,
                 include_str!("fixtures/canvas_paths_images.mjs"),
                 "canvas paths and images",
             )
             .unwrap();
             assert!(
-                matches!(value, Value::Str(ref text) if text.as_ref() == "canvas-paths-images-pending"),
+                value.as_engine_text() == Some("canvas-paths-images-pending"),
                 "{tier:?}"
             );
             run_microtask_checkpoint(&mut engine);
@@ -43013,7 +44145,7 @@ mod tests {
             context.fillStyle='#ff0000'; context.fillRect(0,0,32,48);
             context.fillStyle='#00ff00'; context.fillRect(32,0,32,48);
         "#,"canvas presentation setup").unwrap();
-        let dom = engine.ctx().host_mut::<HostState>().unwrap().dom.clone();
+        let dom = engine.host_mut::<HostState>().unwrap().dom.clone();
         let base = url::Url::parse(DEFAULT_URL).unwrap();
         let make_page = || {
             crate::http::render_arena(
@@ -43297,39 +44429,10 @@ mod tests {
             "#,
         )
         .unwrap();
-        let module_value = engine
-            .ctx()
-            .make_uint8array(&module)
-            .unwrap_or_else(|_| panic!("make wasm fixture"));
-        let forwarding_value = engine
-            .ctx()
-            .make_uint8array(&forwarding)
-            .unwrap_or_else(|_| panic!("make forwarding fixture"));
-        let reentrant_value = engine
-            .ctx()
-            .make_uint8array(&reentrant)
-            .unwrap_or_else(|_| panic!("make reentrant fixture"));
-        let nested_value = engine
-            .ctx()
-            .make_uint8array(&nested)
-            .unwrap_or_else(|_| panic!("make nested fixture"));
-        let global = engine.global_this();
-        engine
-            .ctx()
-            .member_set(&global, "wasmFixture", module_value)
-            .unwrap_or_else(|_| panic!("install wasm fixture"));
-        engine
-            .ctx()
-            .member_set(&global, "wasmForwardingFixture", forwarding_value)
-            .unwrap_or_else(|_| panic!("install forwarding fixture"));
-        engine
-            .ctx()
-            .member_set(&global, "wasmReentrantFixture", reentrant_value)
-            .unwrap_or_else(|_| panic!("install reentrant fixture"));
-        engine
-            .ctx()
-            .member_set(&global, "wasmNestedFixture", nested_value)
-            .unwrap_or_else(|_| panic!("install nested fixture"));
+        install_bytes(&mut engine, "wasmFixture", &module);
+        install_bytes(&mut engine, "wasmForwardingFixture", &forwarding);
+        install_bytes(&mut engine, "wasmReentrantFixture", &reentrant);
+        install_bytes(&mut engine, "wasmNestedFixture", &nested);
 
         eval(
             &mut engine,
@@ -43449,7 +44552,6 @@ mod tests {
             "true|true|8|11|37|46|1|0|2|0|true|1|true|true|true|true|true|true|true|-2|9|true|true|true|true|function,function,global,memory,table;memory,table,global,function,function,function,function,function,function,global;1,2,3"
         );
         let (reported_memories, retained_unavailable, retained_opaque) = engine
-            .ctx()
             .host_mut::<HostState>()
             .map(|state| {
                 let mut allocations = Vec::new();
@@ -43517,15 +44619,7 @@ mod tests {
         let module = wat::parse_str(module_wat).unwrap();
         let mut engine = platform_engine();
         engine.set_tier(Tier::Bytecode);
-        let fixture = engine
-            .ctx()
-            .make_uint8array(&module)
-            .unwrap_or_else(|_| panic!("make large import wasm fixture"));
-        let global = engine.global_this();
-        engine
-            .ctx()
-            .member_set(&global, "largeImportFixture", fixture)
-            .unwrap_or_else(|_| panic!("install large import wasm fixture"));
+        install_bytes(&mut engine, "largeImportFixture", &module);
         eval(
             &mut engine,
             r#"
@@ -43567,15 +44661,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let bytes = engine
-            .ctx()
-            .make_uint8array(&module)
-            .unwrap_or_else(|_| panic!("make exception fixture"));
-        let global = engine.global_this();
-        engine
-            .ctx()
-            .member_set(&global, "exceptionFixture", bytes)
-            .unwrap_or_else(|_| panic!("install exception fixture"));
+        install_bytes(&mut engine, "exceptionFixture", &module);
         eval(
             &mut engine,
             r#"
@@ -44116,7 +45202,6 @@ mod tests {
             .unwrap();
             collect_wasm_test_garbage(&mut engine);
             let (_, exceptions) = engine
-                .ctx()
                 .host_mut::<HostState>()
                 .unwrap()
                 .wasm
@@ -44139,7 +45224,6 @@ mod tests {
             eval(&mut engine, "x.clear()", "release the exception").unwrap();
             collect_wasm_test_garbage(&mut engine);
             let (_, exceptions) = engine
-                .ctx()
                 .host_mut::<HostState>()
                 .unwrap()
                 .wasm
@@ -44350,15 +45434,29 @@ mod tests {
 
     fn install_wasm_test_fixture(engine: &mut trust_js::Engine, source: &str) {
         let bytes = wat::parse_str(source).unwrap();
-        let fixture = engine
-            .ctx()
-            .make_uint8array(&bytes)
-            .unwrap_or_else(|_| panic!("make WASM test fixture"));
-        let global = engine.global_this();
-        engine
-            .ctx()
-            .member_set(&global, "wasmFixture", fixture)
-            .unwrap_or_else(|_| panic!("install WASM test fixture"));
+        install_bytes(engine, "wasmFixture", &bytes);
+    }
+
+    /// Install `bytes` as the Uint8Array global `name`.
+    fn install_bytes(engine: &mut trust_js::Engine, name: &str, bytes: &[u8]) {
+        engine.scope(|cx| {
+            let value = cx
+                .make_uint8array(bytes)
+                .unwrap_or_else(|_| panic!("make the {name} fixture"));
+            let global = cx.global_this();
+            cx.member_set(&global, name, value)
+                .unwrap_or_else(|_| panic!("install the {name} fixture"));
+        });
+    }
+
+    /// Set the global `name` to `value`.
+    fn install_global(engine: &mut trust_js::Engine, name: &str, value: TrustValue) {
+        engine.scope(|cx| {
+            let value = value.value(cx);
+            let global = cx.global_this();
+            cx.member_set(&global, name, value)
+                .unwrap_or_else(|_| panic!("install the global {name}"));
+        });
     }
 
     fn collect_wasm_test_garbage(engine: &mut trust_js::Engine) {
@@ -44366,13 +45464,12 @@ mod tests {
         // Compare heap counts at the same completed host boundary in every test batch.
         for _ in 0..3 {
             run_microtask_checkpoint(engine);
-            engine.ctx().collect_garbage_for_host();
+            engine.scope(|cx| cx.collect_garbage_for_host());
         }
     }
 
     fn cached_wasm_functions(engine: &mut trust_js::Engine) -> usize {
         engine
-            .ctx()
             .host_mut::<HostState>()
             .unwrap()
             .wasm
@@ -45606,23 +46703,17 @@ mod tests {
             "#,
         )
         .unwrap();
-        let fixture = engine
-            .ctx()
-            .make_uint8array(&module)
-            .unwrap_or_else(|_| panic!("make async wasm fixture"));
-        let global = engine.global_this();
-        engine
-            .ctx()
-            .member_set(&global, "asyncTrapFixture", fixture)
-            .unwrap_or_else(|_| panic!("install async wasm fixture"));
-        engine
-            .ctx()
-            .member_set(&global, "freshTrapInstance", Value::Bool(fresh_instance))
-            .unwrap_or_else(|_| panic!("install instance mode"));
-        engine
-            .ctx()
-            .member_set(&global, "asynchronousTrap", Value::Bool(asynchronous))
-            .unwrap_or_else(|_| panic!("install job mode"));
+        install_bytes(&mut engine, "asyncTrapFixture", &module);
+        install_global(
+            &mut engine,
+            "freshTrapInstance",
+            TrustValue::Bool(fresh_instance),
+        );
+        install_global(
+            &mut engine,
+            "asynchronousTrap",
+            TrustValue::Bool(asynchronous),
+        );
         eval(
             &mut engine,
             r#"
@@ -45655,12 +46746,9 @@ mod tests {
             ),
             "256:true"
         );
-        engine
-            .ctx()
-            .member_set(&global, "asyncTrapResults", Value::Null)
-            .unwrap_or_else(|_| panic!("release async trap results"));
+        install_global(&mut engine, "asyncTrapResults", TrustValue::Null);
         collect_wasm_test_garbage(&mut engine);
-        let before = engine.ctx().live_object_count();
+        let before = engine.scope(|cx| cx.live_object_count());
         let cache_before = cached_wasm_functions(&mut engine);
 
         for _ in 0..8 {
@@ -45672,7 +46760,7 @@ mod tests {
             .unwrap();
             collect_wasm_test_garbage(&mut engine);
         }
-        let settled = engine.ctx().live_object_count();
+        let settled = engine.scope(|cx| cx.live_object_count());
         eprintln!(
             "WASM retention: tier={tier:?} fresh_instance={fresh_instance} async={asynchronous} baseline={before} final={settled}"
         );
@@ -45826,7 +46914,6 @@ mod tests {
         assert_eq!(string_value(&mut engine, "fetchOrder.join('|')"), "script");
         assert_eq!(
             engine
-                .ctx()
                 .host_mut::<HostState>()
                 .and_then(|state| state.network.as_ref())
                 .map(|network| network.pending_fetches.len()),
@@ -45861,7 +46948,6 @@ mod tests {
         );
         assert_eq!(
             engine
-                .ctx()
                 .host_mut::<HostState>()
                 .and_then(|state| state.network.as_ref())
                 .map(|network| network.pending_fetches.len()),
@@ -45968,7 +47054,6 @@ mod tests {
         run_microtask_checkpoint(&mut engine);
         assert_eq!(
             engine
-                .ctx()
                 .host_mut::<HostState>()
                 .unwrap()
                 .network
@@ -46459,7 +47544,7 @@ mod tests {
             "child response"
         );
         let client = child_url;
-        let state = engine.ctx().host_mut::<HostState>().unwrap();
+        let state = engine.host_mut::<HostState>().unwrap();
         let context = *state
             .window_request_urls
             .iter()
@@ -46763,7 +47848,6 @@ mod tests {
                 "{tier:?}"
             );
             let worker_id = engine
-                .ctx()
                 .host_mut::<HostState>()
                 .unwrap()
                 .workers
@@ -46785,7 +47869,6 @@ mod tests {
             .unwrap();
             assert!(
                 engine
-                    .ctx()
                     .host_mut::<HostState>()
                     .unwrap()
                     .workers
@@ -46821,7 +47904,6 @@ mod tests {
                     let mut engine = trust_js::Engine::new();
                     engine.set_wall_clock(move || clock.now_ms());
                     engine
-                        .ctx()
                         .op_state()
                         .put_retained_memory_with_external_memory(state);
                     install_trust_js_worker_boundary(&mut engine);
@@ -46886,12 +47968,11 @@ mod tests {
             "bitmap canvas",
         )
         .unwrap();
-        let id = eval_value(&mut engine, "bitmapCanvas.__id", "canvas id")
+        let id = eval_test_value(&mut engine, "bitmapCanvas.__id", "canvas id")
             .unwrap()
             .as_num_opt()
             .unwrap() as usize;
         engine
-            .ctx()
             .host_mut::<HostState>()
             .unwrap()
             .dom
@@ -46953,7 +48034,6 @@ mod tests {
             let mut engine = trust_js::Engine::new();
             engine.set_wall_clock(move || clock.now_ms());
             engine
-                .ctx()
                 .op_state()
                 .put_retained_memory_with_external_memory(state);
             install_trust_js_worker_boundary(&mut engine);
@@ -48355,12 +49435,11 @@ mod tests {
             }
             assert!(Instant::now() < deadline, "messages stalled: {log}");
             if matches!(
-                engine_call_trust_method(&mut engine, "hasPlatformTask", &[]),
-                Ok(Value::Bool(true))
+                engine_test_call(&mut engine, "hasPlatformTask", &[]),
+                Ok(TrustValue::Bool(true))
             ) {
-                engine_call_trust_method(&mut engine, "runPlatformTask", &[]).unwrap_or_else(
-                    |error| panic!("{}", describe_eval_error(&mut engine, error, "port task")),
-                );
+                engine_test_call(&mut engine, "runPlatformTask", &[])
+                    .unwrap_or_else(|error| panic!("{}", error));
             } else {
                 let task = runtime
                     .block_on(async {
@@ -48445,17 +49524,11 @@ mod tests {
             }
             assert!(Instant::now() < deadline, "incoming message stalled: {log}");
             if matches!(
-                engine_call_trust_method(&mut engine, "hasPlatformTask", &[]),
-                Ok(Value::Bool(true))
+                engine_test_call(&mut engine, "hasPlatformTask", &[]),
+                Ok(TrustValue::Bool(true))
             ) {
-                engine_call_trust_method(&mut engine, "runPlatformTask", &[]).unwrap_or_else(
-                    |error| {
-                        panic!(
-                            "{}",
-                            describe_eval_error(&mut engine, error, "platform task")
-                        )
-                    },
-                );
+                engine_test_call(&mut engine, "runPlatformTask", &[])
+                    .unwrap_or_else(|error| panic!("{}", error));
             } else {
                 let task = runtime
                     .block_on(async {
@@ -48633,11 +49706,11 @@ mod tests {
         if let Ok(task) = task_rx.try_recv() {
             dispatch_host_task(engine, task).unwrap();
         } else if matches!(
-            engine_call_trust_method(engine, "hasPlatformTask", &[]),
-            Ok(Value::Bool(true))
+            engine_test_call(engine, "hasPlatformTask", &[]),
+            Ok(TrustValue::Bool(true))
         ) {
-            engine_call_trust_method(engine, "runPlatformTask", &[])
-                .unwrap_or_else(|error| panic!("{}", describe_eval_error(engine, error, "task")));
+            engine_test_call(engine, "runPlatformTask", &[])
+                .unwrap_or_else(|error| panic!("{error}"));
         } else if let Ok(Some(task)) = runtime.block_on(async {
             tokio::time::timeout(Duration::from_millis(20), task_rx.recv()).await
         }) {
@@ -48885,7 +49958,7 @@ mod tests {
              races:race-request,race-xhr,race-fetch,TypeError|shared:shared-ok|\
              partition:TypeError:true:TypeError|held:held"
         );
-        let store = engine.ctx().host_mut::<HostState>().unwrap().blobs.clone();
+        let store = engine.host_mut::<HostState>().unwrap().blobs.clone();
         let held = string_value(&mut engine, "heldURL");
         let kept = string_value(&mut engine, "keptURL");
         assert!(store.resolve(&held).is_some() && store.resolve(&kept).is_some());
@@ -48918,7 +49991,6 @@ mod tests {
         let (runtime, mut engine, mut task_rx) = worker_test_environment();
         let file = crate::file_select::SelectedFile::from_path(&path, String::new()).unwrap();
         let id = engine
-            .ctx()
             .host_mut::<HostState>()
             .unwrap()
             .user_files
@@ -48953,7 +50025,7 @@ mod tests {
         )
         .unwrap();
         let url = string_value(&mut engine, "fileURL");
-        let store = engine.ctx().host_mut::<HostState>().unwrap().blobs.clone();
+        let store = engine.host_mut::<HostState>().unwrap().blobs.clone();
         let entry = store
             .resolve(&url)
             .expect("the store has the selected file's entry");
@@ -49246,12 +50318,11 @@ mod tests {
             }
             assert!(Instant::now() < deadline, "shared workers stalled: {log}");
             if matches!(
-                engine_call_trust_method(&mut engine, "hasPlatformTask", &[]),
-                Ok(Value::Bool(true))
+                engine_test_call(&mut engine, "hasPlatformTask", &[]),
+                Ok(TrustValue::Bool(true))
             ) {
-                engine_call_trust_method(&mut engine, "runPlatformTask", &[]).unwrap_or_else(
-                    |error| panic!("{}", describe_eval_error(&mut engine, error, "shared task")),
-                );
+                engine_test_call(&mut engine, "runPlatformTask", &[])
+                    .unwrap_or_else(|error| panic!("{}", error));
             } else if let Ok(Some(task)) = runtime.block_on(async {
                 tokio::time::timeout(Duration::from_millis(200), task_rx.recv()).await
             }) {
@@ -49274,7 +50345,6 @@ mod tests {
             "{log}"
         );
         let workers = engine
-            .ctx()
             .host_mut::<HostState>()
             .unwrap()
             .workers
@@ -49314,7 +50384,6 @@ mod tests {
         )
         .unwrap();
         let scopes = engine
-            .ctx()
             .host_mut::<HostState>()
             .unwrap()
             .workers
@@ -49370,7 +50439,6 @@ mod tests {
         }
         assert!(
             engine
-                .ctx()
                 .host_mut::<HostState>()
                 .unwrap()
                 .workers
@@ -49418,7 +50486,6 @@ mod tests {
         );
         assert!(
             engine
-                .ctx()
                 .host_mut::<HostState>()
                 .unwrap()
                 .workers
@@ -49590,7 +50657,6 @@ mod tests {
             }
         }
         let tasks = engine
-            .ctx()
             .host_mut::<HostState>()
             .unwrap()
             .workers
@@ -49639,12 +50705,11 @@ mod tests {
         while string_value(&mut engine, "waitResults.length") != "3" {
             assert!(Instant::now() < deadline, "idle worker timeouts stalled");
             if matches!(
-                engine_call_trust_method(&mut engine, "hasPlatformTask", &[]),
-                Ok(Value::Bool(true))
+                engine_test_call(&mut engine, "hasPlatformTask", &[]),
+                Ok(TrustValue::Bool(true))
             ) {
-                engine_call_trust_method(&mut engine, "runPlatformTask", &[]).unwrap_or_else(
-                    |error| panic!("{}", describe_eval_error(&mut engine, error, "worker task")),
-                );
+                engine_test_call(&mut engine, "runPlatformTask", &[])
+                    .unwrap_or_else(|error| panic!("{}", error));
             } else if let Ok(Some(task)) = runtime.block_on(async {
                 tokio::time::timeout(Duration::from_millis(200), task_rx.recv()).await
             }) {
@@ -49993,7 +51058,6 @@ mod tests {
             let origin = clock.origin_ms;
             engine.set_wall_clock(move || clock.now_ms());
             engine
-                .ctx()
                 .op_state()
                 .put_retained_memory_with_external_memory(state);
             install_trust_js_worker_boundary(&mut engine);
@@ -50011,7 +51075,6 @@ mod tests {
         };
         if forwarded {
             engine
-                .ctx()
                 .host_mut::<HostState>()
                 .unwrap()
                 .realm_origins
@@ -50225,7 +51288,6 @@ mod tests {
         assert_eq!(string_value(&mut engine, "String(inlineCurrent)"), "true");
         assert_eq!(
             engine
-                .ctx()
                 .host_mut::<HostState>()
                 .map(|state| state.pending_resources),
             Some(4)
@@ -50236,7 +51298,6 @@ mod tests {
         // still settle in a later networking task.
         for _ in 0..8 {
             let resources_done = engine
-                .ctx()
                 .host_mut::<HostState>()
                 .is_some_and(|state| state.pending_resources == 0);
             if resources_done
@@ -50284,7 +51345,6 @@ mod tests {
         );
         assert_eq!(
             engine
-                .ctx()
                 .host_mut::<HostState>()
                 .map(|state| state.pending_resources),
             Some(0)
@@ -50372,7 +51432,6 @@ mod tests {
         .unwrap();
         run_microtask_checkpoint(&mut engine);
         while engine
-            .ctx()
             .host_mut::<HostState>()
             .is_some_and(|state| state.pending_resources > 0)
         {
@@ -50529,15 +51588,15 @@ mod tests {
         run_microtask_checkpoint(&mut engine);
 
         for _ in 0..8 {
-            let has_task = engine_call_trust_method(&mut engine, "hasPlatformTask", &[])
-                .map(|value| engine.ctx().to_boolean(&value))
+            let has_task = engine_test_call(&mut engine, "hasPlatformTask", &[])
+                .map(|value| value.truthy())
                 .unwrap_or(false);
             if !has_task {
                 break;
             }
             assert!(
-                engine_call_trust_method(&mut engine, "runPlatformTask", &[])
-                    .is_ok_and(|value| engine.ctx().to_boolean(&value))
+                engine_test_call(&mut engine, "runPlatformTask", &[])
+                    .is_ok_and(|value| value.truthy())
             );
             run_microtask_checkpoint(&mut engine);
         }
@@ -50595,7 +51654,6 @@ mod tests {
         )
         .unwrap();
         let node_id = engine
-            .ctx()
             .host_mut::<HostState>()
             .and_then(|state| state.dom.borrow().get_by_id("entry"))
             .expect("module event target exists");
@@ -50610,7 +51668,6 @@ mod tests {
         assert_eq!(string_value(&mut engine, "awaitedModuleEvent"), "pending");
         assert_eq!(
             engine
-                .ctx()
                 .host_mut::<HostState>()
                 .map(|state| state.pending_resources),
             Some(1)
@@ -50636,7 +51693,6 @@ mod tests {
         assert_eq!(string_value(&mut engine, "awaitedModuleEvent"), "load");
         assert_eq!(
             engine
-                .ctx()
                 .host_mut::<HostState>()
                 .map(|state| state.pending_resources),
             Some(0)
@@ -52036,7 +53092,6 @@ mod tests {
         .unwrap();
         let (dom, cache) = {
             let state = engine
-                .ctx()
                 .host_mut::<HostState>()
                 .expect("platform HostState remains installed");
             (state.dom.clone(), state.geom_cache.clone())
@@ -52514,7 +53569,7 @@ mod tests {
                 "rectangle allocation and cycles",
             )
             .unwrap();
-            engine.ctx().unstable_collect_young_for_host_tests();
+            engine.scope(|cx| cx.unstable_collect_young_for_host_tests());
             assert_eq!(
                 string_value(
                     &mut engine,
@@ -52543,7 +53598,7 @@ mod tests {
                 engine.collect_garbage_at_idle();
             }
             assert_eq!(
-                engine.ctx().host_mut::<HostState>().unwrap().geometry.len(),
+                engine.host_mut::<HostState>().unwrap().geometry.len(),
                 1,
                 "{tier:?}: native state must follow JS liveness"
             );
@@ -52576,16 +53631,9 @@ mod tests {
                 .unwrap();
             }
             retired.push({
-                let state = engine.ctx().host_mut::<HostState>().unwrap();
-                Rc::downgrade(
-                    state
-                        .window_realms
-                        .values()
-                        .next()
-                        .unwrap()
-                        .as_obj()
-                        .unwrap(),
-                )
+                let state = engine.host_mut::<HostState>().unwrap();
+                let window = state.window_realms.values().next().unwrap();
+                window.downgrade().expect("a live Window Realm")
             });
             eval(&mut engine, "rectFrame.remove(); rectFrame = null; while (__trust.hasPlatformTask()) __trust.runPlatformTask(); /parent-match/.test('parent-match');", "retire rectangle Realm").unwrap();
         }
@@ -52594,14 +53642,11 @@ mod tests {
             engine.collect_garbage_at_idle();
         }
         assert!(
-            retired[0].upgrade().is_some(),
+            !retired[0].is_cleared(),
             "borrowed rectangle must keep its intrinsic prototype/Realm live"
         );
         for realm in &retired[1..] {
-            assert!(
-                realm.upgrade().is_none(),
-                "native registry rooted retired Realm"
-            );
+            assert!(realm.is_cleared(), "native registry rooted retired Realm");
         }
         assert_eq!(
             string_value(
@@ -52621,13 +53666,10 @@ mod tests {
             engine.collect_garbage_at_idle();
         }
         assert!(
-            retired[0].upgrade().is_none(),
+            retired[0].is_cleared(),
             "released rectangle rooted its Realm"
         );
-        assert_eq!(
-            engine.ctx().host_mut::<HostState>().unwrap().geometry.len(),
-            0
-        );
+        assert_eq!(engine.host_mut::<HostState>().unwrap().geometry.len(), 0);
     }
 
     #[test]
@@ -52670,7 +53712,7 @@ mod tests {
         );
         assert_eq!(string_value(&mut engine, "String(marqueeRecords)"), "0");
         // The stopped clock reaches presentation arenas as TRust's markers.
-        let host = engine.ctx().host_mut::<HostState>().unwrap();
+        let host = engine.host_mut::<HostState>().unwrap();
         let dom = host.dom.clone();
         let dom = dom.borrow();
         let marquee = dom
@@ -52786,7 +53828,6 @@ mod tests {
             "exposed"
         );
         let contexts: Vec<_> = engine
-            .ctx()
             .host_mut::<HostState>()
             .unwrap()
             .window_cookie_contexts
@@ -52829,7 +53870,7 @@ mod tests {
         // run_trust_js_worker installs the launch owner's cookie context at id 0.
         // Test that retrieval keeps that owner rather than using the worker URL.
         let mut worker = worker_platform_engine();
-        let state = worker.ctx().host_mut::<HostState>().unwrap();
+        let state = worker.host_mut::<HostState>().unwrap();
         let worker_settings = state.worker_self.as_mut().unwrap();
         worker_settings.origin = endpoint.clone();
         worker_settings.settings_origin = endpoint.origin();
@@ -52837,7 +53878,7 @@ mod tests {
         state
             .window_cookie_contexts
             .insert(0, (DOCUMENT, state.base.clone(), context));
-        request.cookie_context = Some(cookie_context_for_id(worker.ctx(), 0));
+        request.cookie_context = Some(worker.scope(|cx| cookie_context_for_id(cx, 0)));
         assert_eq!(crate::http::request_cookies(&request), "cf_clearance=frame");
         let worker_cookies = request.cookie_context.as_ref().unwrap();
         assert_eq!(worker_cookies.client.as_ref(), Some(&endpoint));
@@ -53141,7 +54182,7 @@ mod tests {
             globalThis.retainedStorage = child.localStorage;
             localStorage.setItem('marker', 'top'); retainedStorage.setItem('marker', 'retained');
         "#, "retained frame storage setup").unwrap();
-        engine.ctx().host_mut::<HostState>().unwrap().base =
+        engine.host_mut::<HostState>().unwrap().base =
             url::Url::parse("https://different-base.example.com/").unwrap();
         eval(&mut engine, r#"
             __dom_release_job_context(storageContext);
@@ -53179,7 +54220,7 @@ mod tests {
             state.storage = storage.clone();
             let mut engine = configured_engine(state, page);
             // A later host base/settings change cannot re-key these objects.
-            engine.ctx().host_mut::<HostState>().unwrap().base =
+            engine.host_mut::<HostState>().unwrap().base =
                 url::Url::parse("https://unrelated-base.example.test/").unwrap();
             eval(
                 &mut engine,
@@ -53208,12 +54249,12 @@ mod tests {
             .unwrap();
             for _ in 0..32 {
                 run_microtask_checkpoint(&mut engine);
-                if !engine_call_trust_method(&mut engine, "hasPlatformTask", &[])
-                    .is_ok_and(|value| engine.ctx().to_boolean(&value))
+                if !engine_test_call(&mut engine, "hasPlatformTask", &[])
+                    .is_ok_and(|value| value.truthy())
                 {
                     break;
                 }
-                assert!(engine_call_trust_method(&mut engine, "runPlatformTask", &[]).is_ok());
+                assert!(engine_test_call(&mut engine, "runPlatformTask", &[]).is_ok());
             }
             run_microtask_checkpoint(&mut engine);
             assert_eq!(string_value(&mut engine, "result"), expected, "{page}");
@@ -53276,7 +54317,6 @@ mod tests {
             results.push(string_value(&mut engine, "result"));
             channels.extend(
                 engine
-                    .ctx()
                     .host_mut::<HostState>()
                     .unwrap()
                     .message_ports
@@ -53385,12 +54425,12 @@ mod tests {
             .unwrap();
             for _ in 0..64 {
                 run_microtask_checkpoint(&mut engine);
-                if !engine_call_trust_method(&mut engine, "hasPlatformTask", &[])
-                    .is_ok_and(|value| engine.ctx().to_boolean(&value))
+                if !engine_test_call(&mut engine, "hasPlatformTask", &[])
+                    .is_ok_and(|value| value.truthy())
                 {
                     break;
                 }
-                assert!(engine_call_trust_method(&mut engine, "runPlatformTask", &[]).is_ok());
+                assert!(engine_test_call(&mut engine, "runPlatformTask", &[]).is_ok());
             }
             run_microtask_checkpoint(&mut engine);
             results.push(string_value(&mut engine, "result"));
@@ -53553,14 +54593,14 @@ mod tests {
                     crate::js::PRELUDE
                 };
                 eval_test_bootstrap(&mut engine, prelude, "Navigator environment", worker).unwrap();
-                let value = eval_value(
+                let value = eval_test_value(
                     &mut engine,
                     include_str!("fixtures/navigator_interfaces.mjs"),
                     "Navigator interfaces",
                 )
                 .unwrap();
                 assert!(
-                    matches!(value,Value::Str(ref s) if s.as_ref()=="navigator-interfaces-ok"),
+                    value.as_engine_text() == Some("navigator-interfaces-ok"),
                     "worker={worker} {tier:?}"
                 );
             }
@@ -53573,14 +54613,14 @@ mod tests {
             let mut engine = platform_engine();
             engine.set_tier(tier);
             engine.set_tier_threshold(0);
-            let value = eval_value(
+            let value = eval_test_value(
                 &mut engine,
                 include_str!("fixtures/navigator_realms.mjs"),
                 "Navigator Realm boundaries",
             )
             .unwrap();
             assert!(
-                matches!(value,Value::Str(ref s) if s.as_ref()=="navigator-realms-ok"),
+                value.as_engine_text() == Some("navigator-realms-ok"),
                 "{tier:?}"
             );
         }
@@ -53683,7 +54723,6 @@ mod tests {
         let mut engine = trust_js::Engine::new();
         engine.set_wall_clock(move || clock.now_ms());
         engine
-            .ctx()
             .op_state()
             .put_retained_memory_with_external_memory(state);
         install_trust_js_worker_boundary(&mut engine);
@@ -53808,7 +54847,6 @@ mod tests {
         for _ in 0..32 {
             drain_platform_tasks(&mut engine, "__trust");
             let contexts: Vec<_> = engine
-                .ctx()
                 .host::<HostState>()
                 .unwrap()
                 .window_realms
@@ -53816,16 +54854,16 @@ mod tests {
                 .copied()
                 .collect();
             for context in contexts {
-                run_in_context_realm(&mut engine, context, "cookie tasks", |engine| {
+                run_in_context_realm(&mut engine, context, "cookie tasks", |cx| {
                     for _ in 0..32 {
-                        let pending = host_call_trust(engine.ctx(), "hasPlatformTask", &[])
+                        let pending = host_call_trust(cx, "hasPlatformTask", &[])
                             .map_err(|_| String::from("cookie realm task query failed"))?;
-                        if !matches!(pending, Value::Bool(true)) {
+                        if !matches!(pending.kind(), ValueKind::Bool(true)) {
                             break;
                         }
-                        host_call_trust(engine.ctx(), "runPlatformTask", &[])
+                        host_call_trust(cx, "runPlatformTask", &[])
                             .map_err(|_| String::from("cookie realm task failed"))?;
-                        run_microtask_checkpoint(engine);
+                        let _ = cx.run_microtasks_interruptible();
                     }
                     Ok(())
                 })
@@ -54040,13 +55078,8 @@ mod tests {
             }
             eval(&mut engine, "__trust.runPlatformTask()", "clipboard task").unwrap();
         }
-        let requests = std::mem::take(
-            &mut engine
-                .ctx()
-                .host_mut::<HostState>()
-                .unwrap()
-                .clipboard_requests,
-        );
+        let requests =
+            std::mem::take(&mut engine.host_mut::<HostState>().unwrap().clipboard_requests);
         assert_eq!(
             requests
                 .iter()
@@ -54059,7 +55092,7 @@ mod tests {
             "NotAllowedError"
         );
         for ((request, _), ok) in requests.into_iter().zip([true, false, true]) {
-            assert!(settle_clipboard_request(engine.ctx(), request, ok).is_ok());
+            assert!(engine.scope(|cx| settle_clipboard_request(cx, request, ok).is_ok()));
         }
         for _ in 0..20 {
             run_microtask_checkpoint(&mut engine);
@@ -54074,7 +55107,6 @@ mod tests {
         );
         assert!(
             engine
-                .ctx()
                 .host_mut::<HostState>()
                 .unwrap()
                 .clipboard_settlers
@@ -54159,11 +55191,7 @@ mod tests {
                     check(request&&request[0]===location.href&&request[1]==='reload','zero delta reload');
                 }
             "#, "history delta methods").unwrap();
-            let pending = &engine
-                .ctx()
-                .host_mut::<HostState>()
-                .unwrap()
-                .history_traversals;
+            let pending = &engine.host_mut::<HostState>().unwrap().history_traversals;
             assert_eq!(pending, &[(0, -2), (0, 1), (0, -1), (0, -1)], "{tier:?}");
         }
     }
@@ -54495,7 +55523,6 @@ mod tests {
 
         let blob_url = string_value(&mut engine, "blobPortUrl");
         let blobs = engine
-            .ctx()
             .host_mut::<HostState>()
             .expect("host state")
             .blobs
@@ -54915,6 +55942,61 @@ mod tests {
     }
 
     #[test]
+    fn host_made_buffers_ignore_a_replaced_view_buffer_getter() {
+        // A digest's result and a blob URL entry's bytes are ArrayBuffers the host makes
+        // itself. Reading a fresh view's `buffer` instead would run the %TypedArray%.prototype
+        // getter, which page script can replace.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r#"globalThis.blobURL = URL.createObjectURL(new Blob(['blob bytes']));
+            Object.defineProperty(Object.getPrototypeOf(Uint8Array.prototype), 'buffer', {
+                configurable: true, get() { throw Error('the view buffer getter ran'); },
+            });"#,
+            "replace the view buffer getter",
+        )
+        .unwrap();
+        engine.scope(|cx| {
+            let name = cx.str("SHA-256");
+            let input = cx
+                .make_array_buffer(b"abc")
+                .unwrap_or_else(|_| panic!("digest input"));
+            let digest = host_crypto_digest(cx, Value::Undefined, &[name, input])
+                .unwrap_or_else(|error| panic!("{}", describe_throw(cx, error, "digest")));
+            let global = cx.global_this();
+            let url = cx
+                .member_get(&global, "blobURL")
+                .unwrap_or_else(|_| panic!("blob URL"));
+            let op = cx.str("resolve");
+            let entry = host_blob_url(cx, Value::Undefined, &[op, url, Value::Null, Value::Null])
+                .unwrap_or_else(|error| panic!("{}", describe_throw(cx, error, "blob resolve")));
+            cx.member_set(&global, "digestPromise", digest)
+                .unwrap_or_else(|_| panic!("publish the digest"));
+            cx.member_set(&global, "blobEntry", entry)
+                .unwrap_or_else(|_| panic!("publish the blob entry"));
+        });
+        eval(
+            &mut engine,
+            "digestPromise.then(digest => globalThis.digestHex = Array.from(new Uint8Array(digest), \
+             x => x.toString(16).padStart(2, '0')).join(''))",
+            "read the digest",
+        )
+        .unwrap();
+        run_microtask_checkpoint(&mut engine);
+        assert_eq!(
+            string_value(&mut engine, "digestHex"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "[blobEntry[2][0] instanceof ArrayBuffer, blobEntry[2][0].byteLength].join()"
+            ),
+            "true,10"
+        );
+    }
+
+    #[test]
     fn web_crypto_random_views_use_os_entropy_and_preserve_bounds() {
         let mut engine = platform_engine();
         eval(&mut engine,r#"
@@ -55085,7 +56167,6 @@ mod tests {
         );
         state.test_hooks.internals = true;
         engine
-            .ctx()
             .op_state()
             .put_retained_memory_with_external_memory(state);
         install_trust_js_worker_boundary(&mut engine);
@@ -55664,15 +56745,15 @@ mod tests {
 
         for _ in 0..128 {
             run_microtask_checkpoint(&mut engine);
-            let has_task = engine_call_trust_method(&mut engine, "hasPlatformTask", &[])
-                .map(|value| engine.ctx().to_boolean(&value))
+            let has_task = engine_test_call(&mut engine, "hasPlatformTask", &[])
+                .map(|value| value.truthy())
                 .unwrap_or(false);
             if !has_task {
                 break;
             }
             assert!(
-                engine_call_trust_method(&mut engine, "runPlatformTask", &[])
-                    .is_ok_and(|value| engine.ctx().to_boolean(&value))
+                engine_test_call(&mut engine, "runPlatformTask", &[])
+                    .is_ok_and(|value| value.truthy())
             );
         }
         run_microtask_checkpoint(&mut engine);
@@ -55785,15 +56866,15 @@ mod tests {
 
         for _ in 0..192 {
             run_microtask_checkpoint(&mut engine);
-            let has_task = engine_call_trust_method(&mut engine, "hasPlatformTask", &[])
-                .map(|value| engine.ctx().to_boolean(&value))
+            let has_task = engine_test_call(&mut engine, "hasPlatformTask", &[])
+                .map(|value| value.truthy())
                 .unwrap_or(false);
             if !has_task {
                 break;
             }
             assert!(
-                engine_call_trust_method(&mut engine, "runPlatformTask", &[])
-                    .is_ok_and(|value| engine.ctx().to_boolean(&value))
+                engine_test_call(&mut engine, "runPlatformTask", &[])
+                    .is_ok_and(|value| value.truthy())
             );
         }
         run_microtask_checkpoint(&mut engine);
@@ -55863,15 +56944,15 @@ mod tests {
 
         for _ in 0..160 {
             run_microtask_checkpoint(&mut engine);
-            let has_task = engine_call_trust_method(&mut engine, "hasPlatformTask", &[])
-                .map(|value| engine.ctx().to_boolean(&value))
+            let has_task = engine_test_call(&mut engine, "hasPlatformTask", &[])
+                .map(|value| value.truthy())
                 .unwrap_or(false);
             if !has_task {
                 break;
             }
             assert!(
-                engine_call_trust_method(&mut engine, "runPlatformTask", &[])
-                    .is_ok_and(|value| engine.ctx().to_boolean(&value))
+                engine_test_call(&mut engine, "runPlatformTask", &[])
+                    .is_ok_and(|value| value.truthy())
             );
         }
         run_microtask_checkpoint(&mut engine);
@@ -55958,15 +57039,15 @@ mod tests {
 
         for _ in 0..256 {
             run_microtask_checkpoint(&mut engine);
-            let has_task = engine_call_trust_method(&mut engine, "hasPlatformTask", &[])
-                .map(|value| engine.ctx().to_boolean(&value))
+            let has_task = engine_test_call(&mut engine, "hasPlatformTask", &[])
+                .map(|value| value.truthy())
                 .unwrap_or(false);
             if !has_task {
                 break;
             }
             assert!(
-                engine_call_trust_method(&mut engine, "runPlatformTask", &[])
-                    .is_ok_and(|value| engine.ctx().to_boolean(&value))
+                engine_test_call(&mut engine, "runPlatformTask", &[])
+                    .is_ok_and(|value| value.truthy())
             );
         }
         run_microtask_checkpoint(&mut engine);
@@ -56070,15 +57151,15 @@ mod tests {
 
         for _ in 0..192 {
             run_microtask_checkpoint(&mut engine);
-            let has_task = engine_call_trust_method(&mut engine, "hasPlatformTask", &[])
-                .map(|value| engine.ctx().to_boolean(&value))
+            let has_task = engine_test_call(&mut engine, "hasPlatformTask", &[])
+                .map(|value| value.truthy())
                 .unwrap_or(false);
             if !has_task {
                 break;
             }
             assert!(
-                engine_call_trust_method(&mut engine, "runPlatformTask", &[])
-                    .is_ok_and(|value| engine.ctx().to_boolean(&value))
+                engine_test_call(&mut engine, "runPlatformTask", &[])
+                    .is_ok_and(|value| value.truthy())
             );
         }
         run_microtask_checkpoint(&mut engine);
@@ -56095,7 +57176,7 @@ mod tests {
     #[test]
     fn minimal_boundary_boots_the_real_prelude() {
         let mut engine = platform_engine();
-        let node_type = eval_value(&mut engine, "document.nodeType", "node type").unwrap();
+        let node_type = eval_test_value(&mut engine, "document.nodeType", "node type").unwrap();
         assert_eq!(node_type.as_num_opt(), Some(9.0));
         assert_eq!(crate::dom::DOCUMENT, 0);
     }
@@ -56346,7 +57427,7 @@ mod tests {
             let Some(deadline) = deadline.as_num_opt() else {
                 break;
             };
-            call_trust_method(&mut engine, "tickTo", &[Value::Num(deadline)]);
+            call_trust_method(&mut engine, "tickTo", &[TrustValue::Num(deadline)]);
             if string_value(
                 &mut engine,
                 "String(repeatedNavigationFrame.contentDocument.body.dataset.done)",
@@ -56660,7 +57741,6 @@ mod tests {
             let mut engine = trust_js::Engine::new();
             engine.set_wall_clock(move || clock.now_ms());
             engine
-                .ctx()
                 .op_state()
                 .put_retained_memory_with_external_memory(state);
             install_trust_js_worker_boundary(&mut engine);
@@ -56695,7 +57775,7 @@ mod tests {
                 document.body.append(sandboxInitialFrame);
             "#),"initial sandbox Window").unwrap();
             let (node, old_context, old_origin) = {
-                let state = engine.ctx().host_mut::<HostState>().unwrap();
+                let state = engine.host_mut::<HostState>().unwrap();
                 let node = state.dom.borrow().get_by_id("sandbox-initial").unwrap();
                 let context = state.frame_contexts[&node];
                 (node, context, realm_origin(state, context))
@@ -56712,7 +57792,7 @@ mod tests {
                 "sandbox initial replacement",
             )
             .unwrap();
-            let state = engine.ctx().host_mut::<HostState>().unwrap();
+            let state = engine.host_mut::<HostState>().unwrap();
             let context = state.frame_contexts[&node];
             assert_ne!(
                 context, old_context,
@@ -57457,14 +58537,14 @@ mod tests {
             let mut engine = platform_engine();
             engine.set_tier(tier);
             engine.set_tier_threshold(0);
-            let value = eval_value(
+            let value = eval_test_value(
                 &mut engine,
                 include_str!("fixtures/xml_documents.mjs"),
                 "XML document regression fixture",
             )
             .unwrap();
             assert_eq!(
-                value_string(&mut engine, &value),
+                test_value_string(&mut engine, &value),
                 "xml-documents-ok",
                 "{tier:?}"
             );
@@ -57483,14 +58563,14 @@ mod tests {
             );
             engine.set_tier(tier);
             engine.set_tier_threshold(0);
-            let value = eval_value(
+            let value = eval_test_value(
                 &mut engine,
                 include_str!("fixtures/html_tables.mjs"),
                 "HTML table regression fixture",
             )
             .unwrap();
             assert_eq!(
-                value_string(&mut engine, &value),
+                test_value_string(&mut engine, &value),
                 "html-tables-ok",
                 "{tier:?}"
             );
@@ -57509,14 +58589,14 @@ mod tests {
             );
             engine.set_tier(tier);
             engine.set_tier_threshold(0);
-            let value = eval_value(
+            let value = eval_test_value(
                 &mut engine,
                 include_str!("fixtures/keyboard_delivery.mjs"),
                 "native keyboard delivery fixture",
             )
             .unwrap();
             assert_eq!(
-                value_string(&mut engine, &value),
+                test_value_string(&mut engine, &value),
                 "keyboard-delivery-ok",
                 "{tier:?}"
             );
@@ -57535,14 +58615,14 @@ mod tests {
             );
             engine.set_tier(tier);
             engine.set_tier_threshold(0);
-            let value = eval_value(
+            let value = eval_test_value(
                 &mut engine,
                 include_str!("fixtures/keyboard_enter.mjs"),
                 "native Enter regression fixture",
             )
             .unwrap();
             assert_eq!(
-                value_string(&mut engine, &value),
+                test_value_string(&mut engine, &value),
                 "keyboard-enter-ok",
                 "{tier:?}"
             );
@@ -57610,14 +58690,14 @@ mod tests {
             let mut engine = platform_engine();
             engine.set_tier(tier);
             engine.set_tier_threshold(0);
-            let value = eval_value(
+            let value = eval_test_value(
                 &mut engine,
                 include_str!("fixtures/pointer_events.mjs"),
                 "PointerEvent regression fixture",
             )
             .unwrap();
             assert_eq!(
-                value_string(&mut engine, &value),
+                test_value_string(&mut engine, &value),
                 "pointer-events-ok",
                 "{tier:?}"
             );
@@ -57742,7 +58822,7 @@ mod tests {
             .unwrap();
             eval(&mut engine, "frameRoutingSetup()", "frame routing setup").unwrap();
             let [text, boxed] = {
-                let state = engine.ctx().host::<HostState>().unwrap();
+                let state = engine.host::<HostState>().unwrap();
                 let dom = state.dom.borrow();
                 ["text", "box"].map(|id| {
                     dom.composed_descendants(crate::dom::DOCUMENT)
@@ -58149,7 +59229,7 @@ mod tests {
             let mut engine = platform_engine();
             engine.set_tier(tier);
             engine.set_tier_threshold(0);
-            let result = eval_value(&mut engine, r##"
+            let result = eval_test_value(&mut engine, r##"
                 document.append(document.createElement('html'));
                 document.documentElement.innerHTML = '<head><style>html,body{margin:0} ' +
                     '#parent{position:relative;border:3px solid;padding:9px}' +
@@ -58199,7 +59279,7 @@ mod tests {
                 'offset-style-ok'
             "##, "canonical offset styles").unwrap();
             assert!(
-                matches!(result, Value::Str(ref s) if s.as_ref() == "offset-style-ok"),
+                result.as_engine_text() == Some("offset-style-ok"),
                 "{tier:?}"
             );
         }
@@ -58213,7 +59293,7 @@ mod tests {
         // outer collapsed border and a cell's border box holds half of each
         // collapsed border, not the computed border-width.
         let mut engine = platform_engine();
-        let result = eval_value(
+        let result = eval_test_value(
             &mut engine,
             r##"
             document.append(document.createElement('html'));
@@ -58232,10 +59312,10 @@ mod tests {
             "collapsed offsets",
         )
         .unwrap();
-        let Value::Str(result) = result else {
+        let Some(result) = result.as_engine_text() else {
             panic!("collapsed offsets did not return a string");
         };
-        assert_eq!(result.as_ref(), "3,3,54,32,true,0,0,3,3,24,24,0,27,1,24");
+        assert_eq!(result, "3,3,54,32,true,0,0,3,3,24,24,0,27,1,24");
     }
 
     #[test]
@@ -58712,14 +59792,14 @@ mod tests {
         ] {
             assert!(matches!(
                 call_trust_method(&mut engine, "tick", &[]),
-                Value::Bool(true)
+                TrustValue::Bool(true)
             ));
             run_microtask_checkpoint(&mut engine);
             assert_eq!(string_value(&mut engine, "order.join(',')"), expected);
         }
         assert!(matches!(
             call_trust_method(&mut engine, "tick", &[]),
-            Value::Bool(false)
+            TrustValue::Bool(false)
         ));
     }
 
@@ -59047,48 +60127,39 @@ mod tests {
         // Web IDL #invoke-a-callback-function (8f182624) also requires the native
         // boundary to preserve the original receiver/argument behavior.
         let mut engine = trust_js::Engine::new();
-        let owner = eval_value(
-            &mut engine,
-            "(() => { const owner = {value: 42}; owner.operation = function(source, receiver, args) { return owner.value + receiver.extra + args[0]; }; return owner; })()",
-            "native callback capture cycle",
-        )
-        .unwrap();
-        let Value::Obj(object) = &owner else {
-            panic!("fixture must produce an object");
-        };
-        let weak_owner = Rc::downgrade(object);
-        let operation = engine
-            .ctx()
-            .member_get(&owner, "operation")
-            .unwrap_or_else(|_| panic!("fixture operation getter must succeed"));
-        let callback = host_callback_api(
-            engine.ctx(),
-            Value::Undefined,
-            &[
-                operation,
-                Value::from_string(String::from("captureTest")),
-                Value::Num(1.),
-            ],
-        )
-        .unwrap_or_else(|_| panic!("native callback creation must succeed"));
-        engine
-            .ctx()
-            .member_set(&owner, "callback", callback.clone())
-            .unwrap_or_else(|_| panic!("fixture callback assignment must succeed"));
+        let (owner, weak_owner, callback) = engine.scope(|cx| {
+            let owner = eval_value(
+                cx,
+                "(() => { const owner = {value: 42}; owner.operation = function(source, receiver, args) { return owner.value + receiver.extra + args[0]; }; return owner; })()",
+                "native callback capture cycle",
+            )
+            .unwrap();
+            assert!(owner.as_obj().is_some(), "fixture must produce an object");
+            let operation = cx
+                .member_get(&owner, "operation")
+                .unwrap_or_else(|_| panic!("fixture operation getter must succeed"));
+            let name = cx.str("captureTest");
+            let callback = host_callback_api(cx, Value::Undefined, &[operation, name, Value::Num(1.)])
+                .unwrap_or_else(|_| panic!("native callback creation must succeed"));
+            cx.member_set(&owner, "callback", callback)
+                .unwrap_or_else(|_| panic!("fixture callback assignment must succeed"));
+            (hold(cx, &owner), hold_weakly(cx, &owner), hold(cx, &callback))
+        });
         drop(owner);
         run_microtask_checkpoint(&mut engine);
         engine.collect_garbage_at_idle();
         assert!(
-            weak_owner.upgrade().is_some(),
+            !weak_owner.is_cleared(),
             "live native callback lost its capture"
         );
-        let receiver = eval_value(&mut engine, "({extra: 1})", "callback receiver").unwrap();
-        let result = engine
-            .ctx()
-            .invoke(callback.clone(), receiver, &[Value::Num(7.)])
-            .unwrap_or_else(|_| panic!("live callback invocation must succeed"));
-        assert_eq!(result.as_num_opt(), Some(50.));
-        drop(result);
+        let result = engine.scope(|cx| {
+            let receiver = eval_value(cx, "({extra: 1})", "callback receiver").unwrap();
+            let callback = held(cx, &callback);
+            cx.invoke(callback, receiver, &[Value::Num(7.)])
+                .unwrap_or_else(|_| panic!("live callback invocation must succeed"))
+                .as_num_opt()
+        });
+        assert_eq!(result, Some(50.));
         drop(callback);
         run_microtask_checkpoint(&mut engine);
         for _ in 0..3 {
@@ -59096,7 +60167,7 @@ mod tests {
             run_microtask_checkpoint(&mut engine);
         }
         assert!(
-            weak_owner.upgrade().is_none(),
+            weak_owner.is_cleared(),
             "native callback kept an unreachable capture cycle alive"
         );
     }
@@ -59137,12 +60208,10 @@ mod tests {
             )
             .unwrap();
             {
-                let state = engine.ctx().host_mut::<HostState>().unwrap();
+                let state = engine.host_mut::<HostState>().unwrap();
                 assert_eq!(state.window_realms.len(), 1);
-                let Value::Obj(window) = state.window_realms.values().next().unwrap() else {
-                    panic!("Window Realm must have an object global");
-                };
-                retired.push(Rc::downgrade(window));
+                let window = state.window_realms.values().next().unwrap();
+                retired.push(window.downgrade().expect("a live Window Realm"));
             }
             eval(
                 &mut engine,
@@ -59169,11 +60238,9 @@ mod tests {
         )
         .unwrap();
         {
-            let state = engine.ctx().host_mut::<HostState>().unwrap();
-            let Value::Obj(window) = state.window_realms.values().next().unwrap() else {
-                panic!("Window Realm must have an object global");
-            };
-            retired.push(Rc::downgrade(window));
+            let state = engine.host_mut::<HostState>().unwrap();
+            let window = state.window_realms.values().next().unwrap();
+            retired.push(window.downgrade().expect("a live Window Realm"));
         }
         eval(
             &mut engine,
@@ -59188,13 +60255,10 @@ mod tests {
             run_microtask_checkpoint(&mut engine);
             engine.collect_garbage_at_idle();
         }
-        assert!(
-            retired[0].upgrade().is_some(),
-            "borrowed function lost its Realm"
-        );
+        assert!(!retired[0].is_cleared(), "borrowed function lost its Realm");
         for window in &retired[1..] {
             assert!(
-                window.upgrade().is_none(),
+                window.is_cleared(),
                 "unreachable retired Window remained rooted"
             );
         }
@@ -59216,7 +60280,7 @@ mod tests {
             engine.collect_garbage_at_idle();
         }
         assert!(
-            retired[0].upgrade().is_none(),
+            retired[0].is_cleared(),
             "released borrowed function rooted its Realm"
         );
         assert_eq!(string_value(&mut engine, "__trust.takeErrors()"), "");
@@ -59225,9 +60289,10 @@ mod tests {
     #[test]
     fn event_listener_cycles_are_owned_by_the_target_not_the_registry() {
         let mut engine = platform_engine();
-        let target = eval_value(
-            &mut engine,
-            r#"(() => {
+        let weak = engine.scope(|cx| {
+            let target = eval_value(
+                cx,
+                r#"(() => {
                 const target = new EventTarget();
                 target.calls = 0;
                 const handler = () => { target.calls++; };
@@ -59235,34 +60300,29 @@ mod tests {
                 target.addEventListener('mouseover', handler);
                 return target;
             })()"#,
-            "unreachable listener target cycle",
-        )
-        .unwrap();
-        let weak = Rc::downgrade(target.as_obj().unwrap());
-        let dispatch = engine
-            .ctx()
-            .member_get(&target, "dispatchEvent")
-            .unwrap_or_else(|_| panic!("missing dispatchEvent"));
-        let event = eval_value(&mut engine, "new Event('click')", "listener cycle event").unwrap();
-        engine
-            .ctx()
-            .invoke(dispatch, target.clone(), &[event])
-            .unwrap_or_else(|_| panic!("dispatchEvent failed"));
-        assert_eq!(
-            engine
-                .ctx()
-                .member_get(&target, "calls")
-                .unwrap_or_else(|_| panic!("missing calls"))
-                .as_num_opt(),
-            Some(1.)
-        );
-        drop(target);
+                "unreachable listener target cycle",
+            )
+            .unwrap();
+            let dispatch = cx
+                .member_get(&target, "dispatchEvent")
+                .unwrap_or_else(|_| panic!("missing dispatchEvent"));
+            let event = eval_value(cx, "new Event('click')", "listener cycle event").unwrap();
+            cx.invoke(dispatch, target, &[event])
+                .unwrap_or_else(|_| panic!("dispatchEvent failed"));
+            assert_eq!(
+                cx.member_get(&target, "calls")
+                    .unwrap_or_else(|_| panic!("missing calls"))
+                    .as_num_opt(),
+                Some(1.)
+            );
+            hold_weakly(cx, &target)
+        });
         for _ in 0..3 {
             run_microtask_checkpoint(&mut engine);
             engine.collect_garbage_at_idle();
         }
         assert!(
-            weak.upgrade().is_none(),
+            weak.is_cleared(),
             "listener/discovery tables retained a dead target cycle"
         );
     }
@@ -59537,7 +60597,6 @@ mod tests {
         eval(&mut engine,"globalThis.collectionRoot=document.createElement('div');collectionRoot.innerHTML='<i></i>'.repeat(128);", "collection setup").unwrap();
         let id_arrays = |engine: &mut trust_js::Engine| {
             engine
-                .ctx()
                 .host_mut::<HostState>()
                 .unwrap()
                 .dom_gc
@@ -59571,7 +60630,7 @@ mod tests {
             before,
             "native live views must not allocate retained child ID arrays"
         );
-        engine.ctx().collect_garbage_for_host();
+        engine.scope(|cx| cx.collect_garbage_for_host());
         assert_eq!(
             string_value(
                 &mut engine,
@@ -59585,7 +60644,7 @@ mod tests {
             "release collection",
         )
         .unwrap();
-        engine.ctx().collect_garbage_for_host();
+        engine.scope(|cx| cx.collect_garbage_for_host());
     }
 
     #[test]
@@ -59651,7 +60710,6 @@ mod tests {
         .unwrap();
         let id_arrays = |engine: &mut trust_js::Engine| {
             engine
-                .ctx()
                 .host_mut::<HostState>()
                 .unwrap()
                 .dom_gc
@@ -59685,7 +60743,7 @@ mod tests {
             before,
             "native query views must not allocate retained ID arrays"
         );
-        engine.ctx().collect_garbage_for_host();
+        engine.scope(|cx| cx.collect_garbage_for_host());
         assert_eq!(
             string_value(
                 &mut engine,
@@ -59699,7 +60757,7 @@ mod tests {
             "release collection",
         )
         .unwrap();
-        engine.ctx().collect_garbage_for_host();
+        engine.scope(|cx| cx.collect_garbage_for_host());
     }
 
     #[test]
@@ -59711,7 +60769,6 @@ mod tests {
         eval(&mut engine, "globalThis.edgeRoot=document.createElement('div');edgeRoot.innerHTML='<i></i>'.repeat(128);edgeRoot.firstChild;edgeRoot.lastChild;", "edge setup").unwrap();
         let count = |engine: &mut trust_js::Engine| {
             engine
-                .ctx()
                 .host_mut::<HostState>()
                 .unwrap()
                 .dom_gc
@@ -59777,7 +60834,7 @@ mod tests {
     #[test]
     fn native_wrapper_cache_retires_with_the_mixed_heap() {
         let mut engine = platform_engine();
-        let result = eval_value(
+        let result = eval_test_value(
             &mut engine,
             "globalThis.retireWrapper=document.createElement('p');retireWrapper.__id",
             "native wrapper retirement",
@@ -59787,7 +60844,6 @@ mod tests {
         if native_wrapper_cache_enabled() {
             assert!(
                 engine
-                    .ctx()
                     .host_mut::<HostState>()
                     .unwrap()
                     .dom_gc
@@ -59801,11 +60857,14 @@ mod tests {
             engine.collect_garbage_at_idle();
             run_microtask_checkpoint(&mut engine);
         }
-        assert!(matches!(
-            host_cached_dom_wrapper(engine.ctx(), Value::Undefined, &[Value::Num(id as f64)]),
-            Ok(Value::Null)
-        ));
-        let state = engine.ctx().host_mut::<HostState>().unwrap();
+        assert!(engine.scope(|cx| {
+            matches!(
+                host_cached_dom_wrapper(cx, Value::Undefined, &[Value::Num(id as f64)])
+                    .map(|value| value.kind()),
+                Ok(ValueKind::Null)
+            )
+        }));
+        let state = engine.host_mut::<HostState>().unwrap();
         assert!(!state.dom_gc.wrappers.contains_key(&id));
         assert!(!state.dom.borrow().is_valid(id));
         for (&node, identity) in &state.dom_gc.wrappers {
@@ -59857,15 +60916,17 @@ mod tests {
             &mut engine,
             r#"
             globalThis.keptWrapper = document.createElement("div");
-            (function () {
-                for (let i = 0; i < 2048; i++) document.createElement("span");
-            })();
+            // Held while the cache is counted: a collection during the churn
+            // may already have pruned wrappers that died.
+            globalThis.churn = [];
+            for (let i = 0; i < 2048; i++) churn.push(document.createElement("span"));
             globalThis.detachedQueryRoot = document.createElement("div");
             detachedQueryRoot.innerHTML = "<i></i>".repeat(2048);
             (function () {
                 detachedQueryRoot.querySelectorAll("i");
             })();
             globalThis.wrapperCacheBefore = __trust.nodeWrapperCacheState().join(",");
+            churn = null;
             "#,
             "detached wrapper churn",
         )
@@ -59951,14 +61012,14 @@ mod tests {
     #[test]
     fn dom_gc_raw_allocation_and_async_task_leases_bridge_wrapper_publication() {
         let mut engine = platform_engine();
-        let dom = engine.ctx().host_mut::<HostState>().unwrap().dom.clone();
+        let dom = engine.host_mut::<HostState>().unwrap().dom.clone();
         let newborn = dom.borrow_mut().create_element("span");
         engine.collect_garbage_at_idle();
         assert!(
             dom.borrow().is_valid(newborn),
             "raw new-node ID lost before publication"
         );
-        HostGc::end_job(engine.ctx().host_mut::<HostState>().unwrap());
+        HostGc::end_job(engine.host_mut::<HostState>().unwrap());
         engine.collect_garbage_at_idle();
         assert!(
             !dom.borrow().is_valid(newborn),
@@ -59967,7 +61028,7 @@ mod tests {
 
         let task_node = dom.borrow_mut().create_element("script");
         let lease = {
-            let state = engine.ctx().host_mut::<HostState>().unwrap();
+            let state = engine.host_mut::<HostState>().unwrap();
             state.dom_gc.start_resource(task_node);
             HostGc::end_job(state);
             state.dom_gc.resource_lease(task_node)
@@ -60078,7 +61139,7 @@ mod tests {
     #[test]
     fn dom_gc_nursery_late_wrappers_for_old_nodes_and_young_detached_peers() {
         let mut engine = platform_engine();
-        let dom = engine.ctx().host_mut::<HostState>().unwrap().dom.clone();
+        let dom = engine.host_mut::<HostState>().unwrap().dom.clone();
         let old = {
             let mut dom = dom.borrow_mut();
             let id = dom.create_element("div");
@@ -60111,7 +61172,7 @@ mod tests {
         )
         .unwrap();
         run_microtask_checkpoint(&mut engine);
-        engine.ctx().unstable_collect_young_for_host_tests();
+        engine.scope(|cx| cx.unstable_collect_young_for_host_tests());
         assert_eq!(
             string_value(
                 &mut engine,
@@ -60119,28 +61180,19 @@ mod tests {
             ),
             "41:42:43:true"
         );
-        assert!(
-            engine
-                .ctx()
-                .host_mut::<HostState>()
-                .unwrap()
-                .dom_gc
-                .young_owners
-                .is_empty()
-        );
     }
 
     #[test]
     fn dom_gc_nursery_unreachable_raw_nodes_are_reclaimed_with_borrow_fallback() {
         let mut engine = platform_engine();
-        let dom = engine.ctx().host_mut::<HostState>().unwrap().dom.clone();
+        let dom = engine.host_mut::<HostState>().unwrap().dom.clone();
         engine.collect_garbage_at_idle();
         let node = dom.borrow_mut().create_element("div");
-        HostGc::end_job(engine.ctx().host_mut::<HostState>().unwrap());
+        HostGc::end_job(engine.host_mut::<HostState>().unwrap());
         let first_young = dom.borrow().first_young_gc_id();
         {
             let external_reader = dom.borrow();
-            engine.ctx().unstable_collect_young_for_host_tests();
+            engine.scope(|cx| cx.unstable_collect_young_for_host_tests());
             assert!(external_reader.is_valid(node));
             assert_eq!(
                 external_reader.first_young_gc_id(),
@@ -60148,79 +61200,22 @@ mod tests {
                 "borrow fallback must not promote or clear the native journal"
             );
         }
-        engine.ctx().unstable_collect_young_for_host_tests();
+        engine.scope(|cx| cx.unstable_collect_young_for_host_tests());
         assert!(!dom.borrow().is_valid(node));
         let newborn = dom.borrow_mut().create_text("pending publication");
-        engine.ctx().unstable_collect_young_for_host_tests();
+        engine.scope(|cx| cx.unstable_collect_young_for_host_tests());
         assert!(dom.borrow().is_valid(newborn));
-        HostGc::end_job(engine.ctx().host_mut::<HostState>().unwrap());
-        // This survivor is now old: only the next major may reclaim it.
-        engine.ctx().unstable_collect_young_for_host_tests();
-        assert!(dom.borrow().is_valid(newborn));
-        engine.collect_garbage_at_idle();
+        HostGc::end_job(engine.host_mut::<HostState>().unwrap());
+        // Every collection reports the whole DOM graph, so a minor one reclaims the survivor
+        // once its allocation lease has ended.
+        engine.scope(|cx| cx.unstable_collect_young_for_host_tests());
         assert!(!dom.borrow().is_valid(newborn));
-    }
-
-    #[test]
-    fn dom_gc_nursery_unchanged_host_registry_emits_no_old_dom_graph() {
-        #[derive(Default)]
-        struct Count {
-            internal: usize,
-            edges: usize,
-            owners: usize,
-        }
-        impl HostGcVisitor for Count {
-            fn supports_native(&self) -> bool {
-                true
-            }
-            fn is_minor(&self) -> bool {
-                true
-            }
-            fn native_old_generation(&mut self, _: &'static str, _: usize, _: usize) -> bool {
-                true
-            }
-            fn internal(&mut self, _: &Value) {
-                self.internal += 1;
-            }
-            fn edge(&mut self, _: &Value, _: &Value) {}
-            fn root(&mut self, _: &Value) {}
-            fn native_edge(&mut self, _: NativeGcId, _: NativeGcId) {
-                self.edges += 1;
-            }
-            fn js_to_native(&mut self, _: &Value, _: NativeGcId) {
-                self.owners += 1;
-            }
-        }
-        let mut engine = platform_engine();
-        eval(
-            &mut engine,
-            r#"
-            const tree=document.createElement('main');
-            (document.body||document.documentElement||document).appendChild(tree);
-            for(let i=0;i<1000;++i) tree.appendChild(document.createElement('p'));
-        "#,
-            "old native registry",
-        )
-        .unwrap();
-        run_microtask_checkpoint(&mut engine);
-        engine.collect_garbage_at_idle();
-        let state = engine.ctx().host_mut::<HostState>().unwrap();
-        assert!(state.dom_gc.owners.len() >= 1000);
-        assert!(state.dom_gc.young_owners.is_empty());
-        let mut count = Count::default();
-        state.trace_gc(&mut count);
-        assert_eq!(
-            (count.internal, count.edges, count.owners),
-            (0, 0, 0),
-            "an unchanged old native heap must not be enumerated during minor collection"
-        );
     }
 
     #[test]
     fn dom_gc_lazy_static_nodelists_retain_native_nodes_then_release_dead_components() {
         let mut engine = platform_engine();
         let before = engine
-            .ctx()
             .host_mut::<HostState>()
             .unwrap()
             .dom
@@ -60261,7 +61256,6 @@ mod tests {
             run_microtask_checkpoint(&mut engine);
         }
         let after = engine
-            .ctx()
             .host_mut::<HostState>()
             .unwrap()
             .dom
@@ -60458,14 +61452,14 @@ mod tests {
             let mut engine = platform_engine();
             engine.set_tier(tier);
             engine.set_tier_threshold(0);
-            let result = eval_value(
+            let result = eval_test_value(
                 &mut engine,
                 include_str!("fixtures/computed_style_bindings.mjs"),
                 "computed style binding conformance",
             )
             .unwrap();
             assert!(
-                matches!(result, Value::Str(ref s) if s.as_ref() == "computed-style-bindings-ok"),
+                result.as_engine_text() == Some("computed-style-bindings-ok"),
                 "{tier:?}"
             );
         }
@@ -60477,14 +61471,14 @@ mod tests {
             let mut engine = platform_engine();
             engine.set_tier(tier);
             engine.set_tier_threshold(0);
-            let result = eval_value(
+            let result = eval_test_value(
                 &mut engine,
                 include_str!("fixtures/computed_style_initial_values.mjs"),
                 "computed style initial values",
             )
             .unwrap();
             assert!(
-                matches!(result, Value::Str(ref s) if s.as_ref() == "computed-style-initial-values-ok"),
+                result.as_engine_text() == Some("computed-style-initial-values-ok"),
                 "{tier:?}"
             );
         }
@@ -60628,7 +61622,7 @@ mod tests {
         .unwrap();
         run_microtask_checkpoint(&mut engine);
         for _ in 0..3 {
-            engine.ctx().collect_garbage_for_host();
+            engine.scope(|cx| cx.collect_garbage_for_host());
             run_microtask_checkpoint(&mut engine);
         }
         assert_eq!(
@@ -60646,7 +61640,7 @@ mod tests {
         .unwrap();
         run_microtask_checkpoint(&mut engine);
         for _ in 0..3 {
-            engine.ctx().collect_garbage_for_host();
+            engine.scope(|cx| cx.collect_garbage_for_host());
             run_microtask_checkpoint(&mut engine);
         }
         assert_eq!(
@@ -60862,14 +61856,14 @@ mod tests {
         )
         .unwrap();
         for _ in 0..8 {
-            let deadline = eval_value(&mut engine, "__trust.nextDeadline()", "timer deadline")
+            let deadline = eval_test_value(&mut engine, "__trust.nextDeadline()", "timer deadline")
                 .unwrap()
                 .as_num_opt()
                 .unwrap();
-            let dispatched = dispatch_timer_task_to(&mut engine, deadline);
+            let dispatched = test_dispatch_timer(&mut engine, deadline, "timer task");
             let ran = match dispatched {
                 Ok(ran) => ran,
-                Err(error) => panic!("{}", describe_eval_error(&mut engine, error, "timer task")),
+                Err(error) => panic!("{}", error),
             };
             assert!(ran);
             run_microtask_checkpoint(&mut engine);
@@ -60926,11 +61920,11 @@ mod tests {
                     "timer recursion setup",
                 )
                 .unwrap();
-                let dispatched = dispatch_timer_task_to(&mut engine, 1000.0);
+                let dispatched = test_dispatch_timer(&mut engine, 1000.0, "timer task");
                 let ran = match dispatched {
                     Ok(ran) => ran,
                     Err(error) => {
-                        panic!("{}", describe_eval_error(&mut engine, error, "timer task"))
+                        panic!("{}", error)
                     }
                 };
                 assert!(ran);
@@ -60954,13 +61948,10 @@ mod tests {
             "timer diagnostic setup",
         )
         .unwrap();
-        let dispatched = dispatch_timer_task_to(&mut engine, 1000.0);
+        let dispatched = test_dispatch_timer(&mut engine, 1000.0, "timer task");
         let ran = match dispatched {
             Ok(ran) => ran,
-            Err(error) => panic!(
-                "{}",
-                describe_eval_error(&mut engine, error, "timer diagnostic task")
-            ),
+            Err(error) => panic!("{}", error),
         };
         assert!(ran);
         let errors = string_value(&mut engine, "__trust.takeErrors()");
@@ -60999,13 +61990,10 @@ mod tests {
         )
         .unwrap();
 
-        let dispatched = dispatch_timer_task_to(&mut engine, 1000.0);
+        let dispatched = test_dispatch_timer(&mut engine, 1000.0, "timer task");
         let ran = match dispatched {
             Ok(ran) => ran,
-            Err(error) => panic!(
-                "{}",
-                describe_eval_error(&mut engine, error, "nested frame timer task")
-            ),
+            Err(error) => panic!("{}", error),
         };
         assert!(ran);
         assert_eq!(
@@ -61085,7 +62073,7 @@ mod tests {
         request: u64,
         files: Option<Vec<std::path::PathBuf>>,
     ) {
-        match settle_file_picker_request(engine.ctx(), request, files) {
+        match engine.scope(|cx| settle_file_picker_request(cx, request, files).map_err(drop)) {
             Ok(None) => {}
             Ok(Some(trouble)) => panic!("{trouble}"),
             Err(_) => panic!("the file picker settle callback threw"),
@@ -61093,13 +62081,7 @@ mod tests {
     }
 
     fn take_file_pickers(engine: &mut trust_js::Engine) -> Vec<crate::js::FilePickerRequest> {
-        std::mem::take(
-            &mut engine
-                .ctx()
-                .host_mut::<HostState>()
-                .unwrap()
-                .file_picker_requests,
-        )
+        std::mem::take(&mut engine.host_mut::<HostState>().unwrap().file_picker_requests)
     }
 
     #[test]
@@ -61665,7 +62647,6 @@ mod tests {
         let mut engine = platform_engine_with_body();
         let file = crate::file_select::SelectedFile::from_path(&path, String::new()).unwrap();
         let id = engine
-            .ctx()
             .host_mut::<HostState>()
             .unwrap()
             .user_files
@@ -61769,7 +62750,6 @@ mod tests {
         let mut engine = platform_engine_with_body();
         let dropped = crate::file_select::SelectedFile::from_path(&top, String::new()).unwrap();
         let id = engine
-            .ctx()
             .host_mut::<HostState>()
             .unwrap()
             .user_files
@@ -62073,13 +63053,15 @@ mod tests {
                     data =
                         serde_json::json!({"name":"https://original.test/empty", "startTime":1.0});
                 }
-                let named = host_timing_data_value(engine.ctx(), &data)
-                    .unwrap_or_else(|_| panic!("original scalar record conversion"));
-                assert!(host_call_trust(engine.ctx(), "recordResourceTiming", &[named]).is_ok());
-                let packed = host_resource_timing_value(engine.ctx(), &data);
-                assert!(
-                    host_call_trust(engine.ctx(), "recordResourceTimingPacked", &[packed]).is_ok()
-                );
+                assert!(engine.scope(|cx| {
+                    let named = host_timing_data_value(cx, &data)
+                        .unwrap_or_else(|_| panic!("original scalar record conversion"));
+                    host_call_trust(cx, "recordResourceTiming", &[named]).is_ok()
+                }));
+                assert!(engine.scope(|cx| {
+                    let packed = host_resource_timing_value(cx, &data);
+                    host_call_trust(cx, "recordResourceTimingPacked", &[packed]).is_ok()
+                }));
                 assert_eq!(
                     string_value(
                         &mut engine,
@@ -62363,16 +63345,13 @@ mod tests {
             let mut engine = platform_engine();
             engine.set_tier(tier);
             engine.set_tier_threshold(0);
-            let value = eval_value(
+            let value = eval_test_value(
                 &mut engine,
                 include_str!("fixtures/user_timing.mjs"),
                 "User Timing fixture",
             )
             .unwrap();
-            assert!(
-                matches!(value, Value::Str(ref s) if s.as_ref() == "user-timing-ok"),
-                "{tier:?}"
-            );
+            assert!(value.as_engine_text() == Some("user-timing-ok"), "{tier:?}");
         }
     }
 
@@ -62501,7 +63480,7 @@ mod tests {
             new PerformanceObserver(list=>lcpEntries.push(...list.getEntries())).observe({type:'largest-contentful-paint'});
         "#, "LCP painted fixture").unwrap();
         let paint = |engine: &mut trust_js::Engine| {
-            let state = engine.ctx().host_mut::<HostState>().unwrap();
+            let state = engine.host_mut::<HostState>().unwrap();
             let layout = crate::layout2::lay_out_graphical(
                 &state.dom.borrow(),
                 &state.base,
@@ -62514,7 +63493,7 @@ mod tests {
         };
         paint(&mut engine);
         assert_eq!(string_value(&mut engine, "lcpEntries.length"), "0");
-        assert!(host_call_trust(engine.ctx(), "runPerformanceTask", &[]).is_ok());
+        assert!(engine.scope(|cx| host_call_trust(cx, "runPerformanceTask", &[]).is_ok()));
         assert_eq!(
             string_value(
                 &mut engine,
@@ -62531,7 +63510,7 @@ mod tests {
             "document.getElementById('hidden').style.opacity='1';document.getElementById('hidden').textContent='A much longer paragraph becomes visible for the first time';",
             "LCP first visible paint").unwrap();
         paint(&mut engine);
-        assert!(host_call_trust(engine.ctx(), "runPerformanceTask", &[]).is_ok());
+        assert!(engine.scope(|cx| host_call_trust(cx, "runPerformanceTask", &[]).is_ok()));
         assert_eq!(
             string_value(
                 &mut engine,
@@ -62547,14 +63526,14 @@ mod tests {
             let mut engine = platform_engine();
             engine.set_tier(tier);
             engine.set_tier_threshold(0);
-            let value = eval_value(
+            let value = eval_test_value(
                 &mut engine,
                 include_str!("fixtures/user_timing_realms.mjs"),
                 "User Timing Realms",
             )
             .unwrap();
             assert!(
-                matches!(value, Value::Str(ref s) if s.as_ref() == "user-timing-realms-ok"),
+                value.as_engine_text() == Some("user-timing-realms-ok"),
                 "{tier:?}"
             );
         }
@@ -62585,7 +63564,7 @@ mod tests {
             .unwrap();
             run_microtask_checkpoint(&mut engine);
             for _ in 0..3 {
-                engine.ctx().collect_garbage_for_host();
+                engine.scope(|cx| cx.collect_garbage_for_host());
                 run_microtask_checkpoint(&mut engine);
             }
             assert_eq!(
@@ -62603,7 +63582,7 @@ mod tests {
             .unwrap();
             run_microtask_checkpoint(&mut engine);
             for _ in 0..3 {
-                engine.ctx().collect_garbage_for_host();
+                engine.scope(|cx| cx.collect_garbage_for_host());
                 run_microtask_checkpoint(&mut engine);
             }
             assert_eq!(
@@ -62939,7 +63918,7 @@ mod tests {
         .unwrap();
         eval(&mut engine, "counter += 1", "second host entry").unwrap();
 
-        let now = eval_value(&mut engine, "__trust.now() + 100", "timer deadline").unwrap();
+        let now = eval_test_value(&mut engine, "__trust.now() + 100", "timer deadline").unwrap();
         assert_eq!(
             call_trust_method(&mut engine, "tickTo", &[now]).as_num_opt(),
             Some(1.0)
@@ -62949,7 +63928,7 @@ mod tests {
             string_value(&mut engine, "intervalOrder.join(',')"),
             "v42,micro-42"
         );
-        let now = eval_value(&mut engine, "__trust.now() + 100", "timer deadline").unwrap();
+        let now = eval_test_value(&mut engine, "__trust.now() + 100", "timer deadline").unwrap();
         assert_eq!(
             call_trust_method(&mut engine, "tickTo", &[now]).as_num_opt(),
             Some(0.0)
@@ -62991,7 +63970,7 @@ mod tests {
                 hover,
                 crate::js::TraversableLink::for_test(interrupt.clone()),
             );
-            engine.ctx().op_state().put(QueuedClick {
+            engine.op_state().put(QueuedClick {
                 handle,
                 node,
                 reserved,
@@ -63041,7 +64020,7 @@ mod tests {
                 .as_num_opt()
                 .unwrap()
                 + 1.0;
-            let task = dispatch_timer_task_to(&mut engine, deadline);
+            let task = test_dispatch_timer(&mut engine, deadline, "timer task");
             // Clear the old implementation's interrupt so a failure can still
             // inspect the page state rather than interrupt the assertion itself.
             interrupt.begin_user_interaction();
@@ -63053,7 +64032,7 @@ mod tests {
             let crate::js::PageCmd::Click(target) = queued.try_recv().unwrap() else {
                 panic!("expected queued click");
             };
-            call_trust_method(&mut engine, "click", &[Value::Num(target as f64)]);
+            call_trust_method(&mut engine, "click", &[TrustValue::Num(target as f64)]);
             run_microtask_checkpoint(&mut engine);
             eval(
                 &mut engine,
@@ -63083,13 +64062,16 @@ mod tests {
         eval(&mut old_realm, "globalThis.marker = 1", "old realm marker").unwrap();
         let interrupt = old_realm.interrupt_handle();
         interrupt.request_user_navigation();
-        match old_realm
-            .eval_value_interruptible("marker = 99")
-            .expect("navigation probe parses")
-        {
-            Err(EvalError::Interrupted(trust_js::InterruptReason::UserNavigation)) => {}
-            _ => panic!("old realm did not yield to navigation"),
-        }
+        let yielded = old_realm.scope(|cx| {
+            matches!(
+                cx.eval_value_interruptible("marker = 99")
+                    .expect("navigation probe parses"),
+                Err(EvalError::Interrupted(
+                    trust_js::InterruptReason::UserNavigation
+                ))
+            )
+        });
+        assert!(yielded, "old realm did not yield to navigation");
 
         // A navigation yield is reusable while the current page actor is still being unwound.
         interrupt.begin_user_interaction();
@@ -63099,13 +64081,14 @@ mod tests {
         // Page teardown is permanent. A replacement page receives a distinct, unpoisoned handle
         // and realm; no author global from the old page crosses the navigation boundary.
         interrupt.cancel();
-        match old_realm
-            .eval_value_interruptible("marker = 100")
-            .expect("teardown probe parses")
-        {
-            Err(EvalError::Interrupted(trust_js::InterruptReason::Cancelled)) => {}
-            _ => panic!("torn-down realm accepted another author task"),
-        }
+        let cancelled = old_realm.scope(|cx| {
+            matches!(
+                cx.eval_value_interruptible("marker = 100")
+                    .expect("teardown probe parses"),
+                Err(EvalError::Interrupted(trust_js::InterruptReason::Cancelled))
+            )
+        });
+        assert!(cancelled, "torn-down realm accepted another author task");
         drop(old_realm);
 
         let mut new_realm = platform_engine();

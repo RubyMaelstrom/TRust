@@ -88,7 +88,7 @@ async fn static_frames_resume_native_binding_preserves_opaque_identity_readiness
         __trust.hydrateFrames();__trust.parserFinished();__trust.fireDOMContentLoaded();__trust.completeDocumentLoad();
     "#,"materialize completed frame tree").unwrap();
     let context = {
-        let state = engine.ctx().host::<HostState>().unwrap();
+        let state = engine.host::<HostState>().unwrap();
         let context = *state.frame_contexts.values().next().unwrap();
         let restored = service_worker_host::client_for_context(state, context).unwrap();
         assert_eq!(restored.id, original.id);
@@ -100,10 +100,9 @@ async fn static_frames_resume_native_binding_preserves_opaque_identity_readiness
         string_value(&mut engine, "document.readyState+'|'+replayed"),
         "complete|0"
     );
-    run_in_context_realm(&mut engine, context, "restored child metadata", |engine| {
-        assert_eq!(string_value(engine, "document.readyState"), "complete");
-        let timing: Vec<f64> = serde_json::from_str(&string_value(
-            engine,
+    run_in_context_realm(&mut engine, context, "restored child metadata", |cx| {
+        assert_eq!(scoped_string_value(cx, "document.readyState"), "complete");
+        let timing: Vec<f64> = serde_json::from_str(&scoped_string_value(cx,
             "JSON.stringify([performance.timeOrigin,performance.timing.domLoading,performance.timing.responseStart,performance.timing.responseEnd])",
         ))
         .unwrap();
@@ -207,13 +206,13 @@ async fn document_clock_restored_srcdoc_data_and_initial_blank_precede_materiali
     "#, "materialize local frame Documents").unwrap();
     for name in ["blank", "srcdoc", "data", "no-content"] {
         let context = {
-            let state = engine.ctx().host::<HostState>().unwrap();
+            let state = engine.host::<HostState>().unwrap();
             let node = dom.borrow().get_by_id(name).unwrap();
             state.frame_contexts[&node]
         };
-        run_in_context_realm(&mut engine, context, "original local Document clock", |engine| {
-            assert_eq!(string_value(engine, "document.readyState"), "complete");
-            let stamps: Vec<f64> = serde_json::from_str(&string_value(engine,
+        run_in_context_realm(&mut engine, context, "original local Document clock", |cx| {
+            assert_eq!(scoped_string_value(cx, "document.readyState"), "complete");
+            let stamps: Vec<f64> = serde_json::from_str(&scoped_string_value(cx,
                 "JSON.stringify([performance.timeOrigin,performance.timing.navigationStart,performance.timing.domLoading,performance.timing.fetchStart,performance.timing.domainLookupStart,performance.timing.connectStart,performance.timing.domInteractive,performance.timing.domComplete,performance.timing.loadEventEnd,performance.getEntriesByType('navigation').length,performance.now()])"
             )).unwrap();
             assert!(stamps[0] > 0. && stamps[0] <= completed, "{name}: {stamps:?}");
@@ -248,7 +247,6 @@ fn document_clock_live_local_replacement_updates_initial_blank_clock() {
         )
         .unwrap();
         let initial_context = *engine
-            .ctx()
             .host::<HostState>()
             .unwrap()
             .frame_contexts
@@ -256,12 +254,12 @@ fn document_clock_live_local_replacement_updates_initial_blank_clock() {
             .next()
             .unwrap();
         let mut initial_origin = 0.;
-        run_in_context_realm(&mut engine, initial_context, "initial clock", |engine| {
+        run_in_context_realm(&mut engine, initial_context, "initial clock", |cx| {
             assert_eq!(
-                string_value(engine, "String(performance.timing.domLoading)"),
+                scoped_string_value(cx, "String(performance.timing.domLoading)"),
                 "0"
             );
-            initial_origin = string_value(engine, "String(performance.timeOrigin)")
+            initial_origin = scoped_string_value(cx, "String(performance.timeOrigin)")
                 .parse::<f64>()
                 .unwrap();
             Ok(())
@@ -281,15 +279,14 @@ fn document_clock_live_local_replacement_updates_initial_blank_clock() {
             );
         }
         let context = *engine
-            .ctx()
             .host::<HostState>()
             .unwrap()
             .frame_contexts
             .values()
             .next()
             .unwrap();
-        run_in_context_realm(&mut engine, context, "replacement clock", |engine| {
-            let stamps: Vec<f64> = serde_json::from_str(&string_value(engine,
+        run_in_context_realm(&mut engine, context, "replacement clock", |cx| {
+            let stamps: Vec<f64> = serde_json::from_str(&scoped_string_value(cx,
                 "JSON.stringify([performance.timeOrigin,performance.timing.navigationStart,performance.timing.domLoading,performance.timing.fetchStart,performance.getEntriesByType('navigation').length])"
             )).unwrap();
             assert!(stamps[0] > initial_origin, "{source}: {stamps:?}");
@@ -326,18 +323,15 @@ fn static_frames_resumed_styles_keep_resource_states_and_allow_later_insertions(
     )
     .unwrap();
     eval_platform_prelude(&mut engine).unwrap();
-    let resources = host_parsed_style_resources(
-        engine.ctx(),
-        Value::Undefined,
-        &[Value::Num(document as f64)],
-    )
-    .map_err(|error| describe_throw(&mut engine, error, "restored stylesheet resources"))
-    .unwrap();
-    let global = engine.ctx().global_this();
     engine
-        .ctx()
-        .member_set(&global, "nativeStyleResources", resources)
-        .map_err(|error| describe_throw(&mut engine, error, "publish stylesheet resources"))
+        .scope(|cx| {
+            let resources =
+                host_parsed_style_resources(cx, Value::Undefined, &[Value::Num(document as f64)])
+                    .map_err(|error| describe_throw(cx, error, "restored stylesheet resources"))?;
+            let global = cx.global_this();
+            cx.member_set(&global, "nativeStyleResources", resources)
+                .map_err(|error| describe_throw(cx, error, "publish stylesheet resources"))
+        })
         .unwrap();
     assert_eq!(
         string_value(
@@ -397,7 +391,6 @@ fn navigation_source_context_survives_queued_location_navigation_with_zero_and_c
     )
     .unwrap();
     let context = *engine
-        .ctx()
         .host::<HostState>()
         .unwrap()
         .frame_contexts
@@ -405,12 +398,8 @@ fn navigation_source_context_survives_queued_location_navigation_with_zero_and_c
         .next()
         .unwrap();
     assert_ne!(context, 0);
-    run_in_context_realm(&mut engine, context, "child-source navigation", |engine| {
-        eval(
-            engine,
-            "location.href='/from-child';",
-            "navigate from child settings",
-        )
+    run_in_context_realm(&mut engine, context, "child-source navigation", |cx| {
+        eval_value(cx, "location.href='/from-child';", "navigate from child settings").map(|_| ())
     })
     .unwrap();
     eval(

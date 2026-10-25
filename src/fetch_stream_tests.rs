@@ -62,8 +62,7 @@ fn service_worker_response_filtering_redirects_head_and_range_provenance() {
     run_until(&runtime, &mut engine, &mut tasks, "done");
     // Range is a privileged no-CORS header. Author Headers mutations remove
     // it; start with an actual native media request, then replay its response.
-    let context =
-        service_worker_host::fetch::for_context(engine.ctx().host::<HostState>().unwrap(), 0);
+    let context = service_worker_host::fetch::for_context(engine.host::<HostState>().unwrap(), 0);
     for target in [
         format!("{remote_url}/range-source"),
         format!("{base}/range"),
@@ -290,7 +289,7 @@ fn service_worker_navigation_preload_keeps_reserved_client_and_streams_response(
     "#,"preload manager").unwrap();
     run_until(&runtime, &mut engine, &mut tasks, "done");
     assert_eq!(log(&mut engine), "true|preload-test|true");
-    let storage = engine.ctx().host::<HostState>().unwrap().storage.clone();
+    let storage = engine.host::<HostState>().unwrap().storage.clone();
     for (path, mime, disposition) in [
         ("next", "text/html", "null"),
         ("binary", "application/octet-stream", "null"),
@@ -516,7 +515,7 @@ fn service_worker_clients_query_claim_and_keep_document_snapshots() {
     let runtime = runtime();
     let (listener, base) = listen(&runtime);
     let (mut engine, mut tasks) = page(&runtime, &format!("{base}/register"));
-    let storage = engine.ctx().host::<HostState>().unwrap().storage.clone();
+    let storage = engine.host::<HostState>().unwrap().storage.clone();
     let blobs = crate::js::BlobMap::default();
     let static_client = prepare_service_worker_document(
         &storage,
@@ -802,7 +801,7 @@ fn service_worker_documents_keep_controllers_after_their_actors_retire() {
         }
     });
     let (mut engine, mut tasks) = page(&runtime, &format!("{base}/register"));
-    let storage = engine.ctx().host::<HostState>().unwrap().storage.clone();
+    let storage = engine.host::<HostState>().unwrap().storage.clone();
     eval(
         &mut engine,
         r#"
@@ -1014,7 +1013,7 @@ fn service_worker_cookie_subscriptions_wake_saved_scripts_and_extend_event_lifet
         log(&mut engine)
     );
     assert_eq!(
-        service_worker_host::stop_idle_agents_for_test(engine.ctx()),
+        engine.scope(service_worker_host::stop_idle_agents_for_test),
         1
     );
     eval(&mut engine,r#"
@@ -1174,7 +1173,6 @@ fn run_until(
         // with inherited/sandboxed settings must pump those queues as the
         // resident page actor does, including promise-only native failures.
         let contexts: Vec<_> = engine
-            .ctx()
             .host::<HostState>()
             .unwrap()
             .window_realms
@@ -1182,17 +1180,19 @@ fn run_until(
             .copied()
             .collect();
         for context in contexts {
-            run_in_context_realm(engine, context, "frame platform tasks", |engine| {
+            run_in_context_realm(engine, context, "frame platform tasks", |cx| {
                 for _ in 0..32 {
                     if !matches!(
-                        host_call_trust(engine.ctx(), "hasPlatformTask", &[]),
-                        Ok(Value::Bool(true))
+                        host_call_trust(cx, "hasPlatformTask", &[]).map(|value| value.kind()),
+                        Ok(ValueKind::Bool(true))
                     ) {
                         break;
                     }
-                    host_call_trust(engine.ctx(), "runPlatformTask", &[])
+                    host_call_trust(cx, "runPlatformTask", &[])
                         .map_err(|_| String::from("frame platform task failed"))?;
-                    run_microtask_checkpoint(engine);
+                    cx.run_microtasks_interruptible().unwrap_or_else(|reason| {
+                        panic!("microtask checkpoint interrupted: {}", reason.message())
+                    });
                 }
                 Ok(())
             })
@@ -1271,7 +1271,6 @@ async fn stream_until_closed(socket: &mut TcpStream) -> bool {
 
 fn streams_in_flight(engine: &mut trust_js::Engine) -> usize {
     engine
-        .ctx()
         .host_mut::<HostState>()
         .and_then(|state| state.network.as_ref())
         .map_or(0, |network| network.body_streams.len())
@@ -1474,7 +1473,6 @@ fn an_unread_body_suspends_its_transfer_within_the_buffer_limit() {
         Duration::from_millis(600),
     );
     let (buffered, suspended) = engine
-        .ctx()
         .host_mut::<HostState>()
         .and_then(|state| state.network.as_ref())
         .and_then(|network| network.body_streams.values().next())
@@ -2199,7 +2197,7 @@ fn the_user_agents_stop_cancels_the_navigation_and_fetches_but_not_scripts() {
         run_for(&runtime, &mut engine, &mut tasks, Duration::from_millis(20));
     }
     eval(&mut engine, "location.href = '/elsewhere';", "navigate").unwrap();
-    assert!(stop_loading_navigable(engine.ctx(), 0));
+    assert!(engine.scope(|cx| stop_loading_navigable(cx, 0)));
     assert_eq!(
         string_value(&mut engine, "String(__trust.takeNavigationRequest())"),
         "null"
@@ -2213,7 +2211,7 @@ fn the_user_agents_stop_cancels_the_navigation_and_fetches_but_not_scripts() {
     eval(&mut engine, "log.push('still running')", "script").unwrap();
     assert_eq!(log(&mut engine), "fetch:AbortError|still running");
     // Nothing is loading any more.
-    assert!(!stop_loading_navigable(engine.ctx(), 0));
+    assert!(!engine.scope(|cx| stop_loading_navigable(cx, 0)));
     assert_eq!(
         runtime.block_on(server).unwrap(),
         [(String::from("/slow"), true)]
@@ -2272,8 +2270,11 @@ fn stopping_aborts_descendant_documents_by_window_realm() {
         Rc::new(RefCell::new(Dom::new())),
         Rc::new(RealmClock::new()),
     );
+    // Only which contexts have a Window Realm matters here.
+    let mut engine = trust_js::Engine::new();
     for (child, parent) in [(1, 0), (2, 1), (3, 0), (4, 9)] {
-        state.window_realms.insert(child, Value::Num(child as f64));
+        let realm = engine.scope(|cx| hold(cx, &Value::Num(child as f64)));
+        state.window_realms.insert(child, realm);
         state.window_parents.insert(child, parent);
     }
     // A retired child's Window Realm is gone.
@@ -2365,7 +2366,7 @@ fn an_unreachable_streamed_body_still_cancels_its_transfer() {
     let deadline = Instant::now() + Duration::from_secs(10);
     while streams_in_flight(&mut engine) != 0 {
         assert!(Instant::now() < deadline, "the unread body was collected");
-        engine.ctx().collect_garbage_for_host();
+        engine.collect_garbage_at_idle();
         run_for(&runtime, &mut engine, &mut tasks, Duration::from_millis(20));
         while string_value(&mut engine, "__trust.hasPlatformTask()") == "true" {
             eval(&mut engine, "__trust.runPlatformTask()", "platform task").unwrap();
@@ -2376,7 +2377,7 @@ fn an_unreachable_streamed_body_still_cancels_its_transfer() {
         runtime.block_on(server).unwrap(),
         "its transfer was canceled"
     );
-    assert!(!stop_loading_navigable(engine.ctx(), 0));
+    assert!(!engine.scope(|cx| stop_loading_navigable(cx, 0)));
 }
 
 #[test]
@@ -2868,15 +2869,14 @@ fn font_face_loading_decodes_binary_data_and_updates_layout() {
     let runtime = runtime();
     let (mut engine, mut tasks) = page(&runtime, "https://example.test/page");
     let bytes = include_bytes!("../assets/fonts/dejavu/DejaVuSans.ttf");
-    let buffer = engine
-        .ctx()
-        .make_array_buffer(bytes)
-        .unwrap_or_else(|_| panic!("font buffer"));
-    let global = engine.global_this();
-    engine
-        .ctx()
-        .member_set(&global, "fontBytes", buffer)
-        .unwrap_or_else(|_| panic!("font global"));
+    engine.scope(|cx| {
+        let buffer = cx
+            .make_array_buffer(bytes)
+            .unwrap_or_else(|_| panic!("font buffer"));
+        let global = cx.global_this();
+        cx.member_set(&global, "fontBytes", buffer)
+            .unwrap_or_else(|_| panic!("font global"));
+    });
     eval(&mut engine, r#"
         const root = document.createElement('html'); document.appendChild(root);
         const body = document.createElement('body'); root.appendChild(body);
@@ -3325,7 +3325,7 @@ fn opaque_and_cors_cache_roundtrips_keep_private_bytes_without_exposing_them() {
     );
     // Native-only inspection: no opaque bytes or hidden headers are in the
     // serialized JS cache records. The cache owns native capabilities.
-    let storage = engine.ctx().host::<HostState>().unwrap().storage.clone();
+    let storage = engine.host::<HostState>().unwrap().storage.clone();
     let payloads = private_response_host::cached_payloads(&storage);
     assert_eq!(payloads.len(), 3);
     for payload in payloads {
@@ -3413,7 +3413,6 @@ fn opaque_streams_abort_on_the_signal_and_window_stop_after_the_head() {
     run_for(&rt, &mut engine, &mut tasks, Duration::from_millis(50));
     assert!(
         !engine
-            .ctx()
             .host::<HostState>()
             .unwrap()
             .private_responses

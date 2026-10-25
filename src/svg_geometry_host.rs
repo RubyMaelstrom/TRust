@@ -31,7 +31,7 @@ const LENGTH_CONTEXT: u8 = 10;
 /// SVG 2 text.html#__svg__SVGTextContentElement__getExtentOfChar.
 const CHAR_EXTENT: u8 = 11;
 
-fn number(args: &[Value], index: usize) -> f64 {
+fn number<'s>(args: &[Value<'s>], index: usize) -> f64 {
     args.get(index)
         .and_then(Value::as_num_opt)
         .unwrap_or(f64::NAN)
@@ -42,7 +42,7 @@ fn number(args: &[Value], index: usize) -> f64 {
 /// when a result can depend on it: always for matrices, and for the other
 /// queries when the outermost `svg` element has no `viewBox` (whose size
 /// would otherwise establish the user space).
-fn outer_viewport(ctx: &mut Ctx, id: usize, matrix: bool) -> (f64, f64) {
+fn outer_viewport<'s>(ctx: &mut Ctx<'s>, id: usize, matrix: bool) -> (f64, f64) {
     let (outermost, definite) = {
         let dom = host_dom(ctx);
         let dom = dom.borrow();
@@ -90,7 +90,11 @@ fn svg_view_box_is_valid(value: &str) -> bool {
 /// `__svg_geometry(node, operation, a, b, c)`. Returns `null` for a stale or
 /// inaccessible node, for a matrix of a node outside the document, and for a
 /// substring that starts past the last addressable character.
-pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(super) fn call<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let operation = number(args, 1);
     let operation = if operation.is_finite() && (0.0..=255.0).contains(&operation) {
         operation as u8

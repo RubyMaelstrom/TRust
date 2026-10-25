@@ -20,9 +20,9 @@ use std::sync::Arc;
 
 use super::message_port_host::Wake;
 use super::{
-    Ctx, Dom, EvalError, HostState, ModuleFetchEnvironment, RealmClock, Value,
+    Ctx, Dom, EvalError, HostState, ModuleFetchEnvironment, RealmClock, Value, ValueKind,
     eval_trust_js_worker_setup, install_trust_js_worker_boundary, module_dependency_loader,
-    trust_js_worker_internal_call,
+    trust_js_worker_internal_call, value_string,
 };
 use crate::webaudio::bus::Bus;
 use crate::webaudio::worklet::{Call, Factory, ProcessorError, Setup, Worklet};
@@ -44,7 +44,7 @@ struct Launch {
 
 /// The factory for the AudioWorkletGlobalScope of a context created by the
 /// calling realm, or `None` without a network (no module can be fetched).
-pub(super) fn factory(ctx: &mut Ctx) -> Option<Factory> {
+pub(super) fn factory<'s>(ctx: &mut Ctx<'s>) -> Option<Factory> {
     let context = ctx.host_job_context();
     let page = super::request_context_url(ctx, context);
     let cookie_context = super::cookie_context_for_id(ctx, context);
@@ -101,7 +101,6 @@ impl AudioWorkletScope {
         let engine_clock = clock.clone();
         engine.set_wall_clock(move || engine_clock.now_ms());
         engine
-            .ctx()
             .op_state()
             .put_retained_memory_with_external_memory(state);
         install_trust_js_worker_boundary(&mut engine);
@@ -132,25 +131,19 @@ impl AudioWorkletScope {
             return Err(String::from("audio worklet setup was interrupted"));
         }
         let snapshot = worklet_prelude_snapshot()?;
-        match engine.eval_snapshot_value_interruptible(snapshot) {
-            Err(error) => {
-                return Err(format!(
-                    "audio worklet prelude parse error at line {}: {}",
-                    error.line, error.message
-                ));
-            }
+        engine.scope(|cx| match cx.eval_snapshot_value_interruptible(snapshot) {
+            Err(error) => Err(format!(
+                "audio worklet prelude parse error at line {}: {}",
+                error.line, error.message
+            )),
             Ok(Err(EvalError::Throw(error))) => {
-                return Err(super::describe_throw(
-                    &mut engine,
-                    error,
-                    "audio worklet prelude",
-                ));
+                Err(super::describe_throw(cx, error, "audio worklet prelude"))
             }
             Ok(Err(EvalError::Interrupted(_))) => {
-                return Err(String::from("audio worklet setup was interrupted"));
+                Err(String::from("audio worklet setup was interrupted"))
             }
-            Ok(Ok(_)) => {}
-        }
+            Ok(Ok(_)) => Ok(()),
+        })?;
         Ok(Self {
             engine,
             launch,
@@ -158,36 +151,40 @@ impl AudioWorkletScope {
         })
     }
 
-    fn call(&mut self, name: &str, args: &[Value]) -> Result<Value, EvalError> {
-        trust_js_worker_internal_call(&mut self.engine, name, args)
+    /// Call the worklet layer's control method `name` with `args` (made in the call's
+    /// scope), ignoring its result.
+    fn notify(&mut self, name: &str, args: impl for<'s> FnOnce(&mut Ctx<'s>) -> Vec<Value<'s>>) {
+        self.engine.scope(|cx| {
+            let args: trust_js::embed::ValueList = args(cx).into_iter().collect();
+            let _ = trust_js_worker_internal_call(cx, name, &args);
+        });
     }
+}
 
-    fn error_of(&mut self, text: &str) -> ProcessorError {
-        let parsed: serde_json::Value = serde_json::from_str(text).unwrap_or_default();
-        ProcessorError {
-            message: parsed["message"].as_str().unwrap_or("").to_string(),
-            filename: parsed["filename"].as_str().unwrap_or("").to_string(),
-            line: parsed["line"].as_u64().unwrap_or(0) as u32,
-            column: parsed["column"].as_u64().unwrap_or(0) as u32,
-        }
+/// A processor error from the worklet layer's JSON record.
+fn processor_error(text: &str) -> ProcessorError {
+    let parsed: serde_json::Value = serde_json::from_str(text).unwrap_or_default();
+    ProcessorError {
+        message: parsed["message"].as_str().unwrap_or("").to_string(),
+        filename: parsed["filename"].as_str().unwrap_or("").to_string(),
+        line: parsed["line"].as_u64().unwrap_or(0) as u32,
+        column: parsed["column"].as_u64().unwrap_or(0) as u32,
     }
+}
 
-    fn thrown(&mut self, error: EvalError) -> ProcessorError {
-        let message = match error {
-            EvalError::Throw(value) => {
-                super::describe_throw(&mut self.engine, value, "audio worklet")
-            }
-            EvalError::Interrupted(_) => String::from("the audio worklet was interrupted"),
-        };
-        ProcessorError {
-            message,
-            ..Default::default()
-        }
+fn thrown<'s>(ctx: &mut Ctx<'s>, error: EvalError<'s>) -> ProcessorError {
+    let message = match error {
+        EvalError::Throw(value) => super::describe_throw(ctx, value, "audio worklet"),
+        EvalError::Interrupted(_) => String::from("the audio worklet was interrupted"),
+    };
+    ProcessorError {
+        message,
+        ..Default::default()
     }
+}
 
-    fn element(&mut self, array: &Value, index: usize) -> Option<Value> {
-        self.engine.ctx().member_get(array, &index.to_string()).ok()
-    }
+fn element<'s>(ctx: &mut Ctx<'s>, array: &Value<'s>, index: usize) -> Option<Value<'s>> {
+    ctx.member_get(array, &index.to_string()).ok()
 }
 
 fn float_bytes(samples: &[f32]) -> Vec<u8> {
@@ -265,40 +262,41 @@ impl Worklet for AudioWorkletScope {
         }
         self.modules.insert(url.to_string());
         let _ = self.engine.run_microtasks_interruptible();
-        match self.call("workletTake", &[]) {
-            Ok(value) => Ok(super::value_string(&mut self.engine, &value)),
-            Err(_) => Ok(String::from("[]")),
-        }
+        Ok(self.engine.scope(
+            |cx| match trust_js_worker_internal_call(cx, "workletTake", &[]) {
+                Ok(value) => value_string(cx, &value),
+                Err(_) => String::from("[]"),
+            },
+        ))
     }
 
     fn create(&mut self, node: u32, name: &str, packet: &str) -> Result<(), ProcessorError> {
-        let result = self.call(
-            "workletCreate",
-            &[
+        self.engine.scope(|cx| {
+            let args = [
                 Value::Num(f64::from(node)),
-                Value::from_string(name.to_string()),
-                Value::from_string(packet.to_string()),
-            ],
-        );
-        let _ = self.engine.run_microtasks_interruptible();
-        match result {
-            Ok(value) => {
-                let text = super::value_string(&mut self.engine, &value);
-                if text.is_empty() {
-                    Ok(())
-                } else {
-                    Err(self.error_of(&text))
+                cx.string(name.to_string()),
+                cx.string(packet.to_string()),
+            ];
+            let result = trust_js_worker_internal_call(cx, "workletCreate", &args);
+            let _ = cx.run_microtasks_interruptible();
+            match result {
+                Ok(value) => {
+                    let text = value_string(cx, &value);
+                    if text.is_empty() {
+                        Ok(())
+                    } else {
+                        Err(processor_error(&text))
+                    }
                 }
+                Err(error) => Err(thrown(cx, error)),
             }
-            Err(error) => Err(self.thrown(error)),
-        }
+        })
     }
 
     fn global_port(&mut self, packet: &str) {
-        let _ = self.call(
-            "workletGlobalPort",
-            &[Value::from_string(packet.to_string())],
-        );
+        self.notify("workletGlobalPort", |cx| {
+            vec![cx.string(packet.to_string())]
+        });
     }
 
     fn process(&mut self, call: Call, outputs: &mut [Bus]) -> Result<bool, ProcessorError> {
@@ -316,94 +314,92 @@ impl Worklet for AudioWorkletScope {
         let inputs = shape(&mut input_counts.iter().copied());
         let outputs_shape = shape(&mut call.output_channels.iter().copied());
         let params = shape(&mut call.params.iter().map(|values| values.len()));
-        let node = Value::Num(f64::from(call.node));
-        let arrays = match self.call(
-            "workletPrepare",
-            &[
-                node.clone(),
-                Value::from_string(inputs),
-                Value::from_string(outputs_shape),
-                Value::from_string(params),
-            ],
-        ) {
-            Ok(arrays @ Value::Obj(_)) => arrays,
-            Ok(_) => return Ok(false),
-            Err(error) => return Err(self.thrown(error)),
-        };
-        // Inputs, then outputs, then parameters, in the order prepared.
-        let mut index = 0;
-        for bus in call.inputs.iter().flatten() {
-            for channel in 0..bus.channels() {
-                if let Some(array) = self.element(&arrays, index) {
-                    self.engine
-                        .ctx()
-                        .typed_array_set_bytes(&array, &float_bytes(bus.channel(channel)));
-                }
-                index += 1;
-            }
-        }
-        let first_output = index;
-        index += call.output_channels.iter().sum::<usize>();
-        for values in &call.params {
-            if let Some(array) = self.element(&arrays, index) {
-                self.engine
-                    .ctx()
-                    .typed_array_set_bytes(&array, &float_bytes(values));
-            }
-            index += 1;
-        }
-        let result = match self.call("workletRun", &[node]) {
-            Ok(value) => value,
-            Err(error) => return Err(self.thrown(error)),
-        };
-        let active = match &result {
-            Value::Bool(active) => *active,
-            Value::Obj(_) => {
-                let text = self
-                    .engine
-                    .ctx()
-                    .member_get(&result, "error")
-                    .ok()
-                    .map(|value| super::value_string(&mut self.engine, &value))
-                    .unwrap_or_default();
-                return Err(self.error_of(&text));
-            }
-            _ => false,
-        };
-        let mut index = first_output;
-        for (output, &channels) in outputs.iter_mut().zip(&call.output_channels) {
-            for channel in 0..channels {
-                if let Some(array) = self.element(&arrays, index)
-                    && let Some(bytes) = self.engine.ctx().typed_array_bytes(&array)
-                {
-                    let target = output.channel_mut(channel);
-                    for (sample, chunk) in target.iter_mut().zip(bytes.as_chunks::<4>().0) {
-                        *sample = f32::from_le_bytes(*chunk);
+        self.engine.scope(|cx| {
+            let node = Value::Num(f64::from(call.node));
+            let args = [
+                node,
+                cx.string(inputs),
+                cx.string(outputs_shape),
+                cx.string(params),
+            ];
+            let arrays = match trust_js_worker_internal_call(cx, "workletPrepare", &args) {
+                Ok(arrays) if arrays.as_obj().is_some() => arrays,
+                Ok(_) => return Ok(false),
+                Err(error) => return Err(thrown(cx, error)),
+            };
+            // Inputs, then outputs, then parameters, in the order prepared.
+            let mut index = 0;
+            for bus in call.inputs.iter().flatten() {
+                for channel in 0..bus.channels() {
+                    if let Some(array) = element(cx, &arrays, index) {
+                        cx.typed_array_set_bytes(&array, &float_bytes(bus.channel(channel)));
                     }
+                    index += 1;
+                }
+            }
+            let first_output = index;
+            index += call.output_channels.iter().sum::<usize>();
+            for values in &call.params {
+                if let Some(array) = element(cx, &arrays, index) {
+                    cx.typed_array_set_bytes(&array, &float_bytes(values));
                 }
                 index += 1;
             }
-        }
-        Ok(active)
+            let result = match trust_js_worker_internal_call(cx, "workletRun", &[node]) {
+                Ok(value) => value,
+                Err(error) => return Err(thrown(cx, error)),
+            };
+            let active = match result.kind() {
+                ValueKind::Bool(active) => active,
+                ValueKind::Obj(_) => {
+                    let text = match cx.member_get(&result, "error") {
+                        Ok(value) => value_string(cx, &value),
+                        Err(_) => String::new(),
+                    };
+                    return Err(processor_error(&text));
+                }
+                _ => false,
+            };
+            let mut index = first_output;
+            for (output, &channels) in outputs.iter_mut().zip(&call.output_channels) {
+                for channel in 0..channels {
+                    if let Some(array) = element(cx, &arrays, index)
+                        && let Some(bytes) = cx.typed_array_bytes(&array)
+                    {
+                        let target = output.channel_mut(channel);
+                        for (sample, chunk) in target.iter_mut().zip(bytes.as_chunks::<4>().0) {
+                            *sample = f32::from_le_bytes(*chunk);
+                        }
+                    }
+                    index += 1;
+                }
+            }
+            Ok(active)
+        })
     }
 
     fn release(&mut self, node: u32) {
-        let _ = self.call("workletRelease", &[Value::Num(f64::from(node))]);
+        self.notify("workletRelease", |_| vec![Value::Num(f64::from(node))]);
     }
 
     fn set_time(&mut self, frame: u64) {
-        let _ = self.call("workletTime", &[Value::Num(frame as f64)]);
+        self.notify("workletTime", |_| vec![Value::Num(frame as f64)]);
     }
 
     fn run_tasks(&mut self) {
         // Port messages (the context's associated task queue), each followed
         // by a microtask checkpoint; bounded so a flood cannot stall audio.
         for _ in 0..64 {
-            let ready = matches!(self.call("hasPortTask", &[]), Ok(Value::Bool(true)));
+            let ready = self.engine.scope(|cx| {
+                matches!(
+                    trust_js_worker_internal_call(cx, "hasPortTask", &[]).map(|value| value.kind()),
+                    Ok(ValueKind::Bool(true))
+                )
+            });
             if !ready {
                 break;
             }
-            let _ = self.call("runPortTask", &[]);
+            self.notify("runPortTask", |_| Vec::new());
             let _ = self.engine.run_microtasks_interruptible();
         }
         let _ = self.engine.run_microtasks_interruptible();

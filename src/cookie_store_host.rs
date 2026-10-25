@@ -3,7 +3,11 @@
 //! its owning settings context and creation URL, independently of the caller.
 use super::*;
 
-pub(super) fn operation(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(super) fn operation<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let op = host_arg_string(ctx, args, 0);
     let context = args.get(1).and_then(Value::as_num_opt).unwrap_or(0.) as u64;
     let cookie_args = [
@@ -12,7 +16,7 @@ pub(super) fn operation(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
         args.get(3).cloned().unwrap_or(Value::Undefined),
     ];
     let Some(url) = document_cookie_url(ctx, &cookie_args) else {
-        return Ok(Value::from_string(
+        return Ok(ctx.string(
             serde_json::json!({"error":"SecurityError",
             "message":"Cookie storage is unavailable for this environment"})
             .to_string(),
@@ -52,7 +56,7 @@ pub(super) fn operation(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
         },
         _ => serde_json::Value::Null,
     };
-    Ok(Value::from_string(result.to_string()))
+    Ok(ctx.string(result.to_string()))
 }
 
 pub(super) fn dispatch(
@@ -61,20 +65,16 @@ pub(super) fn dispatch(
     changes: crate::http::cookie_store::Changes,
 ) -> Result<(), String> {
     if !engine
-        .ctx()
         .host::<HostState>()
         .is_some_and(|state| state.cookie_subscriptions.contains_key(&context))
     {
         return Ok(());
     }
-    run_in_context_realm(engine, context, "cookie change", |engine| {
-        match host_call_trust_interruptible(
-            engine.ctx(),
-            "cookieStoreChange",
-            &[Value::from_string(serde_json::to_string(&changes).unwrap())],
-        ) {
+    run_in_context_realm(engine, context, "cookie change", |cx| {
+        let changes = cx.string(serde_json::to_string(&changes).unwrap());
+        match host_call_trust_interruptible(cx, "cookieStoreChange", &[changes]) {
             Ok(_) => Ok(()),
-            Err(error) => host_task_failure(engine.ctx(), error, "cookie change"),
+            Err(error) => host_task_failure(cx, error, "cookie change"),
         }
     })
 }

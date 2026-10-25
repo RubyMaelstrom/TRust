@@ -132,25 +132,30 @@ fn direction(from: &str, to: &str) -> Option<&'static str> {
     }
 }
 
-pub(super) fn call(_ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(super) fn call<'s>(
+    _ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     // The bootstrap-only caller supplies primitives. Do not coerce objects here.
-    let [
-        Value::Str(phase),
-        Value::Str(wire),
-        Value::Str(from),
-        Value::Str(to),
-        Value::Num(source_frame),
-        Value::Num(receiver_frame),
-        ..,
-    ] = args
-    else {
+    let [phase, wire, from, to, source_frame, receiver_frame, ..] = args else {
+        return Ok(Value::Undefined);
+    };
+    let (Some(phase), Some(wire), Some(from), Some(to), Some(source_frame), Some(receiver_frame)) = (
+        phase.as_engine_text(),
+        wire.as_engine_text(),
+        from.as_engine_text(),
+        to.as_engine_text(),
+        source_frame.as_num_opt(),
+        receiver_frame.as_num_opt(),
+    ) else {
         return Ok(Value::Undefined);
     };
     let Some(direction) = direction(from, to) else {
         return Ok(Value::Undefined);
     };
     if !matches!(
-        phase.as_ref(),
+        phase,
         "send" | "drop-origin" | "messageerror" | "dispatch" | "dispatched"
     ) {
         return Ok(Value::Undefined);
@@ -163,8 +168,8 @@ pub(super) fn call(_ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
         Ok(n) if n < MAX_RECORDS => eprintln!(
             "[challenge-message] at_ms={} phase={phase} direction={direction} source_frame={} receiver_frame={} fields={}",
             crate::http::trace_ms(),
-            *source_frame as u64,
-            *receiver_frame as u64,
+            source_frame as u64,
+            receiver_frame as u64,
             summarize(wire)
         ),
         Ok(_) => eprintln!("[challenge-message] limit reached; further records omitted"),

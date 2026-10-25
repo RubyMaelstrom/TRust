@@ -23,8 +23,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::{
-    Ctx, HostState, TrustJsHostTask, TrustJsTaskSender, Value, host_arg_node, host_arg_string,
-    host_dom,
+    Ctx, HostState, TrustJsHostTask, TrustJsTaskSender, TrustValue, Value, ValueKind,
+    host_arg_node, host_arg_string, host_dom,
 };
 use crate::dom::media::MediaPresentation;
 use crate::media::container::{self, Container};
@@ -217,26 +217,30 @@ fn dump_appended(source: u64, buffer: u32, bytes: &[u8]) {
     }
 }
 
-fn inline_media(ctx: &mut Ctx) -> bool {
+fn inline_media<'s>(ctx: &mut Ctx<'s>) -> bool {
     host_dom(ctx).borrow().inline_media()
 }
 
 /// HTML #dom-navigator-canplaytype, from the decoders this process has.
-pub(super) fn can_play_type(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(super) fn can_play_type<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     if !inline_media(ctx) {
-        return Ok(Value::from_string(String::new()));
+        return Ok(ctx.string(String::new()));
     }
     let input = host_arg_string(ctx, args, 0);
     let answer = container::can_play_type(&input, Registry::get());
-    Ok(Value::from_string(answer.as_str().to_string()))
+    Ok(ctx.string(answer.as_str().to_string()))
 }
 
 /// MSE #dom-mediasource-istypesupported.
-pub(super) fn mse_type_supported(
-    ctx: &mut Ctx,
-    _this: Value,
-    args: &[Value],
-) -> Result<Value, Value> {
+pub(super) fn mse_type_supported<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     if !inline_media(ctx) {
         return Ok(Value::Bool(false));
     }
@@ -253,11 +257,11 @@ pub(super) fn mse_type_supported(
 /// valid (#check-mime-type-validity), plus 1 supported, 2 smooth and 4 power
 /// efficient for decoding type `type` (TRust neither records nor sends
 /// media, so encoding and WebRTC types are unsupported).
-pub(super) fn media_capabilities(
-    ctx: &mut Ctx,
-    _this: Value,
-    args: &[Value],
-) -> Result<Value, Value> {
+pub(super) fn media_capabilities<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let content = host_arg_string(ctx, args, 0);
     let media = host_arg_string(ctx, args, 1);
     let kind = host_arg_string(ctx, args, 2);
@@ -277,7 +281,7 @@ pub(super) fn media_capabilities(
     Ok(Value::Num(f64::from(flags)))
 }
 
-fn task_sender(ctx: &mut Ctx) -> Option<TrustJsTaskSender> {
+fn task_sender<'s>(ctx: &mut Ctx<'s>) -> Option<TrustJsTaskSender> {
     ctx.host_mut::<HostState>()?.task_events.clone()
 }
 
@@ -287,7 +291,11 @@ fn task_sender(ctx: &mut Ctx) -> Option<TrustJsTaskSender> {
 /// `start` or `play` control (HTML #concept-media-load-resource's wait for
 /// the user to request playback). Returns the player id, or -1 when the URL
 /// cannot be fetched (the element then runs its failure steps).
-pub(super) fn load(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(super) fn load<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     if !inline_media(ctx) {
         return Ok(Value::Num(-1.0));
     }
@@ -312,7 +320,10 @@ pub(super) fn load(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
         return Ok(Value::Num(-1.0));
     };
     let calling = ctx.host_job_context();
-    let deferred = matches!(args.get(5), Some(Value::Bool(true)));
+    let deferred = matches!(
+        args.get(5).map(|value| value.kind()),
+        Some(ValueKind::Bool(true))
+    );
     let id = {
         let Some(state) = ctx.host_mut::<HostState>() else {
             return Ok(Value::Num(-1.0));
@@ -325,7 +336,7 @@ pub(super) fn load(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
     // local).
     let provided = args
         .get(4)
-        .filter(|value| !matches!(value, Value::Undefined | Value::Null))
+        .filter(|value| !matches!(value.kind(), ValueKind::Undefined | ValueKind::Null))
         .cloned();
     if let Some(value) = provided {
         let Some(bytes) = ctx.buffer_source_bytes(&value, true) else {
@@ -432,7 +443,11 @@ pub(super) fn load(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
 /// to media element `node` (MSE #mediasource-attach). Returns the player
 /// id, or -1 when the MediaSource is not "closed" (the element runs its
 /// failure steps).
-pub(super) fn attach(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(super) fn attach<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     if !inline_media(ctx) {
         return Ok(Value::Num(-1.0));
     }
@@ -529,12 +544,16 @@ fn bytes_json(bytes: &[u8]) -> String {
 /// `__eme(op, cdm, a, b, c)`: the Clear Key CDM of MediaKeys `cdm` (local
 /// w3c/encrypted-media@fb9130a #clear-key). Failures come back as
 /// "ExceptionName:message".
-pub(super) fn eme(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(super) fn eme<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     use crate::media::eme::{ClearKey, Error};
     let op = host_arg_string(ctx, args, 0);
     let id = args.get(1).and_then(Value::as_num_opt).unwrap_or(-1.0) as u64;
     let number = |index: usize| args.get(index).and_then(Value::as_num_opt).unwrap_or(-1.0);
-    let string = |text: &str| Value::from_string(text.to_string());
+    let string = |ctx: &Ctx<'s>, text: &str| ctx.string(text.to_string());
     let failure = |error: Error| match error {
         Error::Type(message) => format!("TypeError:{message}"),
         Error::NotSupported(message) => format!("NotSupportedError:{message}"),
@@ -559,21 +578,22 @@ pub(super) fn eme(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
                 .get(3)
                 .and_then(|value| ctx.buffer_source_bytes(value, false))
             else {
-                return Ok(string("TypeError:initData is not a BufferSource"));
+                return Ok(string(ctx, "TypeError:initData is not a BufferSource"));
             };
             let Some(cdm) = ctx
                 .host_mut::<HostState>()
                 .and_then(|state| state.media.cdms.get_mut(&id))
             else {
-                return Ok(string("InvalidStateError:no CDM"));
+                return Ok(string(ctx, "InvalidStateError:no CDM"));
             };
-            Ok(string(&match cdm.generate_request(&kind, &data) {
+            let text = match cdm.generate_request(&kind, &data) {
                 Ok((session, message)) => format!(
                     "{{\"session\":{session},\"message\":{}}}",
                     bytes_json(&message)
                 ),
                 Err(error) => failure(error),
-            }))
+            };
+            Ok(string(ctx, &text))
         }
         "update" => {
             let session = number(2) as u32;
@@ -581,21 +601,22 @@ pub(super) fn eme(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
                 .get(3)
                 .and_then(|value| ctx.buffer_source_bytes(value, false))
             else {
-                return Ok(string("TypeError:response is not a BufferSource"));
+                return Ok(string(ctx, "TypeError:response is not a BufferSource"));
             };
             let Some(cdm) = ctx
                 .host_mut::<HostState>()
                 .and_then(|state| state.media.cdms.get_mut(&id))
             else {
-                return Ok(string("InvalidStateError:no CDM"));
+                return Ok(string(ctx, "InvalidStateError:no CDM"));
             };
-            Ok(string(&match cdm.update(session, &data) {
+            let text = match cdm.update(session, &data) {
                 Ok(known) => {
                     let known: Vec<String> = known.iter().map(|kid| bytes_json(kid)).collect();
                     format!("{{\"known\":[{}]}}", known.join(","))
                 }
                 Err(error) => failure(error),
-            }))
+            };
+            Ok(string(ctx, &text))
         }
         "close" | "remove" => {
             let session = number(2) as u32;
@@ -657,7 +678,11 @@ fn setter_json(reopened: bool, result: Result<(), mse::Exception>) -> String {
 
 /// `__media_source(op, id, a, b, c)`: an operation of MediaSource `id` and
 /// its SourceBuffer `a` (MSE). Exceptions come back as their names.
-pub(super) fn media_source(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(super) fn media_source<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let op = host_arg_string(ctx, args, 0);
     let id = args.get(1).and_then(Value::as_num_opt).unwrap_or(-1.0) as u64;
     let number = |index: usize| {
@@ -665,8 +690,12 @@ pub(super) fn media_source(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resul
             .and_then(Value::as_num_opt)
             .unwrap_or(f64::NAN)
     };
-    let flag = |index: usize| matches!(args.get(index), Some(Value::Bool(true)));
-    let string = |text: &str| Value::from_string(text.to_string());
+    let flag = |index: usize| {
+        matches!(
+            args.get(index).map(|value| value.kind()),
+            Some(ValueKind::Bool(true))
+        )
+    };
     match op.as_str() {
         "create" => {
             if !inline_media(ctx) {
@@ -740,45 +769,45 @@ pub(super) fn media_source(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resul
         );
     }
     let value = match op.as_str() {
-        "state" => string(source.ready_state().as_str()),
-        "duration" => Value::Num(source.duration()),
+        "state" => TrustValue::from_text(source.ready_state().as_str()),
+        "duration" => TrustValue::Num(source.duration()),
         "setDuration" => match source.set_duration(number(2)) {
-            Ok(outcome) => string(&outcome_json(&outcome)),
-            Err(error) => string(error.name()),
+            Ok(outcome) => TrustValue::from_text(outcome_json(&outcome)),
+            Err(error) => TrustValue::from_text(error.name()),
         },
         "detach" => {
             source.detach();
             entry.player = None;
-            Value::Undefined
+            TrustValue::Undefined
         }
-        "reopen" => Value::Bool(source.reopen()),
+        "reopen" => TrustValue::Bool(source.reopen()),
         "add" => match source.add_source_buffer(&mime, flag(3)) {
-            Ok(buffer) => Value::Num(f64::from(buffer)),
-            Err(error) => string(error.name()),
+            Ok(buffer) => TrustValue::Num(f64::from(buffer)),
+            Err(error) => TrustValue::from_text(error.name()),
         },
-        "removeBuffer" => string(
+        "removeBuffer" => TrustValue::from_text(
             source
                 .remove_source_buffer(buffer)
                 .err()
                 .map_or("", |e| e.name()),
         ),
         "endOfStream" => match source.end_of_stream(flag(2)) {
-            Ok(outcome) => string(&outcome_json(&outcome)),
-            Err(error) => string(error.name()),
+            Ok(outcome) => TrustValue::from_text(outcome_json(&outcome)),
+            Err(error) => TrustValue::from_text(error.name()),
         },
         "live" => {
             let range = (!number(2).is_nan()).then(|| (number(2), number(3)));
-            string(
+            TrustValue::from_text(
                 source
                     .set_live_seekable_range(range)
                     .err()
                     .map_or("", |e| e.name()),
             )
         }
-        "liveRange" => string(&ranges_json(
+        "liveRange" => TrustValue::from_text(ranges_json(
             &source.live_seekable_range().into_iter().collect::<Vec<_>>(),
         )),
-        "prepare" => string(
+        "prepare" => TrustValue::from_text(
             source
                 .prepare_append(buffer, number(3).max(0.0) as usize, position)
                 .err()
@@ -787,7 +816,7 @@ pub(super) fn media_source(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resul
         "append" => {
             let bytes = staged.unwrap_or_default();
             dump_appended(id, buffer, &bytes);
-            string(source.append(buffer, &bytes).err().map_or("", |e| e.name()))
+            TrustValue::from_text(source.append(buffer, &bytes).err().map_or("", |e| e.name()))
         }
         "process" => {
             let outcome = source.process(buffer);
@@ -799,12 +828,12 @@ pub(super) fn media_source(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resul
                     source.buffered(buffer)
                 );
             }
-            string(&outcome_json(&outcome))
+            TrustValue::from_text(outcome_json(&outcome))
         }
-        "abort" => string(&outcome_json(&source.abort(buffer))),
+        "abort" => TrustValue::from_text(outcome_json(&source.abort(buffer))),
         "remove" => {
             source.remove(buffer, number(3), number(4));
-            Value::Undefined
+            TrustValue::Undefined
         }
         "buffered" => {
             let ranges = if number(2) < 0.0 {
@@ -812,9 +841,9 @@ pub(super) fn media_source(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resul
             } else {
                 source.buffered(buffer)
             };
-            string(&ranges_json(&ranges))
+            TrustValue::from_text(ranges_json(&ranges))
         }
-        "mode" => string(source.mode(buffer).as_str()),
+        "mode" => TrustValue::from_text(source.mode(buffer).as_str()),
         "setMode" => {
             let mode = if text == "sequence" {
                 AppendMode::Sequence
@@ -822,43 +851,43 @@ pub(super) fn media_source(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resul
                 AppendMode::Segments
             };
             let (reopened, result) = source.set_mode(buffer, mode);
-            string(&setter_json(reopened, result))
+            TrustValue::from_text(setter_json(reopened, result))
         }
-        "offset" => Value::Num(source.timestamp_offset(buffer)),
+        "offset" => TrustValue::Num(source.timestamp_offset(buffer)),
         "setOffset" => {
             let (reopened, result) = source.set_timestamp_offset(buffer, number(3));
-            string(&setter_json(reopened, result))
+            TrustValue::from_text(setter_json(reopened, result))
         }
         "window" => {
             let (start, end) = source.append_window(buffer);
-            string(&format!("[{},{}]", json_number(start), json_number(end)))
+            TrustValue::from_text(format!("[{},{}]", json_number(start), json_number(end)))
         }
         "setWindow" => {
             source.set_append_window(buffer, number(3), number(4));
-            Value::Undefined
+            TrustValue::Undefined
         }
         "changeType" => match source.change_type(buffer, &text) {
-            Ok((reopened, outcome)) => string(&format!(
+            Ok((reopened, outcome)) => TrustValue::from_text(format!(
                 "{{\"reopened\":{reopened},\"outcome\":{}}}",
                 outcome_json(&outcome)
             )),
-            Err(error) => string(error.name()),
+            Err(error) => TrustValue::from_text(error.name()),
         },
-        "parsingMedia" => Value::Bool(source.parsing_media(buffer)),
+        "parsingMedia" => TrustValue::Bool(source.parsing_media(buffer)),
         "active" => {
             source.set_active(buffer, flag(3));
-            Value::Undefined
+            TrustValue::Undefined
         }
-        _ => Value::Undefined,
+        _ => TrustValue::Undefined,
     };
-    Ok(value)
+    Ok(value.value(ctx))
 }
 
 /// Create the player for element `node` reading `source`, and its
 /// presentation; returns the player id.
 #[allow(clippy::too_many_arguments)]
-fn start(
-    ctx: &mut Ctx,
+fn start<'s>(
+    ctx: &mut Ctx<'s>,
     node: usize,
     id: u64,
     calling: u64,
@@ -942,7 +971,7 @@ fn start(
     id as f64
 }
 
-fn blob_bytes(ctx: &mut Ctx, url: &url::Url, context: u64) -> Option<Vec<u8>> {
+fn blob_bytes<'s>(ctx: &mut Ctx<'s>, url: &url::Url, context: u64) -> Option<Vec<u8>> {
     let state = ctx.host_mut::<HostState>()?;
     let origin = super::realm_origin(state, context);
     let key = super::blob_storage_key(&origin);
@@ -952,7 +981,11 @@ fn blob_bytes(ctx: &mut Ctx, url: &url::Url, context: u64) -> Option<Vec<u8>> {
 
 /// `__media_control(node, id, op, a, b)`: a command for the player of
 /// element `node`.
-pub(super) fn control(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(super) fn control<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let node = {
         let dom = host_dom(ctx);
         let dom = dom.borrow();
@@ -963,7 +996,7 @@ pub(super) fn control(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Val
     let a = args.get(3).cloned().unwrap_or(Value::Undefined);
     let b = args.get(4).cloned().unwrap_or(Value::Undefined);
     let number = |value: &Value| value.as_num_opt().unwrap_or(0.0);
-    let flag = |value: &Value| matches!(value, Value::Bool(true));
+    let flag = |value: &Value| matches!(value.kind(), ValueKind::Bool(true));
     if op == "close" {
         let removed = ctx.host_mut::<HostState>().and_then(|state| {
             let entry = state.media.players.get(&id)?;
@@ -1087,7 +1120,6 @@ pub(super) fn dispatch(
     task: MediaTask,
 ) -> Result<(), String> {
     let Some((node, context)) = engine
-        .ctx()
         .host_mut::<HostState>()
         .and_then(|state| state.media.players.get(&id))
         .map(|entry| (entry.node, entry.context))
@@ -1096,12 +1128,12 @@ pub(super) fn dispatch(
         return Ok(());
     };
     if matches!(task, MediaTask::Player(Event::Metadata { .. }))
-        && let Some(state) = engine.ctx().host_mut::<HostState>()
+        && let Some(state) = engine.host_mut::<HostState>()
     {
         // The resource has answered: whether a Web Audio graph may hear it.
         state.media.update_taint(id);
     }
-    let string = |text: &str| Value::from_string(text.to_string());
+    let string = TrustValue::from_text;
     if logging() {
         match &task {
             MediaTask::Player(Event::Time(_)) | MediaTask::Network(NetworkEvent::Progress) => {}
@@ -1109,12 +1141,12 @@ pub(super) fn dispatch(
             MediaTask::Network(event) => media_log!("player {id}: network {event:?}"),
         }
     }
-    let mut args = vec![
-        Value::Num(id as f64),
-        Value::Undefined,
-        Value::Undefined,
-        Value::Undefined,
-        Value::Undefined,
+    let mut args = [
+        TrustValue::Num(id as f64),
+        TrustValue::Undefined,
+        TrustValue::Undefined,
+        TrustValue::Undefined,
+        TrustValue::Undefined,
     ];
     match task {
         MediaTask::Network(event) => {
@@ -1156,8 +1188,8 @@ pub(super) fn dispatch(
                     .collect();
                 let (width, height) = video_size.unwrap_or((0, 0));
                 args[1] = string("metadata");
-                args[2] = Value::Num(duration.map_or(f64::NAN, micros_to_seconds));
-                args[3] = Value::Bool(seekable);
+                args[2] = TrustValue::Num(duration.map_or(f64::NAN, micros_to_seconds));
+                args[3] = TrustValue::Bool(seekable);
                 args[4] = string(&format!(
                     "{{\"width\":{width},\"height\":{height},\"tracks\":[{}]}}",
                     tracks.join(",")
@@ -1165,7 +1197,7 @@ pub(super) fn dispatch(
             }
             Event::ReadyState(state) => {
                 args[1] = string("ready");
-                args[2] = Value::Num(match state {
+                args[2] = TrustValue::Num(match state {
                     ReadyState::Nothing => 0.0,
                     ReadyState::Metadata => 1.0,
                     ReadyState::CurrentData => 2.0,
@@ -1175,29 +1207,29 @@ pub(super) fn dispatch(
             }
             Event::Duration(duration) => {
                 args[1] = string("duration");
-                args[2] = Value::Num(seconds_or_nan(duration));
+                args[2] = TrustValue::Num(seconds_or_nan(duration));
             }
             Event::Resize(width, height) => {
                 set_natural_size(engine, node, width, height);
                 args[1] = string("resize");
-                args[2] = Value::Num(f64::from(width));
-                args[3] = Value::Num(f64::from(height));
+                args[2] = TrustValue::Num(f64::from(width));
+                args[3] = TrustValue::Num(f64::from(height));
             }
             Event::Waiting => args[1] = string("waiting"),
             Event::Playing => args[1] = string("playing"),
             Event::SeekDone(time) => {
                 args[1] = string("seeked");
-                args[2] = Value::Num(micros_to_seconds(time));
+                args[2] = TrustValue::Num(micros_to_seconds(time));
             }
             Event::Time(time) => {
                 args[1] = string("time");
-                args[2] = Value::Num(micros_to_seconds(time));
+                args[2] = TrustValue::Num(micros_to_seconds(time));
             }
             Event::Ended => args[1] = string("ended"),
             Event::WaitingForKey => args[1] = string("waitingforkey"),
             Event::Error(kind, message) => {
                 args[1] = string("error");
-                args[2] = Value::Num(match kind {
+                args[2] = TrustValue::Num(match kind {
                     ErrorKind::Network => 2.0,
                     ErrorKind::Decode => 3.0,
                     ErrorKind::SrcNotSupported => 4.0,
@@ -1206,16 +1238,19 @@ pub(super) fn dispatch(
             }
         },
     }
-    super::run_in_context_realm(engine, context, "media task", move |engine| {
-        match super::host_call_trust_interruptible(engine.ctx(), "mediaEvent", &args) {
+    super::run_in_context_realm(engine, context, "media task", move |cx| {
+        let args = TrustValue::values(cx, &args);
+        match super::host_call_trust_interruptible(cx, "mediaEvent", &args) {
             Ok(_) => Ok(()),
-            Err(error) => super::host_task_failure(engine.ctx(), error, "media task"),
+            Err(error) => super::host_task_failure(cx, error, "media task"),
         }
     })
 }
 
 fn set_natural_size(engine: &mut trust_js::Engine, node: usize, width: u32, height: u32) {
-    let dom = host_dom(engine.ctx());
+    let Some(dom) = engine.host::<HostState>().map(|state| state.dom.clone()) else {
+        return;
+    };
     let mut dom = dom.borrow_mut();
     if let Some(mut presentation) = dom.media_presentation(node) {
         presentation.natural = Some((width, height)).filter(|&(w, h)| w > 0 && h > 0);

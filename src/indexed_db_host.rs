@@ -383,10 +383,10 @@ impl Coordinator {
         }
     }
 
-    fn task_value(ctx: &mut Ctx, task: Task) -> Value {
+    fn task_value<'s>(ctx: &mut Ctx<'s>, task: Task) -> Value<'s> {
         let version = |version: Option<u64>| version.map_or(Value::Null, |v| Value::Num(v as f64));
         let id = |id: u64| Value::Num(id as f64);
-        let name = |name: &str| Value::from_string(String::from(name));
+        let name = |name: &str| ctx.string(String::from(name));
         let items = match task {
             Task::Run(request) => vec![name("run"), id(request)],
             Task::VersionChange {
@@ -411,33 +411,33 @@ impl Coordinator {
     }
 }
 
-fn item(ctx: &mut Ctx, list: &Value, index: usize) -> Value {
+fn item<'s>(ctx: &mut Ctx<'s>, list: &Value<'s>, index: usize) -> Value<'s> {
     ctx.member_get(list, &index.to_string())
         .unwrap_or(Value::Undefined)
 }
 
-fn item_id(ctx: &mut Ctx, list: &Value, index: usize) -> u64 {
+fn item_id<'s>(ctx: &mut Ctx<'s>, list: &Value<'s>, index: usize) -> u64 {
     item(ctx, list, index)
         .as_num_opt()
         .filter(|value| value.is_finite() && *value >= 0.0)
         .map_or(0, |value| value as u64)
 }
 
-fn item_version(ctx: &mut Ctx, list: &Value, index: usize) -> Option<u64> {
+fn item_version<'s>(ctx: &mut Ctx<'s>, list: &Value<'s>, index: usize) -> Option<u64> {
     item(ctx, list, index)
         .as_num_opt()
         .filter(|value| value.is_finite() && *value >= 0.0)
         .map(|value| value as u64)
 }
 
-fn item_text(ctx: &mut Ctx, list: &Value, index: usize) -> String {
+fn item_text<'s>(ctx: &mut Ctx<'s>, list: &Value<'s>, index: usize) -> String {
     let value = item(ctx, list, index);
     ctx.coerce_engine_text(&value)
         .map(|text| text.to_string())
         .unwrap_or_default()
 }
 
-fn item_texts(ctx: &mut Ctx, list: &Value, index: usize) -> Vec<String> {
+fn item_texts<'s>(ctx: &mut Ctx<'s>, list: &Value<'s>, index: usize) -> Vec<String> {
     let value = item(ctx, list, index);
     let length = ctx
         .member_get(&value, "length")
@@ -450,7 +450,11 @@ fn item_texts(ctx: &mut Ctx, list: &Value, index: usize) -> Vec<String> {
 
 /// `__indexed_db(op, arguments)`: the platform prelude's coordinator operations.
 /// The bootstrap captures this binding; author code never reaches it.
-pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(super) fn call<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let op = super::host_arg_string(ctx, args, 0);
     let list = args.get(1).cloned().unwrap_or(Value::Undefined);
     let realm = ctx.host_job_context();

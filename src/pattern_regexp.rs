@@ -172,16 +172,17 @@ const MATCHER: &str = r#"(() => {
 struct Matcher {
     engine: trust_js::Engine,
     interrupt: std::sync::Arc<trust_js::RuntimeInterrupt>,
-    function: trust_js::embed::Value,
+    function: trust_js::embed::Handle,
 }
 
 impl Matcher {
     fn new() -> Option<Self> {
         let interrupt = std::sync::Arc::new(trust_js::RuntimeInterrupt::default());
         let mut engine = trust_js::Engine::new_with_interrupt(interrupt.clone());
-        let Ok(Ok(function)) = engine.eval_value(MATCHER) else {
-            return None;
-        };
+        let function = engine.scope(|cx| {
+            let function = cx.eval_value(MATCHER).ok()?.ok()?;
+            trust_js::embed::Handle::new(cx, &function).ok()
+        })?;
         Some(Self {
             engine,
             interrupt,
@@ -196,20 +197,27 @@ impl Matcher {
         deadline: Option<Instant>,
     ) -> Evaluation {
         self.interrupt.set_deadline(deadline);
-        let result = self.engine.call_function_interruptible(
-            &self.function,
-            trust_js::embed::Value::Undefined,
-            &[
-                trust_js::embed::Value::from_engine_text(pattern),
-                trust_js::embed::Value::from_engine_text(value),
-            ],
-        );
+        let function = &self.function;
+        let verdict = self.engine.scope(|cx| {
+            let Ok(function) = function.get(cx) else {
+                return Evaluation::Unavailable;
+            };
+            let args = [
+                cx.string_from_engine_text(pattern),
+                cx.string_from_engine_text(value),
+            ];
+            let result =
+                cx.call_function_interruptible(&function, trust_js::embed::Value::Undefined, &args);
+            match result.map(|value| value.kind()) {
+                Ok(trust_js::embed::ValueKind::Bool(matched)) => {
+                    Evaluation::Complete(Some(matched))
+                }
+                Ok(trust_js::embed::ValueKind::Null) => Evaluation::Complete(None),
+                _ => Evaluation::Unavailable,
+            }
+        });
         self.interrupt.set_deadline(None);
-        match result {
-            Ok(trust_js::embed::Value::Bool(matched)) => Evaluation::Complete(Some(matched)),
-            Ok(trust_js::embed::Value::Null) => Evaluation::Complete(None),
-            _ => Evaluation::Unavailable,
-        }
+        verdict
     }
 }
 
@@ -334,8 +342,10 @@ mod tests {
         let mut matcher = Matcher::new().expect("private pattern matcher");
         // A private-realm fault injection avoids timing-dependent exhaustion.
         // The second constructor call must retry the same valid pattern.
-        let setup = matcher.engine.eval_value(
-            r#"(() => {
+        let installed = matcher.engine.scope(|cx| {
+            matches!(
+                cx.eval_value(
+                    r#"(() => {
                 const NativeRegExp = RegExp;
                 let fail = true;
                 globalThis.RegExp = function(pattern, flags) {
@@ -343,8 +353,11 @@ mod tests {
                     return new NativeRegExp(pattern, flags);
                 };
             })()"#,
-        );
-        assert!(matches!(setup, Ok(Ok(_))));
+                ),
+                Ok(Ok(_))
+            )
+        });
+        assert!(installed);
         assert_eq!(
             matcher.evaluate("a+".into(), "aaa".into(), None),
             Evaluation::Unavailable

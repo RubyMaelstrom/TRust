@@ -1,7 +1,7 @@
 //! HTML #dom-createImageBitmap / #cropped-to-the-source-rectangle-with-formatting.
 //! Local WHATWG snapshot e5071a20 (2026-09-06). Bitmap bytes stay in privately
 //! rooted JS typed arrays, so closing or collecting a bitmap releases its storage.
-use super::{Ctx, HostState, Value, host_arg_string};
+use super::{Ctx, Value, host_arg_string};
 use image::{ImageDecoder, RgbaImage, imageops::FilterType};
 
 const MAX_BYTES: usize = 256 * 1024 * 1024;
@@ -130,16 +130,19 @@ fn format(mut input: RgbaImage, input_premultiplied: bool, n: &[f64]) -> Option<
     Some((input, premultiplied))
 }
 
-pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(super) fn call<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let op = host_arg_string(ctx, args, 0);
     if op == "slots" {
         let candidate = args.get(1).cloned().unwrap_or(Value::Undefined);
-        return Ok(ctx
-            .host_mut::<HostState>()
-            .expect("bitmap host")
-            .image_bitmap_slots
-            .get_or_insert(candidate)
-            .clone());
+        return Ok(super::shared_slot(
+            ctx,
+            |state| &mut state.image_bitmap_slots,
+            candidate,
+        ));
     }
     let Some(numbers) = args.get(1) else {
         return Ok(Value::Null);

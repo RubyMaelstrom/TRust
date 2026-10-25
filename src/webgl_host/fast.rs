@@ -2,13 +2,14 @@
 //! branding, arity, and left-to-right conversion. Only arguments whose conversion
 //! cannot run author code take this path; the complete JS binding handles all
 //! other values, lost contexts, foreign objects, and sequence overloads.
-use super::{Ctx, HostState, Reply, Value, execute};
+use super::super::{held, hold_weakly};
+use super::{Ctx, HostState, Reply, Value, ValueKind, execute};
 use rustc_hash::FxHashMap;
-use std::rc::Rc;
-use trust_js::embed::WeakValue;
+use trust_js::embed::WeakHandle;
 
-/// Memoized brand checks of the fast path, by object address. A weak handle
-/// keeps each address from being reused while it is cached. Context records
+/// Memoized brand checks of the fast path, by object address. Each entry names
+/// its object weakly; the host's collection sweep forgets the entries of dead
+/// objects before their addresses can be reused (`Cache::sweep`). Context records
 /// change only through the host's `init` and `dispose` operations, which
 /// forget them; resource records never change after creation and are checked
 /// against their context's current epoch.
@@ -19,13 +20,13 @@ pub(in crate::trust_js_backend) struct Cache {
 }
 
 struct CachedContext {
-    object: WeakValue,
+    object: WeakHandle,
     id: usize,
     epoch: f64,
 }
 
 struct CachedResource {
-    object: WeakValue,
+    object: WeakHandle,
     kind: &'static str,
     owner: usize,
     epoch: f64,
@@ -43,8 +44,13 @@ impl Cache {
         self.contexts.clear();
     }
 
-    /// The tables' own storage. A weak handle also keeps a collected
-    /// object's allocation until its entry is dropped.
+    /// Forget the entries of objects a collection found dead, after it cleared their handles.
+    pub(in crate::trust_js_backend) fn sweep(&mut self) {
+        self.contexts.retain(|_, entry| !entry.object.is_cleared());
+        self.resources.retain(|_, entry| !entry.object.is_cleared());
+    }
+
+    /// The tables' own storage.
     pub(in crate::trust_js_backend) fn retained_bytes(&self) -> usize {
         self.contexts.capacity() * size_of::<(usize, CachedContext)>()
             + self.resources.capacity() * size_of::<(usize, CachedResource)>()
@@ -65,12 +71,13 @@ enum Method {
     },
 }
 
-pub(super) fn wrap(ctx: &mut Ctx, fallback: Value) -> Result<Value, Value> {
+pub(super) fn wrap<'s>(ctx: &mut Ctx<'s>, fallback: Value<'s>) -> Result<Value<'s>, Value<'s>> {
     let name = ctx.member_get(&fallback, "name")?;
-    let Value::Str(name) = name else {
+    let ValueKind::Str(name) = name.kind() else {
         return Ok(fallback);
     };
-    let method = match name.as_ref() {
+    let name = name.as_engine_text().to_owned();
+    let method = match name.as_str() {
         "bindBuffer" => Method::BindBuffer,
         "vertexAttribPointer" => Method::AttribPointer,
         "bindVertexArrayOES" => Method::BindVertexArray,
@@ -116,37 +123,38 @@ pub(super) fn wrap(ctx: &mut Ctx, fallback: Value) -> Result<Value, Value> {
     // JS stores native-function -> fallback in its private WeakMap. Holding only
     // a weak handle here lets a retired Window's methods and Realm be collected;
     // the function's reachable ephemeron retains its fallback while it is callable.
-    let fallback = ctx.downgrade_object_value(&fallback).unwrap();
+    let fallback = hold_weakly(ctx, &fallback);
     Ok(ctx.new_native_fn(
         &name,
         arity,
-        Rc::new(move |ctx, this, args| {
+        move |ctx, this, args| {
             if args.len() >= arity
                 && let Some(result) = run(ctx, &this, args, method)?
             {
                 return Ok(result);
             }
-            let fallback = fallback.upgrade().ok_or_else(|| {
+            let fallback = fallback.upgrade(ctx).ok().flatten().ok_or_else(|| {
                 ctx.make_error("TypeError", "WebGL binding is no longer available")
             })?;
             ctx.invoke(fallback, this, args)
-        }),
+        },
+        trust_js::embed::NativeCaptures::None,
     ))
 }
 
-fn number(value: &Value, kind: u8) -> Option<f64> {
+fn number<'s>(value: &Value<'s>, kind: u8) -> Option<f64> {
     if kind == b'b' {
-        return if let Value::Bool(value) = value {
-            Some(f64::from(*value))
+        return if let ValueKind::Bool(value) = value.kind() {
+            Some(f64::from(value))
         } else {
             None
         };
     }
-    let Value::Num(value) = value else {
+    let ValueKind::Num(value) = value.kind() else {
         return None;
     };
     Some(match kind {
-        b'f' => *value as f32 as f64,
+        b'f' => value as f32 as f64,
         b'l' => {
             if value.is_finite() {
                 value.trunc()
@@ -171,15 +179,15 @@ fn number(value: &Value, kind: u8) -> Option<f64> {
     })
 }
 
-fn resource(
-    ctx: &mut Ctx,
-    slots: &Value,
-    this: &Value,
+fn resource<'s>(
+    ctx: &mut Ctx<'s>,
+    slots: &Value<'s>,
+    this: &Value<'s>,
     epoch: f64,
-    value: &Value,
+    value: &Value<'s>,
     kind: &'static str,
-) -> Result<Option<u32>, Value> {
-    if matches!(value, Value::Null | Value::Undefined) {
+) -> Result<Option<u32>, Value<'s>> {
+    if matches!(value.kind(), ValueKind::Null | ValueKind::Undefined) {
         return Ok(Some(0));
     }
     let (Some(address), Some(owner)) = (ctx.object_addr(value), ctx.object_addr(this)) else {
@@ -187,7 +195,7 @@ fn resource(
     };
     let cache = &ctx.host_mut::<HostState>().unwrap().webgl_fast;
     if let Some(cached) = cache.resources.get(&address)
-        && cached.object.upgrade().is_some()
+        && !cached.object.is_cleared()
     {
         return Ok(
             (cached.kind == kind && cached.owner == owner && cached.epoch == epoch)
@@ -197,7 +205,8 @@ fn resource(
     let Some(id) = resource_record(ctx, slots, this, epoch, value, kind)? else {
         return Ok(None);
     };
-    if let Some(object) = ctx.downgrade_object_value(value) {
+    if value.as_obj().is_some() {
+        let object = hold_weakly(ctx, value);
         let cache = &mut ctx.host_mut::<HostState>().unwrap().webgl_fast;
         if cache.resources.len() >= MAX_CACHED_RESOURCES {
             cache.resources.clear();
@@ -218,19 +227,20 @@ fn resource(
 
 /// The id of a WebGL object or location record of `kind` owned by the
 /// context `this` in its current `epoch`.
-fn resource_record(
-    ctx: &mut Ctx,
-    slots: &Value,
-    this: &Value,
+fn resource_record<'s>(
+    ctx: &mut Ctx<'s>,
+    slots: &Value<'s>,
+    this: &Value<'s>,
     epoch: f64,
-    value: &Value,
+    value: &Value<'s>,
     kind: &str,
-) -> Result<Option<u32>, Value> {
+) -> Result<Option<u32>, Value<'s>> {
     let record = ctx.weak_map_get(slots, value)?;
-    if !matches!(record, Value::Obj(_)) {
+    if !matches!(record.kind(), ValueKind::Obj(_)) {
         return Ok(None);
     }
-    if !matches!(ctx.member_get(&record, "kind")?, Value::Str(ref s) if s.as_ref() == kind) {
+    if !matches!(ctx.member_get(&record, "kind")?.kind(), ValueKind::Str(s) if s.as_engine_text() == kind)
+    {
         return Ok(None);
     }
     let owner = ctx.member_get(&record, "context")?;
@@ -245,18 +255,19 @@ fn resource_record(
         .map(|n| n as u32))
 }
 
-fn run(
-    ctx: &mut Ctx,
-    this: &Value,
-    args: &[Value],
+fn run<'s>(
+    ctx: &mut Ctx<'s>,
+    this: &Value<'s>,
+    args: &[Value<'s>],
     method: Method,
-) -> Result<Option<Value>, Value> {
+) -> Result<Option<Value<'s>>, Value<'s>> {
     let slots = ctx
         .host_mut::<HostState>()
         .unwrap()
         .webgl_slots
         .clone()
         .unwrap();
+    let slots = held(ctx, &slots);
     if matches!(method, Method::BindVertexArray) {
         let record = ctx.weak_map_get(&slots, this)?;
         return bind_vertex_array(ctx, &slots, &record, &args[0]);
@@ -295,8 +306,8 @@ fn run(
                 )?;
                 ctx.map_set(
                     &refs,
-                    Value::from_string(format!("Buffer:{}", target as u32)),
-                    args[1].clone(),
+                    ctx.string(format!("Buffer:{}", target as u32)),
+                    args[1],
                 )?;
             }
         }
@@ -322,7 +333,7 @@ fn run(
             let buffer = if binding == 0 {
                 Value::Null
             } else {
-                let value = ctx.map_get(&refs, &Value::str("Buffer:34962"))?;
+                let value = ctx.map_get(&refs, &ctx.str("Buffer:34962"))?;
                 if resource(ctx, &slots, this, epoch, &value, "Buffer")? != Some(binding) {
                     return Ok(None);
                 }
@@ -332,7 +343,7 @@ fn run(
                 let refs = ctx.member_get(&record, "vertexRefs")?;
                 ctx.map_set(
                     &refs,
-                    Value::from_string(format!("attrib{}", numbers[0] as u32)),
+                    ctx.string(format!("attrib{}", numbers[0] as u32)),
                     buffer,
                 )?;
             }
@@ -348,7 +359,7 @@ fn run(
                 return Ok(None);
             };
             let transpose = if matrix {
-                let Value::Bool(v) = args[1] else {
+                let ValueKind::Bool(v) = args[1].kind() else {
                     return Ok(None);
                 };
                 v
@@ -407,22 +418,29 @@ fn run(
 }
 
 /// The id and epoch of the live WebGL context `this`, from its private record.
-fn context(ctx: &mut Ctx, slots: &Value, this: &Value) -> Result<Option<(usize, f64)>, Value> {
+fn context<'s>(
+    ctx: &mut Ctx<'s>,
+    slots: &Value<'s>,
+    this: &Value<'s>,
+) -> Result<Option<(usize, f64)>, Value<'s>> {
     let Some(address) = ctx.object_addr(this) else {
         return Ok(None);
     };
     let cache = &ctx.host_mut::<HostState>().unwrap().webgl_fast;
     if let Some(cached) = cache.contexts.get(&address)
-        && cached.object.upgrade().is_some()
+        && !cached.object.is_cleared()
     {
         return Ok(Some((cached.id, cached.epoch)));
     }
     let record = ctx.weak_map_get(slots, this)?;
-    if !matches!(record, Value::Obj(_)) {
+    if !matches!(record.kind(), ValueKind::Obj(_)) {
         return Ok(None);
     }
-    if !matches!(ctx.member_get(&record, "kind")?, Value::Str(ref s) if s.as_ref() == "Context")
-        || !matches!(ctx.member_get(&record, "lost")?, Value::Bool(false))
+    if !matches!(ctx.member_get(&record, "kind")?.kind(), ValueKind::Str(s) if s.as_engine_text() == "Context")
+        || !matches!(
+            ctx.member_get(&record, "lost")?.kind(),
+            ValueKind::Bool(false)
+        )
     {
         return Ok(None);
     }
@@ -433,7 +451,8 @@ fn context(ctx: &mut Ctx, slots: &Value, this: &Value) -> Result<Option<(usize, 
         return Ok(None);
     };
     let id = id as usize;
-    if let Some(object) = ctx.downgrade_object_value(this) {
+    if this.as_obj().is_some() {
+        let object = hold_weakly(ctx, this);
         let cache = &mut ctx.host_mut::<HostState>().unwrap().webgl_fast;
         if cache.contexts.len() >= MAX_CACHED_CONTEXTS {
             cache.contexts.clear();
@@ -445,20 +464,23 @@ fn context(ctx: &mut Ctx, slots: &Value, this: &Value) -> Result<Option<(usize, 
     Ok(Some((id, epoch)))
 }
 
-fn bind_vertex_array(
-    ctx: &mut Ctx,
-    slots: &Value,
-    extension: &Value,
-    value: &Value,
-) -> Result<Option<Value>, Value> {
-    if !matches!(extension, Value::Obj(_))
-        || !matches!(ctx.member_get(extension, "kind")?, Value::Str(ref s) if s.as_ref() == "VertexArrayExtension")
+fn bind_vertex_array<'s>(
+    ctx: &mut Ctx<'s>,
+    slots: &Value<'s>,
+    extension: &Value<'s>,
+    value: &Value<'s>,
+) -> Result<Option<Value<'s>>, Value<'s>> {
+    if !matches!(extension.kind(), ValueKind::Obj(_))
+        || !matches!(ctx.member_get(extension, "kind")?.kind(), ValueKind::Str(s) if s.as_engine_text() == "VertexArrayExtension")
     {
         return Ok(None);
     }
     let owner = ctx.member_get(extension, "context")?;
     let record = ctx.weak_map_get(slots, &owner)?;
-    if !matches!(ctx.member_get(&record, "lost")?, Value::Bool(false)) {
+    if !matches!(
+        ctx.member_get(&record, "lost")?.kind(),
+        ValueKind::Bool(false)
+    ) {
         return Ok(None);
     }
     let Some(epoch) = ctx.member_get(&record, "epoch")?.as_num_opt() else {
@@ -476,7 +498,7 @@ fn bind_vertex_array(
     if matches!(execute(ctx, id as usize, "bindVertexArrayOES", &[array as f64], None, ""), Reply::Number(n) if n == array as f64)
     {
         let refs = ctx.member_get(&record, "refs")?;
-        ctx.map_set(&refs, Value::str("vertexArray"), value.clone())?;
+        ctx.map_set(&refs, ctx.str("vertexArray"), *value)?;
         let vertex_refs = if array == 0 {
             ctx.member_get(&record, "defaultVertexRefs")?
         } else {

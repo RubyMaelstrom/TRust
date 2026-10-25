@@ -8,10 +8,10 @@
 
 use super::{
     Ctx, HostGcVisitor, HostRetainedMemoryVisitor, HostState, RetainedManagedAllocation, Value,
+    ValueKind, hold_weakly,
 };
 use rustc_hash::FxHashMap;
-use std::cell::Cell;
-use trust_js::embed::WeakValue;
+use trust_js::embed::WeakHandle;
 
 const COMPACT_FLOOR: usize = 256;
 const ATTRIBUTES: [&str; 8] = [
@@ -67,39 +67,23 @@ impl Rectangle {
 }
 
 struct Entry {
-    owner: WeakValue,
+    owner: WeakHandle,
     rectangle: Rectangle,
 }
 
+/// A Realm's DOMRectReadOnly and DOMRect prototypes, reported as edges from its global.
 struct RealmPrototypes {
-    global: WeakValue,
-    values: [Value; 2],
+    global: WeakHandle,
+    values: [WeakHandle; 2],
 }
 
+/// Rectangles by object identity, and each Realm's prototypes by its global's. Both name their
+/// objects weakly; a collection's sweep forgets the dead ones before their cells (and so their
+/// identities) are freed, so an identity never names a dead object's entry.
+#[derive(Default)]
 pub(super) struct Registry {
     realms: FxHashMap<usize, RealmPrototypes>,
-    young_realms: Vec<usize>,
-    young: FxHashMap<usize, Entry>,
-    old: FxHashMap<usize, Entry>,
-    next_compaction: usize,
-    registrations: usize,
-    next_old_compaction: usize,
-    minor: Cell<bool>,
-}
-
-impl Default for Registry {
-    fn default() -> Self {
-        Self {
-            realms: Default::default(),
-            young_realms: Vec::new(),
-            young: Default::default(),
-            old: Default::default(),
-            next_compaction: COMPACT_FLOOR,
-            registrations: 0,
-            next_old_compaction: COMPACT_FLOOR,
-            minor: Cell::new(false),
-        }
-    }
+    entries: FxHashMap<usize, Entry>,
 }
 
 fn shrink<T>(entries: &mut FxHashMap<usize, T>) {
@@ -111,118 +95,42 @@ fn shrink<T>(entries: &mut FxHashMap<usize, T>) {
 impl Registry {
     #[cfg(test)]
     pub(super) fn len(&self) -> usize {
-        self.young.len() + self.old.len()
+        self.entries.len()
     }
 
-    fn insert(&mut self, key: usize, owner: WeakValue, rectangle: Rectangle) {
-        if self.young.len() >= self.next_compaction {
-            self.young
-                .retain(|_, entry| entry.owner.upgrade().is_some());
-            shrink(&mut self.young);
-            self.next_compaction = self.young.len().saturating_mul(2).max(COMPACT_FLOOR);
-        }
-        self.registrations += 1;
-        if self.registrations >= self.next_old_compaction {
-            self.old.retain(|_, entry| entry.owner.upgrade().is_some());
-            shrink(&mut self.old);
-            self.registrations = 0;
-            self.next_old_compaction = self.old.len().max(COMPACT_FLOOR);
-        }
-        // Keeping the WeakValue also prevents recycling the Rc allocation's
-        // identity before this entry is retired. No address-only stale brand.
-        debug_assert!(!self.old.contains_key(&key) && !self.young.contains_key(&key));
-        self.young.insert(key, Entry { owner, rectangle });
+    fn insert(&mut self, key: usize, owner: WeakHandle, rectangle: Rectangle) {
+        debug_assert!(!self.entries.contains_key(&key));
+        self.entries.insert(key, Entry { owner, rectangle });
     }
 
     fn get(&self, key: usize) -> Option<Rectangle> {
-        self.young
-            .get(&key)
-            .or_else(|| self.old.get(&key))
-            .map(|entry| entry.rectangle)
+        self.entries.get(&key).map(|entry| entry.rectangle)
     }
 
     fn get_mut(&mut self, key: usize) -> Option<&mut Rectangle> {
-        self.young
-            .get_mut(&key)
-            .or_else(|| self.old.get_mut(&key))
-            .map(|entry| &mut entry.rectangle)
+        self.entries.get_mut(&key).map(|entry| &mut entry.rectangle)
     }
 
     pub(super) fn trace(&self, visitor: &mut dyn HostGcVisitor) {
-        self.minor.set(visitor.is_minor());
         // Interface prototypes are intrinsic to their Realm even if author
         // code replaces the global constructor. They are edges FROM the global,
         // never roots: a retired unreachable Realm must still be collectible.
-        let mut trace_realm = |realm: &RealmPrototypes| {
-            let global = realm.global.upgrade();
+        for realm in self.realms.values() {
             for prototype in &realm.values {
-                visitor.internal(prototype);
-                if let Some(global) = &global {
-                    visitor.edge(global, prototype);
-                }
-            }
-        };
-        if self.minor.get() {
-            // Prototype handles are immutable after bootstrap. Once promoted,
-            // both they and their Realm are old; the engine owns barriers for
-            // author writes to the prototype objects themselves. Do not walk
-            // every stable old Realm on each nursery collection.
-            for key in &self.young_realms {
-                if let Some(realm) = self.realms.get(key) {
-                    trace_realm(realm);
-                }
-            }
-        } else {
-            for realm in self.realms.values() {
-                trace_realm(realm);
+                visitor.edge(&realm.global, prototype);
             }
         }
     }
 
-    pub(super) fn sweep(&mut self, is_live: &dyn Fn(&Value) -> bool) {
-        let keep_realm = |realm: &RealmPrototypes| {
-            realm
-                .global
-                .upgrade()
-                .is_some_and(|global| is_live(&global))
-        };
-        if self.minor.get() {
-            for key in &self.young_realms {
-                if self.realms.get(key).is_some_and(|realm| !keep_realm(realm)) {
-                    self.realms.remove(key);
-                }
-            }
-        } else {
-            self.realms.retain(|_, realm| keep_realm(realm));
-            shrink(&mut self.realms);
-        }
-        self.young_realms.clear();
-        if self.young_realms.capacity() > COMPACT_FLOOR {
-            self.young_realms.shrink_to(COMPACT_FLOOR);
-        }
-        let keep = |_: &usize, entry: &mut Entry| {
-            entry.owner.upgrade().is_some_and(|value| is_live(&value))
-        };
-        if !self.minor.get() {
-            self.old.retain(keep);
-            self.registrations = 0;
-        }
-        self.young.retain(keep);
-        self.old.extend(self.young.drain());
-        shrink(&mut self.old);
-        shrink(&mut self.young);
-        self.next_compaction = COMPACT_FLOOR;
-        self.next_old_compaction = self.old.len().max(COMPACT_FLOOR);
+    /// Forget what a collection found dead, after it cleared the weak handles.
+    pub(super) fn sweep(&mut self) {
+        self.realms.retain(|_, realm| !realm.global.is_cleared());
+        shrink(&mut self.realms);
+        self.entries.retain(|_, entry| !entry.owner.is_cleared());
+        shrink(&mut self.entries);
     }
 
     pub(super) fn scan_retained_memory(&self, visitor: &mut dyn HostRetainedMemoryVisitor) {
-        if self.young_realms.capacity() != 0 {
-            visitor.allocation(RetainedManagedAllocation::new(
-                "trust.geometry.young-realms",
-                self.young_realms.as_ptr() as usize,
-                self.young_realms.capacity() * std::mem::size_of::<usize>(),
-            ));
-        }
         if self.realms.capacity() != 0 {
             visitor.allocation(RetainedManagedAllocation::new(
                 "trust.geometry.realms",
@@ -231,30 +139,24 @@ impl Registry {
             ));
             visitor.opaque_storage();
         }
-        for realm in self.realms.values() {
-            for value in &realm.values {
-                visitor.value(value);
-            }
-        }
-        for (name, entries) in [
-            ("trust.geometry.young", &self.young),
-            ("trust.geometry.old", &self.old),
-        ] {
-            if entries.capacity() != 0 {
-                visitor.allocation(RetainedManagedAllocation::new(
-                    name,
-                    entries as *const _ as usize,
-                    entries.capacity() * std::mem::size_of::<(usize, Entry)>(),
-                ));
-                // Hash-table/control-block allocation layouts are opaque;
-                // these requested bytes are a lower bound, not JS roots.
-                visitor.opaque_storage();
-            }
+        if self.entries.capacity() != 0 {
+            visitor.allocation(RetainedManagedAllocation::new(
+                "trust.geometry.entries",
+                &self.entries as *const _ as usize,
+                self.entries.capacity() * std::mem::size_of::<(usize, Entry)>(),
+            ));
+            // Hash-table allocation layouts are opaque; these requested bytes
+            // are a lower bound.
+            visitor.opaque_storage();
         }
     }
 }
 
-fn record(ctx: &mut Ctx, value: &Value, mutable: bool) -> Result<(usize, Rectangle), Value> {
+fn record<'s>(
+    ctx: &mut Ctx<'s>,
+    value: &Value<'s>,
+    mutable: bool,
+) -> Result<(usize, Rectangle), Value<'s>> {
     let key = ctx.object_addr(value);
     let rectangle = key.and_then(|key| {
         ctx.host_mut::<HostState>()
@@ -268,13 +170,15 @@ fn record(ctx: &mut Ctx, value: &Value, mutable: bool) -> Result<(usize, Rectang
     }
 }
 
-fn register(ctx: &mut Ctx, value: &Value, rectangle: Rectangle) -> Result<(), Value> {
+fn register<'s>(
+    ctx: &mut Ctx<'s>,
+    value: &Value<'s>,
+    rectangle: Rectangle,
+) -> Result<(), Value<'s>> {
     let Some(key) = ctx.object_addr(value) else {
         return Err(ctx.make_error("TypeError", "DOMRect must be an object"));
     };
-    let owner = ctx
-        .downgrade_object_value(value)
-        .expect("object identity has a weak handle");
+    let owner = hold_weakly(ctx, value);
     ctx.host_mut::<HostState>()
         .expect("geometry host")
         .geometry
@@ -282,7 +186,12 @@ fn register(ctx: &mut Ctx, value: &Value, rectangle: Rectangle) -> Result<(), Va
     Ok(())
 }
 
-fn construct(ctx: &mut Ctx, _: Value, args: &[Value], captures: &[Value]) -> Result<Value, Value> {
+fn construct<'s>(
+    ctx: &mut Ctx<'s>,
+    _: Value<'s>,
+    args: &[Value<'s>],
+    captures: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     // Web IDL #interface-object: convert arguments before looking up the
     // NewTarget prototype. Native construction avoids JS class allocation and
     // superclass calls, both observably different from this algorithm.
@@ -294,17 +203,17 @@ fn construct(ctx: &mut Ctx, _: Value, args: &[Value], captures: &[Value]) -> Res
     for (index, number) in values.iter_mut().enumerate() {
         if let Some(value) = args
             .get(index)
-            .filter(|value| !matches!(value, Value::Undefined))
+            .filter(|value| !matches!(value.kind(), ValueKind::Undefined))
         {
             *number = ctx.coerce_number(value)?;
         }
     }
-    let mutable = matches!(captures[0], Value::Bool(true));
+    let mutable = matches!(captures[0].kind(), ValueKind::Bool(true));
     let mut prototype = ctx.member_get(&new_target, "prototype")?;
     if ctx.object_addr(&prototype).is_none() {
         let global = ctx.callable_realm_global(&new_target)?;
         let key = ctx.object_addr(&global).expect("Realm global is an object");
-        prototype = ctx
+        let handle = ctx
             .host_mut::<HostState>()
             .expect("geometry host")
             .geometry
@@ -313,6 +222,11 @@ fn construct(ctx: &mut Ctx, _: Value, args: &[Value], captures: &[Value]) -> Res
             .expect("geometry is exposed in each Window/Worker Realm")
             .values[usize::from(mutable)]
         .clone();
+        prototype = handle
+            .upgrade(ctx)
+            .ok()
+            .flatten()
+            .expect("a Realm's prototypes live while its global does");
     }
     let value = ctx.new_object_with_proto(&prototype);
     register(
@@ -327,7 +241,11 @@ fn construct(ctx: &mut Ctx, _: Value, args: &[Value], captures: &[Value]) -> Res
     Ok(value)
 }
 
-fn serialization_state(ctx: &mut Ctx, _: Value, args: &[Value]) -> Result<Value, Value> {
+fn serialization_state<'s>(
+    ctx: &mut Ctx<'s>,
+    _: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     // HTML #structuredserializeinternal / Geometry 1 #structured-serialization:
     // inspect the primary interface and numeric slots, never author properties.
     let value = args.first().unwrap_or(&Value::Undefined);
@@ -354,13 +272,27 @@ fn serialization_state(ctx: &mut Ctx, _: Value, args: &[Value]) -> Result<Value,
     ]))
 }
 
-fn get(ctx: &mut Ctx, this: Value, _: &[Value], captures: &[Value]) -> Result<Value, Value> {
+fn get<'s>(
+    ctx: &mut Ctx<'s>,
+    this: Value<'s>,
+    _: &[Value<'s>],
+    captures: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let index = captures[0].as_num_opt().unwrap() as usize;
-    let (_, rectangle) = record(ctx, &this, matches!(captures[1], Value::Bool(true)))?;
+    let (_, rectangle) = record(
+        ctx,
+        &this,
+        matches!(captures[1].kind(), ValueKind::Bool(true)),
+    )?;
     Ok(Value::Num(rectangle.attribute(index)))
 }
 
-fn set(ctx: &mut Ctx, this: Value, args: &[Value], captures: &[Value]) -> Result<Value, Value> {
+fn set<'s>(
+    ctx: &mut Ctx<'s>,
+    this: Value<'s>,
+    args: &[Value<'s>],
+    captures: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     // Web IDL #dfn-attribute-setter: check the interface brand before running
     // observable ToNumber. No native borrow survives that reentrant operation.
     let (key, rectangle) = record(ctx, &this, true)?;
@@ -389,11 +321,14 @@ fn set(ctx: &mut Ctx, this: Value, args: &[Value], captures: &[Value]) -> Result
 /// `updateRect(rect, x, y, width, height, observed)`: the platform updates
 /// a reflecting SVGRect from its attribute without running its write steps,
 /// and marks it observed.
-fn update(ctx: &mut Ctx, _: Value, args: &[Value]) -> Result<Value, Value> {
+fn update<'s>(ctx: &mut Ctx<'s>, _: Value<'s>, args: &[Value<'s>]) -> Result<Value<'s>, Value<'s>> {
     let (key, _) = record(ctx, args.first().unwrap_or(&Value::Undefined), false)?;
     let values =
         std::array::from_fn(|i| args.get(i + 1).and_then(Value::as_num_opt).unwrap_or(0.0));
-    let observed = matches!(args.get(5), Some(Value::Bool(true)));
+    let observed = matches!(
+        args.get(5).map(|value| value.kind()),
+        Some(ValueKind::Bool(true))
+    );
     if let Some(rectangle) = ctx
         .host_mut::<HostState>()
         .expect("geometry host")
@@ -406,7 +341,11 @@ fn update(ctx: &mut Ctx, _: Value, args: &[Value]) -> Result<Value, Value> {
     Ok(Value::Undefined)
 }
 
-fn snapshot(ctx: &mut Ctx, _: Value, args: &[Value]) -> Result<Value, Value> {
+fn snapshot<'s>(
+    ctx: &mut Ctx<'s>,
+    _: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let (_, rectangle) = record(ctx, args.first().unwrap_or(&Value::Undefined), false)?;
     Ok(ctx.make_array(
         (0..8)
@@ -415,7 +354,12 @@ fn snapshot(ctx: &mut Ctx, _: Value, args: &[Value]) -> Result<Value, Value> {
     ))
 }
 
-fn create(ctx: &mut Ctx, _: Value, args: &[Value], captures: &[Value]) -> Result<Value, Value> {
+fn create<'s>(
+    ctx: &mut Ctx<'s>,
+    _: Value<'s>,
+    args: &[Value<'s>],
+    captures: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     // Internal layout numbers are already IDL doubles, not author values.
     let values = std::array::from_fn(|i| args.get(i).and_then(Value::as_num_opt).unwrap_or(0.0));
     let value = ctx.new_object_with_proto(&captures[0]);
@@ -424,48 +368,44 @@ fn create(ctx: &mut Ctx, _: Value, args: &[Value], captures: &[Value]) -> Result
         &value,
         Rectangle {
             values,
-            mutable: matches!(captures[1], Value::Bool(true)),
+            mutable: matches!(captures[1].kind(), ValueKind::Bool(true)),
             observed: false,
         },
     )?;
     Ok(value)
 }
 
-pub(super) fn bind(ctx: &mut Ctx, _: Value, args: &[Value]) -> Result<Value, Value> {
+pub(super) fn bind<'s>(
+    ctx: &mut Ctx<'s>,
+    _: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let readonly = args.first().cloned().unwrap_or(Value::Null);
     let mutable = args.get(1).cloned().unwrap_or(Value::Null);
     let global = ctx.global_this();
     let key = ctx.object_addr(&global).unwrap();
-    let owner = ctx.downgrade_object_value(&global).unwrap();
-    ctx.host_mut::<HostState>()
-        .expect("geometry host")
-        .geometry
-        .young_realms
-        .push(key);
+    let prototypes = RealmPrototypes {
+        global: hold_weakly(ctx, &global),
+        values: [hold_weakly(ctx, &readonly), hold_weakly(ctx, &mutable)],
+    };
     ctx.host_mut::<HostState>()
         .expect("geometry host")
         .geometry
         .realms
-        .insert(
-            key,
-            RealmPrototypes {
-                global: owner,
-                values: [readonly.clone(), mutable.clone()],
-            },
-        );
+        .insert(key, prototypes);
     let readonly_ctor =
-        ctx.new_native_fn_with_captures("DOMRectReadOnly", 0, construct, vec![Value::Bool(false)]);
+        ctx.new_native_fn_with_captures("DOMRectReadOnly", 0, construct, &[Value::Bool(false)]);
     let mutable_ctor =
-        ctx.new_native_fn_with_captures("DOMRect", 0, construct, vec![Value::Bool(true)]);
+        ctx.new_native_fn_with_captures("DOMRect", 0, construct, &[Value::Bool(true)]);
     ctx.set_constructor_prototype(&readonly_ctor, &readonly);
     ctx.set_constructor_prototype(&mutable_ctor, &mutable);
     for (index, name) in ATTRIBUTES.iter().enumerate() {
-        let getter = |ctx: &Ctx, needs_mutable| {
+        let getter = |ctx: &Ctx<'s>, needs_mutable| {
             ctx.new_native_fn_with_captures(
                 &format!("get {name}"),
                 0,
                 get,
-                vec![Value::Num(index as f64), Value::Bool(needs_mutable)],
+                &[Value::Num(index as f64), Value::Bool(needs_mutable)],
             )
         };
         ctx.define_accessor_value(&readonly, name, Some(getter(ctx, false)), None, true);
@@ -474,7 +414,7 @@ pub(super) fn bind(ctx: &mut Ctx, _: Value, args: &[Value]) -> Result<Value, Val
                 &format!("set {name}"),
                 1,
                 set,
-                vec![Value::Num(index as f64)],
+                &[Value::Num(index as f64)],
             );
             ctx.define_accessor_value(&mutable, name, Some(getter(ctx, true)), Some(setter), true);
         }
@@ -483,18 +423,13 @@ pub(super) fn bind(ctx: &mut Ctx, _: Value, args: &[Value]) -> Result<Value, Val
         readonly_ctor,
         mutable_ctor,
         Value::Obj(ctx.make_native("snapshotRect", 1, snapshot)),
-        ctx.new_native_fn_with_captures(
-            "createDOMRect",
-            4,
-            create,
-            vec![mutable, Value::Bool(true)],
-        ),
+        ctx.new_native_fn_with_captures("createDOMRect", 4, create, &[mutable, Value::Bool(true)]),
         Value::Obj(ctx.make_native("serializeRect", 1, serialization_state)),
         ctx.new_native_fn_with_captures(
             "createDOMRectReadOnly",
             4,
             create,
-            vec![readonly, Value::Bool(false)],
+            &[readonly, Value::Bool(false)],
         ),
         Value::Obj(ctx.make_native("updateRect", 6, update)),
     ]))
@@ -503,7 +438,11 @@ pub(super) fn bind(ctx: &mut Ctx, _: Value, args: &[Value]) -> Result<Value, Val
 /// Geometry 1 #dommatrix-parse for a Window Realm's DOMMatrix(ReadOnly)
 /// constructor and setMatrixValue(): `null` for failure, otherwise
 /// `[is2D, m11, m12, …, m44]` in column-major order.
-pub(super) fn parse_matrix(ctx: &mut Ctx, _: Value, args: &[Value]) -> Result<Value, Value> {
+pub(super) fn parse_matrix<'s>(
+    ctx: &mut Ctx<'s>,
+    _: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let text = super::host_arg_string(ctx, args, 0);
     let Some((matrix, two_dimensional)) = crate::dom::css_transform_list_matrix(&text) else {
         return Ok(Value::Null);

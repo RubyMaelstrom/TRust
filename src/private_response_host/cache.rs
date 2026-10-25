@@ -202,7 +202,11 @@ fn change(
     }
 }
 
-pub(super) fn operation(ctx: &mut Ctx, op: &str, args: &[Value]) -> Result<Value, Value> {
+pub(super) fn operation<'s>(
+    ctx: &mut Ctx<'s>,
+    op: &str,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     if op == "cache-release" {
         let lease = args.get(1).and_then(Value::as_num_opt).unwrap_or(0.) as u64;
         ctx.host_mut::<HostState>()
@@ -217,7 +221,7 @@ pub(super) fn operation(ctx: &mut Ctx, op: &str, args: &[Value]) -> Result<Value
     // As with __storage_get/cas, the platform block supplies its object's
     // immutable owning storage key, independently of the current caller.
     let Some(owner) = input["origin"].as_str().filter(|key| *key != "null") else {
-        return Ok(Value::from_string("{\"error\":\"SecurityError\"}".into()));
+        return Ok(ctx.string("{\"error\":\"SecurityError\"}".into()));
     };
     let state = ctx.host_mut::<HostState>().unwrap();
     let result = change(
@@ -227,7 +231,7 @@ pub(super) fn operation(ctx: &mut Ctx, op: &str, args: &[Value]) -> Result<Value
         op,
         input["name"].as_str(),
     );
-    Ok(Value::from_string(match result {
+    Ok(ctx.string(match result {
         Ok(value) => value.to_string(),
         Err(error) => serde_json::json!({"error":error}).to_string(),
     }))

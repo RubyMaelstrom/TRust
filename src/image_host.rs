@@ -9,7 +9,9 @@
 //! again. Each request reports Resource Timing to its node document's global
 //! (Fetch #fetch-finale, Resource Timing #marking-resource-timing); only
 //! HTTP(S) requests produce entries (Fetch #fetch-finale's report timing steps).
-use super::{Ctx, HostState, TrustJsHostTask, TrustJsPendingFetch, Value, host_arg_string};
+use super::{
+    Ctx, HostState, TrustJsHostTask, TrustJsPendingFetch, Value, ValueKind, host_arg_string,
+};
 use crate::http::{CredentialsMode, RequestMode};
 use crate::page_images::{ImageFailure, ImageJoin, ImageRequestKey, SharedImageFetch};
 use crate::performance::ResourceTiming;
@@ -51,7 +53,7 @@ pub(super) fn probe(source: &str, bytes: &[u8]) -> Option<(u32, u32)> {
     Some(size)
 }
 
-pub(super) fn result_value(ctx: &mut Ctx, result: Option<LoadedImage>) -> Value {
+pub(super) fn result_value<'s>(ctx: &mut Ctx<'s>, result: Option<LoadedImage>) -> Value<'s> {
     let Some(loaded) = result else {
         return Value::Null;
     };
@@ -105,7 +107,7 @@ pub(super) fn result_value(ctx: &mut Ctx, result: Option<LoadedImage>) -> Value 
 
 /// The settings context whose Document owns `node`: the request client of its
 /// image fetches and the global that receives their timing entries.
-fn node_context(ctx: &mut Ctx, node: usize) -> u64 {
+fn node_context<'s>(ctx: &mut Ctx<'s>, node: usize) -> u64 {
     let calling = ctx.host_job_context();
     let state = ctx.host_mut::<HostState>().expect("image host");
     let dom = state.dom.clone();
@@ -156,8 +158,8 @@ pub(super) fn request_timing(
 /// Start (or join) a document image request for `source`, owned by settings
 /// context `context`. `None` when the request failed a precondition; the
 /// store then records the refusal for waiting presentation consumers.
-pub(super) fn document_request(
-    ctx: &mut Ctx,
+pub(super) fn document_request<'s>(
+    ctx: &mut Ctx<'s>,
     context: u64,
     source: &str,
     cors: Option<CredentialsMode>,
@@ -262,17 +264,20 @@ pub(super) fn document_request(
     Some((fetch, join, handle))
 }
 
-pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(super) fn call<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let started = crate::performance::now_ms();
     let op = host_arg_string(ctx, args, 0);
     if op == "slots" {
         let candidate = args.get(1).cloned().unwrap_or(Value::Undefined);
-        return Ok(ctx
-            .host_mut::<HostState>()
-            .expect("image host")
-            .image_element_slots
-            .get_or_insert(candidate)
-            .clone());
+        return Ok(super::shared_slot(
+            ctx,
+            |state| &mut state.image_element_slots,
+            candidate,
+        ));
     }
     match op.as_str() {
         "pixels" => return Ok(pixels(ctx, args)),
@@ -407,6 +412,7 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
         ctx.invoke(resolve, Value::Undefined, &[Value::Null])?;
         return Ok(promise);
     };
+    let resolve = super::hold(ctx, &resolve);
     let state = ctx.host_mut::<HostState>().expect("image host");
     let network = state.network.as_mut().expect("prepared network");
     let cache = network.cache.clone();
@@ -469,7 +475,7 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
 
 /// The decoded pixels behind one request record (HTML #prepare-an-image-for-
 /// presentation), materialized for a canvas, WebGL or ImageBitmap consumer.
-fn pixels(ctx: &mut Ctx, args: &[Value]) -> Value {
+fn pixels<'s>(ctx: &mut Ctx<'s>, args: &[Value<'s>]) -> Value<'s> {
     let token = args.get(1).and_then(Value::as_num_opt).unwrap_or(-1.) as u64;
     let bytes = ctx
         .host_mut::<HostState>()
@@ -484,7 +490,7 @@ fn pixels(ctx: &mut Ctx, args: &[Value]) -> Value {
 /// The element task that completed an image request either made it the
 /// element's current request (retain its bytes, release the previous ones) or
 /// found it superseded by a newer request (release it).
-fn adopt(ctx: &mut Ctx, args: &[Value]) {
+fn adopt<'s>(ctx: &mut Ctx<'s>, args: &[Value<'s>]) {
     let node = args
         .get(1)
         .and_then(Value::as_num_opt)
@@ -493,7 +499,10 @@ fn adopt(ctx: &mut Ctx, args: &[Value]) {
         .get(2)
         .and_then(Value::as_num_opt)
         .map(|token| token as u64);
-    let accepted = matches!(args.get(3), Some(Value::Bool(true)));
+    let accepted = matches!(
+        args.get(3).map(|value| value.kind()),
+        Some(ValueKind::Bool(true))
+    );
     let Some(state) = ctx.host_mut::<HostState>() else {
         return;
     };
@@ -514,7 +523,7 @@ fn adopt(ctx: &mut Ctx, args: &[Value]) {
 
 /// HTML #lazy-loading-attributes: a lazy image's request waits for its
 /// resumption steps. Presentation consumers wait for it instead of fetching.
-fn expect(ctx: &mut Ctx, args: &[Value]) {
+fn expect<'s>(ctx: &mut Ctx<'s>, args: &[Value<'s>]) {
     let source = host_arg_string(ctx, args, 1);
     let Ok(url) = url::Url::parse(&source) else {
         return;
@@ -533,7 +542,7 @@ fn expect(ctx: &mut Ctx, args: &[Value]) {
 /// Image elements created by the HTML parser or fragment parsing/cloning in
 /// `document` that have not yet run "update the image data" (HTML #when-to-
 /// obtain-images: whenever the element is created). Removed from the list.
-fn created(ctx: &mut Ctx, args: &[Value]) -> Value {
+fn created<'s>(ctx: &mut Ctx<'s>, args: &[Value<'s>]) -> Value<'s> {
     let document = args
         .get(1)
         .and_then(Value::as_num_opt)

@@ -7,12 +7,15 @@ use super::*;
 use parley::fontique::{Descriptor, FontStyle, FontWeight, FontWidth};
 use unicode_casefold::UnicodeCaseFold as _;
 
-pub(super) fn query(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(super) fn query<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let op = host_arg_string(ctx, args, 0);
     if op == "epoch" {
-        return Ok(Value::from_string(
-            host_dom(ctx).borrow().font_source_epoch().to_string(),
-        ));
+        let epoch = host_dom(ctx).borrow().font_source_epoch().to_string();
+        return Ok(ctx.string(epoch));
     }
     if op == "scopes" || op == "pending" || op == "needed" {
         if ctx
@@ -50,10 +53,14 @@ pub(super) fn query(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
     } else {
         serde_json::json!(crate::dom::font_face_descriptor(&text, &extra))
     };
-    Ok(Value::from_string(result.to_string()))
+    Ok(ctx.string(result.to_string()))
 }
 
-fn scopes(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn scopes<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let op = host_arg_string(ctx, args, 0);
     if op == "needed"
         && ctx
@@ -82,7 +89,7 @@ fn scopes(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
         let needed = document
             .map(|document| dom.needed_font_members(document))
             .unwrap_or_default();
-        return Ok(Value::from_string(serde_json::to_string(&needed).unwrap()));
+        return Ok(ctx.string(serde_json::to_string(&needed).unwrap()));
     }
     if op == "pending" {
         let pending = ctx.host::<HostState>().is_some_and(|state| {
@@ -97,12 +104,12 @@ fn scopes(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
                         != 0
                 })
         });
-        return Ok(Value::from_string(pending.to_string()));
+        return Ok(ctx.string(pending.to_string()));
     }
     let sources = document
         .map(|document| dom.font_source_scopes(document))
         .unwrap_or_default();
-    Ok(Value::from_string(serde_json::to_string(&sources).unwrap()))
+    Ok(ctx.string(serde_json::to_string(&sources).unwrap()))
 }
 
 fn matching_faces(font: &str, text: &str, declarations: &[String]) -> Option<Vec<usize>> {
@@ -203,7 +210,11 @@ fn matching_faces(font: &str, text: &str, declarations: &[String]) -> Option<Vec
 /// `load(id, declarations, baseURL, bytes?)`. Binary/data/local sources can
 /// finish synchronously here, but script always settles them on a font task.
 /// Network sources report through FontFaceDone in the requesting realm.
-pub(super) fn load(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(super) fn load<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let request = args.first().and_then(Value::as_num_opt).unwrap_or(0.) as u64;
     let declarations = host_arg_string(ctx, args, 1);
     let source = host_arg_string(ctx, args, 2);
@@ -337,7 +348,11 @@ pub(super) fn load(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
 
 /// Register all font-source members before layout, including unloaded faces.
 /// Their member identities let shaping request the precise FontFace object.
-pub(super) fn install(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(super) fn install<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     #[derive(serde::Deserialize)]
     struct Registration {
         member: u64,

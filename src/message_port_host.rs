@@ -402,7 +402,11 @@ impl Registry {
 }
 
 /// Bootstrap captures this binding; author code gets only branded MessagePort wrappers.
-pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(super) fn call<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let op = host_arg_string(ctx, args, 0);
     let id = args.get(1).and_then(Value::as_num_opt).unwrap_or(0.0) as u64;
     let payload = if op == "receive" {
@@ -415,7 +419,7 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
     let realm = ctx.host_job_context();
     let result = {
         let Some(state) = ctx.host_mut::<HostState>() else {
-            return Ok(Value::from_string(String::from("null")));
+            return Ok(ctx.string(String::from("null")));
         };
         let agent = &state.message_ports;
         let wake = state.task_events.as_ref().map_or_else(
@@ -438,7 +442,7 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
     };
     match result {
         // Serialized messages are DOM engine text (see `host_arg_string`).
-        Ok(value) => Ok(Value::from_engine_text(value.to_string())),
+        Ok(value) => Ok(ctx.string_from_engine_text(value.to_string())),
         Err(message) => Err(ctx.make_error("QuotaExceededError", message)),
     }
 }

@@ -228,7 +228,6 @@ fn warm(engine: &mut trust_js::Engine, snapshot: &'static [u8]) -> Result<(), St
     let (task_tx, task_rx) = tokio::sync::mpsc::unbounded_channel();
     state.task_events = Some(TrustJsTaskSender::Page(task_tx));
     engine
-        .ctx()
         .op_state()
         .put_retained_memory_with_external_memory(state);
     install_agent_host_hooks(engine);
@@ -248,15 +247,11 @@ fn warm(engine: &mut trust_js::Engine, snapshot: &'static [u8]) -> Result<(), St
 
     // As in `host_create_window_realm`, creation and bootstrap are one
     // publication step: no collection may see partially built intrinsics.
-    engine.ctx().suspend_gc();
-    let realm = engine.ctx().create_embed_realm();
-    let Value::Obj(global) = &realm else {
-        engine.ctx().resume_gc();
-        return Err(String::from(
-            "spare engine warm-up Realm has no global object",
-        ));
-    };
-    let warm_up_global = Rc::downgrade(global);
+    let (realm, warm_up_global) = engine.scope(|cx| {
+        cx.suspend_gc();
+        let realm = cx.create_embed_realm();
+        (hold(cx, &realm), hold_weakly(cx, &realm))
+    });
     let bootstrap = engine.with_embed_realm(&realm, |engine| {
         for &(name, len, host_fn) in TRUST_JS_HOST_FUNCTIONS {
             engine.define_global(name, len, host_fn);
@@ -264,7 +259,7 @@ fn warm(engine: &mut trust_js::Engine, snapshot: &'static [u8]) -> Result<(), St
         eval(engine, &config, "spare engine configuration")?;
         eval_bootstrap_snapshot(engine, snapshot, "spare engine platform prelude")
     });
-    engine.ctx().resume_gc();
+    engine.scope(|cx| cx.resume_gc());
 
     // Settle the warm-up's own jobs while its host state still exists, so
     // nothing it queued can run later as part of the page. On any failure
@@ -284,11 +279,11 @@ fn warm(engine: &mut trust_js::Engine, snapshot: &'static [u8]) -> Result<(), St
 
     // Remove every owner of the warm-up Realm, collect it, and prove it gone.
     drop(realm);
-    drop(engine.ctx().op_state().take::<HostState>());
+    drop(engine.op_state().take::<HostState>());
     drop(task_rx);
     let _ = engine.take_unhandled_rejections_full();
     engine.collect_garbage_at_idle();
-    if warm_up_global.upgrade().is_some() {
+    if !warm_up_global.is_cleared() {
         return Err(String::from(
             "spare engine warm-up Realm outlived its collection",
         ));
@@ -654,18 +649,24 @@ mod tests {
                 const SURFACE: &str = "Reflect.ownKeys(globalThis).map(String).join() + \
                     '|' + Reflect.ownKeys(Object.prototype).map(String).join()";
                 let mut fresh = trust_js::Engine::new();
-                let expected = eval_value(&mut fresh, SURFACE, "fresh surface")
-                    .map(|value| value_string(&mut fresh, &value))
+                let expected = fresh
+                    .scope(|cx| {
+                        eval_value(cx, SURFACE, "fresh surface")
+                            .map(|value| value_string(cx, &value))
+                    })
                     .unwrap();
 
                 // `warm` itself proves that its Realm was collected.
                 let mut engine = trust_js::Engine::new();
                 warm(&mut engine, platform_prelude_snapshot().unwrap()).unwrap();
-                assert!(engine.ctx().host_mut::<HostState>().is_none());
+                assert!(engine.host_mut::<HostState>().is_none());
                 assert!(!engine.has_pending_jobs());
                 assert!(engine.take_unhandled_rejections().is_empty());
-                let surface = eval_value(&mut engine, SURFACE, "warm surface")
-                    .map(|value| value_string(&mut engine, &value))
+                let surface = engine
+                    .scope(|cx| {
+                        eval_value(cx, SURFACE, "warm surface")
+                            .map(|value| value_string(cx, &value))
+                    })
                     .unwrap();
                 assert_eq!(surface, expected);
             })

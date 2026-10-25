@@ -128,7 +128,7 @@ impl Agent {
     }
 }
 
-fn owner(ctx: &mut Ctx) -> String {
+fn owner<'s>(ctx: &mut Ctx<'s>) -> String {
     let context = ctx.host_job_context();
     let cookies = cookie_context_for_id(ctx, context);
     let (_, origin, _) = blob_environment(ctx);
@@ -154,7 +154,7 @@ pub(super) fn public_urls(urls: &[url::Url], kind: &str) -> Vec<String> {
 
 /// Fetch's service-worker response path can forward the internal response,
 /// but only from a capability owned by this worker's storage partition.
-pub(super) fn for_service_worker(ctx: &mut Ctx, token: &str) -> Option<Arc<Payload>> {
+pub(super) fn for_service_worker<'s>(ctx: &mut Ctx<'s>, token: &str) -> Option<Arc<Payload>> {
     let key = owner(ctx);
     let state = ctx.host::<HostState>()?;
     profile(&state.storage)
@@ -167,8 +167,8 @@ pub(super) fn for_service_worker(ctx: &mut Ctx, token: &str) -> Option<Arc<Paylo
         .filter(|payload| payload.owner == key)
 }
 
-pub(super) fn install(
-    ctx: &mut Ctx,
+pub(super) fn install<'s>(
+    ctx: &mut Ctx<'s>,
     mut internal: crate::http::InternalResponse,
     public_headers: Vec<(String, String)>,
     stream: Option<crate::http::BodyStream>,
@@ -272,7 +272,11 @@ pub(super) fn install(
     Some(state.private_responses.retain(payload))
 }
 
-pub(super) fn operation(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(super) fn operation<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let op = host_arg_string(ctx, args, 0);
     if op.starts_with("cache-") {
         return cache::operation(ctx, &op, args);
@@ -308,12 +312,14 @@ pub(super) fn operation(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
     }
     if op == "retain" {
         return Ok(match payload {
-            Some(payload) => Value::from_string(
-                ctx.host_mut::<HostState>()
+            Some(payload) => {
+                let token = ctx
+                    .host_mut::<HostState>()
                     .unwrap()
                     .private_responses
-                    .retain(payload),
-            ),
+                    .retain(payload);
+                ctx.string(token)
+            }
             None => Value::Null,
         });
     }
@@ -327,6 +333,7 @@ pub(super) fn operation(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
         return Ok(promise);
     };
     let context = ctx.host_job_context();
+    let resolve_handle = super::hold(ctx, &resolve);
     let work = ctx.host_mut::<HostState>().and_then(|state| {
         let events = state.task_events.clone()?;
         let network = state.network.as_mut()?;
@@ -336,7 +343,7 @@ pub(super) fn operation(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
             id,
             TrustJsPendingFetch {
                 context,
-                resolve: resolve.clone(),
+                resolve: resolve_handle,
                 native_lease: None,
                 keepalive: false,
                 task: None,

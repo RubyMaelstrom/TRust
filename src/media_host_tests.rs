@@ -459,11 +459,11 @@ fn a_muted_traversable_silences_its_players_and_audio_contexts_unobserved() {
     .unwrap();
     run_until(&runtime, &mut engine, &mut tasks, "v.readyState >= 1");
     let mutes = |engine: &mut trust_js::Engine| {
-        let state = engine.ctx().host_mut::<HostState>().unwrap();
+        let state = engine.host_mut::<HostState>().unwrap();
         (state.media.player_mutes(), state.webaudio.context_mutes())
     };
     let set_muted = |engine: &mut trust_js::Engine, muted: bool| {
-        let state = engine.ctx().host_mut::<HostState>().unwrap();
+        let state = engine.host_mut::<HostState>().unwrap();
         let traversable = state.traversables.selected;
         state.set_traversable_muted(traversable, muted);
     };
@@ -517,7 +517,7 @@ fn a_video_paints_its_frames() {
         "(r => [r.width, r.height].join())(v.getBoundingClientRect())",
     );
     assert_eq!(rect, "96,64");
-    let dom = engine.ctx().host_mut::<HostState>().unwrap().dom.clone();
+    let dom = engine.host_mut::<HostState>().unwrap().dom.clone();
     let base_url = url::Url::parse(&base).unwrap();
     let frame = crate::render::headless::render_dom_with_resources(
         &dom.borrow(),
@@ -568,7 +568,7 @@ fn a_video_keeps_painting_after_a_same_document_url_change() {
     )
     .unwrap();
     run_until(&runtime, &mut engine, &mut tasks, "log.includes('ready')");
-    let dom = engine.ctx().host_mut::<HostState>().unwrap().dom.clone();
+    let dom = engine.host_mut::<HostState>().unwrap().dom.clone();
     let base_url = url::Url::parse(&base).unwrap();
     let paint = |engine: &mut trust_js::Engine| {
         let rect = string_value(
@@ -646,7 +646,7 @@ fn native_controls_draw_and_operate_the_element() {
     )
     .unwrap();
     run_until(&runtime, &mut engine, &mut tasks, "log.includes('ready')");
-    let dom = engine.ctx().host_mut::<HostState>().unwrap().dom.clone();
+    let dom = engine.host_mut::<HostState>().unwrap().dom.clone();
     let video = {
         let dom = dom.borrow();
         dom.descendants(crate::dom::DOCUMENT)

@@ -1286,7 +1286,11 @@ fn packet(result: Result<serde_json::Value, Error>) -> serde_json::Value {
     }
 }
 
-pub(super) fn operation(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(super) fn operation<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let op = host_arg_string(ctx, args, 0);
     if op == "fetchChunk" {
         return fetch::chunk(ctx, args);
@@ -1298,13 +1302,13 @@ pub(super) fn operation(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
     let input = host_arg_string(ctx, args, 2);
     let input: serde_json::Value = serde_json::from_str(&input).unwrap_or_default();
     let result = operation_inner(ctx, &op, context, input);
-    Ok(Value::from_string(packet(result).to_string()))
+    Ok(ctx.string(packet(result).to_string()))
 }
 
 /// HTML #initialise-the-document-object's initial-about:blank exception:
 /// replace the Document while retaining its Window, ESO and client id.
-fn initial_navigation(
-    ctx: &mut Ctx,
+fn initial_navigation<'s>(
+    ctx: &mut Ctx<'s>,
     context: u64,
     input: &serde_json::Value,
 ) -> Result<serde_json::Value, Error> {
@@ -1491,8 +1495,8 @@ fn initial_navigation(
     Ok(json!({"updated":true,"controller":controller,"ready":ready}))
 }
 
-fn operation_inner(
-    ctx: &mut Ctx,
+fn operation_inner<'s>(
+    ctx: &mut Ctx<'s>,
     op: &str,
     context: u64,
     input: serde_json::Value,
@@ -2137,7 +2141,7 @@ fn operation_inner(
     Ok(json!(id))
 }
 
-fn import(ctx: &mut Ctx, target: &str) -> Result<serde_json::Value, Error> {
+fn import<'s>(ctx: &mut Ctx<'s>, target: &str) -> Result<serde_json::Value, Error> {
     let scope = ctx
         .host::<HostState>()
         .and_then(|state| state.service_scope.clone())
@@ -2218,14 +2222,11 @@ pub(super) fn dispatch_notice(
     notice: Notice,
 ) -> Result<(), String> {
     if matches!(&notice, Notice::FocusWindow) {
-        return run_in_context_realm(engine, context, "service-worker window focus", |engine| {
-            host_call_trust_interruptible(
-                engine.ctx(),
-                "serviceWindowAction",
-                &[Value::from_string("focus".into())],
-            )
-            .map(|_| ())
-            .map_err(|_| "Window focus failed".into())
+        return run_in_context_realm(engine, context, "service-worker window focus", |cx| {
+            let action = cx.str("focus");
+            host_call_trust_interruptible(cx, "serviceWindowAction", &[action])
+                .map(|_| ())
+                .map_err(|_| "Window focus failed".into())
         });
     }
     if let Notice::WindowAction { action } = &notice {
@@ -2236,37 +2237,22 @@ pub(super) fn dispatch_notice(
             return Ok(());
         };
         let node = engine
-            .ctx()
             .host::<HostState>()
             .and_then(|s| s.window_cookie_contexts.get(&context))
             .map(|(node, _, _)| *node);
-        let agent = &mut engine
-            .ctx()
-            .host_mut::<HostState>()
-            .unwrap()
-            .service_workers;
+        let agent = &mut engine.host_mut::<HostState>().unwrap().service_workers;
         if let Some(node) = node {
             agent.navigation_replies.insert(node, action.reply.clone());
         } else {
             agent.top_navigation_reply = Some(action.reply.clone());
         }
-        let result = run_in_context_realm(
-            engine,
-            context,
-            "service-worker client navigation",
-            |engine| {
-                host_call_trust_interruptible(
-                    engine.ctx(),
-                    "serviceWindowAction",
-                    &[
-                        Value::from_string("navigate".into()),
-                        Value::from_string(url.to_string()),
-                    ],
-                )
-                .map(|_| ())
-                .map_err(|_| "Window navigation failed".into())
-            },
-        );
+        let result =
+            run_in_context_realm(engine, context, "service-worker client navigation", |cx| {
+                let args = [cx.str("navigate"), cx.string(url.to_string())];
+                host_call_trust_interruptible(cx, "serviceWindowAction", &args)
+                    .map(|_| ())
+                    .map_err(|_| "Window navigation failed".into())
+            });
         if result.is_err() {
             action
                 .reply
@@ -2276,20 +2262,15 @@ pub(super) fn dispatch_notice(
     }
     if let Notice::Inspect { inspection } = notice {
         let mut window = None;
-        let result = run_in_context_realm(
-            engine,
-            context,
-            "service-worker client inspection",
-            |engine| {
-                if let Ok(value) =
-                    host_call_trust_interruptible(engine.ctx(), "serviceClientInfo", &[])
+        let result =
+            run_in_context_realm(engine, context, "service-worker client inspection", |cx| {
+                if let Ok(value) = host_call_trust_interruptible(cx, "serviceClientInfo", &[])
                     && let Some(text) = value.as_text()
                 {
                     window = serde_json::from_str(&text).ok();
                 }
                 Ok(())
-            },
-        );
+            });
         inspection.complete(window);
         return result;
     }
@@ -2298,7 +2279,6 @@ pub(super) fn dispatch_notice(
         return Ok(());
     }
     let Some(endpoint) = engine
-        .ctx()
         .host_mut::<HostState>()
         .and_then(|s| s.service_workers.endpoints.get_mut(&context))
     else {
@@ -2320,7 +2300,9 @@ pub(super) fn dispatch_notice(
         engine,
         context,
         "serviceNotice",
-        &[Value::from_string(serde_json::to_string(&notice).unwrap())],
+        &[TrustValue::from_text(
+            serde_json::to_string(&notice).unwrap(),
+        )],
     )
 }
 
@@ -2331,7 +2313,6 @@ pub(super) fn dispatch_result(
     result: Result<jobs::Output, Error>,
 ) -> Result<(), String> {
     let Some(endpoint) = engine
-        .ctx()
         .host_mut::<HostState>()
         .and_then(|s| s.service_workers.endpoints.get_mut(&context))
     else {
@@ -2348,8 +2329,8 @@ pub(super) fn dispatch_result(
         context,
         "serviceResult",
         &[
-            Value::Num(id as f64),
-            Value::from_string(result.to_string()),
+            TrustValue::Num(id as f64),
+            TrustValue::from_text(result.to_string()),
         ],
     )
 }
@@ -2358,18 +2339,19 @@ pub(super) fn deliver(
     engine: &mut trust_js::Engine,
     context: u64,
     method: &str,
-    args: &[Value],
+    args: &[TrustValue],
 ) -> Result<(), String> {
-    run_in_context_realm(engine, context, "service worker", |engine| {
-        match host_call_trust_interruptible(engine.ctx(), method, args) {
+    run_in_context_realm(engine, context, "service worker", |cx| {
+        let args = TrustValue::values(cx, args);
+        match host_call_trust_interruptible(cx, method, &args) {
             Ok(_) => Ok(()),
-            Err(error) => host_task_failure(engine.ctx(), error, "service worker"),
+            Err(error) => host_task_failure(cx, error, "service worker"),
         }
     })
 }
 
 #[cfg(test)]
-pub(super) fn stop_idle_agents_for_test(ctx: &mut Ctx) -> usize {
+pub(super) fn stop_idle_agents_for_test<'s>(ctx: &mut Ctx<'s>) -> usize {
     let Some(state) = ctx.host::<HostState>() else {
         return 0;
     };
@@ -2392,26 +2374,20 @@ mod tests {
     fn port(
         engine: &mut trust_js::Engine,
         op: &str,
-        id: Value,
+        id: TrustValue,
         payload: &str,
     ) -> serde_json::Value {
-        let value = message_port_host::call(
-            engine.ctx(),
-            Value::Undefined,
-            &[
-                Value::from_string(op.to_string()),
-                id,
-                Value::from_string(payload.to_string()),
-            ],
-        )
-        .unwrap_or_else(|_| panic!("MessagePort {op} failed"));
-        serde_json::from_str(&value.as_text().unwrap()).unwrap()
+        engine.scope(|cx| {
+            let args = [cx.str(op), id.value(cx), cx.str(payload)];
+            let value = message_port_host::call(cx, Value::Undefined, &args)
+                .unwrap_or_else(|_| panic!("MessagePort {op} failed"));
+            serde_json::from_str(&value.as_text().unwrap()).unwrap()
+        })
     }
 
     fn packet_engine() -> trust_js::Engine {
         let mut engine = trust_js::Engine::new();
         engine
-            .ctx()
             .op_state()
             .put_retained_memory_with_external_memory(HostState::new(
                 Rc::new(RefCell::new(Dom::new())),
@@ -2421,12 +2397,12 @@ mod tests {
     }
 
     fn transferred_port(engine: &mut trust_js::Engine) -> (u64, String) {
-        let pair = port(engine, "create", Value::Num(0.), "");
+        let pair = port(engine, "create", TrustValue::Num(0.), "");
         let peer = pair[0].as_u64().unwrap();
         let token = port(
             engine,
             "transfer",
-            Value::Num(pair[1].as_u64().unwrap() as f64),
+            TrustValue::Num(pair[1].as_u64().unwrap() as f64),
             "",
         );
         (peer, token.as_str().unwrap().to_string())
@@ -2436,7 +2412,6 @@ mod tests {
     fn service_worker_message_packets_release_on_error_and_unpolled_task_drop() {
         let mut engine = packet_engine();
         let ports = engine
-            .ctx()
             .host::<HostState>()
             .unwrap()
             .message_ports
@@ -2447,20 +2422,21 @@ mod tests {
         // A removed receiver fails before the postWorker match arm. Its
         // already-detached transfer must still be discarded.
         assert!(
-            operation_inner(
-                engine.ctx(),
-                "postWorker",
-                999,
-                serde_json::json!({"worker":1,"packet":text})
-            )
-            .is_err()
+            engine
+                .scope(|cx| operation_inner(
+                    cx,
+                    "postWorker",
+                    999,
+                    serde_json::json!({"worker":1,"packet":text})
+                ))
+                .is_err()
         );
         assert_eq!(
-            port(&mut engine, "peer", Value::Num(peer as f64), ""),
+            port(&mut engine, "peer", TrustValue::Num(peer as f64), ""),
             serde_json::Value::Null
         );
         assert_eq!(
-            port(&mut engine, "receive", Value::from_string(key), ""),
+            port(&mut engine, "receive", TrustValue::from_text(key), ""),
             false
         );
 
@@ -2475,19 +2451,19 @@ mod tests {
         };
         drop(unpolled);
         assert_eq!(
-            port(&mut engine, "receive", Value::from_string(key), ""),
+            port(&mut engine, "receive", TrustValue::from_text(key), ""),
             false
         );
 
         let (peer, key) = transferred_port(&mut engine);
         let packet = MessagePacket::new(ports, serde_json::json!({"ports":[key]}).to_string());
-        let received = port(&mut engine, "receive", Value::from_string(key), "");
+        let received = port(&mut engine, "receive", TrustValue::from_text(key), "");
         drop(packet);
         assert_eq!(
             port(
                 &mut engine,
                 "peer",
-                Value::Num(received.as_u64().unwrap() as f64),
+                TrustValue::Num(received.as_u64().unwrap() as f64),
                 ""
             ),
             peer
@@ -2498,7 +2474,6 @@ mod tests {
     fn service_worker_message_cleanup_reaches_the_end_of_nested_queued_transfers() {
         let mut engine = packet_engine();
         let ports = engine
-            .ctx()
             .host::<HostState>()
             .unwrap()
             .message_ports
@@ -2515,10 +2490,20 @@ mod tests {
         let mut text = serde_json::json!({"canvases":[canvas]}).to_string();
         let mut innermost = String::new();
         for index in 0..1100 {
-            let pair = port(&mut engine, "create", Value::Num(0.), "");
+            let pair = port(&mut engine, "create", TrustValue::Num(0.), "");
             let destination = pair[1].as_u64().unwrap();
-            port(&mut engine, "send", Value::Num(destination as f64), &text);
-            let key = port(&mut engine, "transfer", Value::Num(destination as f64), "");
+            port(
+                &mut engine,
+                "send",
+                TrustValue::Num(destination as f64),
+                &text,
+            );
+            let key = port(
+                &mut engine,
+                "transfer",
+                TrustValue::Num(destination as f64),
+                "",
+            );
             if index == 0 {
                 innermost = key.as_str().unwrap().to_string();
             }
@@ -2527,7 +2512,7 @@ mod tests {
         drop(MessagePacket::new(ports, text));
         assert!(crate::canvas_offscreen::receive(&canvas).is_none());
         assert_eq!(
-            port(&mut engine, "receive", Value::from_string(innermost), ""),
+            port(&mut engine, "receive", TrustValue::from_text(innermost), ""),
             false
         );
     }
@@ -2537,22 +2522,17 @@ mod tests {
         let mut engine = packet_engine();
         let url = url::Url::parse(DEFAULT_URL).unwrap();
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
-        engine
-            .ctx()
-            .host_mut::<HostState>()
-            .unwrap()
-            .enable_network(
-                url.clone(),
-                tokio::runtime::Handle::current(),
-                Arc::default(),
-                sender,
-            );
-        operation_inner(engine.ctx(), "init", 0, serde_json::json!({
+        engine.host_mut::<HostState>().unwrap().enable_network(
+            url.clone(),
+            tokio::runtime::Handle::current(),
+            Arc::default(),
+            sender,
+        );
+        engine.scope(|cx| operation_inner(cx, "init", 0, serde_json::json!({
             "url":url.as_str(),"key":url.origin().ascii_serialization(),"secure":true,"kind":"window"
-        })).unwrap();
+        }))).unwrap();
         let (profile, client) = {
             let endpoint = &engine
-                .ctx()
                 .host::<HostState>()
                 .unwrap()
                 .service_workers
@@ -2582,32 +2562,34 @@ mod tests {
                 source: worker.info(),
             });
             assert!(
-                operation_inner(engine.ctx(), "takeMessage", 0, serde_json::Value::Null)
+                engine
+                    .scope(|cx| operation_inner(cx, "takeMessage", 0, serde_json::Value::Null))
                     .unwrap()
                     .is_object()
             );
             // A decode can claim its first holder and then throw. Finishing
             // or destroying the recipient must release only the remainder.
-            let received = port(&mut engine, "receive", Value::from_string(claimed), "");
+            let received = port(&mut engine, "receive", TrustValue::from_text(claimed), "");
             if detach {
                 engine
-                    .ctx()
                     .host_mut::<HostState>()
                     .unwrap()
                     .service_workers
                     .remove(0);
             } else {
-                operation_inner(engine.ctx(), "finishMessage", 0, serde_json::Value::Null).unwrap();
+                engine
+                    .scope(|cx| operation_inner(cx, "finishMessage", 0, serde_json::Value::Null))
+                    .unwrap();
             }
             assert_eq!(
-                port(&mut engine, "receive", Value::from_string(unclaimed), ""),
+                port(&mut engine, "receive", TrustValue::from_text(unclaimed), ""),
                 false
             );
             assert_eq!(
                 port(
                     &mut engine,
                     "peer",
-                    Value::Num(received.as_u64().unwrap() as f64),
+                    TrustValue::Num(received.as_u64().unwrap() as f64),
                     ""
                 ),
                 peer
@@ -2701,35 +2683,34 @@ mod tests {
             );
             let mut engine = trust_js::Engine::new();
             engine
-                .ctx()
                 .op_state()
                 .put_retained_memory_with_external_memory(state);
             engine
         };
         let mut first = make(url);
-        let pair = port(&mut first, "create", Value::Num(0.), "");
+        let pair = port(&mut first, "create", TrustValue::Num(0.), "");
         let receiver = pair[1].as_u64().unwrap();
         port(
             &mut first,
             "send",
-            Value::Num(receiver as f64),
+            TrustValue::Num(receiver as f64),
             "queued before container initialization",
         );
         let mut second = make(url::Url::parse("https://secure.test/page").unwrap());
-        operation_inner(second.ctx(), "init", 0, serde_json::json!({
+        second.scope(|cx| operation_inner(cx, "init", 0, serde_json::json!({
             "url":"https://secure.test/page", "key":"https://secure.test", "secure":true, "kind":"window"
-        })).unwrap();
-        let token = port(&mut first, "transfer", Value::Num(receiver as f64), "");
+        }))).unwrap();
+        let token = port(&mut first, "transfer", TrustValue::Num(receiver as f64), "");
         let received = port(
             &mut second,
             "receive",
-            Value::from_string(token.as_str().unwrap().to_string()),
+            TrustValue::from_text(token.as_str().unwrap()),
             "",
         );
         assert_eq!(received.as_u64(), Some(receiver));
-        port(&mut second, "start", Value::Num(receiver as f64), "");
+        port(&mut second, "start", TrustValue::Num(receiver as f64), "");
         assert_eq!(
-            port(&mut second, "take", Value::Num(0.), ""),
+            port(&mut second, "take", TrustValue::Num(0.), ""),
             serde_json::json!([receiver, "queued before container initialization"])
         );
     }

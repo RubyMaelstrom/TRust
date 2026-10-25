@@ -19,14 +19,15 @@
 //! other value is the `externref` payload of a fresh exception of the agent's JavaScript
 //! exception tag. Host interruptions are no JavaScript exceptions and stay uncatchable traps.
 
-use super::HostState;
+use super::{HostState, held, hold, hold_weakly};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use trust_js::embed::{
-    ArrayBufferBytes, Ctx, HostGc, HostGcVisitor, HostRetainedMemoryVisitor,
+    ArrayBufferBytes, Ctx, Handle, HostGcVisitor, HostRetainedMemoryVisitor,
     RetainedExternalAllocation, RetainedExternalMemory, RetainedManagedAllocation, Value,
+    ValueKind, ValueList, WeakHandle,
 };
 
 static WASM_CALL_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -58,7 +59,8 @@ macro_rules! wasm_trace {
 #[derive(Clone)]
 pub(super) struct PageWasm {
     state: Rc<RefCell<Option<WasmState>>>,
-    buffers: Rc<RefCell<Vec<Option<Value>>>>,
+    /// Each memory's current fixed-length `Memory.buffer`, kept until it is detached.
+    buffers: Rc<RefCell<Vec<Option<Handle>>>>,
 }
 
 impl PageWasm {
@@ -97,11 +99,8 @@ impl PageWasm {
                         state
                             .function_cache
                             .capacity()
-                            .saturating_mul(std::mem::size_of::<(usize, Value)>()),
+                            .saturating_mul(std::mem::size_of::<(usize, WeakHandle)>()),
                     );
-                    for value in state.function_cache.values() {
-                        visitor.value(value);
-                    }
                     let objects = &state.exceptions;
                     state_bytes = state_bytes
                         .saturating_add(
@@ -120,21 +119,14 @@ impl PageWasm {
                             objects
                                 .tag_cache
                                 .capacity()
-                                .saturating_mul(std::mem::size_of::<(usize, Value)>()),
+                                .saturating_mul(std::mem::size_of::<(usize, WeakHandle)>()),
                         )
                         .saturating_add(
                             objects
                                 .exception_cache
                                 .capacity()
-                                .saturating_mul(std::mem::size_of::<(u32, Value)>()),
+                                .saturating_mul(std::mem::size_of::<(u32, WeakHandle)>()),
                         );
-                    for value in objects
-                        .tag_cache
-                        .values()
-                        .chain(objects.exception_cache.values())
-                    {
-                        visitor.value(value);
-                    }
                     state_bytes =
                         state_bytes
                             .saturating_add(
@@ -217,11 +209,8 @@ impl PageWasm {
                 buffers_bytes = buffers_bytes.saturating_add(
                     buffers
                         .capacity()
-                        .saturating_mul(std::mem::size_of::<Option<Value>>()),
+                        .saturating_mul(std::mem::size_of::<Option<Handle>>()),
                 );
-                for value in buffers.iter().flatten() {
-                    visitor.value(value);
-                }
             }
             Err(_) => visitor.unavailable(),
         }
@@ -233,12 +222,24 @@ impl PageWasm {
     }
 }
 
-impl HostGc for PageWasm {
-    fn trace_gc(&self, visitor: &mut dyn HostGcVisitor) {
+impl PageWasm {
+    /// The JS API object caches' part of the host's graph (`HostState::trace_gc`).
+    pub(super) fn trace_gc(&self, visitor: &mut dyn HostGcVisitor) {
         let Ok(state) = self.state.try_borrow() else {
-            // Wasm may be suspended in an imported JS callback. Its operand stack and
-            // in-flight instantiation are not represented by an idle Store snapshot.
-            // Leave cache handles undiscounted (strong roots) for this collection.
+            // Wasm may be suspended in an imported JS callback, its store lent to the Caller:
+            // its operand stack and in-flight instantiation are not represented by an idle
+            // Store snapshot. Every cached object is a root of this collection.
+            let _ = with_active_state(|state| {
+                let objects = &state.exceptions;
+                for wrapper in state
+                    .function_cache
+                    .values()
+                    .chain(objects.tag_cache.values())
+                    .chain(objects.exception_cache.values())
+                {
+                    visitor.root(wrapper);
+                }
+            });
             return;
         };
         let Some(state) = state.as_ref() else { return };
@@ -277,13 +278,12 @@ impl HostGc for PageWasm {
             targets.sort_unstable();
             targets.dedup();
         }
-        let mut representatives: HashMap<usize, &Value> = HashMap::new();
+        let mut representatives: HashMap<usize, &WeakHandle> = HashMap::new();
         for (&id, wrapper) in &state.function_cache {
             let Some(&function) = state.funcs.get(id) else {
                 continue;
             };
             let group = groups.group(function);
-            visitor.internal(wrapper);
             if let Some(first) = representatives.get(&group) {
                 // A linear-size star, not a quadratic all-to-all export graph.
                 visitor.edge(first, wrapper);
@@ -312,18 +312,23 @@ impl HostGc for PageWasm {
         }
     }
 
-    fn sweep_gc(&mut self, is_live: &dyn Fn(&Value) -> bool) {
+    /// Forget the cached objects a collection found dead (`HostState::sweep_gc_with_native`).
+    /// A collection that found the store lent to a Caller kept every cached object.
+    pub(super) fn sweep_gc(&mut self) {
         let Ok(mut state) = self.state.try_borrow_mut() else {
             return;
         };
         if let Some(state) = state.as_mut() {
-            state.function_cache.retain(|_, value| is_live(value));
-            state.exceptions.tag_cache.retain(|_, value| is_live(value));
+            state.function_cache.retain(|_, value| !value.is_cleared());
+            state
+                .exceptions
+                .tag_cache
+                .retain(|_, value| !value.is_cleared());
             // A collected Exception object releases its exception, which the store frees once
             // Wasm no longer references it either.
             let store = &state.store;
             state.exceptions.exception_cache.retain(|&address, value| {
-                let live = is_live(value);
+                let live = !value.is_cleared();
                 if !live && let Some(exn) = wasmi::ExnRef::from_addr(store, address) {
                     exn.release(store);
                 }
@@ -343,14 +348,8 @@ impl HostGc for PageWasm {
 /// fields reach another cached exception keeps that object alive as well.
 fn trace_exception_objects(state: &WasmState, visitor: &mut dyn HostGcVisitor) {
     let objects = &state.exceptions;
-    for wrapper in objects.tag_cache.values() {
-        visitor.internal(wrapper);
-    }
     if objects.exception_cache.is_empty() {
         return;
-    }
-    for wrapper in objects.exception_cache.values() {
-        visitor.internal(wrapper);
     }
     let store = &state.store;
     let mut reachable = HashSet::new();
@@ -392,8 +391,8 @@ fn trace_exception_objects(state: &WasmState, visitor: &mut dyn HostGcVisitor) {
 fn visit_cached_function_targets(
     start: usize,
     links: &HashMap<usize, Vec<usize>>,
-    representatives: &HashMap<usize, &Value>,
-    visit: &mut impl FnMut(&Value),
+    representatives: &HashMap<usize, &WeakHandle>,
+    visit: &mut impl FnMut(&WeakHandle),
 ) {
     let mut pending = vec![start];
     let mut seen = HashSet::new();
@@ -501,7 +500,7 @@ struct WasmState {
     func_ids: HashMap<wasmi::Func, usize>,
     /// Strong handles accounted as internal cache edges by HostGc, not permanent roots.
     /// Native Store addresses themselves remain agent-lifetime allocations for now.
-    function_cache: HashMap<usize, Value>,
+    function_cache: HashMap<usize, WeakHandle>,
     globals: Vec<wasmi::Global>,
     global_ids: HashMap<wasmi::Global, usize>,
     memories: Vec<MemorySlot>,
@@ -523,11 +522,11 @@ struct ExceptionObjects {
     /// The Tag object cache by tag handle. Its handles are internal edges without roots: a
     /// Tag object that JavaScript no longer references cannot be observed again, so a later
     /// lookup may create a new one.
-    tag_cache: HashMap<usize, Value>,
+    tag_cache: HashMap<usize, WeakHandle>,
     /// The Exception object cache by exception address. Each entry holds its exception once
     /// (`wasmi::ExnRef::hold`), and HostGc keeps the entry while Wasm can still reach the
     /// exception, so that throwing it out again yields the same object.
-    exception_cache: HashMap<u32, Value>,
+    exception_cache: HashMap<u32, WeakHandle>,
 }
 
 impl ExceptionObjects {
@@ -654,72 +653,94 @@ fn share_memory(
     storage
 }
 
-fn page_wasm(ctx: &mut Ctx) -> Option<PageWasm> {
+fn page_wasm<'s>(ctx: &mut Ctx<'s>) -> Option<PageWasm> {
     ctx.host_mut::<HostState>().map(|state| state.wasm.clone())
 }
 
-pub(super) fn host_function_cache(
-    ctx: &mut Ctx,
-    _this: Value,
-    args: &[Value],
-) -> Result<Value, Value> {
+pub(super) fn host_function_cache<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let Some(page) = page_wasm(ctx) else {
         return Ok(Value::Undefined);
     };
     let Some(id) = arg_id(args, 0) else {
         return Ok(Value::Undefined);
     };
+    let candidate = args
+        .get(1)
+        .filter(|value| value.is_callable())
+        .map(|wrapper| (hold_weakly(ctx, wrapper), *wrapper));
     let cache = |state: &mut WasmState| {
         if id >= state.funcs.len() {
-            return Value::Undefined;
+            return Cached::Missing;
         }
-        if let Some(wrapper) = state.function_cache.get(&id) {
-            return wrapper.clone();
+        if let Some(wrapper) = state
+            .function_cache
+            .get(&id)
+            .filter(|wrapper| !wrapper.is_cleared())
+        {
+            return Cached::Existing(wrapper.clone());
         }
-        if let Some(wrapper) = args.get(1).filter(|value| value.is_callable()) {
-            state.function_cache.insert(id, wrapper.clone());
-            return wrapper.clone();
+        match &candidate {
+            Some((handle, _)) => {
+                state.function_cache.insert(id, handle.clone());
+                Cached::Inserted
+            }
+            None => Cached::Missing,
         }
-        Value::Undefined
     };
-    let result = match page.state.try_borrow_mut() {
-        Ok(mut state) => state.as_mut().map(cache).unwrap_or(Value::Undefined),
-        Err(_) => with_active_state(cache).unwrap_or(Value::Undefined),
+    let cached = match page.state.try_borrow_mut() {
+        Ok(mut state) => state.as_mut().map(cache),
+        Err(_) => with_active_state(cache),
     };
-    Ok(result)
+    Ok(cached_value(
+        ctx,
+        cached,
+        candidate.map(|(_, wrapper)| wrapper),
+    ))
 }
 
-fn arg_id(args: &[Value], index: usize) -> Option<usize> {
+fn arg_id<'s>(args: &[Value<'s>], index: usize) -> Option<usize> {
     let number = args.get(index)?.as_num_opt()?;
     (number >= 0.0 && number.is_finite() && number.fract() == 0.0).then_some(number as usize)
 }
 
-fn arg_string(ctx: &mut Ctx, args: &[Value], index: usize) -> Result<String, Value> {
+fn arg_string<'s>(
+    ctx: &mut Ctx<'s>,
+    args: &[Value<'s>],
+    index: usize,
+) -> Result<String, Value<'s>> {
     ctx.coerce_string(args.get(index).unwrap_or(&Value::Undefined))
         .map(|value| value.to_string())
 }
 
-fn array_get(ctx: &mut Ctx, value: &Value, index: usize) -> Result<Value, Value> {
+fn array_get<'s>(
+    ctx: &mut Ctx<'s>,
+    value: &Value<'s>,
+    index: usize,
+) -> Result<Value<'s>, Value<'s>> {
     ctx.member_get(value, &index.to_string())
 }
 
-fn envelope(ctx: &Ctx, code: impl Into<String>, value: Value) -> Value {
-    ctx.make_array(vec![Value::from_string(code.into()), value])
+fn envelope<'s>(ctx: &Ctx<'s>, code: impl Into<String>, value: Value<'s>) -> Value<'s> {
+    ctx.make_array(vec![ctx.string(code.into()), value])
 }
 
-fn wasm_ok(ctx: &Ctx, value: Value) -> Value {
+fn wasm_ok<'s>(ctx: &Ctx<'s>, value: Value<'s>) -> Value<'s> {
     ctx.make_array(vec![Value::Num(0.0), value])
 }
 
-fn wasm_err(ctx: &Ctx, kind: &str, message: impl Into<String>) -> Value {
-    envelope(ctx, kind, Value::from_string(message.into()))
+fn wasm_err<'s>(ctx: &Ctx<'s>, kind: &str, message: impl Into<String>) -> Value<'s> {
+    envelope(ctx, kind, ctx.string(message.into()))
 }
 
-fn type_error(ctx: &Ctx, message: impl Into<String>) -> Value {
+fn type_error<'s>(ctx: &Ctx<'s>, message: impl Into<String>) -> Value<'s> {
     ctx.make_error("TypeError", message)
 }
 
-fn range_error(ctx: &Ctx, message: impl Into<String>) -> Value {
+fn range_error<'s>(ctx: &Ctx<'s>, message: impl Into<String>) -> Value<'s> {
     ctx.make_error("RangeError", message)
 }
 
@@ -764,11 +785,11 @@ fn to_i32(number: f64) -> i32 {
     number.trunc().rem_euclid(4_294_967_296.0) as u32 as i32
 }
 
-fn js_to_numeric_wasm(
-    ctx: &mut Ctx,
-    value: &Value,
+fn js_to_numeric_wasm<'s>(
+    ctx: &mut Ctx<'s>,
+    value: &Value<'s>,
     ty: wasmi::ValType,
-) -> Result<wasmi::Val, Value> {
+) -> Result<wasmi::Val, Value<'s>> {
     match ty {
         wasmi::ValType::I32 => Ok(wasmi::Val::I32(to_i32(ctx.coerce_number(value)?))),
         wasmi::ValType::I64 => Ok(wasmi::Val::I64(ctx.coerce_bigint_i64(value)?)),
@@ -783,10 +804,10 @@ fn js_to_numeric_wasm(
     }
 }
 
-fn numeric_wasm_to_js(ctx: &Ctx, value: &wasmi::Val) -> Result<Value, Value> {
+fn numeric_wasm_to_js<'s>(ctx: &Ctx<'s>, value: &wasmi::Val) -> Result<Value<'s>, Value<'s>> {
     match value {
         wasmi::Val::I32(value) => Ok(Value::Num(f64::from(*value))),
-        wasmi::Val::I64(value) => Ok(Value::bigint_from_i64(*value)),
+        wasmi::Val::I64(value) => Ok(ctx.bigint_from_i64(*value)),
         wasmi::Val::F32(value) => Ok(Value::Num(f64::from(value.to_float()))),
         wasmi::Val::F64(value) => Ok(Value::Num(value.to_float())),
         _ => Err(type_error(
@@ -798,14 +819,18 @@ fn numeric_wasm_to_js(ctx: &Ctx, value: &wasmi::Val) -> Result<Value, Value> {
 
 /// Call one of the active Realm's private JS-side bridge operations. The WebAssembly bootstrap
 /// installs them on the Realm's platform control object; none is reachable from author code.
-fn call_bridge(ctx: &mut Ctx, name: &str, args: &[Value]) -> Result<Value, Value> {
+fn call_bridge<'s>(
+    ctx: &mut Ctx<'s>,
+    name: &str,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let control = super::platform_control(ctx)?;
     let bridge = ctx.member_get(&control, "wasm")?;
     let function = ctx.member_get(&bridge, name)?;
     ctx.invoke(function, Value::Undefined, args)
 }
 
-fn extern_intern(ctx: &mut Ctx, value: &Value) -> Result<usize, Value> {
+fn extern_intern<'s>(ctx: &mut Ctx<'s>, value: &Value<'s>) -> Result<usize, Value<'s>> {
     call_bridge(ctx, "externIntern", std::slice::from_ref(value)).map(|id| {
         id.as_num_opt()
             .filter(|number| *number >= 0.0)
@@ -813,11 +838,11 @@ fn extern_intern(ctx: &mut Ctx, value: &Value) -> Result<usize, Value> {
     })
 }
 
-fn extern_get(ctx: &mut Ctx, id: usize) -> Result<Value, Value> {
+fn extern_get<'s>(ctx: &mut Ctx<'s>, id: usize) -> Result<Value<'s>, Value<'s>> {
     call_bridge(ctx, "externGet", &[Value::Num(id as f64)])
 }
 
-fn make_exported_func(ctx: &mut Ctx, id: usize) -> Result<Value, Value> {
+fn make_exported_func<'s>(ctx: &mut Ctx<'s>, id: usize) -> Result<Value<'s>, Value<'s>> {
     call_bridge(ctx, "makeFunc", &[Value::Num(id as f64)])
 }
 
@@ -828,8 +853,12 @@ enum RefArg {
     Extern(usize),
 }
 
-fn prepare_ref(ctx: &mut Ctx, value: &Value, ty: wasmi::ValType) -> Result<RefArg, Value> {
-    if matches!(value, Value::Null) {
+fn prepare_ref<'s>(
+    ctx: &mut Ctx<'s>,
+    value: &Value<'s>,
+    ty: wasmi::ValType,
+) -> Result<RefArg, Value<'s>> {
+    if matches!(value.kind(), ValueKind::Null) {
         return Ok(RefArg::Null(ty));
     }
     match ty {
@@ -857,7 +886,11 @@ enum PreparedValue {
     Reference(RefArg),
 }
 
-fn prepare_value(ctx: &mut Ctx, value: &Value, ty: wasmi::ValType) -> Result<PreparedValue, Value> {
+fn prepare_value<'s>(
+    ctx: &mut Ctx<'s>,
+    value: &Value<'s>,
+    ty: wasmi::ValType,
+) -> Result<PreparedValue, Value<'s>> {
     match ty {
         wasmi::ValType::FuncRef | wasmi::ValType::ExternRef => {
             prepare_ref(ctx, value, ty).map(PreparedValue::Reference)
@@ -937,8 +970,12 @@ fn build_value(state: &mut WasmState, value: PreparedValue) -> Result<wasmi::Val
     }
 }
 
+/// A Wasm result on its way to JavaScript, made into a value by [`resolve_output`].
 enum OutputToken {
-    Value(Value),
+    Undefined,
+    Null,
+    Num(f64),
+    BigInt(i64),
     Func(usize),
     Extern(usize),
 }
@@ -950,7 +987,7 @@ fn extract_output<C: wasmi::AsContext<Data = StoreData>>(
 ) -> OutputToken {
     match value {
         wasmi::Val::FuncRef(wasmi::Nullable::Null)
-        | wasmi::Val::ExternRef(wasmi::Nullable::Null) => OutputToken::Value(Value::Null),
+        | wasmi::Val::ExternRef(wasmi::Nullable::Null) => OutputToken::Null,
         wasmi::Val::FuncRef(wasmi::Nullable::Val(function)) => {
             OutputToken::Func(state.register_func(*function))
         }
@@ -961,44 +998,69 @@ fn extract_output<C: wasmi::AsContext<Data = StoreData>>(
                 .copied()
                 .unwrap_or(0),
         ),
-        value => OutputToken::Value(numeric_wasm_to_js_without_error(value)),
+        value => numeric_wasm_to_js_without_error(value),
     }
 }
 
-fn numeric_wasm_to_js_without_error(value: &wasmi::Val) -> Value {
+fn numeric_wasm_to_js_without_error(value: &wasmi::Val) -> OutputToken {
     match value {
-        wasmi::Val::I32(value) => Value::Num(f64::from(*value)),
-        wasmi::Val::I64(value) => Value::bigint_from_i64(*value),
-        wasmi::Val::F32(value) => Value::Num(f64::from(value.to_float())),
-        wasmi::Val::F64(value) => Value::Num(value.to_float()),
-        _ => Value::Undefined,
+        wasmi::Val::I32(value) => OutputToken::Num(f64::from(*value)),
+        wasmi::Val::I64(value) => OutputToken::BigInt(*value),
+        wasmi::Val::F32(value) => OutputToken::Num(f64::from(value.to_float())),
+        wasmi::Val::F64(value) => OutputToken::Num(value.to_float()),
+        _ => OutputToken::Undefined,
     }
 }
 
-fn resolve_output(ctx: &mut Ctx, value: OutputToken) -> Result<Value, Value> {
+fn resolve_output<'s>(ctx: &mut Ctx<'s>, value: OutputToken) -> Result<Value<'s>, Value<'s>> {
     match value {
-        OutputToken::Value(value) => Ok(value),
+        OutputToken::Undefined => Ok(Value::Undefined),
+        OutputToken::Null => Ok(Value::Null),
+        OutputToken::Num(value) => Ok(Value::Num(value)),
+        OutputToken::BigInt(value) => Ok(ctx.bigint_from_i64(value)),
         OutputToken::Func(id) => make_exported_func(ctx, id),
         OutputToken::Extern(id) => extern_get(ctx, id),
     }
 }
 
 thread_local! {
-    static ACTIVE_CTX: Cell<*mut Ctx> = const { Cell::new(std::ptr::null_mut()) };
+    /// The context of the JavaScript call that entered Wasm, its scope erased: an imported
+    /// function's callback opens a scope of its own over it (`with_active_ctx`).
+    static ACTIVE_CTX: Cell<*mut Ctx<'static>> = const { Cell::new(std::ptr::null_mut()) };
     static ACTIVE_STATE: Cell<*mut WasmState> = const { Cell::new(std::ptr::null_mut()) };
     static ACTIVE_CALLER: Cell<*mut wasmi::Caller<'static, StoreData>> =
         const { Cell::new(std::ptr::null_mut()) };
-    static PENDING_THROW: RefCell<Option<Value>> = const { RefCell::new(None) };
+    /// The value an imported function threw while Wasm unwinds to its JavaScript caller,
+    /// which rethrows it.
+    static PENDING_THROW: RefCell<Option<Handle>> = const { RefCell::new(None) };
 }
 
-struct ContextGuard(*mut Ctx);
+struct ContextGuard(*mut Ctx<'static>);
 
 impl ContextGuard {
-    fn set(ctx: &mut Ctx) -> Self {
-        let previous = ACTIVE_CTX.with(|slot| slot.replace(ctx as *mut Ctx));
+    fn set<'s>(ctx: &mut Ctx<'s>) -> Self {
+        let pointer = std::ptr::from_mut(ctx).cast::<Ctx<'static>>();
+        let previous = ACTIVE_CTX.with(|slot| slot.replace(pointer));
         PENDING_THROW.with(|slot| *slot.borrow_mut() = None);
         Self(previous)
     }
+}
+
+/// Run `operation` in a scope of its own over the context of the JavaScript call that entered
+/// Wasm (`ContextGuard`); `None` outside one.
+fn with_active_ctx<R>(operation: impl for<'s> FnOnce(&mut Ctx<'s>) -> R) -> Option<R> {
+    let pointer = ACTIVE_CTX.with(Cell::get);
+    // SAFETY: ContextGuard leaves the initiating `&mut Ctx` dormant while wasmi runs. Callbacks
+    // are synchronous and execute on the same agent thread; the operation is generic over its
+    // scope, so none of its values outlives it.
+    (!pointer.is_null()).then(|| operation(unsafe { &mut *pointer.cast::<Ctx<'_>>() }))
+}
+
+/// The value [`pending_trap`] left for the JavaScript caller to rethrow.
+fn take_pending_throw<'s>(ctx: &Ctx<'s>) -> Option<Value<'s>> {
+    PENDING_THROW
+        .with(|slot| slot.borrow_mut().take())
+        .map(|error| held(ctx, &error))
 }
 
 impl Drop for ContextGuard {
@@ -1112,11 +1174,11 @@ fn module_for_page(page: &PageWasm, id: Option<usize>) -> Option<wasmi::Module> 
 /// detached ("WebAssembly.Memory" key); the next `buffer` access creates its replacement over the
 /// same, grown Data Block. Wasm `memory.grow` cannot run JavaScript, so performing this at each
 /// transition back to JavaScript is indistinguishable from doing it right after the instruction.
-fn refresh_buffers(
-    ctx: &mut Ctx,
+fn refresh_buffers<'s>(
+    ctx: &mut Ctx<'s>,
     memories: &mut [MemorySlot],
     context: impl wasmi::AsContext<Data = StoreData>,
-    buffers: &mut [Option<Value>],
+    buffers: &mut [Option<Handle>],
 ) {
     for (index, slot) in memories.iter_mut().enumerate() {
         let pages = slot.memory.size(&context);
@@ -1129,13 +1191,14 @@ fn refresh_buffers(
         ));
         slot.buffer_pages = pages;
         if let Some(buffer) = buffers.get_mut(index).and_then(Option::take) {
+            let buffer = held(ctx, &buffer);
             ctx.detach_array_buffer(&buffer);
         }
     }
 }
 
 /// [`refresh_buffers`] while the store is lent to an imported-function callback.
-fn refresh_active_buffers(ctx: &mut Ctx) {
+fn refresh_active_buffers<'s>(ctx: &mut Ctx<'s>) {
     let Some(page) = page_wasm(ctx) else {
         return;
     };
@@ -1151,7 +1214,8 @@ fn wasm_trap() -> wasmi::Error {
 
 /// Ends the Wasm execution with an uncatchable trap and rethrows `error` unchanged when it
 /// returns to JavaScript.
-fn pending_trap(error: Value) -> wasmi::Error {
+fn pending_trap<'s>(ctx: &Ctx<'s>, error: Value<'s>) -> wasmi::Error {
+    let error = hold(ctx, &error);
     PENDING_THROW.with(|slot| *slot.borrow_mut() = Some(error));
     wasm_trap()
 }
@@ -1163,16 +1227,16 @@ fn pending_trap(error: Value) -> wasmi::Error {
 /// becomes the `externref` payload of a new exception of the JavaScript exception tag (step
 /// 3.10.3). A host interruption is no JavaScript exception (TRust JS's `RuntimeInterrupt`): no
 /// Wasm handler may catch it, so it unwinds as a trap and resumes in JavaScript.
-fn thrown_to_wasm(ctx: &mut Ctx, thrown: Value) -> wasmi::Error {
+fn thrown_to_wasm<'s>(ctx: &mut Ctx<'s>, thrown: Value<'s>) -> wasmi::Error {
     if ctx.pending_interrupt().is_some() {
-        return pending_trap(thrown);
+        return pending_trap(ctx, thrown);
     }
     let address = match call_bridge(ctx, "exceptionAddress", std::slice::from_ref(&thrown)) {
         Ok(address) => address
             .as_num_opt()
             .filter(|address| (1.0..=f64::from(u32::MAX)).contains(address))
             .map(|address| address as u32),
-        Err(error) => return pending_trap(error),
+        Err(error) => return pending_trap(ctx, error),
     };
     let exn = match address {
         Some(address) => with_active_caller(|caller| {
@@ -1184,10 +1248,10 @@ fn thrown_to_wasm(ctx: &mut Ctx, thrown: Value) -> wasmi::Error {
         None => {
             let payload = match prepare_ref(ctx, &thrown, wasmi::ValType::ExternRef) {
                 Ok(payload) => payload,
-                Err(error) => return pending_trap(error),
+                Err(error) => return pending_trap(ctx, error),
             };
             let Some(payload) = build_active_ref(payload) else {
-                return pending_trap(thrown);
+                return pending_trap(ctx, thrown);
             };
             with_active_caller(|caller| {
                 let tag = with_active_state(|state| {
@@ -1201,16 +1265,16 @@ fn thrown_to_wasm(ctx: &mut Ctx, thrown: Value) -> wasmi::Error {
     };
     match exn {
         Some(exn) => wasmi::Error::exception(exn),
-        None => pending_trap(thrown),
+        None => pending_trap(ctx, thrown),
     }
 }
 
-fn import_results(
-    ctx: &mut Ctx,
-    returned: Value,
+fn import_results<'s>(
+    ctx: &mut Ctx<'s>,
+    returned: Value<'s>,
     types: &[wasmi::ValType],
     output: &mut [wasmi::Val],
-) -> Result<(), Value> {
+) -> Result<(), Value<'s>> {
     match types {
         [] => Ok(()),
         [ty] => {
@@ -1262,72 +1326,72 @@ fn make_import_func<C: wasmi::AsContextMut<Data = StoreData>>(
         .copied()
         .any(is_js_opaque);
     wasmi::Func::new(context, ty, move |mut caller, params, output| {
-        let context_pointer = ACTIVE_CTX.with(Cell::get);
-        if context_pointer.is_null() {
-            return Err(wasmi::Error::new(
-                "WebAssembly host call outside a JavaScript context",
-            ));
-        }
-        // SAFETY: ContextGuard leaves the initiating `&mut Ctx` dormant while wasmi runs. This
-        // callback is synchronous and executes on the same agent thread.
-        let ctx = unsafe { &mut *context_pointer };
         let _caller_guard = CallerGuard::set(&mut caller);
-        if opaque {
-            // "run a host function" step 2 throws before the JavaScript function runs; like
-            // every throw completion of a host function, the TypeError is catchable in Wasm.
-            let error = type_error(
-                ctx,
-                "WebAssembly: cannot call a host function whose signature contains v128 or exnref",
-            );
-            return Err(thrown_to_wasm(ctx, error));
-        }
-        refresh_active_buffers(ctx);
-        let mut arguments = Vec::with_capacity(params.len());
-        for value in params {
-            let token = match value {
-                wasmi::Val::FuncRef(wasmi::Nullable::Val(function)) => {
-                    let id = with_active_state(|state| state.register_func(*function)).unwrap_or(0);
-                    make_exported_func(ctx, id)
-                }
-                wasmi::Val::ExternRef(wasmi::Nullable::Val(reference)) => {
-                    let id = with_active_caller(|caller| {
-                        reference.data(&*caller).downcast_ref::<usize>().copied()
-                    })
-                    .flatten()
-                    .unwrap_or(0);
-                    extern_get(ctx, id)
-                }
-                wasmi::Val::FuncRef(wasmi::Nullable::Null)
-                | wasmi::Val::ExternRef(wasmi::Nullable::Null) => Ok(Value::Null),
-                value => numeric_wasm_to_js(ctx, value),
-            };
-            match token {
-                Ok(value) => arguments.push(value),
-                Err(error) => return Err(thrown_to_wasm(ctx, error)),
+        with_active_ctx(|ctx| -> Result<(), wasmi::Error> {
+            if opaque {
+                // "run a host function" step 2 throws before the JavaScript function runs; like
+                // every throw completion of a host function, the TypeError is catchable in Wasm.
+                let error = type_error(
+                    ctx,
+                    "WebAssembly: cannot call a host function whose signature contains v128 or exnref",
+                );
+                return Err(thrown_to_wasm(ctx, error));
             }
-        }
-        let result = call_bridge(
-            ctx,
-            "invokeImport",
-            &[
-                Value::Num(f64::from(token)),
-                Value::Num(f64::from(index)),
-                ctx.make_array(arguments),
-            ],
-        )
-        .and_then(|returned| import_results(ctx, returned, &result_types, output));
-        if let Err(error) = &result {
-            // Inspect only engine-owned Error data, never [[Get]] or toString.
-            // The diagnostic is bounded and cannot run author code or alter the throw (§7).
-            wasm_trace!(format!(
-                "import error token={token} index={index} params={params:?} error={:?}",
-                ctx.error_diagnostic(error)
-            ));
-        }
-        match result {
-            Ok(()) => Ok(()),
-            Err(error) => Err(thrown_to_wasm(ctx, error)),
-        }
+            refresh_active_buffers(ctx);
+            // Each conversion can run JavaScript, which can collect: the list keeps them.
+            let mut arguments = ValueList::with_capacity(params.len());
+            for value in params {
+                let token = match value {
+                    wasmi::Val::FuncRef(wasmi::Nullable::Val(function)) => {
+                        let id = with_active_state(|state| state.register_func(*function)).unwrap_or(0);
+                        make_exported_func(ctx, id)
+                    }
+                    wasmi::Val::ExternRef(wasmi::Nullable::Val(reference)) => {
+                        let id = with_active_caller(|caller| {
+                            reference.data(&*caller).downcast_ref::<usize>().copied()
+                        })
+                        .flatten()
+                        .unwrap_or(0);
+                        extern_get(ctx, id)
+                    }
+                    wasmi::Val::FuncRef(wasmi::Nullable::Null)
+                    | wasmi::Val::ExternRef(wasmi::Nullable::Null) => Ok(Value::Null),
+                    value => numeric_wasm_to_js(ctx, value),
+                };
+                match token {
+                    Ok(value) => arguments.push(value),
+                    Err(error) => return Err(thrown_to_wasm(ctx, error)),
+                }
+            }
+            let arguments = arguments.into_array(ctx);
+            let result = call_bridge(
+                ctx,
+                "invokeImport",
+                &[
+                    Value::Num(f64::from(token)),
+                    Value::Num(f64::from(index)),
+                    arguments,
+                ],
+            )
+            .and_then(|returned| import_results(ctx, returned, &result_types, output));
+            if let Err(error) = &result {
+                // Inspect only engine-owned Error data, never [[Get]] or toString.
+                // The diagnostic is bounded and cannot run author code or alter the throw (§7).
+                wasm_trace!(format!(
+                    "import error token={token} index={index} params={params:?} error={:?}",
+                    ctx.error_diagnostic(error)
+                ));
+            }
+            match result {
+                Ok(()) => Ok(()),
+                Err(error) => Err(thrown_to_wasm(ctx, error)),
+            }
+        })
+        .unwrap_or_else(|| {
+            Err(wasmi::Error::new(
+                "WebAssembly host call outside a JavaScript context",
+            ))
+        })
     })
 }
 
@@ -1359,7 +1423,7 @@ enum Thrown {
     /// Step 11.4.1: an exception of the JavaScript exception tag throws its payload again.
     Value(OutputToken),
     /// Step 11.5.1: the Exception object cache already holds the exception's object.
-    Object(Value),
+    Object(WeakHandle),
     /// Step 11.5.1: a new Exception object for the exception `address` of the tag `tag`. The
     /// hold of the uncaught exception passes to the object's cache entry.
     New { address: u32, tag: usize },
@@ -1400,7 +1464,7 @@ fn uncaught_exception(
                     .copied()
                     .unwrap_or(0),
             ),
-            _ => OutputToken::Value(Value::Null),
+            _ => OutputToken::Null,
         };
         exn.release(&context);
         return Some(Thrown::Value(token));
@@ -1439,10 +1503,15 @@ fn active_failure(error: wasmi::Error) -> Failure {
 
 /// Turns an uncaught exception into the value JavaScript throws, creating and caching a new
 /// Exception object ("create an Exception object") if needed.
-fn thrown_to_js(ctx: &mut Ctx, page: &PageWasm, thrown: Thrown) -> Value {
+fn thrown_to_js<'s>(ctx: &mut Ctx<'s>, page: &PageWasm, thrown: Thrown) -> Value<'s> {
     match thrown {
         Thrown::Value(token) => resolve_output(ctx, token).unwrap_or_else(|error| error),
-        Thrown::Object(object) => object,
+        // The cache keeps the object while Wasm can still throw its exception.
+        Thrown::Object(object) => object
+            .upgrade(ctx)
+            .ok()
+            .flatten()
+            .unwrap_or(Value::Undefined),
         Thrown::New { address, tag } => {
             match call_bridge(
                 ctx,
@@ -1450,7 +1519,7 @@ fn thrown_to_js(ctx: &mut Ctx, page: &PageWasm, thrown: Thrown) -> Value {
                 &[Value::Num(f64::from(address)), Value::Num(tag as f64)],
             ) {
                 Ok(object) => {
-                    cache_exception(page, address, object.clone());
+                    cache_exception(ctx, page, address, &object);
                     object
                 }
                 Err(error) => {
@@ -1464,7 +1533,8 @@ fn thrown_to_js(ctx: &mut Ctx, page: &PageWasm, thrown: Thrown) -> Value {
 
 /// Enters `object` in the agent's Exception object cache for the exception `address`, whose
 /// hold passes to the entry.
-fn cache_exception(page: &PageWasm, address: u32, object: Value) {
+fn cache_exception<'s>(ctx: &Ctx<'s>, page: &PageWasm, address: u32, object: &Value<'s>) {
+    let object = hold_weakly(ctx, object);
     let insert = |state: &mut WasmState| state.exceptions.exception_cache.insert(address, object);
     let previous = match page.state.try_borrow_mut() {
         Ok(mut state) => state.as_mut().map(insert),
@@ -1496,7 +1566,11 @@ fn release_exception(page: &PageWasm, address: u32) {
     }
 }
 
-pub(super) fn host_validate(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(super) fn host_validate<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let Some(bytes) = args
         .first()
         .and_then(|value| ctx.buffer_source_bytes(value, true))
@@ -1519,19 +1593,19 @@ pub(super) fn host_validate(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
     ))
 }
 
-pub(super) fn host_compile(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(super) fn host_compile<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let Some(bytes) = args
         .first()
         .and_then(|value| ctx.buffer_source_bytes(value, true))
     else {
-        return Ok(Value::from_string(
-            "WebAssembly: expected a BufferSource".to_string(),
-        ));
+        return Ok(ctx.string("WebAssembly: expected a BufferSource".to_string()));
     };
     let Some(page) = page_wasm(ctx) else {
-        return Ok(Value::from_string(
-            "WebAssembly is unavailable on this page".to_string(),
-        ));
+        return Ok(ctx.string("WebAssembly is unavailable on this page".to_string()));
     };
     let engine = match page.state.try_borrow_mut() {
         Ok(mut state) => state.get_or_insert_with(WasmState::new).engine.clone(),
@@ -1542,11 +1616,9 @@ pub(super) fn host_compile(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resul
         wasmi::Module::new(&engine, &bytes)
     })) {
         Ok(Ok(module)) => module,
-        Ok(Err(error)) => return Ok(Value::from_string(error.to_string())),
+        Ok(Err(error)) => return Ok(ctx.string(error.to_string())),
         Err(_) => {
-            return Ok(Value::from_string(
-                "WebAssembly module uses an unsupported feature".to_string(),
-            ));
+            return Ok(ctx.string("WebAssembly module uses an unsupported feature".to_string()));
         }
     };
     let import_count = module.imports().count();
@@ -1572,48 +1644,48 @@ pub(super) fn host_compile(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resul
     Ok(Value::Num(id as f64))
 }
 
-pub(super) fn host_module_imports(
-    ctx: &mut Ctx,
-    _this: Value,
-    args: &[Value],
-) -> Result<Value, Value> {
+pub(super) fn host_module_imports<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let Some(page) = page_wasm(ctx) else {
         return Ok(ctx.make_array(Vec::new()));
     };
     let mut output = Vec::new();
     if let Some(module) = module_for_page(&page, arg_id(args, 0)) {
         for import in module.imports() {
-            output.push(Value::from_string(import.module().to_string()));
-            output.push(Value::from_string(import.name().to_string()));
-            output.push(Value::from_string(wasm_kind(import.ty()).to_string()));
+            output.push(ctx.string(import.module().to_string()));
+            output.push(ctx.string(import.name().to_string()));
+            output.push(ctx.string(wasm_kind(import.ty()).to_string()));
         }
     }
     Ok(ctx.make_array(output))
 }
 
-pub(super) fn host_module_exports(
-    ctx: &mut Ctx,
-    _this: Value,
-    args: &[Value],
-) -> Result<Value, Value> {
+pub(super) fn host_module_exports<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let Some(page) = page_wasm(ctx) else {
         return Ok(ctx.make_array(Vec::new()));
     };
     let mut output = Vec::new();
     if let Some(module) = module_for_page(&page, arg_id(args, 0)) {
         for export in module.exports() {
-            output.push(Value::from_string(export.name().to_string()));
-            output.push(Value::from_string(wasm_kind(export.ty()).to_string()));
+            output.push(ctx.string(export.name().to_string()));
+            output.push(ctx.string(wasm_kind(export.ty()).to_string()));
         }
     }
     Ok(ctx.make_array(output))
 }
 
-pub(super) fn host_module_custom_sections(
-    ctx: &mut Ctx,
-    _this: Value,
-    args: &[Value],
-) -> Result<Value, Value> {
+pub(super) fn host_module_custom_sections<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let name = arg_string(ctx, args, 1)?;
     let Some(page) = page_wasm(ctx) else {
         return Ok(ctx.make_array(Vec::new()));
@@ -1646,9 +1718,9 @@ enum ImportBinding {
     TagRef(usize),
 }
 
-fn parse_imports(
-    ctx: &mut Ctx,
-    descriptor: Option<&Value>,
+fn parse_imports<'s>(
+    ctx: &mut Ctx<'s>,
+    descriptor: Option<&Value<'s>>,
     types: &[wasmi::ExternType],
 ) -> Result<Vec<ImportBinding>, (&'static str, String)> {
     let descriptor = descriptor.cloned().unwrap_or(Value::Undefined);
@@ -1965,11 +2037,11 @@ fn instantiate_active(
     }
 }
 
-pub(super) fn host_instantiate(
-    ctx: &mut Ctx,
-    _this: Value,
-    args: &[Value],
-) -> Result<Value, Value> {
+pub(super) fn host_instantiate<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let Some(page) = page_wasm(ctx) else {
         return Ok(wasm_err(ctx, "Link", "WebAssembly is unavailable"));
     };
@@ -2039,7 +2111,7 @@ pub(super) fn host_instantiate(
             result
         }
     };
-    if let Some(error) = PENDING_THROW.with(|slot| slot.borrow_mut().take()) {
+    if let Some(error) = take_pending_throw(ctx) {
         return Err(error);
     }
     Ok(match result {
@@ -2057,11 +2129,11 @@ pub(super) fn host_instantiate(
     })
 }
 
-pub(super) fn host_instance_exports(
-    ctx: &mut Ctx,
-    _this: Value,
-    args: &[Value],
-) -> Result<Value, Value> {
+pub(super) fn host_instance_exports<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let Some(page) = page_wasm(ctx) else {
         return Ok(ctx.make_array(Vec::new()));
     };
@@ -2154,10 +2226,10 @@ pub(super) fn host_instance_exports(
                 } else {
                     String::new()
                 };
-                output.push(Value::from_string(name));
-                output.push(Value::from_string(kind.to_string()));
+                output.push(ctx.string(name));
+                output.push(ctx.string(kind.to_string()));
                 output.push(Value::Num(id as f64));
-                output.push(Value::from_string(auxiliary.to_string()));
+                output.push(ctx.string(auxiliary.to_string()));
             }
         }
         Err(_) => {
@@ -2217,21 +2289,21 @@ pub(super) fn host_instance_exports(
                 } else {
                     String::new()
                 };
-                output.push(Value::from_string(name));
-                output.push(Value::from_string(kind.to_string()));
+                output.push(ctx.string(name));
+                output.push(ctx.string(kind.to_string()));
                 output.push(Value::Num(id as f64));
-                output.push(Value::from_string(auxiliary.to_string()));
+                output.push(ctx.string(auxiliary.to_string()));
             }
         }
     }
     Ok(ctx.make_array(output))
 }
 
-pub(super) fn host_call_export(
-    ctx: &mut Ctx,
-    _this: Value,
-    args: &[Value],
-) -> Result<Value, Value> {
+pub(super) fn host_call_export<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let Some(page) = page_wasm(ctx) else {
         return Err(type_error(ctx, "WebAssembly is unavailable"));
     };
@@ -2393,7 +2465,7 @@ pub(super) fn host_call_export(
         })(),
     };
 
-    if let Some(error) = PENDING_THROW.with(|slot| slot.borrow_mut().take()) {
+    if let Some(error) = take_pending_throw(ctx) {
         return Err(error);
     }
     let tokens = match call {
@@ -2414,21 +2486,29 @@ pub(super) fn host_call_export(
             return Err(thrown_to_js(ctx, &page, thrown));
         }
     };
-    let mut values = Vec::with_capacity(tokens.len());
+    // Making an exported function's wrapper can run JavaScript: the list keeps the results.
+    let mut values = ValueList::with_capacity(tokens.len());
     for token in tokens {
         values.push(resolve_output(ctx, token)?);
     }
     let value = match values.as_slice() {
         [] => Value::Undefined,
-        [value] => value.clone(),
-        _ => ctx.make_array(values),
+        [value] => *value,
+        _ => values.into_array(ctx),
     };
     Ok(wasm_ok(ctx, value))
 }
 
-pub(super) fn host_global_new(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(super) fn host_global_new<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let name = arg_string(ctx, args, 0)?;
-    let mutable = matches!(args.get(1), Some(Value::Bool(true)));
+    let mutable = matches!(
+        args.get(1).map(|value| value.kind()),
+        Some(ValueKind::Bool(true))
+    );
     let Some(ty) = value_type(&name) else {
         return Err(type_error(ctx, "WebAssembly.Global: invalid value type"));
     };
@@ -2490,7 +2570,11 @@ fn global_info(page: &PageWasm, id: Option<usize>) -> Option<(wasmi::ValType, wa
     }
 }
 
-pub(super) fn host_global_get(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(super) fn host_global_get<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let Some(page) = page_wasm(ctx) else {
         return Ok(Value::Undefined);
     };
@@ -2528,7 +2612,11 @@ pub(super) fn host_global_get(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Re
     }
 }
 
-pub(super) fn host_global_set(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(super) fn host_global_set<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let Some(page) = page_wasm(ctx) else {
         return Ok(Value::Undefined);
     };
@@ -2586,7 +2674,11 @@ pub(super) fn host_global_set(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Re
     }
 }
 
-pub(super) fn host_memory_new(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(super) fn host_memory_new<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let initial = args.first().and_then(Value::as_num_opt).unwrap_or(-1.0);
     let maximum = args.get(1).and_then(Value::as_num_opt).unwrap_or(-1.0);
     if !(0.0..=u32::MAX as f64).contains(&initial) || initial.fract() != 0.0 {
@@ -2634,11 +2726,11 @@ pub(super) fn host_memory_new(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Re
     Ok(Value::Num(id as f64))
 }
 
-pub(super) fn host_memory_size(
-    ctx: &mut Ctx,
-    _this: Value,
-    args: &[Value],
-) -> Result<Value, Value> {
+pub(super) fn host_memory_size<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let Some(page) = page_wasm(ctx) else {
         return Ok(Value::Num(0.0));
     };
@@ -2656,17 +2748,18 @@ pub(super) fn host_memory_size(
     Ok(Value::Num(pages as f64))
 }
 
-fn detach_buffer(ctx: &mut Ctx, buffers: &mut [Option<Value>], id: usize) {
+fn detach_buffer<'s>(ctx: &mut Ctx<'s>, buffers: &mut [Option<Handle>], id: usize) {
     if let Some(buffer) = buffers.get_mut(id).and_then(Option::take) {
+        let buffer = held(ctx, &buffer);
         ctx.detach_array_buffer(&buffer);
     }
 }
 
-pub(super) fn host_memory_grow(
-    ctx: &mut Ctx,
-    _this: Value,
-    args: &[Value],
-) -> Result<Value, Value> {
+pub(super) fn host_memory_grow<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let delta = args.get(1).and_then(Value::as_num_opt).unwrap_or(-1.0);
     if !(0.0..=u32::MAX as f64).contains(&delta) || delta.fract() != 0.0 {
         return Err(range_error(ctx, "WebAssembly.Memory.grow: invalid delta"));
@@ -2727,11 +2820,11 @@ pub(super) fn host_memory_grow(
     }
 }
 
-pub(super) fn host_memory_buffer(
-    ctx: &mut Ctx,
-    _this: Value,
-    args: &[Value],
-) -> Result<Value, Value> {
+pub(super) fn host_memory_buffer<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let Some(page) = page_wasm(ctx) else {
         return Ok(Value::Undefined);
     };
@@ -2770,7 +2863,7 @@ pub(super) fn host_memory_buffer(
         .and_then(Option::as_ref)
         .cloned();
     if let Some(buffer) = existing {
-        return Ok(buffer);
+        return Ok(held(ctx, &buffer));
     }
     // JS API "create a fixed length memory buffer": a fresh ArrayBuffer whose
     // [[ArrayBufferData]] is the memory's Data Block and whose detach key is
@@ -2781,11 +2874,15 @@ pub(super) fn host_memory_buffer(
     if buffers.len() <= id {
         buffers.resize(id + 1, None);
     }
-    buffers[id] = Some(buffer.clone());
+    buffers[id] = Some(hold(ctx, &buffer));
     Ok(buffer)
 }
 
-pub(super) fn host_table_new(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(super) fn host_table_new<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let element = arg_string(ctx, args, 0)?;
     let Some(element) = value_type(&element)
         .filter(|ty| matches!(ty, wasmi::ValType::FuncRef | wasmi::ValType::ExternRef))
@@ -2840,11 +2937,11 @@ pub(super) fn host_table_new(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Res
     Ok(Value::Num(id as f64))
 }
 
-pub(super) fn host_table_length(
-    ctx: &mut Ctx,
-    _this: Value,
-    args: &[Value],
-) -> Result<Value, Value> {
+pub(super) fn host_table_length<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let Some(page) = page_wasm(ctx) else {
         return Ok(Value::Num(0.0));
     };
@@ -2862,7 +2959,11 @@ pub(super) fn host_table_length(
     Ok(Value::Num(length as f64))
 }
 
-pub(super) fn host_table_get(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(super) fn host_table_get<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let Some(page) = page_wasm(ctx) else {
         return Ok(Value::Null);
     };
@@ -2927,7 +3028,11 @@ fn table_info(page: &PageWasm, id: Option<usize>) -> Option<wasmi::ValType> {
     }
 }
 
-pub(super) fn host_table_set(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(super) fn host_table_set<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let Some(page) = page_wasm(ctx) else {
         return Ok(Value::Undefined);
     };
@@ -2982,7 +3087,11 @@ pub(super) fn host_table_set(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Res
     }
 }
 
-pub(super) fn host_table_grow(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(super) fn host_table_grow<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let Some(page) = page_wasm(ctx) else {
         return Err(range_error(ctx, "WebAssembly is unavailable"));
     };
@@ -3030,11 +3139,11 @@ pub(super) fn host_table_grow(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Re
 /// JS API #tags, #exceptions and the `JSTag` attribute: the store operations behind
 /// `WebAssembly.Tag`, `WebAssembly.Exception` and `WebAssembly.JSTag`. The prelude performs
 /// the Web IDL conversions and brand checks; `args[0]` names the operation.
-pub(super) fn host_exception_binding(
-    ctx: &mut Ctx,
-    _this: Value,
-    args: &[Value],
-) -> Result<Value, Value> {
+pub(super) fn host_exception_binding<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let operation = arg_string(ctx, args, 0)?;
     let Some(page) = page_wasm(ctx) else {
         return Err(type_error(ctx, "WebAssembly is unavailable"));
@@ -3043,6 +3152,7 @@ pub(super) fn host_exception_binding(
         "tagNew" => tag_new(ctx, &page, args.get(1).unwrap_or(&Value::Undefined)),
         "jsTag" => js_tag(ctx, &page),
         "tagCache" => Ok(cached_object(
+            ctx,
             &page,
             arg_id(args, 1),
             args.get(2),
@@ -3055,6 +3165,7 @@ pub(super) fn host_exception_binding(
             args.get(2).unwrap_or(&Value::Undefined),
         ),
         "exceptionCache" => Ok(cached_object(
+            ctx,
             &page,
             arg_id(args, 1),
             args.get(2),
@@ -3067,7 +3178,11 @@ pub(super) fn host_exception_binding(
 
 /// `new Tag(type)` steps 1–5 for the already converted `ValueType` strings `types`
 /// (ToValueType, then `tag_alloc` of `parameters → « »`).
-fn tag_new(ctx: &mut Ctx, page: &PageWasm, types: &Value) -> Result<Value, Value> {
+fn tag_new<'s>(
+    ctx: &mut Ctx<'s>,
+    page: &PageWasm,
+    types: &Value<'s>,
+) -> Result<Value<'s>, Value<'s>> {
     let length = ctx.member_get(types, "length")?.as_num_opt().unwrap_or(0.0) as usize;
     let mut params = Vec::with_capacity(length);
     for index in 0..length {
@@ -3096,7 +3211,7 @@ fn tag_new(ctx: &mut Ctx, page: &PageWasm, types: &Value) -> Result<Value, Value
 }
 
 /// The getter of `WebAssembly.JSTag`, step 1: "get the JavaScript exception tag".
-fn js_tag(ctx: &mut Ctx, page: &PageWasm) -> Result<Value, Value> {
+fn js_tag<'s>(ctx: &mut Ctx<'s>, page: &PageWasm) -> Result<Value<'s>, Value<'s>> {
     let id = match page.state.try_borrow_mut() {
         Ok(mut state) => {
             let state = state.get_or_insert_with(WasmState::new);
@@ -3113,44 +3228,73 @@ fn js_tag(ctx: &mut Ctx, page: &PageWasm) -> Result<Value, Value> {
 
 /// Looks `key` up in one of the agent's object caches (JS API #object-caches), entering
 /// `wrapper` if the cache has no object for it yet. Returns the cached object or undefined.
-fn cached_object<K: Copy + Eq + std::hash::Hash + TryFrom<usize>>(
+fn cached_object<'s, K: Copy + Eq + std::hash::Hash + TryFrom<usize>>(
+    ctx: &Ctx<'s>,
     page: &PageWasm,
     key: Option<usize>,
-    wrapper: Option<&Value>,
-    cache: impl Fn(&mut ExceptionObjects) -> &mut HashMap<K, Value>,
-) -> Value {
+    wrapper: Option<&Value<'s>>,
+    cache: impl Fn(&mut ExceptionObjects) -> &mut HashMap<K, WeakHandle>,
+) -> Value<'s> {
     let Some(key) = key.and_then(|key| K::try_from(key).ok()) else {
         return Value::Undefined;
     };
+    let candidate = wrapper
+        .filter(|wrapper| wrapper.as_obj().is_some())
+        .map(|wrapper| (hold_weakly(ctx, wrapper), *wrapper));
     let lookup = |state: &mut WasmState| {
         let cache = cache(&mut state.exceptions);
-        if let Some(object) = cache.get(&key) {
-            return object.clone();
+        if let Some(object) = cache.get(&key).filter(|object| !object.is_cleared()) {
+            return Cached::Existing(object.clone());
         }
-        match wrapper.filter(|wrapper| matches!(wrapper, Value::Obj(_))) {
-            Some(wrapper) => {
-                cache.insert(key, wrapper.clone());
-                wrapper.clone()
+        match &candidate {
+            Some((handle, _)) => {
+                cache.insert(key, handle.clone());
+                Cached::Inserted
             }
-            None => Value::Undefined,
+            None => Cached::Missing,
         }
     };
-    match page.state.try_borrow_mut() {
-        Ok(mut state) => state.as_mut().map(lookup).unwrap_or(Value::Undefined),
-        Err(_) => with_active_state(lookup).unwrap_or(Value::Undefined),
+    let cached = match page.state.try_borrow_mut() {
+        Ok(mut state) => state.as_mut().map(lookup),
+        Err(_) => with_active_state(lookup),
+    };
+    cached_value(ctx, cached, candidate.map(|(_, wrapper)| wrapper))
+}
+
+/// The outcome of a JS API object cache lookup that inserts the candidate object it is given.
+enum Cached {
+    Existing(WeakHandle),
+    Inserted,
+    Missing,
+}
+
+/// The object a cache lookup found or inserted, read into `ctx`'s scope.
+fn cached_value<'s>(
+    ctx: &Ctx<'s>,
+    cached: Option<Cached>,
+    candidate: Option<Value<'s>>,
+) -> Value<'s> {
+    match cached {
+        Some(Cached::Existing(object)) => object
+            .upgrade(ctx)
+            .ok()
+            .flatten()
+            .unwrap_or(Value::Undefined),
+        Some(Cached::Inserted) => candidate.unwrap_or(Value::Undefined),
+        Some(Cached::Missing) | None => Value::Undefined,
     }
 }
 
 /// `new Exception(exceptionTag, payload, options)` steps 1–8 for the tag handle `tag` and the
 /// converted `sequence<any>` `payload`. Returns the address of the new exception, which is
 /// held once for the Exception object cache entry that the prelude creates next.
-fn exception_new(
-    ctx: &mut Ctx,
+fn exception_new<'s>(
+    ctx: &mut Ctx<'s>,
     page: &PageWasm,
     tag: Option<usize>,
-    payload: &Value,
-) -> Result<Value, Value> {
-    let unavailable = |ctx: &mut Ctx| type_error(ctx, "WebAssembly is unavailable");
+    payload: &Value<'s>,
+) -> Result<Value<'s>, Value<'s>> {
+    let unavailable = |ctx: &mut Ctx<'s>| type_error(ctx, "WebAssembly is unavailable");
     let Some(tag_id) = tag else {
         return Err(type_error(ctx, "WebAssembly.Exception: unknown tag"));
     };
@@ -3276,12 +3420,12 @@ fn read_exception_arg<C: wasmi::AsContext<Data = StoreData>>(
 
 /// `getArg(exceptionTag, index)` steps 3–9 for the exception `address`, after the prelude
 /// checked that `exceptionTag` is the exception's [[Type]] (step 2).
-fn exception_arg(
-    ctx: &mut Ctx,
+fn exception_arg<'s>(
+    ctx: &mut Ctx<'s>,
     page: &PageWasm,
     address: Option<usize>,
     index: Option<usize>,
-) -> Result<Value, Value> {
+) -> Result<Value<'s>, Value<'s>> {
     let (Some(address), Some(index)) = (address.and_then(|a| u32::try_from(a).ok()), index) else {
         return Err(type_error(
             ctx,

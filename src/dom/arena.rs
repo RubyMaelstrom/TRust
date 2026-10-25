@@ -359,19 +359,23 @@ impl<T> DenseIdMap<T> {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn first_young_id(&self) -> NodeId {
         self.generation.as_ref().map_or(0, |g| g.first_young_id)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn is_young(&self, id: NodeId) -> bool {
         id >= self.first_young_id()
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn young_ids(&self) -> impl Iterator<Item = NodeId> + '_ {
         let start = self.generation.as_ref().map_or(0, |g| g.first_young_slot);
         self.slots[start..].iter().map(|(id, _)| *id)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn remembered_ids(&self) -> impl Iterator<Item = NodeId> + '_ {
         self.generation
             .iter()

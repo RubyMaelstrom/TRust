@@ -498,22 +498,26 @@ fn collect(
 /// Report the end of an actual page rendering update. The private JS control
 /// owns per-Document first-paint sets, candidate selection and observer queues.
 pub(super) fn report(engine: &mut trust_js::Engine, paint: &crate::render::PagePaint) {
-    let Ok(Value::Bool(true)) = host_call_trust(engine.ctx(), "wantsLargestContentfulPaint", &[])
-    else {
+    let scroll = engine.scope(|cx| {
+        let wanted = host_call_trust(cx, "wantsLargestContentfulPaint", &[])
+            .is_ok_and(|value| matches!(value.kind(), ValueKind::Bool(true)));
+        if !wanted {
+            return None;
+        }
+        let mut scroll = |name| {
+            host_call_trust(cx, name, &[])
+                .ok()
+                .and_then(|v| v.as_num_opt())
+                .unwrap_or(0.) as f32
+        };
+        let x = scroll("windowScrollX");
+        Some(CssPoint::new(x, scroll("windowScrollY")))
+    });
+    let Some(scroll) = scroll else {
         return;
     };
-    let scroll = CssPoint::new(
-        host_call_trust(engine.ctx(), "windowScrollX", &[])
-            .ok()
-            .and_then(|v| v.as_num_opt())
-            .unwrap_or(0.) as f32,
-        host_call_trust(engine.ctx(), "windowScrollY", &[])
-            .ok()
-            .and_then(|v| v.as_num_opt())
-            .unwrap_or(0.) as f32,
-    );
     let now = crate::performance::now_ms();
-    let Some(state) = engine.ctx().host_mut::<HostState>() else {
+    let Some(state) = engine.host_mut::<HostState>() else {
         return;
     };
     let dom = state.dom.borrow();
@@ -587,30 +591,31 @@ pub(super) fn report(engine: &mut trust_js::Engine, paint: &crate::render::PageP
     );
     drop(images);
     drop(dom);
-    let ctx = engine.ctx();
-    let values = ctx.make_array(
-        candidates
-            .into_iter()
-            .map(|candidate| {
-                ctx.make_array(vec![
-                    Value::Num(candidate.node as f64),
-                    Value::Num(candidate.size),
-                    Value::Num(f64::from(candidate.width)),
-                    Value::Num(f64::from(candidate.height)),
-                    Value::from_string(candidate.url),
-                    Value::Num(candidate.loaded_at),
-                    Value::from_string(candidate.id),
-                    Value::Num(document as f64),
-                    Value::from_string(candidate.request_key),
-                ])
-            })
-            .collect(),
-    );
-    let _ = host_call_trust(
-        ctx,
-        "recordLargestContentfulPaint",
-        &[values, Value::Num(now), Value::Num(document as f64)],
-    );
+    engine.scope(|ctx| {
+        let values = ctx.make_array(
+            candidates
+                .into_iter()
+                .map(|candidate| {
+                    ctx.make_array(vec![
+                        Value::Num(candidate.node as f64),
+                        Value::Num(candidate.size),
+                        Value::Num(f64::from(candidate.width)),
+                        Value::Num(f64::from(candidate.height)),
+                        ctx.string(candidate.url),
+                        Value::Num(candidate.loaded_at),
+                        ctx.string(candidate.id),
+                        Value::Num(document as f64),
+                        ctx.string(candidate.request_key),
+                    ])
+                })
+                .collect(),
+        );
+        let _ = host_call_trust(
+            ctx,
+            "recordLargestContentfulPaint",
+            &[values, Value::Num(now), Value::Num(document as f64)],
+        );
+    });
 }
 
 #[cfg(test)]

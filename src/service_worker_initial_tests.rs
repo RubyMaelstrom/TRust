@@ -29,7 +29,7 @@ fn service_worker_initial_window_keeps_client_id_and_commits_navigation_controll
     // Give this API-level page the same Document ownership the frontend
     // supplies, so initial child clients exist before their JS containers.
     {
-        let state = engine.ctx().host_mut::<HostState>().unwrap();
+        let state = engine.host_mut::<HostState>().unwrap();
         let client = service_worker_host::client_for_context(state, 0).unwrap();
         let owner = crate::service_worker::DocumentClient::new(client);
         state
@@ -52,7 +52,7 @@ fn service_worker_initial_window_keeps_client_id_and_commits_navigation_controll
     run_until(&runtime, &mut engine, &mut tasks, "setupDone");
     assert_eq!(log(&mut engine), "");
     let (context, client) = {
-        let state = engine.ctx().host::<HostState>().unwrap();
+        let state = engine.host::<HostState>().unwrap();
         let context = *state.frame_contexts.values().next().unwrap();
         (
             context,
@@ -83,7 +83,7 @@ fn service_worker_initial_window_keeps_client_id_and_commits_navigation_controll
     assert_eq!(client.url().as_str(), format!("{base}/outside/first"));
     assert!(client.controller().is_none());
     {
-        let state = engine.ctx().host::<HostState>().unwrap();
+        let state = engine.host::<HostState>().unwrap();
         assert_eq!(
             state.window_request_urls[&context].as_str(),
             format!("{base}/outside/first")
@@ -132,7 +132,7 @@ fn service_worker_initial_window_keeps_client_id_and_commits_navigation_controll
         secondFrame.onload=()=>insideDone=true;secondFrame.src='/scope/controlled';__trust.hydrateFrames();
     "#,"initial replacement within controller scope").unwrap();
     let second_client = {
-        let state = engine.ctx().host::<HostState>().unwrap();
+        let state = engine.host::<HostState>().unwrap();
         let second = *state
             .frame_contexts
             .values()

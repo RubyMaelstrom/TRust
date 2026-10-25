@@ -711,9 +711,10 @@ async fn intercept_inner(request: &Request) -> Head {
     result
 }
 
-pub(super) fn preload(ctx: &mut Ctx, args: &[Value]) -> Result<Value, Value> {
+pub(super) fn preload<'s>(ctx: &mut Ctx<'s>, args: &[Value<'s>]) -> Result<Value<'s>, Value<'s>> {
     let event_id = args.get(1).and_then(Value::as_num_opt).unwrap_or(0.) as u64;
     let (promise, resolve, _) = ctx.new_promise_with_resolvers();
+    let resolve_handle = super::hold(ctx, &resolve);
     let state = ctx.host_mut::<HostState>().expect("service worker host");
     let exchange = state
         .service_scope
@@ -738,7 +739,7 @@ pub(super) fn preload(ctx: &mut Ctx, args: &[Value]) -> Result<Value, Value> {
         id,
         TrustJsPendingFetch {
             context: 0,
-            resolve,
+            resolve: resolve_handle,
             native_lease: None,
             keepalive: false,
             task: None,
@@ -771,10 +772,10 @@ pub(super) fn preload(ctx: &mut Ctx, args: &[Value]) -> Result<Value, Value> {
     Ok(promise)
 }
 
-pub(super) fn chunk(ctx: &mut Ctx, args: &[Value]) -> Result<Value, Value> {
+pub(super) fn chunk<'s>(ctx: &mut Ctx<'s>, args: &[Value<'s>]) -> Result<Value<'s>, Value<'s>> {
     let id = args.get(1).and_then(Value::as_num_opt).unwrap_or(0.) as u64;
     let bytes = args.get(2).and_then(|v| ctx.buffer_source_bytes(v, false));
-    let end = matches!(args.get(2), Some(Value::Null));
+    let end = matches!(args.get(2).map(|value| value.kind()), Some(ValueKind::Null));
     let exchange = ctx
         .host::<HostState>()
         .and_then(|s| s.service_scope.as_ref())
@@ -797,8 +798,8 @@ pub(super) fn chunk(ctx: &mut Ctx, args: &[Value]) -> Result<Value, Value> {
     Ok(Value::Undefined)
 }
 
-pub(super) fn response(
-    ctx: &mut Ctx,
+pub(super) fn response<'s>(
+    ctx: &mut Ctx<'s>,
     op: &str,
     input: serde_json::Value,
 ) -> Result<serde_json::Value, Error> {
@@ -829,8 +830,8 @@ pub(super) fn response(
     Ok(accepted.into())
 }
 
-fn response_head(
-    ctx: &mut Ctx,
+fn response_head<'s>(
+    ctx: &mut Ctx<'s>,
     exchange: &Arc<Exchange>,
     input: &serde_json::Value,
 ) -> Result<(Response, Option<BodyStream>), String> {

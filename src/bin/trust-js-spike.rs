@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use trust_js::bytecode::Tier;
+use trust_js::Tier;
 
 const DEFAULT_BENCHMARK: &str = "/usr/share/cry/benchmarks/js-engine-benchmark/run.js";
 

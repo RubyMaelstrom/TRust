@@ -6,7 +6,8 @@
 //! objects by id (HTML #the-offscreencanvas-interface). Both share one
 //! implementation of the 2D drawing operations.
 use super::{
-    Ctx, HostState, Value, host_arg_node, host_arg_string, host_dom, host_layout_environment,
+    Ctx, HostState, Value, ValueKind, host_arg_node, host_arg_string, host_dom,
+    host_layout_environment,
 };
 use crate::canvas::{Canvas, Sizing};
 use crate::canvas_offscreen::{Mode, Offscreen};
@@ -17,15 +18,15 @@ use std::rc::Rc;
 use vello_cpu::kurbo::Affine;
 
 /// One binding call: the operation, its numeric arguments and its payload.
-struct Request {
+struct Request<'s> {
     op: String,
     n: Vec<f64>,
-    payload: Value,
+    payload: Value<'s>,
     text: String,
 }
 
-impl Request {
-    fn read(ctx: &mut Ctx, args: &[Value]) -> Result<Self, Value> {
+impl<'s> Request<'s> {
+    fn read(ctx: &mut Ctx<'s>, args: &[Value<'s>]) -> Result<Self, Value<'s>> {
         let op = host_arg_string(ctx, args, 1);
         let mut n = Vec::new();
         if let Some(values) = args.get(2) {
@@ -50,18 +51,18 @@ impl Request {
 }
 
 /// Operations that address no canvas.
-fn realm_op(ctx: &mut Ctx, req: &Request) -> Result<Option<Value>, Value> {
+fn realm_op<'s>(ctx: &mut Ctx<'s>, req: &Request<'s>) -> Result<Option<Value<'s>>, Value<'s>> {
     let op = req.op.as_str();
     if op == "gradientSlots" || op == "textMetricsSlots" {
         // Shared, privately rooted WeakMap: cross-Realm CanvasGradient brands
         // work without exposing data or keeping otherwise dead gradients alive.
-        let state = ctx.host_mut::<HostState>().unwrap();
-        let slots = if op == "gradientSlots" {
-            &mut state.canvas_gradient_slots
-        } else {
-            &mut state.canvas_text_metrics_slots
-        };
-        return Ok(Some(slots.get_or_insert(req.payload.clone()).clone()));
+        let slot: fn(&mut HostState) -> &mut Option<trust_js::embed::Handle> =
+            if op == "gradientSlots" {
+                |state| &mut state.canvas_gradient_slots
+            } else {
+                |state| &mut state.canvas_text_metrics_slots
+            };
+        return Ok(Some(super::shared_slot(ctx, slot, req.payload)));
     }
     // HTML #dom-canvaspattern-settransform and pattern release: patterns are
     // not tied to one canvas.
@@ -281,12 +282,15 @@ fn percent_decoded(fragment: &str) -> Option<String> {
 
 /// Decode a private image record `[width, height, pixels, clean, _,
 /// premultiplied]` (a loaded image or an ImageBitmap) into a bitmap.
-fn record_bitmap(ctx: &mut Ctx, record: &Value) -> Result<Option<(sk::Pixmap, bool)>, Value> {
+fn record_bitmap<'s>(
+    ctx: &mut Ctx<'s>,
+    record: &Value<'s>,
+) -> Result<Option<(sk::Pixmap, bool)>, Value<'s>> {
     let width = ctx.member_get(record, "0")?.as_num_opt().unwrap_or(0.) as u32;
     let height = ctx.member_get(record, "1")?.as_num_opt().unwrap_or(0.) as u32;
     let pixels = ctx.member_get(record, "2")?;
-    let clean = matches!(ctx.member_get(record, "3")?, Value::Bool(true));
-    let premultiplied = matches!(ctx.member_get(record, "5")?, Value::Bool(true));
+    let clean = matches!(ctx.member_get(record, "3")?.kind(), ValueKind::Bool(true));
+    let premultiplied = matches!(ctx.member_get(record, "5")?.kind(), ValueKind::Bool(true));
     Ok(ctx
         .typed_array_bytes(&pixels)
         .and_then(|bytes| {
@@ -301,13 +305,13 @@ fn record_bitmap(ctx: &mut Ctx, record: &Value) -> Result<Option<(sk::Pixmap, bo
 
 /// The image argument of drawImage()/createPattern(): a record, an
 /// OffscreenCanvas (its id), or (element binding) an element's node.
-fn image_source(
-    ctx: &mut Ctx,
-    req: &Request,
+fn image_source<'s>(
+    ctx: &mut Ctx<'s>,
+    req: &Request<'s>,
     origin: &str,
-) -> Result<Option<(sk::Pixmap, bool)>, Value> {
-    match &req.payload {
-        Value::Undefined => {
+) -> Result<Option<(sk::Pixmap, bool)>, Value<'s>> {
+    match req.payload.kind() {
+        ValueKind::Undefined => {
             let dom = host_dom(ctx);
             let dom = dom.borrow();
             Ok(req
@@ -315,15 +319,15 @@ fn image_source(
                 .first()
                 .and_then(|source| source_bitmap(ctx, &dom, *source as usize, origin)))
         }
-        Value::Num(id) => {
-            super::webgl_host::publish_offscreen(ctx, *id as u32);
-            Ok(offscreen(ctx, *id as u32).and_then(|canvas| canvas.borrow().snapshot()))
+        ValueKind::Num(id) => {
+            super::webgl_host::publish_offscreen(ctx, id as u32);
+            Ok(offscreen(ctx, id as u32).and_then(|canvas| canvas.borrow().snapshot()))
         }
-        record => record_bitmap(ctx, record),
+        _ => record_bitmap(ctx, &req.payload),
     }
 }
 
-fn offscreen(ctx: &mut Ctx, id: u32) -> Option<Rc<RefCell<Offscreen>>> {
+fn offscreen<'s>(ctx: &mut Ctx<'s>, id: u32) -> Option<Rc<RefCell<Offscreen>>> {
     ctx.host_mut::<HostState>()?
         .offscreen_canvases
         .get(&id)
@@ -331,7 +335,11 @@ fn offscreen(ctx: &mut Ctx, id: u32) -> Option<Rc<RefCell<Offscreen>>> {
 }
 
 /// A premultiplied bitmap as a private ImageBitmap record.
-fn bitmap_record(ctx: &mut Ctx, bitmap: &sk::Pixmap, clean: bool) -> Result<Value, Value> {
+fn bitmap_record<'s>(
+    ctx: &mut Ctx<'s>,
+    bitmap: &sk::Pixmap,
+    clean: bool,
+) -> Result<Value<'s>, Value<'s>> {
     let pixels = ctx.make_uint8array(bitmap.data())?;
     // Do not let inherited setters/thenables expose opaque source pixels.
     let record = ctx.new_object_with_proto(&Value::Null);
@@ -352,11 +360,14 @@ fn bitmap_record(ctx: &mut Ctx, bitmap: &sk::Pixmap, clean: bool) -> Result<Valu
 }
 
 /// HTML #a-serialisation-of-the-bitmap-as-a-file, as `[type, bytes]`.
-fn encoded(ctx: &mut Ctx, encoded: Option<(&'static str, Vec<u8>)>) -> Result<Value, Value> {
+fn encoded<'s>(
+    ctx: &mut Ctx<'s>,
+    encoded: Option<(&'static str, Vec<u8>)>,
+) -> Result<Value<'s>, Value<'s>> {
     match encoded {
         Some((mime, bytes)) => {
             let bytes = ctx.make_uint8array(&bytes)?;
-            Ok(ctx.make_array(vec![Value::from_string(mime.to_string()), bytes]))
+            Ok(ctx.make_array(vec![ctx.string(mime.to_string()), bytes]))
         }
         None => Ok(Value::Null),
     }
@@ -365,14 +376,14 @@ fn encoded(ctx: &mut Ctx, encoded: Option<(&'static str, Vec<u8>)>) -> Result<Va
 /// HTML #set-an-imagebitmaprenderingcontext's-output-bitmap with an
 /// ImageBitmap's data (`record`), or without one (transparent black at the
 /// canvas's dimensions).
-fn set_output_bitmap(
-    ctx: &mut Ctx,
+fn set_output_bitmap<'s>(
+    ctx: &mut Ctx<'s>,
     canvas: &mut Canvas,
-    record: &Value,
+    record: &Value<'s>,
     width: u32,
     height: u32,
-) -> Result<(), Value> {
-    if matches!(record, Value::Null | Value::Undefined) {
+) -> Result<(), Value<'s>> {
+    if matches!(record.kind(), ValueKind::Null | ValueKind::Undefined) {
         canvas.sizing = Sizing::Blank;
         canvas.adopt(width, height, None, true);
         return Ok(());
@@ -385,7 +396,11 @@ fn set_output_bitmap(
     Ok(())
 }
 
-pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(super) fn call<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let req = Request::read(ctx, args)?;
     if let Some(result) = realm_op(ctx, &req)? {
         return Ok(result);
@@ -400,7 +415,7 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
         .ok_or_else(|| ctx.make_error("TypeError", "Invalid canvas"))?;
     let readback = if matches!(op, "url" | "snapshot") {
         Some(id)
-    } else if image_op && matches!(payload, Value::Undefined) {
+    } else if image_op && matches!(payload.kind(), ValueKind::Undefined) {
         n.first().map(|n| *n as usize)
     } else {
         None
@@ -443,7 +458,7 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
         };
         let language = dom
             .inherited_lang(root)
-            .map_or(Value::Null, |lang| Value::from_string(lang.to_owned()));
+            .map_or(Value::Null, |lang| ctx.string(lang.to_owned()));
         let rtl = dom.html_directionality_rtl(root);
         return Ok(ctx.make_array(vec![language, Value::Bool(rtl)]));
     }
@@ -642,7 +657,7 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
                 Canvas::new(width, height, true)
                     .map_or_else(|| "data:,".to_string(), |mut canvas| canvas.data_url())
             };
-            return Ok(Value::from_string(url));
+            return Ok(ctx.string(url));
         }
         _ => {}
     }
@@ -698,7 +713,7 @@ fn attribute_size(dom: &Dom, id: usize) -> (u32, u32) {
     (parse("width", 300), parse("height", 150))
 }
 
-fn insert_offscreen(ctx: &mut Ctx, offscreen: Offscreen) -> u32 {
+fn insert_offscreen<'s>(ctx: &mut Ctx<'s>, offscreen: Offscreen) -> u32 {
     let state = ctx.host_mut::<HostState>().unwrap();
     loop {
         state.next_offscreen_canvas = state.next_offscreen_canvas.wrapping_add(1).max(1);
@@ -717,7 +732,11 @@ fn insert_offscreen(ctx: &mut Ctx, offscreen: Offscreen) -> u32 {
 }
 
 /// `__offscreen_canvas(id, op, numbers, payload)`.
-pub(super) fn offscreen_call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(super) fn offscreen_call<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let req = Request::read(ctx, args)?;
     if let Some(result) = realm_op(ctx, &req)? {
         return Ok(result);
@@ -966,7 +985,7 @@ pub(super) fn offscreen_call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Res
                 state.offscreen_canvases.remove(&id);
             }
             return Ok(
-                crate::canvas_offscreen::send(holder).map_or(Value::Null, Value::from_string)
+                crate::canvas_offscreen::send(holder).map_or(Value::Null, |text| ctx.string(text))
             );
         }
         "markLost" => {
@@ -1020,7 +1039,7 @@ pub(super) fn offscreen_call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Res
 
 /// A changed OffscreenCanvas whose placeholder is in this agent's DOM asks
 /// for that document's next rendering update, where it is pushed.
-fn request_rendering(ctx: &mut Ctx, id: u32) {
+fn request_rendering<'s>(ctx: &mut Ctx<'s>, id: u32) {
     let Some(target) = offscreen(ctx, id) else {
         return;
     };
@@ -1052,7 +1071,7 @@ fn request_rendering(ctx: &mut Ctx, id: u32) {
 /// HTML "update the rendering" for the OffscreenCanvases of this agent:
 /// push each changed bitmap to its placeholder canvas element, then (in a
 /// Window agent) present every committed frame to its placeholder.
-pub(super) fn push_placeholders(ctx: &mut Ctx) {
+pub(super) fn push_placeholders<'s>(ctx: &mut Ctx<'s>) {
     let Some(state) = ctx.host_mut::<HostState>() else {
         return;
     };
@@ -1087,7 +1106,7 @@ pub(super) fn present_frames(dom: &mut Dom, node: Option<usize>) {
 }
 
 /// Whether any OffscreenCanvas of this agent has a change to push.
-pub(super) fn placeholders_dirty(ctx: &mut Ctx) -> bool {
+pub(super) fn placeholders_dirty<'s>(ctx: &mut Ctx<'s>) -> bool {
     ctx.host_mut::<HostState>().is_some_and(|state| {
         state.offscreen_canvases.values().any(|canvas| {
             let canvas = canvas.borrow();
@@ -1098,14 +1117,14 @@ pub(super) fn placeholders_dirty(ctx: &mut Ctx) -> bool {
 
 /// The shared 2D drawing operations (HTML #2dcontext). Returns the result
 /// and whether the bitmap changed.
-fn context_op(
-    ctx: &mut Ctx,
-    req: &Request,
+fn context_op<'s>(
+    ctx: &mut Ctx<'s>,
+    req: &Request<'s>,
     canvas: &mut Canvas,
     environment: &Environment<'_>,
     base: &url::Url,
     source: Option<(sk::Pixmap, bool)>,
-) -> Result<(Value, bool), Value> {
+) -> Result<(Value<'s>, bool), Value<'s>> {
     let op = req.op.as_str();
     let n = &req.n;
     let text = &req.text;
@@ -1132,7 +1151,7 @@ fn context_op(
     }
     let mut changed = false;
     let result = match op {
-        "getTextStyle" => Value::from_string(
+        "getTextStyle" => ctx.string(
             canvas
                 .state
                 .text
@@ -1159,7 +1178,7 @@ fn context_op(
             }
         }
         // HTML #dom-context-2d-filter.
-        "getFilter" => Value::from_string(
+        "getFilter" => ctx.string(
             canvas
                 .state
                 .filter
@@ -1360,7 +1379,7 @@ fn context_op(
             }
             Value::Undefined
         }
-        "getShadowColor" => Value::from_string(canvas.state.shadow.serialized.clone()),
+        "getShadowColor" => ctx.string(canvas.state.shadow.serialized.clone()),
         "setShadowBlur" => {
             if let Some(&value) = n.first()
                 && value.is_finite()
@@ -1465,11 +1484,11 @@ fn context_op(
             }
             Value::Undefined
         }
-        "getSmoothingQuality" => Value::from_string(
+        "getSmoothingQuality" => ctx.string(
             ["low", "medium", "high"][usize::from(canvas.state.smoothing_quality.min(2))]
                 .to_string(),
         ),
-        "getStyle" => Value::from_string(if n.first() == Some(&1.) {
+        "getStyle" => ctx.string(if n.first() == Some(&1.) {
             canvas.state.stroke_text.clone()
         } else {
             canvas.state.fill_text.clone()
@@ -1480,7 +1499,7 @@ fn context_op(
             }
             Value::Undefined
         }
-        "getComposite" => Value::from_string(canvas.state.composite.clone()),
+        "getComposite" => ctx.string(canvas.state.composite.clone()),
         "setAlpha" => {
             if let Some(&alpha) = n.first()
                 && (0. ..=1.).contains(&alpha)
@@ -1519,7 +1538,7 @@ fn context_op(
             };
             Value::Undefined
         }
-        "getCap" => Value::from_string(
+        "getCap" => ctx.string(
             match canvas.state.stroke.line_cap {
                 sk::LineCap::Butt => "butt",
                 sk::LineCap::Round => "round",
@@ -1536,7 +1555,7 @@ fn context_op(
             };
             Value::Undefined
         }
-        "getJoin" => Value::from_string(
+        "getJoin" => ctx.string(
             match canvas.state.stroke.line_join {
                 sk::LineJoin::Round => "round",
                 sk::LineJoin::Bevel => "bevel",
@@ -1576,8 +1595,8 @@ fn context_op(
 
 /// Snapshot canvas sources before drawing (including overlapping self-copies).
 /// Image sources use already-available resource bytes; never block JS on I/O.
-fn source_bitmap(
-    ctx: &mut Ctx,
+fn source_bitmap<'s>(
+    ctx: &mut Ctx<'s>,
     dom: &crate::dom::Dom,
     id: usize,
     destination_origin: &str,

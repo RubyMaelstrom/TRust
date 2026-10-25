@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use super::{Ctx, HostState, TrustJsHostTask, Value, host_arg_string};
+use super::{Ctx, HostState, TrustJsHostTask, Value, ValueKind, host_arg_string};
 use crate::webaudio::AudioData;
 use crate::webaudio::bus::{ChannelConfig, CountMode, Interpretation};
 use crate::webaudio::engine::{Command, Engine, Notice, Realtime};
@@ -122,13 +122,13 @@ pub(super) struct WebAudioTask {
     pub(super) notices: Vec<Notice>,
 }
 
-fn number(args: &[Value], index: usize) -> f64 {
+fn number<'s>(args: &[Value<'s>], index: usize) -> f64 {
     args.get(index)
         .and_then(Value::as_num_opt)
         .unwrap_or(f64::NAN)
 }
 
-fn whole(args: &[Value], index: usize) -> u64 {
+fn whole<'s>(args: &[Value<'s>], index: usize) -> u64 {
     let value = number(args, index);
     if value.is_finite() && value >= 0.0 {
         value as u64
@@ -137,7 +137,7 @@ fn whole(args: &[Value], index: usize) -> u64 {
     }
 }
 
-fn floats(ctx: &mut Ctx, value: Option<&Value>) -> Option<Vec<f32>> {
+fn floats<'s>(ctx: &mut Ctx<'s>, value: Option<&Value<'s>>) -> Option<Vec<f32>> {
     let bytes = ctx.typed_array_bytes(value?)?;
     Some(
         bytes
@@ -149,7 +149,7 @@ fn floats(ctx: &mut Ctx, value: Option<&Value>) -> Option<Vec<f32>> {
     )
 }
 
-fn doubles(ctx: &mut Ctx, value: Option<&Value>) -> Option<Vec<f64>> {
+fn doubles<'s>(ctx: &mut Ctx<'s>, value: Option<&Value<'s>>) -> Option<Vec<f64>> {
     let bytes = ctx.typed_array_bytes(value?)?;
     Some(
         bytes
@@ -168,7 +168,7 @@ fn float_bytes(samples: &[f32]) -> Vec<u8> {
         .collect()
 }
 
-fn channel_config(args: &[Value], index: usize) -> ChannelConfig {
+fn channel_config<'s>(args: &[Value<'s>], index: usize) -> ChannelConfig {
     ChannelConfig {
         count: (whole(args, index) as usize).clamp(1, crate::webaudio::MAX_CHANNELS),
         mode: match whole(args, index + 1) {
@@ -202,7 +202,7 @@ fn device(silent: bool) -> (u32, u16) {
     *DEVICE.get_or_init(crate::media::audio::default_device)
 }
 
-fn silent(ctx: &mut Ctx) -> bool {
+fn silent<'s>(ctx: &mut Ctx<'s>) -> bool {
     cfg!(test)
         || ctx
             .host_mut::<HostState>()
@@ -210,7 +210,11 @@ fn silent(ctx: &mut Ctx) -> bool {
 }
 
 /// `__audio_context_binding(op, …)` for the Web Audio operations.
-pub(super) fn binding(ctx: &mut Ctx, op: &str, args: &[Value]) -> Result<Value, Value> {
+pub(super) fn binding<'s>(
+    ctx: &mut Ctx<'s>,
+    op: &str,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     match op {
         "device" => {
             let (rate, channels) = device(silent(ctx));
@@ -266,7 +270,7 @@ pub(super) fn binding(ctx: &mut Ctx, op: &str, args: &[Value]) -> Result<Value, 
             let imag = floats(ctx, args.get(2)).unwrap_or_default();
             let normalize = args
                 .get(3)
-                .is_some_and(|value| matches!(value, Value::Bool(true)));
+                .is_some_and(|value| matches!(value.kind(), ValueKind::Bool(true)));
             let wave = Arc::new(Wave::new(&real, &imag, normalize));
             let Some(state) = ctx.host_mut::<HostState>() else {
                 return Ok(Value::Num(0.0));
@@ -561,7 +565,7 @@ pub(super) fn binding(ctx: &mut Ctx, op: &str, args: &[Value]) -> Result<Value, 
                     worklet_outputs
                         .map(|counts| counts.iter().map(|&count| count as usize).collect()),
                     args.get(10)
-                        .is_some_and(|value| matches!(value, Value::Bool(true))),
+                        .is_some_and(|value| matches!(value.kind(), ValueKind::Bool(true))),
                 )),
                 "media-element" => match element_tap {
                     Some(tap) => Box::new(nodes::MediaElementSource::new(tap)),
@@ -730,7 +734,7 @@ pub(super) fn binding(ctx: &mut Ctx, op: &str, args: &[Value]) -> Result<Value, 
     Ok(Value::Undefined)
 }
 
-fn create(ctx: &mut Ctx, realtime: bool, args: &[Value]) -> Value {
+fn create<'s>(ctx: &mut Ctx<'s>, realtime: bool, args: &[Value<'s>]) -> Value<'s> {
     let silent = silent(ctx);
     let realm = ctx.host_job_context();
     let Some(state) = ctx.host_mut::<HostState>() else {
@@ -768,7 +772,7 @@ fn create(ctx: &mut Ctx, realtime: bool, args: &[Value]) -> Value {
                 silent: silent
                     || args
                         .get(5)
-                        .is_some_and(|value| matches!(value, Value::Bool(true))),
+                        .is_some_and(|value| matches!(value.kind(), ValueKind::Bool(true))),
                 mute: mute.clone(),
             },
             notify,
@@ -798,7 +802,7 @@ fn create(ctx: &mut Ctx, realtime: bool, args: &[Value]) -> Value {
 /// phaseResponse)`: BiquadFilterNode's (from the parameters' [[current
 /// value]]s) or IIRFilterNode's getFrequencyResponse(). Frequencies outside
 /// [0, sampleRate/2] give NaN.
-fn frequency_response(ctx: &mut Ctx, context: u64, args: &[Value]) -> Value {
+fn frequency_response<'s>(ctx: &mut Ctx<'s>, context: u64, args: &[Value<'s>]) -> Value<'s> {
     let node = whole(args, 2) as u32;
     let frequencies = floats(ctx, args.get(3)).unwrap_or_default();
     let Some(state) = ctx.host_mut::<HostState>() else {
@@ -858,7 +862,7 @@ fn frequency_response(ctx: &mut Ctx, context: u64, args: &[Value]) -> Value {
 /// maxDecibels, array, byteLength)`: an AnalyserNode's data written into
 /// `array` (#AnalyserNode-methods): "floatFrequency", "byteFrequency",
 /// "floatTime", "byteTime", or "reset" (fftSize changed).
-fn analyse(ctx: &mut Ctx, context: u64, args: &[Value]) -> Value {
+fn analyse<'s>(ctx: &mut Ctx<'s>, context: u64, args: &[Value<'s>]) -> Value<'s> {
     let node = whole(args, 2) as u32;
     let op = host_arg_string(ctx, args, 3);
     let size = (whole(args, 4) as usize).clamp(32, nodes::analyser::MAX_FFT);
@@ -915,7 +919,7 @@ fn analyse(ctx: &mut Ctx, context: u64, args: &[Value]) -> Value {
 /// `decode(context, bytes)`: decodeAudioData()'s decoding operation on a
 /// decoding thread; its result arrives as a `decoded` task. Returns the job
 /// id (0 when the context is gone).
-fn decode(ctx: &mut Ctx, context: u64, args: &[Value]) -> Value {
+fn decode<'s>(ctx: &mut Ctx<'s>, context: u64, args: &[Value<'s>]) -> Value<'s> {
     let bytes = args
         .get(2)
         .and_then(|value| ctx.buffer_source_bytes(value, false))
@@ -950,7 +954,7 @@ fn decode(ctx: &mut Ctx, context: u64, args: &[Value]) -> Value {
 /// `buffer(rate, length, ...channels)`: acquire script's channel data as a
 /// content (#acquire-the-content step 3). A detached channel makes the
 /// whole content zero-length.
-fn buffer(ctx: &mut Ctx, args: &[Value]) -> Value {
+fn buffer<'s>(ctx: &mut Ctx<'s>, args: &[Value<'s>]) -> Value<'s> {
     let rate = number(args, 1) as f32;
     let length = whole(args, 2) as usize;
     let mut channels = Vec::new();
@@ -987,7 +991,7 @@ fn buffer(ctx: &mut Ctx, args: &[Value]) -> Value {
 /// Keep `data` as a content for an AudioBuffer: (id, length, channels).
 fn store(engine: &mut trust_js::Engine, data: Arc<AudioData>) -> Option<(f64, f64, f64)> {
     let (length, channels) = (data.length as f64, data.channels.len() as f64);
-    let state = engine.ctx().host_mut::<HostState>()?;
+    let state = engine.host_mut::<HostState>()?;
     let id = state.webaudio.next();
     state.webaudio.contents.insert(id, data);
     Some((id as f64, length, channels))
@@ -996,14 +1000,15 @@ fn store(engine: &mut trust_js::Engine, data: Arc<AudioData>) -> Option<(f64, f6
 /// Deliver a context's notices to its realm.
 pub(super) fn dispatch(engine: &mut trust_js::Engine, task: WebAudioTask) -> Result<(), String> {
     let Some(realm) = engine
-        .ctx()
         .host_mut::<HostState>()
         .and_then(|state| state.webaudio.contexts.get(&task.context))
         .map(|entry| entry.realm)
     else {
         return Ok(());
     };
-    let context = Value::Num(task.context as f64);
+    let context = task.context as f64;
+    // Each call runs JavaScript, which can collect: the values of later calls are made as
+    // each is called.
     let mut calls = Vec::with_capacity(task.notices.len());
     for notice in task.notices {
         let mut text = String::new();
@@ -1059,22 +1064,21 @@ pub(super) fn dispatch(engine: &mut trust_js::Engine, task: WebAudioTask) -> Res
                 )
             }
         };
-        calls.push([
-            context.clone(),
-            Value::from_string(kind.to_string()),
-            Value::Num(a),
-            Value::Num(b),
-            Value::Num(c),
-            Value::Num(d),
-            Value::from_string(text),
-        ]);
+        calls.push((kind, a, b, c, d, text));
     }
-    super::run_in_context_realm(engine, realm, "Web Audio task", move |engine| {
-        for args in calls {
-            if let Err(error) =
-                super::host_call_trust_interruptible(engine.ctx(), "webAudioEvent", &args)
-            {
-                return super::host_task_failure(engine.ctx(), error, "Web Audio task");
+    super::run_in_context_realm(engine, realm, "Web Audio task", move |cx| {
+        for (kind, a, b, c, d, text) in calls {
+            let args = [
+                Value::Num(context),
+                cx.str(kind),
+                Value::Num(a),
+                Value::Num(b),
+                Value::Num(c),
+                Value::Num(d),
+                cx.string(text),
+            ];
+            if let Err(error) = super::host_call_trust_interruptible(cx, "webAudioEvent", &args) {
+                return super::host_task_failure(cx, error, "Web Audio task");
             }
         }
         Ok(())
