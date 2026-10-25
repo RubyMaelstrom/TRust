@@ -16771,8 +16771,23 @@ mod tests {
         // The shell painted first, before the setTimeout fired — no image
         // yet, so the initial-load path started no batch.
         assert!(app.imgs_in_flight.is_empty(), "shell carried no images");
-        // Drain the filled render the settle (setTimeout) produced.
-        drain_page_event(&mut app).await;
+        // Drain renders up to the filled one the settle (setTimeout) produced: a
+        // rendering opportunity may come before the timer's task.
+        let mounted = |app: &super::App| {
+            app.browser
+                .as_ref()
+                .unwrap()
+                .doc
+                .image_urls
+                .iter()
+                .any(|u| u.ends_with("tile.png"))
+        };
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            while !mounted(&app) {
+                drain_page_event(&mut app).await;
+            }
+        })
+        .await;
         let g = app.browser.as_ref().unwrap();
         assert!(
             g.doc.image_urls.iter().any(|u| u.ends_with("tile.png")),
