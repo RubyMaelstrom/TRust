@@ -7,65 +7,90 @@
 //! each WeakRef's prototype retains its creating Realm. Native weak handles
 //! have neither a prototype nor an associated Realm.
 
+use std::cell::Cell;
 use trust_js::embed::{
     Ctx, HostRetainedMemoryVisitor, RetainedManagedAllocation, Value, WeakHandle,
 };
 
 const COMPACT_FLOOR: usize = 256;
 
-/// Every Range the Agent created, named weakly. A collection's sweep forgets those it found dead.
+/// Every Range the Agent created, named weakly, in the engine's two generations: those a
+/// collection has seen, and those registered since. A collection's sweep forgets those it found
+/// dead. A minor collection frees only objects allocated since the last collection, so its sweep
+/// visits the young Ranges alone.
 #[derive(Default)]
 pub(super) struct Registry {
-    ranges: Vec<WeakHandle>,
+    old: Vec<WeakHandle>,
+    young: Vec<WeakHandle>,
+    /// Whether the collection in progress is minor (`Registry::begin_collection`).
+    collecting_young: Cell<bool>,
 }
 
 impl Registry {
     pub(super) fn register(&mut self, range: WeakHandle) {
-        self.ranges.push(range);
+        self.young.push(range);
     }
 
     /// Whether any Range may still be live. A dead handle not yet pruned
     /// answers true; the caller then takes the snapshot, which prunes it.
     pub(super) fn may_have_ranges(&self) -> bool {
-        !self.ranges.is_empty()
+        !self.old.is_empty() || !self.young.is_empty()
     }
 
     /// The live Ranges, read into `ctx`'s scope. The registry is taken out of the host state
     /// while it is read (`Registry::take`), so no host borrow is held.
     pub(super) fn snapshot<'s>(&mut self, ctx: &Ctx<'s>) -> Vec<Value<'s>> {
         let mut values = Vec::new();
-        self.ranges.retain(|range| match range.upgrade(ctx) {
-            Ok(Some(value)) => {
-                values.push(value);
-                true
-            }
-            _ => false,
-        });
-        shrink(&mut self.ranges);
+        for ranges in [&mut self.old, &mut self.young] {
+            ranges.retain(|range| match range.upgrade(ctx) {
+                Ok(Some(value)) => {
+                    values.push(value);
+                    true
+                }
+                _ => false,
+            });
+            shrink(ranges);
+        }
         values
     }
 
-    /// Forget the Ranges a collection found dead, after it cleared their handles.
+    /// Note whether the collection whose sweep comes next is minor (`HostState::trace_gc`).
+    pub(super) fn begin_collection(&self, minor: bool) {
+        self.collecting_young.set(minor);
+    }
+
+    /// Forget the Ranges a collection found dead, after it cleared their handles: after a minor
+    /// collection, young ones alone. Every Range left is then old.
     pub(super) fn sweep(&mut self) {
-        self.ranges.retain(|range| !range.is_cleared());
-        shrink(&mut self.ranges);
+        if !self.collecting_young.get() {
+            self.old.retain(|range| !range.is_cleared());
+        }
+        self.young.retain(|range| !range.is_cleared());
+        self.old.append(&mut self.young);
+        shrink(&mut self.old);
+        shrink(&mut self.young);
     }
 
     pub(super) fn scan_retained_memory(&self, visitor: &mut dyn HostRetainedMemoryVisitor) {
-        if self.ranges.capacity() != 0 {
-            visitor.allocation(RetainedManagedAllocation::new(
-                "trust.live-ranges",
-                self.ranges.as_ptr() as usize,
-                self.ranges.capacity() * std::mem::size_of::<WeakHandle>(),
-            ));
-            // A weak handle's table entry belongs to the engine.
-            visitor.opaque_storage();
+        for (name, ranges) in [
+            ("trust.live-ranges.old", &self.old),
+            ("trust.live-ranges.young", &self.young),
+        ] {
+            if ranges.capacity() != 0 {
+                visitor.allocation(RetainedManagedAllocation::new(
+                    name,
+                    ranges.as_ptr() as usize,
+                    ranges.capacity() * std::mem::size_of::<WeakHandle>(),
+                ));
+                // A weak handle's table entry belongs to the engine.
+                visitor.opaque_storage();
+            }
         }
     }
 
     #[cfg(test)]
     pub(super) fn len(&self) -> usize {
-        self.ranges.len()
+        self.old.len() + self.young.len()
     }
 }
 
@@ -121,6 +146,42 @@ mod tests {
             registry.sweep();
             assert!(registry.len() < 4096, "{} ranges survived", registry.len());
         }
-        assert!(registry.ranges.capacity() <= 4 * COMPACT_FLOOR.max(4096));
+        assert!(registry.old.capacity() <= 4 * COMPACT_FLOOR.max(4096));
+        assert!(registry.young.capacity() <= 4 * COMPACT_FLOOR.max(4096));
+    }
+
+    /// A minor collection frees young Ranges alone: its sweep forgets the dead young ones and
+    /// counts the rest old, and a Range that was old when it became unreachable waits for a
+    /// major collection, whose sweep visits every Range.
+    #[test]
+    fn range_registry_minor_sweep_forgets_dead_young_ranges_and_keeps_old_ones() {
+        let mut engine = trust_js::Engine::new();
+        let mut registry = Registry::default();
+        engine.eval("globalThis.kept = {}", false).unwrap();
+        engine.scope(|cx| {
+            let global = cx.global_this();
+            let kept = cx.member_get(&global, "kept").unwrap();
+            registry.register(WeakHandle::new(cx, &kept).unwrap());
+        });
+        registry.begin_collection(false);
+        engine.collect_garbage_at_idle();
+        registry.sweep();
+        assert_eq!((registry.old.len(), registry.young.len()), (1, 0));
+        engine.eval("globalThis.kept = null", false).unwrap();
+        register_unreachable(&mut engine, &mut registry, 1000);
+        registry.begin_collection(true);
+        engine.scope(|cx| cx.unstable_collect_young_for_host_tests());
+        registry.sweep();
+        // The conservative stack scan may keep a few of the dropped objects.
+        assert!(registry.young.is_empty());
+        assert!(registry.old.len() < 100, "{} ranges survived", registry.old.len());
+        assert!(
+            !registry.old[0].is_cleared(),
+            "a minor collection does not free an old Range"
+        );
+        registry.begin_collection(false);
+        engine.collect_garbage_at_idle();
+        registry.sweep();
+        assert!(registry.old.len() < 100, "{} ranges survived", registry.old.len());
     }
 }

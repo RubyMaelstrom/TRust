@@ -928,6 +928,9 @@ struct DomGcRegistry {
     /// Canonical Document wrappers cross Window realms during adoption. Pointer identities
     /// borrow the existing owner records; this index adds no strong JavaScript references.
     documents: rustc_hash::FxHashMap<usize, usize>,
+    /// The owners recorded or replaced since the last collection that swept the DOM. The
+    /// others are old, so a minor collection reports and sweeps these alone.
+    young_owners: rustc_hash::FxHashSet<usize>,
     /// Nodes whose wrapper has been given an event-listener list (DOM
     /// #concept-event-listener). Only their wrappers take part in listener
     /// discovery when a subtree is connected or disconnected, so the platform
@@ -936,6 +939,10 @@ struct DomGcRegistry {
     listener_nodes: rustc_hash::FxHashSet<usize>,
     pending_resources: Rc<RefCell<HashMap<usize, usize>>>,
     traced: Cell<bool>,
+    /// Whether the collection in progress is minor, and whether its report was the DOM graph's
+    /// young part alone (`HostState::trace_gc`).
+    collecting_minor: Cell<bool>,
+    traced_minor: Cell<bool>,
 }
 
 impl DomGcRegistry {
@@ -969,9 +976,11 @@ impl DomGcRegistry {
         self.forget_document(identity);
         if nodes.is_empty() {
             self.owners.remove(&identity);
+            self.young_owners.remove(&identity);
         } else {
             self.owners
                 .insert(identity, DomGcOwner { value, nodes, kind });
+            self.young_owners.insert(identity);
         }
     }
 
@@ -2126,6 +2135,7 @@ impl RetainedMemory for HostState {
                 + dom_gc.documents.capacity() * std::mem::size_of::<(usize, usize)>()
                 + dom_gc.wrappers.capacity() * std::mem::size_of::<(usize, usize)>()
                 + dom_gc.listener_nodes.capacity() * std::mem::size_of::<usize>()
+                + dom_gc.young_owners.capacity() * std::mem::size_of::<usize>()
                 + dom_gc
                     .owners
                     .values()
@@ -2624,25 +2634,37 @@ impl trust_js::embed::RetainedExternalMemory for HostState {
 impl HostTrace for HostState {
     fn trace_gc(&self, visitor: &mut dyn HostGcVisitor) {
         self.wasm.trace_gc(visitor);
+        let collecting_minor = visitor.is_minor();
+        self.live_ranges.begin_collection(collecting_minor);
         self.geometry.trace(visitor);
+        self.dom_gc.collecting_minor.set(collecting_minor);
         self.dom_gc.traced.set(false);
-        // Only a collection that reports the whole DOM graph may sweep it. Every traversable's
-        // arena (`Traversables`) traces its nodes as its own native owner; node identities are
-        // unique across them.
+        // Only a collection that reports the DOM graph may sweep it: the whole graph, or in a
+        // minor collection its young part. Every traversable's arena (`Traversables`) traces its
+        // nodes as its own native owner; node identities are unique across them.
         let mut arenas = Vec::with_capacity(1 + self.traversables.parked.len());
         for arena in self.arenas() {
             let Ok(dom) = arena.try_borrow_mut() else {
                 // A native holds an arena across an allocation: its graph cannot be read, so
-                // every owner the registry names is a root of this collection, and no node is
-                // swept (the sweep needs `traced`).
-                for entry in self.dom_gc.owners.values() {
-                    visitor.root(&entry.value);
+                // every owner the registry names is a root of this collection (in a minor one,
+                // every young owner: the others are old), and no node is swept (the sweep needs
+                // `traced`).
+                if collecting_minor {
+                    for identity in &self.dom_gc.young_owners {
+                        if let Some(entry) = self.dom_gc.owners.get(identity) {
+                            visitor.root(&entry.value);
+                        }
+                    }
+                } else {
+                    for entry in self.dom_gc.owners.values() {
+                        visitor.root(&entry.value);
+                    }
                 }
                 return;
             };
             arenas.push((Rc::as_ptr(arena) as usize, dom));
         }
-        let dom = &arenas[0].1;
+        let (owner, dom) = (arenas[0].0, &arenas[0].1);
         let owner_of = |node: usize| {
             arenas
                 .iter()
@@ -2654,7 +2676,14 @@ impl HostTrace for HostState {
             owner,
             id,
         };
-        if std::env::var_os("TRUST_JS_GC_DUMP").is_some() {
+        // A minor collection keeps every node allocated before the last sweep, so it takes the
+        // graph's young part alone: the young nodes' edges and roots, the edges of the old nodes
+        // changed since, and the owners recorded since. Young generations are an arena's own: a
+        // group's arenas collect fully.
+        let minor = arenas.len() == 1
+            && collecting_minor
+            && visitor.native_old_generation("trust.dom", owner, dom.first_young_gc_id());
+        if !minor && std::env::var_os("TRUST_JS_GC_DUMP").is_some() {
             let mut roots = std::collections::BTreeMap::<usize, usize>::new();
             let mut allocations = std::collections::BTreeMap::<usize, usize>::new();
             let mut resources = std::collections::BTreeMap::<usize, usize>::new();
@@ -2680,11 +2709,21 @@ impl HostTrace for HostState {
         }
         for (owner, dom) in &arenas {
             let owner = *owner;
-            dom.visit_gc_edges(|from, to| {
-                visitor.native_edge(node_id(owner, from), node_id(owner, to))
-            });
+            if minor {
+                dom.visit_gc_young_edges(|from, to| {
+                    visitor.native_edge(node_id(owner, from), node_id(owner, to))
+                });
+            } else {
+                dom.visit_gc_edges(|from, to| {
+                    visitor.native_edge(node_id(owner, from), node_id(owner, to))
+                });
+            }
             dom.visit_gc_roots(|node| {
-                if dom.is_valid(node) {
+                if minor {
+                    if dom.is_young_gc_node(node) {
+                        visitor.native_root(node_id(owner, node));
+                    }
+                } else if dom.is_valid(node) {
                     visitor.native_root(node_id(owner, node));
                 } else if let Some(holder) = owner_of(node) {
                     // A record about a node that moved to another arena
@@ -2695,11 +2734,13 @@ impl HostTrace for HostState {
             dom.visit_gc_pending_allocations(|node| visitor.native_root(node_id(owner, node)));
         }
         for &node in self.dom_gc.pending_resources.borrow().keys() {
-            if let Some(owner) = owner_of(node) {
+            if let Some(owner) = owner_of(node)
+                && (!minor || dom.is_young_gc_node(node))
+            {
                 visitor.native_root(node_id(owner, node));
             }
         }
-        for entry in self.dom_gc.owners.values() {
+        let mut trace_entry = |entry: &DomGcOwner| {
             for &node in &entry.nodes {
                 let Some(owner) = owner_of(node) else {
                     continue;
@@ -2714,7 +2755,19 @@ impl HostTrace for HostState {
                     DomGcOwnerKind::Observer => visitor.native_to_js(id, &entry.value),
                 }
             }
+        };
+        if minor {
+            for identity in &self.dom_gc.young_owners {
+                if let Some(entry) = self.dom_gc.owners.get(identity) {
+                    trace_entry(entry);
+                }
+            }
+        } else {
+            for entry in self.dom_gc.owners.values() {
+                trace_entry(entry);
+            }
         }
+        self.dom_gc.traced_minor.set(minor);
         self.dom_gc.traced.set(true);
     }
 }
@@ -2727,14 +2780,11 @@ impl HostGc for HostState {
         self.webgl_fast.sweep();
         // Forget the owners this collection found dead, whether or not it could trace the
         // DOM: their cells are freed next, and an identity must not name a dead owner's entry
-        // once a new object can have it.
+        // once a new object can have it. A minor collection frees young owners alone.
         {
             let wrappers = &mut self.dom_gc.wrappers;
             let documents = &mut self.dom_gc.documents;
-            self.dom_gc.owners.retain(|&identity, entry| {
-                if !entry.value.is_cleared() {
-                    return true;
-                }
+            let mut forget = |identity: usize, entry: &DomGcOwner| {
                 for node in &entry.nodes {
                     if wrappers.get(node) == Some(&identity) {
                         wrappers.remove(node);
@@ -2743,8 +2793,27 @@ impl HostGc for HostState {
                         documents.remove(node);
                     }
                 }
-                false
-            });
+            };
+            if self.dom_gc.collecting_minor.get() {
+                let owners = &mut self.dom_gc.owners;
+                for &identity in &self.dom_gc.young_owners {
+                    if owners
+                        .get(&identity)
+                        .is_some_and(|entry| entry.value.is_cleared())
+                        && let Some(entry) = owners.remove(&identity)
+                    {
+                        forget(identity, &entry);
+                    }
+                }
+            } else {
+                self.dom_gc.owners.retain(|&identity, entry| {
+                    if !entry.value.is_cleared() {
+                        return true;
+                    }
+                    forget(identity, entry);
+                    false
+                });
+            }
         }
         if !self.dom_gc.traced.replace(false) {
             return;
@@ -2758,6 +2827,7 @@ impl HostGc for HostState {
             };
             arenas.push((Rc::as_ptr(handle) as usize, dom));
         }
+        let minor = self.dom_gc.traced_minor.get();
         {
             let live = |id: usize| {
                 arenas
@@ -2772,7 +2842,7 @@ impl HostGc for HostState {
                     })
             };
             let wrappers = &mut self.dom_gc.wrappers;
-            self.dom_gc.owners.retain(|&identity, entry| {
+            let mut retain_nodes = |identity: usize, entry: &mut DomGcOwner| {
                 entry.nodes.retain(|&node| {
                     let keep = live(node);
                     if !keep && wrappers.get(&node) == Some(&identity) {
@@ -2781,12 +2851,29 @@ impl HostGc for HostState {
                     keep
                 });
                 !entry.nodes.is_empty()
-            });
-            self.dom_gc
-                .documents
-                .retain(|_, identity| self.dom_gc.owners.contains_key(identity));
+            };
+            // A minor sweep frees young nodes alone, which only young owners name.
+            if minor {
+                let owners = &mut self.dom_gc.owners;
+                for &identity in &self.dom_gc.young_owners {
+                    if owners
+                        .get_mut(&identity)
+                        .is_some_and(|entry| !retain_nodes(identity, entry))
+                    {
+                        owners.remove(&identity);
+                    }
+                }
+            } else {
+                self.dom_gc
+                    .owners
+                    .retain(|&identity, entry| retain_nodes(identity, entry));
+                self.dom_gc
+                    .documents
+                    .retain(|_, identity| self.dom_gc.owners.contains_key(identity));
+            }
         }
-        for (owner, dom) in arenas.iter_mut() {
+        let mut removed = Vec::new();
+        for (index, (owner, dom)) in arenas.iter_mut().enumerate() {
             let owner = *owner;
             let live = |id| {
                 native_is_live(NativeGcId {
@@ -2795,7 +2882,12 @@ impl HostGc for HostState {
                     id,
                 })
             };
-            for node in &dom.sweep_gc_nodes(&live) {
+            let swept = if minor {
+                dom.sweep_gc_young_nodes(&live)
+            } else {
+                dom.sweep_gc_nodes(&live)
+            };
+            for node in &swept {
                 self.dom_gc.documents.remove(node);
                 self.dom_gc.wrappers.remove(node);
                 self.dom_gc.listener_nodes.remove(node);
@@ -2804,8 +2896,15 @@ impl HostGc for HostState {
                 }
             }
             dom.finish_gc_generation();
+            if index == 0 {
+                removed = swept;
+            }
         }
         let dom = &arenas[0].1;
+        self.dom_gc.young_owners.clear();
+        if self.dom_gc.young_owners.capacity() > 64 {
+            self.dom_gc.young_owners = Default::default();
+        }
         if self.dom_gc.documents.capacity() > self.dom_gc.documents.len().saturating_mul(4).max(64)
         {
             self.dom_gc
@@ -2821,14 +2920,27 @@ impl HostGc for HostState {
         if listener_nodes.capacity() > listener_nodes.len().saturating_mul(4).max(64) {
             listener_nodes.shrink_to(listener_nodes.len().saturating_mul(2));
         }
-        if let Ok(mut cache) = self.geom_cache.try_borrow_mut() {
-            cache.boxes.retain(|&node, _| dom.is_valid(node));
-            cache.tracks.retain(|&node, _| dom.is_valid(node));
-            cache.scrolling_areas.retain(|&node, _| dom.is_valid(node));
-            cache.frame_viewports.retain(|&node, _| dom.is_valid(node));
-            cache
-                .viewport_fixed_roots
-                .retain(|&node| dom.is_valid(node));
+        // A minor sweep removes young nodes alone, whose entries are the only stale ones.
+        if (!removed.is_empty() || !minor)
+            && let Ok(mut cache) = self.geom_cache.try_borrow_mut()
+        {
+            if minor {
+                for node in &removed {
+                    cache.boxes.remove(node);
+                    cache.tracks.remove(node);
+                    cache.scrolling_areas.remove(node);
+                    cache.frame_viewports.remove(node);
+                    cache.viewport_fixed_roots.remove(node);
+                }
+            } else {
+                cache.boxes.retain(|&node, _| dom.is_valid(node));
+                cache.tracks.retain(|&node, _| dom.is_valid(node));
+                cache.scrolling_areas.retain(|&node, _| dom.is_valid(node));
+                cache.frame_viewports.retain(|&node, _| dom.is_valid(node));
+                cache
+                    .viewport_fixed_roots
+                    .retain(|&node| dom.is_valid(node));
+            }
             macro_rules! shrink_cache {
                 ($cache:expr) => {
                     if $cache.capacity() > $cache.len().saturating_mul(4).max(64) {
@@ -60595,6 +60707,9 @@ mod tests {
         }
         let mut engine = platform_engine();
         eval(&mut engine,"globalThis.collectionRoot=document.createElement('div');collectionRoot.innerHTML='<i></i>'.repeat(128);", "collection setup").unwrap();
+        // Count live ID arrays only: a collection during the views' use (GC stress) may free
+        // one the setup left as garbage.
+        engine.collect_garbage_at_idle();
         let id_arrays = |engine: &mut trust_js::Engine| {
             engine
                 .host_mut::<HostState>()
@@ -60708,6 +60823,9 @@ mod tests {
             "query setup",
         )
         .unwrap();
+        // Count live ID arrays only: a collection during the views' use (GC stress) may free
+        // one the setup left as garbage.
+        engine.collect_garbage_at_idle();
         let id_arrays = |engine: &mut trust_js::Engine| {
             engine
                 .host_mut::<HostState>()
@@ -61180,6 +61298,14 @@ mod tests {
             ),
             "41:42:43:true"
         );
+        assert!(
+            engine
+                .host_mut::<HostState>()
+                .unwrap()
+                .dom_gc
+                .young_owners
+                .is_empty()
+        );
     }
 
     #[test]
@@ -61206,10 +61332,66 @@ mod tests {
         engine.scope(|cx| cx.unstable_collect_young_for_host_tests());
         assert!(dom.borrow().is_valid(newborn));
         HostGc::end_job(engine.host_mut::<HostState>().unwrap());
-        // Every collection reports the whole DOM graph, so a minor one reclaims the survivor
-        // once its allocation lease has ended.
+        // This survivor is now old: only the next major collection may reclaim it.
         engine.scope(|cx| cx.unstable_collect_young_for_host_tests());
+        assert!(dom.borrow().is_valid(newborn));
+        engine.collect_garbage_at_idle();
         assert!(!dom.borrow().is_valid(newborn));
+    }
+
+    #[test]
+    fn dom_gc_nursery_unchanged_host_registry_emits_no_old_dom_graph() {
+        #[derive(Default)]
+        struct Count {
+            values: usize,
+            edges: usize,
+            owners: usize,
+        }
+        impl HostGcVisitor for Count {
+            fn is_minor(&self) -> bool {
+                true
+            }
+            fn native_old_generation(&mut self, _: &'static str, _: usize, _: usize) -> bool {
+                true
+            }
+            fn edge(&mut self, _: &WeakHandle, _: &WeakHandle) {}
+            fn root(&mut self, _: &WeakHandle) {
+                self.values += 1;
+            }
+            fn native_edge(&mut self, _: NativeGcId, _: NativeGcId) {
+                self.edges += 1;
+            }
+            fn js_to_native(&mut self, _: &WeakHandle, _: NativeGcId) {
+                self.owners += 1;
+            }
+            fn native_to_js(&mut self, _: NativeGcId, _: &WeakHandle) {
+                self.values += 1;
+            }
+            fn native_root(&mut self, _: NativeGcId) {}
+        }
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r#"
+            const tree=document.createElement('main');
+            (document.body||document.documentElement||document).appendChild(tree);
+            for(let i=0;i<1000;++i) tree.appendChild(document.createElement('p'));
+        "#,
+            "old native registry",
+        )
+        .unwrap();
+        run_microtask_checkpoint(&mut engine);
+        engine.collect_garbage_at_idle();
+        let state = engine.host_mut::<HostState>().unwrap();
+        assert!(state.dom_gc.owners.len() >= 1000);
+        assert!(state.dom_gc.young_owners.is_empty());
+        let mut count = Count::default();
+        state.trace_gc(&mut count);
+        assert_eq!(
+            (count.values, count.edges, count.owners),
+            (0, 0, 0),
+            "an unchanged old native heap must not be enumerated during minor collection"
+        );
     }
 
     #[test]

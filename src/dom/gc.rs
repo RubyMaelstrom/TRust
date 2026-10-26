@@ -15,16 +15,10 @@ impl Dom {
         self.nodes.enable_generations();
     }
 
-    // The engine reports every collection's host graph whole (`HostState::trace_gc`), so only
-    // the generational tests read the nursery.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn first_young_gc_id(&self) -> NodeId {
         self.nodes.first_young_id()
     }
 
-    // The engine reports every collection's host graph whole (`HostState::trace_gc`), so only
-    // the generational tests read the nursery.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn is_young_gc_node(&self, id: NodeId) -> bool {
         self.nodes.is_young(id)
     }
@@ -43,9 +37,6 @@ impl Dom {
         }
     }
 
-    // The engine reports every collection's host graph whole (`HostState::trace_gc`), so only
-    // the generational tests read the nursery.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn visit_gc_young_edges(&self, mut visit: impl FnMut(NodeId, NodeId)) {
         for id in self.nodes.young_ids().chain(self.nodes.remembered_ids()) {
             self.visit_node_gc_edges(id, &mut visit);
@@ -123,9 +114,6 @@ impl Dom {
 
     /// Retire only nursery identities. Old physical nodes and caches are never walked here;
     /// remaining queue work is proportional to pending native mutations/events, not tree size.
-    // The engine reports every collection's host graph whole (`HostState::trace_gc`), so only
-    // the generational tests read the nursery.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn sweep_gc_young_nodes(&mut self, live: &dyn Fn(NodeId) -> bool) -> Vec<NodeId> {
         let nodes = &self.nodes;
         self.pending_style_invalidations

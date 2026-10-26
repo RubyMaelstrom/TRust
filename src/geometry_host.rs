@@ -11,6 +11,7 @@ use super::{
     ValueKind, hold_weakly,
 };
 use rustc_hash::FxHashMap;
+use std::cell::Cell;
 use trust_js::embed::WeakHandle;
 
 const COMPACT_FLOOR: usize = 256;
@@ -79,11 +80,19 @@ struct RealmPrototypes {
 
 /// Rectangles by object identity, and each Realm's prototypes by its global's. Both name their
 /// objects weakly; a collection's sweep forgets the dead ones before their cells (and so their
-/// identities) are freed, so an identity never names a dead object's entry.
+/// identities) are freed, so an identity never names a dead object's entry. Like the engine's
+/// heap, the registry has two generations: what a collection has seen, and what was registered
+/// since. A minor collection frees only objects allocated since the last collection, so it
+/// reports and sweeps the young part alone.
 #[derive(Default)]
 pub(super) struct Registry {
     realms: FxHashMap<usize, RealmPrototypes>,
-    entries: FxHashMap<usize, Entry>,
+    /// The Realms registered since the last collection.
+    young_realms: Vec<usize>,
+    young: FxHashMap<usize, Entry>,
+    old: FxHashMap<usize, Entry>,
+    /// Whether the collection in progress is minor (`Registry::trace`).
+    minor: Cell<bool>,
 }
 
 fn shrink<T>(entries: &mut FxHashMap<usize, T>) {
@@ -95,39 +104,85 @@ fn shrink<T>(entries: &mut FxHashMap<usize, T>) {
 impl Registry {
     #[cfg(test)]
     pub(super) fn len(&self) -> usize {
-        self.entries.len()
+        self.young.len() + self.old.len()
     }
 
     fn insert(&mut self, key: usize, owner: WeakHandle, rectangle: Rectangle) {
-        debug_assert!(!self.entries.contains_key(&key));
-        self.entries.insert(key, Entry { owner, rectangle });
+        debug_assert!(!self.young.contains_key(&key) && !self.old.contains_key(&key));
+        self.young.insert(key, Entry { owner, rectangle });
     }
 
     fn get(&self, key: usize) -> Option<Rectangle> {
-        self.entries.get(&key).map(|entry| entry.rectangle)
+        self.young
+            .get(&key)
+            .or_else(|| self.old.get(&key))
+            .map(|entry| entry.rectangle)
     }
 
     fn get_mut(&mut self, key: usize) -> Option<&mut Rectangle> {
-        self.entries.get_mut(&key).map(|entry| &mut entry.rectangle)
+        self.young
+            .get_mut(&key)
+            .or_else(|| self.old.get_mut(&key))
+            .map(|entry| &mut entry.rectangle)
+    }
+
+    fn register_realm(&mut self, key: usize, prototypes: RealmPrototypes) {
+        self.realms.insert(key, prototypes);
+        self.young_realms.push(key);
     }
 
     pub(super) fn trace(&self, visitor: &mut dyn HostGcVisitor) {
+        self.minor.set(visitor.is_minor());
         // Interface prototypes are intrinsic to their Realm even if author
         // code replaces the global constructor. They are edges FROM the global,
         // never roots: a retired unreachable Realm must still be collectible.
-        for realm in self.realms.values() {
+        // A Realm's prototypes do not change once it is registered, so once a
+        // collection has seen them they are old like their global, which a
+        // minor collection keeps: it takes the young Realms' edges alone.
+        let mut report = |realm: &RealmPrototypes| {
             for prototype in &realm.values {
                 visitor.edge(&realm.global, prototype);
+            }
+        };
+        if self.minor.get() {
+            for key in &self.young_realms {
+                if let Some(realm) = self.realms.get(key) {
+                    report(realm);
+                }
+            }
+        } else {
+            for realm in self.realms.values() {
+                report(realm);
             }
         }
     }
 
-    /// Forget what a collection found dead, after it cleared the weak handles.
+    /// Forget what a collection found dead, after it cleared the weak handles: after a minor
+    /// collection, young entries alone. Every entry left is then old.
     pub(super) fn sweep(&mut self) {
-        self.realms.retain(|_, realm| !realm.global.is_cleared());
-        shrink(&mut self.realms);
-        self.entries.retain(|_, entry| !entry.owner.is_cleared());
-        shrink(&mut self.entries);
+        if self.minor.get() {
+            for key in &self.young_realms {
+                if self
+                    .realms
+                    .get(key)
+                    .is_some_and(|realm| realm.global.is_cleared())
+                {
+                    self.realms.remove(key);
+                }
+            }
+        } else {
+            self.realms.retain(|_, realm| !realm.global.is_cleared());
+            shrink(&mut self.realms);
+            self.old.retain(|_, entry| !entry.owner.is_cleared());
+        }
+        self.young_realms.clear();
+        if self.young_realms.capacity() > COMPACT_FLOOR {
+            self.young_realms.shrink_to(COMPACT_FLOOR);
+        }
+        self.young.retain(|_, entry| !entry.owner.is_cleared());
+        self.old.extend(self.young.drain());
+        shrink(&mut self.old);
+        shrink(&mut self.young);
     }
 
     pub(super) fn scan_retained_memory(&self, visitor: &mut dyn HostRetainedMemoryVisitor) {
@@ -139,15 +194,27 @@ impl Registry {
             ));
             visitor.opaque_storage();
         }
-        if self.entries.capacity() != 0 {
+        if self.young_realms.capacity() != 0 {
             visitor.allocation(RetainedManagedAllocation::new(
-                "trust.geometry.entries",
-                &self.entries as *const _ as usize,
-                self.entries.capacity() * std::mem::size_of::<(usize, Entry)>(),
+                "trust.geometry.young-realms",
+                self.young_realms.as_ptr() as usize,
+                self.young_realms.capacity() * std::mem::size_of::<usize>(),
             ));
-            // Hash-table allocation layouts are opaque; these requested bytes
-            // are a lower bound.
-            visitor.opaque_storage();
+        }
+        for (name, entries) in [
+            ("trust.geometry.young", &self.young),
+            ("trust.geometry.old", &self.old),
+        ] {
+            if entries.capacity() != 0 {
+                visitor.allocation(RetainedManagedAllocation::new(
+                    name,
+                    entries as *const _ as usize,
+                    entries.capacity() * std::mem::size_of::<(usize, Entry)>(),
+                ));
+                // Hash-table allocation layouts are opaque; these requested bytes
+                // are a lower bound.
+                visitor.opaque_storage();
+            }
         }
     }
 }
@@ -391,8 +458,7 @@ pub(super) fn bind<'s>(
     ctx.host_mut::<HostState>()
         .expect("geometry host")
         .geometry
-        .realms
-        .insert(key, prototypes);
+        .register_realm(key, prototypes);
     let readonly_ctor =
         ctx.new_native_fn_with_captures("DOMRectReadOnly", 0, construct, &[Value::Bool(false)]);
     let mutable_ctor =
