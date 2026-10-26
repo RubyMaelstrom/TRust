@@ -3326,6 +3326,12 @@ mod desktop {
     // ECMA-262 #sec-liveness permits servicing the request after input quiets.
     // TRust JS's allocation safepoints/limits remain active throughout this hint.
     const INPUT_GC_QUIET_INTERVAL: Duration = Duration::from_millis(150);
+    // How long a page stays parked with nothing scheduled before the actor
+    // collects fully. No browser collects fully when input stops: V8's memory
+    // reducer starts a full collection 8 s after the heap grew, once the
+    // allocation rate is low, and Firefox's shrinking collection waits for
+    // user inactivity. A timer-free page parks right after each input burst.
+    const IDLE_GC_DELAY: Duration = Duration::from_secs(8);
 
     /// Run the TRust JS page pipeline as a one-shot transformation.
     ///
@@ -4845,6 +4851,10 @@ mod desktop {
         let mut interaction_burst_started: Option<Instant> = None;
         let mut background_service: Option<(Instant, usize)> = None;
         let mut task_gc_defer_until: Option<Instant> = None;
+        // Whether work ran since the last idle collection, and when the
+        // current idle period's collection is due (see `IDLE_GC_DELAY`).
+        let mut idle_gc_due = true;
+        let mut idle_gc_at: Option<Instant> = None;
         // Whether anything happened since the actor last asked whether the
         // document has become inert (see `retire_if_inert`).
         let mut retirement_check_due = true;
@@ -5110,9 +5120,19 @@ mod desktop {
                     // checks retain responsibility there. Forcing a full tracing
                     // collection before every 16 ms animation sleep made a large
                     // YouTube heap consume a core while callbacks made no DOM
-                    // changes. Collect only before a genuinely indefinite park.
-                    if wait.is_none() && !defer_task_gc {
-                        page.engine.collect_garbage_at_idle();
+                    // changes. Collect only once a genuinely indefinite park has
+                    // lasted `IDLE_GC_DELAY`, and once per idle period.
+                    if wait.is_none() && !defer_task_gc && idle_gc_due {
+                        let now = Instant::now();
+                        let at = *idle_gc_at.get_or_insert(now + IDLE_GC_DELAY);
+                        if at <= now {
+                            page.engine.collect_garbage_at_idle();
+                            idle_gc_due = false;
+                            idle_gc_at = None;
+                        } else {
+                            wait = Some(at - now);
+                            timeout_wake = Wake::Maintenance;
+                        }
                     }
                     interrupt.set_deadline(None);
                     let ready = runtime.block_on(wait_for_work(
@@ -5147,6 +5167,9 @@ mod desktop {
 
             if !matches!(wake, Wake::Maintenance) {
                 retirement_check_due = true;
+                // Work arrived: an idle collection waits for the next idle period.
+                idle_gc_due = true;
+                idle_gc_at = None;
             }
             // Remember whether this turn started inside the bounded background-service
             // window. A completed rendering opportunity may start that window, but it must
