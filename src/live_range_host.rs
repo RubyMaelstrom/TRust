@@ -174,7 +174,11 @@ mod tests {
         registry.sweep();
         // The conservative stack scan may keep a few of the dropped objects.
         assert!(registry.young.is_empty());
-        assert!(registry.old.len() < 100, "{} ranges survived", registry.old.len());
+        assert!(
+            registry.old.len() < 100,
+            "{} ranges survived",
+            registry.old.len()
+        );
         assert!(
             !registry.old[0].is_cleared(),
             "a minor collection does not free an old Range"
@@ -182,6 +186,10 @@ mod tests {
         registry.begin_collection(false);
         engine.collect_garbage_at_idle();
         registry.sweep();
-        assert!(registry.old.len() < 100, "{} ranges survived", registry.old.len());
+        assert!(
+            registry.old.len() < 100,
+            "{} ranges survived",
+            registry.old.len()
+        );
     }
 }
