@@ -23430,11 +23430,9 @@ fn track_module_evaluation_in<'s>(ctx: &mut Ctx<'s>, node_id: usize, name: &str)
         },
         trust_js::embed::NativeCaptures::None,
     );
-    let attached = ctx
-        .member_get(&promise, "then")
-        .map_err(EvalError::Throw)
-        .and_then(|then| ctx.invoke_interruptible(then, promise, &[fulfilled, rejected]))
-        .is_ok();
+    // Web IDL "upon fulfillment"/"upon rejection" of the evaluation promise: PerformPromiseThen,
+    // never its author-replaceable `then` property.
+    let attached = ctx.react_to_promise(&promise, fulfilled, rejected).is_ok();
     if !attached && let Some(state) = ctx.host_mut::<HostState>() {
         state.pending_resources = state.pending_resources.saturating_sub(1);
         state.pending_module_evaluations = state.pending_module_evaluations.saturating_sub(1);
@@ -30088,15 +30086,9 @@ fn host_promise_resolved_with<'s>(
     Ok(ctx.promise_resolved_with(value))
 }
 
-fn host_resolved_promise<'s>(ctx: &mut Ctx<'s>, value: Value<'s>) -> Result<Value<'s>, Value<'s>> {
-    let global = ctx.global_this();
-    let promise = ctx.member_get(&global, "Promise")?;
-    let resolve = ctx.member_get(&promise, "resolve")?;
-    ctx.invoke(resolve, promise, &[value])
-}
-
 /// Web Crypto §14.3.5 copies the `BufferSource` bytes before digesting and resolves the returned
-/// promise with a realm-local `ArrayBuffer` containing the digest.
+/// promise with a realm-local `ArrayBuffer` containing the digest. Web IDL #a-promise-resolved-with
+/// uses the realm's intrinsic %Promise%, never the page's replaceable `Promise.resolve`.
 fn host_crypto_sha256_digest<'s>(
     ctx: &mut Ctx<'s>,
     _this: Value<'s>,
@@ -30110,10 +30102,11 @@ fn host_crypto_sha256_digest<'s>(
         .unwrap_or_default();
     let digest = sha2::Sha256::digest(input);
     let buffer = ctx.make_array_buffer(&digest)?;
-    host_resolved_promise(ctx, buffer)
+    Ok(ctx.promise_resolved_with(buffer))
 }
 
-/// Native SHA family: do not run SHA-384/512's rounds as interpreted BigInts.
+/// Native SHA family: do not run SHA-384/512's rounds as interpreted BigInts. The result is
+/// Web IDL "a promise resolved with" the digest, made from the realm's intrinsic %Promise%.
 fn host_crypto_digest<'s>(
     ctx: &mut Ctx<'s>,
     _this: Value<'s>,
@@ -30133,7 +30126,7 @@ fn host_crypto_digest<'s>(
         _ => return Err(ctx.make_error("NotSupportedError", "Unsupported digest")),
     };
     let buffer = ctx.make_array_buffer(&bytes)?;
-    host_resolved_promise(ctx, buffer)
+    Ok(ctx.promise_resolved_with(buffer))
 }
 
 /// Web Crypto #Crypto-method-getRandomValues / #hmac-operations-generate-key.
@@ -56128,6 +56121,361 @@ mod tests {
                 "[blobEntry[2][0] instanceof ArrayBuffer, blobEntry[2][0].byteLength].join()"
             ),
             "true,10"
+        );
+    }
+
+    #[test]
+    fn platform_promises_ignore_a_replaced_global_promise() {
+        // Web IDL #a-promise-resolved-with makes its promise from the realm's intrinsic
+        // %Promise%. A page that replaces Promise.resolve, then the global Promise, still gets
+        // real promises from crypto.subtle.digest and from the host's digests (Subresource
+        // Integrity's `__crypto_digest`), and neither replacement is ever called.
+        fn publish_host_digests(engine: &mut trust_js::Engine, prefix: &str) {
+            engine.scope(|cx| {
+                let global = cx.global_this();
+                let input = cx
+                    .make_array_buffer(b"abc")
+                    .unwrap_or_else(|_| panic!("digest input"));
+                let name = cx.str("SHA-1");
+                let digest = host_crypto_digest(cx, Value::Undefined, &[name, input])
+                    .unwrap_or_else(|error| panic!("{}", describe_throw(cx, error, "digest")));
+                let sha256 = host_crypto_sha256_digest(cx, Value::Undefined, &[input])
+                    .unwrap_or_else(|error| panic!("{}", describe_throw(cx, error, "SHA-256")));
+                cx.member_set(&global, &format!("{prefix}Digest"), digest)
+                    .unwrap_or_else(|_| panic!("publish the digest"));
+                cx.member_set(&global, &format!("{prefix}Sha256"), sha256)
+                    .unwrap_or_else(|_| panic!("publish the SHA-256 digest"));
+            });
+        }
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r#"globalThis.replacementCalls = [];
+            const IntrinsicPromise = Promise, intrinsicThen = Promise.prototype.then;
+            globalThis.isIntrinsicPromise = value => {
+                if (Object.getPrototypeOf(value) !== IntrinsicPromise.prototype) return false;
+                try { Reflect.apply(intrinsicThen, value, [undefined, () => {}]); return true; }
+                catch (_) { return false; }
+            };
+            globalThis.settled = {};
+            globalThis.settle = (name, promise) => Reflect.apply(intrinsicThen, promise, [
+                value => {
+                    settled[name] = Array.from(new Uint8Array(value), x => x.toString(16).padStart(2, '0')).join('');
+                },
+                error => { settled[name] = 'rejected ' + error; },
+            ]);
+            Promise.resolve = function () { replacementCalls.push('Promise.resolve'); return {then() {}}; };"#,
+            "replace Promise.resolve",
+        )
+        .unwrap();
+        publish_host_digests(&mut engine, "intrinsic");
+        eval(
+            &mut engine,
+            r#"globalThis.Promise = function Promise() { replacementCalls.push('Promise'); };
+            Promise.resolve = function () { replacementCalls.push('global Promise.resolve'); return {then() {}}; };
+            globalThis.subtleDigest = crypto.subtle.digest('SHA-256', new TextEncoder().encode('abc'));"#,
+            "replace the global Promise",
+        )
+        .unwrap();
+        publish_host_digests(&mut engine, "global");
+        let names = "['intrinsicDigest', 'intrinsicSha256', 'globalDigest', 'globalSha256', 'subtleDigest']";
+        eval(
+            &mut engine,
+            &format!(
+                "globalThis.promiseKinds = {names}.map(name => isIntrinsicPromise(globalThis[name])).join();\n\
+                 for (const name of {names}) settle(name, globalThis[name]);"
+            ),
+            "settle the digests",
+        )
+        .unwrap();
+        drain_platform_tasks(&mut engine, "__trust");
+        assert_eq!(
+            string_value(&mut engine, "promiseKinds"),
+            "true,true,true,true,true"
+        );
+        let sha1 = "a9993e364706816aba3e25717850c26c9cd0d89d";
+        let sha256 = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        assert_eq!(
+            string_value(
+                &mut engine,
+                &format!("{names}.map(name => settled[name]).join()")
+            ),
+            [sha1, sha256, sha1, sha256, sha256].join(",")
+        );
+        assert_eq!(string_value(&mut engine, "replacementCalls.join()"), "");
+    }
+
+    #[test]
+    fn platform_web_api_promises_ignore_a_replaced_global_promise() {
+        // Web IDL #a-new-promise, #a-promise-resolved-with and #a-promise-rejected-with use
+        // the realm's intrinsic %Promise%; "react to", "upon fulfillment"/"upon rejection" and
+        // #waiting-for-all-promise use PerformPromiseThen. A page replaces Promise's statics
+        // and the global Promise, then Promise.prototype.then and catch, with versions that
+        // record their calls (and delegate, so a platform call shows up): the platform's
+        // promises stay intrinsic promises with the right outcomes, and the replacements are
+        // never called. (The second phase starts after the fixture's wrapper attached its
+        // own `catch`, and covers flows that never resolve a promise with a thenable, which
+        // ECMA-262's promise resolve functions do through `then`.)
+        platform_fixture_in_window_and_secure_worker(
+            "replaced Promise statics, global, then and catch",
+            r#"
+            const isWindow = typeof document !== 'undefined';
+            const IntrinsicPromise = Promise, intrinsicThen = Promise.prototype.then;
+            const intrinsicCatch = Promise.prototype.catch;
+            const statics = {};
+            for (const name of ['resolve', 'reject', 'all', 'allSettled', 'race', 'any', 'withResolvers'])
+                if (typeof IntrinsicPromise[name] === 'function') statics[name] = IntrinsicPromise[name];
+            const isIntrinsic = value => {
+                if (value === null || typeof value !== 'object' || Object.getPrototypeOf(value) !== IntrinsicPromise.prototype)
+                    return false;
+                try { Reflect.apply(intrinsicThen, value, [undefined, () => {}]); return true; } catch (_) { return false; }
+            };
+            const replacementCalls = [];
+            let step = 'setup';
+            const recordCall = name => { replacementCalls.push(step + ': ' + name); };
+            for (const name in statics)
+                IntrinsicPromise[name] = function (...args) { recordCall('Promise.' + name); return Reflect.apply(statics[name], this, args); };
+            globalThis.Promise = function Promise(executor) { recordCall('new Promise'); return new IntrinsicPromise(executor); };
+            for (const name in statics)
+                globalThis.Promise[name] = function (...args) {
+                    recordCall('global Promise.' + name);
+                    return Reflect.apply(statics[name], IntrinsicPromise, args);
+                };
+
+            const outcomes = [];
+            const outcome = async (name, makePromise, describe = value => String(value)) => {
+                step = name;
+                let promise;
+                try { promise = makePromise(); } catch (error) { outcomes.push(name + ':threw ' + error.name); return; }
+                if (!isIntrinsic(promise)) { outcomes.push(name + ':not an intrinsic promise'); return; }
+                try { outcomes.push(name + ':' + describe(await promise)); }
+                catch (error) { outcomes.push(name + ':' + (error && error.name)); }
+            };
+            const wasm = new Uint8Array([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]);
+            await outcome('queueMicrotask', () => new IntrinsicPromise(resolve => queueMicrotask(() => resolve('ran'))));
+            await outcome('digest', () => crypto.subtle.digest('SHA-256', new Uint8Array([0x61, 0x62, 0x63])),
+                value => new Uint8Array(value)[0]);
+            await outcome('Blob.text', () => Blob.prototype.text.call({}));
+            await outcome('Response.text', () => new Response('abc').text());
+            await outcome('databases', () => indexedDB.databases(), value => Array.isArray(value));
+            await outcome('compile', () => WebAssembly.compile(wasm), value => value instanceof WebAssembly.Module);
+            let module;
+            await outcome('instantiate bytes', () => WebAssembly.instantiate(wasm),
+                value => { module = value.module; return value.instance instanceof WebAssembly.Instance; });
+            await outcome('instantiate module', () => WebAssembly.instantiate(module), value => value instanceof WebAssembly.Instance);
+            await outcome('compileStreaming', () => WebAssembly.compileStreaming(
+                new Response(wasm, {headers: {'Content-Type': 'application/wasm'}})), value => value instanceof WebAssembly.Module);
+            const cache = await caches.open('promise-probe');
+            await outcome('cache.put', () => cache.put('https://example.com/cached', new Response('cached')));
+            let expected = 'queueMicrotask:ran|digest:186|Blob.text:TypeError|Response.text:abc|databases:true|compile:true|' +
+                'instantiate bytes:true|instantiate module:true|compileStreaming:true|cache.put:undefined';
+            if (isWindow) {
+                await outcome('whenDefined invalid', () => customElements.whenDefined('-invalid'));
+                const pending = customElements.whenDefined('x-promise-probe');
+                customElements.define('x-promise-probe', class extends HTMLElement {});
+                await outcome('whenDefined pending', () => pending, value => typeof value);
+                await outcome('whenDefined defined', () => customElements.whenDefined('x-promise-probe'), value => typeof value);
+                await outcome('replace', () => new CSSStyleSheet().replace('p { color: red }'), value => value.cssRules.length);
+                await outcome('play', () => document.createElement('video').play());
+                await outcome('exitFullscreen', () => document.exitFullscreen());
+                await outcome('requestFullscreen', () => document.createElement('div').requestFullscreen());
+                await outcome('requestPointerLock', () => document.createElement('div').requestPointerLock());
+                await outcome('decodeAudioData', () => new OfflineAudioContext(1, 128, 44100).decodeAudioData());
+                await outcome('MutationObserver', () => new IntrinsicPromise(resolve => {
+                    const target = document.createElement('div');
+                    new MutationObserver(records => resolve(records.length)).observe(target, {attributes: true});
+                    target.setAttribute('a', '1');
+                }));
+                expected += '|whenDefined invalid:SyntaxError|whenDefined pending:function|whenDefined defined:function|' +
+                    'replace:1|play:NotAllowedError|exitFullscreen:TypeError|requestFullscreen:TypeError|' +
+                    'requestPointerLock:WrongDocumentError|decodeAudioData:TypeError|MutationObserver:1';
+            }
+
+            // Second phase: reactions and "wait for all" (Promise.all stays replaced).
+            IntrinsicPromise.prototype.then = function (...args) { recordCall('then'); return Reflect.apply(intrinsicThen, this, args); };
+            IntrinsicPromise.prototype.catch = function (...args) { recordCall('catch'); return Reflect.apply(intrinsicCatch, this, args); };
+            const fonts = isWindow ? document.fonts : self.fonts;
+            await outcome('fonts.load none', () => fonts.load('10px promise-probe-missing'), value => Array.isArray(value) + ',' + value.length);
+            fonts.add(new FontFace('promise-probe', new ArrayBuffer(4)));
+            await outcome('fonts.load invalid', () => fonts.load('10px promise-probe'));
+            await outcome('cache.match', () => cache.match('https://example.com/cached'), value => value.status);
+            await outcome('cache.matchAll', () => cache.matchAll(), value => value.length);
+            await outcome('Response.text again', () => new Response('abc').text());
+            expected += '|fonts.load none:true,0|fonts.load invalid:SyntaxError|cache.match:200|cache.matchAll:1|' +
+                'Response.text again:abc';
+            if (isWindow) {
+                step = 'sendBeacon';
+                outcomes.push('sendBeacon:' + navigator.sendBeacon('https://example.invalid/beacon', 'x'));
+                await outcome('track', () => new IntrinsicPromise(resolve => {
+                    if (!document.documentElement) document.append(document.createElement('html'));
+                    const video = document.createElement('video'), track = document.createElement('track');
+                    track.kind = 'subtitles';
+                    track.default = true;
+                    track.src = 'data:text/vtt,' + encodeURIComponent('WEBVTT\n\n00:00.000 --> 00:01.000\nhi\n');
+                    track.addEventListener('load', () => resolve(track.track.cues.length));
+                    track.addEventListener('error', () => resolve('error'));
+                    video.append(track);
+                    document.documentElement.append(video);
+                }));
+                await outcome('play again', () => document.createElement('video').play());
+                expected += '|sendBeacon:true|track:1|play again:NotAllowedError';
+            }
+            check(outcomes.join('|') === expected, 'outcomes: ' + outcomes.join('|'));
+            check(replacementCalls.length === 0, 'platform code called the replacements: ' + replacementCalls.join(', '));
+            "#,
+        );
+    }
+
+    #[test]
+    fn platform_byte_algorithms_ignore_replaced_view_and_buffer_intrinsics() {
+        // Web IDL #dfn-get-buffer-source-copy and the algorithms that read bytes (Encoding,
+        // Web Crypto, the File API, Fetch body extraction and consumption, Streams, Compression,
+        // structured serialization, Indexed Database keys, WebAssembly, Geometry) use a view's
+        // [[ViewedArrayBuffer]], [[ByteOffset]] and [[ByteLength]] and a buffer's
+        // [[ArrayBufferByteLength]]: the page's replacements of the prototype accessors and
+        // methods, which count their calls and return wrong values, are never called.
+        platform_fixture_in_window_and_secure_worker(
+            "replaced view and buffer intrinsics",
+            r#"
+            // The fixture's own reads use the intrinsics, kept before the page replaces them.
+            const TypedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype);
+            const intrinsicLength = Object.getOwnPropertyDescriptor(TypedArrayPrototype, 'length').get;
+            const lengthOf = view => Reflect.apply(intrinsicLength, view, []);
+            const hexOf = value => {
+                const bytes = new Uint8Array(value);
+                let out = '';
+                for (let i = 0; i < lengthOf(bytes); i++) out += bytes[i].toString(16).padStart(2, '0');
+                return out;
+            };
+            const bytesOf = (...values) => {
+                const buffer = new ArrayBuffer(values.length), bytes = new Uint8Array(buffer);
+                for (let i = 0; i < values.length; i++) bytes[i] = values[i];
+                return buffer;
+            };
+            // "abc" inside a larger buffer, so that a wrong buffer, offset or length shows.
+            const framed = bytesOf(0xff, 0x61, 0x62, 0x63, 0xff);
+            const abcView = new Uint8Array(framed, 1, 3), abcDataView = new DataView(framed, 1, 3);
+            const abcBuffer = bytesOf(0x61, 0x62, 0x63);
+            const accentStart = new Uint8Array(bytesOf(0xff, 0xc3), 1, 1);
+            const accentEnd = new DataView(bytesOf(0xa9, 0xff), 0, 1);
+            const destinationBuffer = new ArrayBuffer(8), destination = new Uint8Array(destinationBuffer, 2, 4);
+            const wasmModule = new DataView(bytesOf(0xff, 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0xff), 1, 8);
+            const identity = new Float64Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+
+            // The page replaces the accessors and methods with ones that count their
+            // calls and return wrong values.
+            const calls = Object.create(null), bogus = new ArrayBuffer(1);
+            const replace = (target, key, label, descriptor) => {
+                calls[label] = 0;
+                Object.defineProperty(target, key, Object.assign({configurable: true}, descriptor));
+            };
+            const wrongGetter = (target, key, label, wrong) =>
+                replace(target, key, label, {get() { calls[label]++; return wrong; }});
+            const wrongMethod = (target, key, label, wrong) =>
+                replace(target, key, label, {writable: true, value() { calls[label]++; return wrong(); }});
+            for (const [target, name] of [[TypedArrayPrototype, '%TypedArray%'], [DataView.prototype, 'DataView']]) {
+                wrongGetter(target, 'buffer', name + '.buffer', bogus);
+                wrongGetter(target, 'byteOffset', name + '.byteOffset', 1);
+                wrongGetter(target, 'byteLength', name + '.byteLength', 1);
+            }
+            wrongGetter(TypedArrayPrototype, 'length', '%TypedArray%.length', 1);
+            wrongGetter(ArrayBuffer.prototype, 'byteLength', 'ArrayBuffer.byteLength', 1);
+            wrongGetter(ArrayBuffer.prototype, 'detached', 'ArrayBuffer.detached', true);
+            wrongGetter(ArrayBuffer.prototype, 'resizable', 'ArrayBuffer.resizable', true);
+            wrongMethod(TypedArrayPrototype, 'set', '%TypedArray%.set', () => undefined);
+            wrongMethod(TypedArrayPrototype, 'subarray', '%TypedArray%.subarray', () => new Uint8Array(0));
+            wrongMethod(TypedArrayPrototype, 'slice', '%TypedArray%.slice', () => new Uint8Array(0));
+            wrongMethod(TypedArrayPrototype, 'indexOf', '%TypedArray%.indexOf', () => -1);
+            wrongMethod(TypedArrayPrototype, Symbol.iterator, '%TypedArray%[@@iterator]', () => [][Symbol.iterator]());
+            wrongMethod(ArrayBuffer.prototype, 'slice', 'ArrayBuffer.slice', () => new ArrayBuffer(0));
+
+            // Encoding: views, a buffer, a code point split across streamed views, encodeInto.
+            check(new TextDecoder().decode(abcView) === 'abc' && new TextDecoder().decode(abcDataView) === 'abc' &&
+                new TextDecoder().decode(abcBuffer) === 'abc', 'TextDecoder.decode');
+            const streaming = new TextDecoder();
+            check(streaming.decode(accentStart, {stream: true}) + streaming.decode(accentEnd) === 'é',
+                'a code point split across streamed views');
+            const progress = new TextEncoder().encodeInto('abc', destination);
+            check(progress.read === 3 && progress.written === 3 && hexOf(destinationBuffer) === '0000616263000000',
+                'TextEncoder.encodeInto ' + hexOf(destinationBuffer));
+
+            // Web Crypto: a digest of a view, and bits derived to a length that is not whole bytes.
+            check(hexOf(await crypto.subtle.digest('SHA-256', abcDataView)) ===
+                'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad', 'digest of a DataView');
+            const alice = await crypto.subtle.generateKey({name: 'X25519'}, false, ['deriveBits']);
+            const bob = await crypto.subtle.generateKey({name: 'X25519'}, false, ['deriveBits']);
+            const exchange = {name: 'X25519', public: bob.publicKey};
+            const secret = new Uint8Array(await crypto.subtle.deriveBits(exchange, alice.privateKey, 256));
+            const bits = new Uint8Array(await crypto.subtle.deriveBits(exchange, alice.privateKey, 12));
+            check(lengthOf(bits) === 2 && bits[0] === secret[0] && bits[1] === (secret[1] & 0xf0), 'deriveBits to 12 bits');
+
+            // File API: parts from views and a buffer, reads, slices and FileReader.
+            const blob = new Blob([abcView, abcDataView, abcBuffer], {type: 'application/octet-stream'});
+            check(blob.size === 9 && await blob.text() === 'abcabcabc', 'a Blob of views and a buffer');
+            check(hexOf(await blob.arrayBuffer()) === '616263616263616263' && lengthOf(await blob.bytes()) === 9,
+                'Blob.arrayBuffer and Blob.bytes');
+            check(await blob.slice(2, 5).text() === 'cab', 'Blob.slice');
+            const file = new File([abcView], 'abc.txt', {type: 'text/plain'});
+            check(file.size === 3 && await file.text() === 'abc', 'a File of a view');
+            const read = (method, value) => new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(reader.result);
+                reader.onerror = () => reject(reader.error);
+                reader[method](value);
+            });
+            check(await read('readAsDataURL', blob) === 'data:application/octet-stream;base64,YWJjYWJjYWJj' &&
+                await read('readAsBinaryString', blob) === 'abcabcabc' && await read('readAsText', blob) === 'abcabcabc' &&
+                hexOf(await read('readAsArrayBuffer', blob)) === '616263616263616263', 'FileReader');
+
+            // Fetch: bodies of views and a buffer, a body stream, multipart, data: and blob: URLs.
+            check(await new Response(abcView).text() === 'abc' && hexOf(await new Response(abcDataView).arrayBuffer()) === '616263' &&
+                hexOf(await new Response(abcBuffer).bytes()) === '616263', 'Response bodies');
+            const chunk = await new Response(abcView).body.getReader().read();
+            check(!chunk.done && hexOf(chunk.value) === '616263', 'a body stream chunk');
+            check(await new Request('https://example.com/', {method: 'POST', body: abcDataView}).text() === 'abc', 'a Request body');
+            const form = new FormData();
+            form.append('field', 'value');
+            form.append('file', new File([abcView], 'abc.bin', {type: 'application/octet-stream'}));
+            const parsed = await new Response(form).formData();
+            check(parsed.get('field') === 'value' && parsed.get('file').name === 'abc.bin' &&
+                await parsed.get('file').text() === 'abc', 'a multipart/form-data round trip');
+            check(await (await fetch('data:text/plain;base64,YWJj')).text() === 'abc' &&
+                await (await fetch('data:,a%62c')).text() === 'abc', 'data: URLs');
+            const url = URL.createObjectURL(blob);
+            check(await (await fetch(url)).text() === 'abcabcabc', 'a blob: URL round trip');
+            const send = responseType => new Promise(resolve => {
+                const xhr = new XMLHttpRequest();
+                xhr.open('GET', url);
+                xhr.responseType = responseType;
+                xhr.addEventListener('loadend', () => resolve(xhr.response));
+                xhr.send();
+            });
+            check(hexOf(await send('arraybuffer')) === '616263616263616263' && await send('text') === 'abcabcabc',
+                'XMLHttpRequest of a blob: URL');
+            URL.revokeObjectURL(url);
+
+            // Streams and Compression.
+            const compressed = new Blob([abcView]).stream().pipeThrough(new CompressionStream('gzip'));
+            check(await new Response(compressed.pipeThrough(new DecompressionStream('gzip'))).text() === 'abc',
+                'a compression round trip');
+            const recoded = new Blob(['é']).stream().pipeThrough(new TextDecoderStream()).pipeThrough(new TextEncoderStream());
+            check(await new Response(recoded).text() === 'é', 'TextDecoderStream and TextEncoderStream');
+
+            // Structured serialization, Indexed Database keys, WebAssembly and Geometry.
+            check(await structuredClone(blob).text() === 'abcabcabc' && hexOf(structuredClone(abcView)) === '616263',
+                'structured clones of a Blob and a view');
+            check(indexedDB.cmp(abcView, abcDataView) === 0 && indexedDB.cmp(abcView, abcBuffer) === 0 &&
+                indexedDB.cmp(abcView, bytesOf(0x61, 0x62)) === 1, 'binary keys compare their bytes');
+            check(hexOf(IDBKeyRange.only(abcDataView).lower) === '616263', 'a binary key range');
+            check(WebAssembly.validate(wasmModule) && WebAssembly.Module.exports(new WebAssembly.Module(wasmModule)).length === 0,
+                'WebAssembly bytes of a DataView');
+            check(typeof document === 'undefined' || String(DOMMatrix.fromFloat64Array(identity)) ===
+                'matrix3d(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1)', 'a 3D matrix serialization');
+
+            const called = [];
+            for (const label in calls) if (calls[label] !== 0) called.push(label + ' x' + calls[label]);
+            check(called.length === 0, 'platform code called the page replacements: ' + called.join(', '));
+            "#,
         );
     }
 

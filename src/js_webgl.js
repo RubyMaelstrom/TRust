@@ -15,6 +15,7 @@ globalThis.__trust_install_webgl = function(g, adapter) {
     const typedOffset = descriptor(typedProto,"byteOffset").get;
     const typedLength = descriptor(typedProto,"byteLength").get;
     const typedTag = descriptor(typedProto,Symbol.toStringTag).get;
+    const typedElements = descriptor(typedProto,"length").get;
     const bufferResizable = descriptor(ArrayBuffer.prototype,"resizable").get;
     // A worker that is not cross-origin isolated has no SharedArrayBuffer.
     const sharedGrowable = typeof SharedArrayBuffer === "function" ? descriptor(SharedArrayBuffer.prototype,"growable").get : null;
@@ -79,6 +80,15 @@ globalThis.__trust_install_webgl = function(g, adapter) {
     function scalarValues(args,start,width,integer,values=[]) {
         const offset=values.length;
         for(let i=0;i<width;i++)values[offset+i]=number(args[start+i],integer?"i":"f");
+        return values;
+    }
+    // Web IDL #js-to-union: a Float32Array is the Float32List itself. Its
+    // elements are read by index, not through %TypedArray%.prototype's
+    // author-replaceable iterator; other values convert as before.
+    function floatList(data) {
+        if(apply(typedTag,data,[])!=="Float32Array")return Array.from(data,v=>number(v,"f"));
+        const values=[];
+        for(let i=0,n=apply(typedElements,data,[]);i<n;i++)values[i]=data[i];
         return values;
     }
     function resizableBuffer(buffer) {
@@ -269,7 +279,7 @@ globalThis.__trust_install_webgl = function(g, adapter) {
     for(const name of ["getActiveAttrib","getActiveUniform"]){method(name,function(program,index){const s=context(this);required(arguments,2);const p=resource(s,program,"Program");index=index>>>0;if(p<0)return null;return makeInfo(WebGLActiveInfo,"ActiveInfo",call(s,name,[p,index]));},2);}
     for(let width=1;width<=4;width++){
         for(const integer of [false,true])for(const vector of [false,true]){const name="uniform"+width+(integer?"i":"f")+(vector?"v":"");method(name,function(location){const s=context(this);required(arguments,vector?2:width+1);const id=resource(s,location,"UniformLocation",true);if(vector){uniformList(s,id,width,integer,false,false,arguments[1]);return;}const n=scalarValues(arguments,1,width,integer,[id,width,+integer,0]);if(id>=0)call(s,"uniform",n);},vector?2:width+1);}
-        for(const vector of [false,true]){const name="vertexAttrib"+width+"f"+(vector?"v":"");method(name,function(index){const s=context(this);required(arguments,vector?2:width+1);index=index>>>0;const values=vector?Array.from(arguments[1],v=>number(v,"f")):scalarValues(arguments,1,width,false);if(values.length<width){error(s,1281);return;}const n=[index,0,0,0,1];for(let i=0;i<width;i++)n[i+1]=values[i];call(s,"vertexAttrib",n);},vector?2:width+1);}
+        for(const vector of [false,true]){const name="vertexAttrib"+width+"f"+(vector?"v":"");method(name,function(index){const s=context(this);required(arguments,vector?2:width+1);index=index>>>0;const values=vector?floatList(arguments[1]):scalarValues(arguments,1,width,false);if(values.length<width){error(s,1281);return;}const n=[index,0,0,0,1];for(let i=0;i<width;i++)n[i+1]=values[i];call(s,"vertexAttrib",n);},vector?2:width+1);}
     }
     for(let width=2;width<=4;width++){method("uniformMatrix"+width+"fv",function(location,transpose,data){const s=context(this);required(arguments,3);const id=resource(s,location,"UniformLocation",true);transpose=!!transpose;uniformList(s,id,width*width,false,true,transpose,data);},3);}
     for(const name of ["enableVertexAttribArray","disableVertexAttribArray"]){method(name,function(index){const s=context(this);call(s,name,convert(arguments,"u"));},1);}

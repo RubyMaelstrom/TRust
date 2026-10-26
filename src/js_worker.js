@@ -649,7 +649,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     g.setInterval = {setInterval(fn) { return addTimer(fn, arguments[1], Array.prototype.slice.call(arguments, 2), true); }}.setInterval;
     g.clearTimeout = {clearTimeout(id = 0) { removeTimer(id); }}.clearTimeout;
     g.clearInterval = {clearInterval(id = 0) { removeTimer(id); }}.clearInterval;
-    g.queueMicrotask = {queueMicrotask(fn) { Promise.resolve().then(function () { try { fn(); } catch (e) { reportException(e); } }); }}.queueMicrotask;
+    // Captured intrinsics keep the microtask queue independent of later
+    // writes to globalThis.Promise, as in a Window.
+    const microtaskPromise = Promise.resolve(), microtaskThen = Promise.prototype.then;
+    g.queueMicrotask = {queueMicrotask(fn) { internalsApply(microtaskThen, microtaskPromise, [function () { try { fn(); } catch (e) { reportException(e); } }]); }}.queueMicrotask;
     // HR-Time #now-method / #dfn-coarsen-time: use the shared native monotonic
     // clock, independently of Date's integral milliseconds or author overrides.
     // HTML #run-a-worker records the origin before the worker prelude runs.

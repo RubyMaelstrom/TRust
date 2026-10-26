@@ -146,6 +146,16 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     let windowMessageSlots;
     const messageApply = Reflect.apply;
     const messageWeakGet = WeakMap.prototype.get, messageWeakSet = WeakMap.prototype.set;
+    // Web IDL #a-new-promise, #a-promise-resolved-with and
+    // #a-promise-rejected-with use the realm's intrinsic %Promise%: the
+    // Window's platform steps call these captures, never the replaceable
+    // global Promise or its statics.
+    const PlatformPromise = Promise, platformPromiseResolve = Promise.resolve;
+    const platformPromiseReject = Promise.reject, platformPromiseThen = Promise.prototype.then;
+    const resolvedPromise = value => messageApply(platformPromiseResolve, PlatformPromise, [value]);
+    const rejectedPromise = reason => messageApply(platformPromiseReject, PlatformPromise, [reason]);
+    // Steps run in a promise job, as `Promise.resolve().then(steps)` runs them.
+    const promiseJob = steps => messageApply(platformPromiseThen, resolvedPromise(undefined), [steps]);
     function windowMessageState(window) {
         let state = messageApply(messageWeakGet, windowMessageSlots, [window]);
         state = state && state.resolve ? state.resolve() : state;
@@ -1093,9 +1103,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             for (let i = 0; i < 16; i++)
                 if (!geometryFinite(m[i]))
                     throw geometryDOMException("Cannot stringify a matrix with non-finite elements.", "InvalidStateError");
+            // A 3D matrix's elements are the 16 of its Float64Array, counted
+            // without %TypedArray%.prototype's author-replaceable length getter.
             const values = state.is2D ? [m[0], m[1], m[4], m[5], m[12], m[13]] : m;
+            const count = state.is2D ? 6 : 16;
             let text = state.is2D ? "matrix(" : "matrix3d(";
-            for (let i = 0; i < values.length; i++) text += (i ? ", " : "") + values[i];
+            for (let i = 0; i < count; i++) text += (i ? ", " : "") + values[i];
             return text + ")";
         }
     }
@@ -1784,7 +1797,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 || r === "preconnect" || r === "dns-prefetch")) {
             internalsFor(node).cssStarted = true;
             // Async, like a real hint resolving — settles inside the same job drain.
-            Promise.resolve().then(() => { try { node.dispatchEvent(new Event("load")); } catch (e) {} });
+            promiseJob(() => { try { node.dispatchEvent(new Event("load")); } catch (e) {} });
         }
     }
     // HTML #link-type-stylesheet and #link-type-preload: a connected link is
@@ -5698,12 +5711,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             internalsFor(frame).trustNavigationToken = token;
             let pending;
             try { pending = navigateDocumentAsync(url, sourceURL, sourcePolicy, nodeIds.get(frame), sourceContext); }
-            catch (e) { pending = Promise.resolve(null); }
-            return pending.then(function (r) {
+            catch (e) { pending = resolvedPromise(null); }
+            return messageApply(platformPromiseThen, pending, [function (r) {
                 if (internalsFor(frame).trustNavigationToken !== token || !frame.isConnected) return;
                 internalsFor(frame).trustNavigationToken = null;
                 processFrameNavigationResponse(frame, url, r, timingStart);
-            });
+            }]);
         }
         let r;
         try { r = navigateDocument(url, sourceURL, sourcePolicy, nodeIds.get(frame), sourceContext); } catch (e) { r = null; }
@@ -5821,7 +5834,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 ftrace("queueFrameNavigation task -> processIframeAttributes src=" + frame.getAttribute("src") + " connected=" + frame.isConnected);
                 pending = processIframeAttributes(frame, true);
             } catch (e) { ftrace("queueFrameNavigation task threw " + ((e && e.message) || e)); }
-            if (pending && typeof pending.then === "function") pending.then(settle, settle);
+            // A parallel navigation returns its platform promise (no author thenable).
+            if (pending) messageApply(platformPromiseThen, pending, [settle, settle]);
             else settle();
         });
         return true;
@@ -6759,7 +6773,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (options != null && typeof options !== "object" && typeof options !== "function")
             throw new TypeError("PointerLockOptions must be a dictionary");
         const raw = !!(options && options.unadjustedMovement), target = this;
-        return new Promise((resolve, reject) => {
+        return new PlatformPromise((resolve, reject) => {
             const record = {id:pointerLockState.next++, target, document:target.ownerDocument,
                 raw, resolve, reject, owner:trust, sent:false};
             let error = null;
@@ -9696,11 +9710,29 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         ["lineGapOverride", "line-gap-override", "normal"], ["sizeAdjust", "size-adjust", "100%"],
     ];
     const fontTasks = [], fontSources = new Set(), pendingFontLoads = new Map();
-    const fontPromise = Promise, fontAll = Promise.all.bind(Promise);
+    const fontPromise = Promise, fontReject = Promise.reject, fontDefine = Object.defineProperty;
     const nativeFontLoad = __font_load, nativeFontInstall = __font_install, nativeFontQuery = __font_query;
     const fontDeclarationGet = fontAdapter ? null : CSSStyleDeclaration.prototype.getPropertyValue;
     const fontDeclarationSet = fontAdapter ? null : CSSStyleDeclaration.prototype.setProperty;
     const fontApply = Reflect.apply;
+    // Web IDL #waiting-for-all-promise: each promise is reacted to with
+    // PerformPromiseThen (`__promise_react`), never Promise.all, Promise.resolve
+    // or a `then` lookup; the results keep the promises' order and the first
+    // rejection rejects.
+    function fontWaitForAll(promises) {
+        let resolveAll, rejectAll;
+        const all = new fontPromise((resolve, reject) => { resolveAll = resolve; rejectAll = reject; });
+        const results = [];
+        let remaining = promises.length;
+        if (remaining === 0) resolveAll(results);
+        for (let index = 0; index < promises.length; index++) {
+            __promise_react(promises[index], value => {
+                fontDefine(results, index, {__proto__: null, value, writable: true, enumerable: true, configurable: true});
+                if (--remaining === 0) resolveAll(results);
+            }, rejectAll);
+        }
+        return all;
+    }
     const fontBufferLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength").get;
     const fontIsView = ArrayBuffer.isView;
     const fontRealm = {};
@@ -10025,7 +10057,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             let pending = false;
             for (const [face, member] of own.members) if (needed.has(member)) {
                 const state = fontFaceState(face);
-                if (state.status === "unloaded") loadFontFace(face).catch(() => {});
+                if (state.status === "unloaded") __promise_react(loadFontFace(face), undefined, () => {});
                 if (state.status === "unloaded" || state.status === "loading") pending = true;
             }
             return pending;
@@ -10113,9 +10145,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 fontSetState(this);
                 if (!arguments.length) throw new TypeError("FontFaceSet.load requires a font");
                 font = fontString(font); text = fontString(text);
-            } catch (error) {return fontPromise.reject(error);}
+            } catch (error) {return fontApply(fontReject, fontPromise, [error]);}
             return new fontPromise((resolve,reject) => fontTask(() => {
-                try {fontAll(fontMatches(this,font,text).map(loadFontFace)).then(resolve,reject);}
+                try {__promise_react(fontWaitForAll(fontMatches(this,font,text).map(loadFontFace)), resolve, reject);}
                 catch (error) {reject(error);}
             }));
         }
@@ -10366,9 +10398,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // negative RTL/vertical ranges and non-scrollable overflow:clip.
         left = elementSnapInlinePosition.call(this, left, direction || 0);
         const changed = __dom_scroll_set(nodeIds.get(this), top, left);
-        if (!changed) return Promise.resolve();
+        if (!changed) return resolvedPromise(undefined);
         const self = this;
-        return new Promise(function (resolve) { queueElementScroll(self, resolve); });
+        return new PlatformPromise(function (resolve) { queueElementScroll(self, resolve); });
     }
     function elementDocumentRect() {
         let r = null;
@@ -11389,7 +11421,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (!pressed) return true;
         // Implemented in terms of the DOM API, as HTML requires.
         if (inPart(layout.play, x, y)) {
-            if (state.paused || state.ended) Reflect.apply(mediaPlay, element, []).catch(function () {});
+            if (state.paused || state.ended) messageApply(platformPromiseThen, Reflect.apply(mediaPlay, element, []), [undefined, function () {}]);
             else Reflect.apply(mediaPause, element, []);
         } else if (inPart(layout.mute, x, y)) {
             mediaMutedSetter.call(element, !mediaMuted(element, state));
@@ -11397,8 +11429,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             seekMedia(element, state, (x - layout.scrubber.x) / layout.scrubber.w * state.duration, false);
         } else if (inPart(layout.fullscreen, x, y)) {
             const document = element.ownerDocument;
-            if (fullscreenElementOf(document) === element) exitFullscreenDocument(document).catch(function () {});
-            else Reflect.apply(requestFullscreen, element, []).catch(function () {});
+            if (fullscreenElementOf(document) === element)
+                messageApply(platformPromiseThen, exitFullscreenDocument(document), [undefined, function () {}]);
+            else messageApply(platformPromiseThen, Reflect.apply(requestFullscreen, element, []), [undefined, function () {}]);
         }
         state.controlsUntil = currentTime() + 3000;
         updateControls(element, state);
@@ -11977,18 +12010,18 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         play() {
             const state = mediaRecord(this);
             if (!allowedToPlay(this, state)) {
-                const p = Promise.reject(new DOMException(
+                const p = rejectedPromise(new DOMException(
                     inlineMedia ? "play() failed because the user didn't interact with the document first"
                         : "play() failed: no inline media playback in this rendering",
                     "NotAllowedError"
                 ));
-                p.catch(function () {});
+                messageApply(platformPromiseThen, p, [undefined, function () {}]);
                 return p;
             }
             if (state.error !== null && state.error.code === 4)
-                return Promise.reject(new DOMException("The element has no supported sources", "NotSupportedError"));
+                return rejectedPromise(new DOMException("The element has no supported sources", "NotSupportedError"));
             let resolve, reject;
-            const promise = new Promise(function (res, rej) { resolve = res; reject = rej; });
+            const promise = new PlatformPromise(function (res, rej) { resolve = res; reject = rej; });
             state.playPromises.push({resolve, reject});
             internalPlaySteps(this, state);
             return promise;
@@ -13198,7 +13231,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                         deliver(null);
                         return;
                     }
-                    fetchAPI.readBody(response).then(deliver, function () { deliver(null); });
+                    messageApply(platformPromiseThen, fetchAPI.readBody(response), [deliver, function () { deliver(null); }]);
                 });
             });
         } catch (error) {
@@ -14096,7 +14129,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const slots = binding("slots", new WeakMap()), token = {};
         const get = WeakMap.prototype.get.bind(slots), set = WeakMap.prototype.set.bind(slots);
         const host = (...args) => apply(binding, undefined, args);
-        const PromiseCtor = Promise, Exception = DOMException;
+        const PromiseCtor = Promise, promiseReject = Promise.reject, Exception = DOMException;
         const finite = Number.isFinite, fround = Math.fround, NumberCtor = Number;
         const define = Object.defineProperty, freeze = Object.freeze, create = Object.create;
         const apply = Reflect.apply;
@@ -14114,6 +14147,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             Object.getPrototypeOf(F32.prototype), "buffer").get;
         const typedArrayTag = Object.getOwnPropertyDescriptor(
             Object.getPrototypeOf(F32.prototype), Symbol.toStringTag).get;
+        const typedArraySet = Object.getPrototypeOf(F32.prototype).set;
         const MAX_FLOAT = 3.4028234663852886e38;
         const MAX_CHANNELS = 32;
         // Total samples one AudioBuffer may hold (512 MiB of float data).
@@ -14224,7 +14258,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 throw new Exception("Document is not fully active", "InvalidStateError");
         }
         function queue(fn) { __queue_dom_task(fn); }
-        function rejected(error) { return apply(PromiseCtor.reject, PromiseCtor, [error]); }
+        function rejected(error) { return apply(promiseReject, PromiseCtor, [error]); }
         function fire(target, type, init) {
             dispatch(target, createTrustedEvent(Event, type, init || {}), false);
         }
@@ -14634,8 +14668,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 set(this, state);
                 const descriptors = new F64(params.length * 5);
                 params.forEach((spec, index) => {
-                    descriptors.set([spec.value, spec.min, spec.max, spec.rate === "k-rate" ? 1 : 0,
-                        spec.compound ? 1 : 0], index * 5);
+                    apply(typedArraySet, descriptors, [[spec.value, spec.min, spec.max, spec.rate === "k-rate" ? 1 : 0,
+                        spec.compound ? 1 : 0], index * 5]);
                 });
                 state.id = host("node", owner.id, kind, inputs, max(outputs, 1), channelCount,
                     MODES.indexOf(state.mode), interpretation === "discrete" ? 1 : 0, descriptors, ...(init || []));
@@ -15280,7 +15314,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 const curve = curveValue === undefined ? undefined : new F32(floatSequence(curveValue));
                 const oversample = member(dict, "oversample");
                 const oversampleValue = oversample === undefined ? "none" : enumValue(oversample, OVERSAMPLE);
-                if (curve !== undefined && curve.length < 2)
+                if (curve !== undefined && apply(typedArrayLength, curve, []) < 2)
                     throw new Exception("A curve needs at least two values", "InvalidStateError");
                 super(token, context, "shaper", 2, [], [curve || null, [1, 2, 4][OVERSAMPLE.indexOf(oversampleValue)]]);
                 const state = nodeRecord(this);
@@ -22422,13 +22456,13 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                     const document = wrap(id);
                     if (!document) { documents.delete(id); continue; }
                     ceUpgradeName(this, document, definition);
-                    Promise.resolve().then(() => ceConnectName(this, document, definition));
+                    promiseJob(() => ceConnectName(this, document, definition));
                 }
             } else {
                 // This registry's relevant global object's associated Document.
                 registryWithAssociatedDocument.call(this, () => {
                     ceUpgradeName(this, g.document, definition);
-                    Promise.resolve().then(() => ceConnectName(this, g.document, definition));
+                    promiseJob(() => ceConnectName(this, g.document, definition));
                 });
             }
             const w = state.waiting.get(name);
@@ -22448,17 +22482,17 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         }
         // HTML #dom-customelementregistry-whendefined.
         whenDefined(name) {
-            if (arguments.length < 1) return Promise.reject(new TypeError("whenDefined requires 1 argument"));
+            if (arguments.length < 1) return rejectedPromise(new TypeError("whenDefined requires 1 argument"));
             let state;
             try { state = registryState(this); name = idlDOMString(name); }
-            catch (e) { return Promise.reject(e); }
+            catch (e) { return rejectedPromise(e); }
             if (!isValidCustomElementName(name))
-                return Promise.reject(new DOMException("Invalid custom element name", "SyntaxError"));
-            if (state.defs.has(name)) return Promise.resolve(state.defs.get(name));
+                return rejectedPromise(new DOMException("Invalid custom element name", "SyntaxError"));
+            if (state.defs.has(name)) return resolvedPromise(state.defs.get(name));
             let w = state.waiting.get(name);
             if (!w) {
                 w = {};
-                w.promise = new Promise((resolve) => { w.resolve = resolve; });
+                w.promise = new PlatformPromise((resolve) => { w.resolve = resolve; });
                 state.waiting.set(name, w);
             }
             return w.promise;
@@ -23599,9 +23633,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         replace(text) {
             requireStyleSheet(this);
             text = domString(text);
-            if (!internalsFor(this).constructed || internalsFor(this).locked) return Promise.reject(new DOMException("Sheet cannot be replaced", "NotAllowedError"));
+            if (!internalsFor(this).constructed || internalsFor(this).locked) return rejectedPromise(new DOMException("Sheet cannot be replaced", "NotAllowedError"));
             internalsFor(this).locked = true;
-            return Promise.resolve().then(() => { sheetReplace.call(this, text); internalsFor(this).locked = false; return this; });
+            return promiseJob(() => { sheetReplace.call(this, text); internalsFor(this).locked = false; return this; });
         }
         replaceSync(text) {
             requireStyleSheet(this);
@@ -28856,13 +28890,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         finishDrag(session);
     };
     // Text -> its UTF-8 bytes as a binary (latin1) string, so btoa() and
-    // ArrayBuffer views see real bytes (not surrogate-pair chars).
-    const utf8Binary = (s) => {
-        const bytes = new g.TextEncoder().encode(s);
-        let out = "";
-        for (let i = 0; i < bytes.length; i++) out += String.fromCharCode(bytes[i]);
-        return out;
-    };
+    // ArrayBuffer views see real bytes (not surrogate-pair chars). The File
+    // API block's helpers read the bytes through its captured intrinsics.
+    const utf8Binary = (s) => fileAPI.binaryString(fileAPI.utf8(s));
     // XHR #dom-formdata steps for the shared FormData interface: the form and
     // submitter checks, then HTML #constructing-the-form-data-set. Entries are
     // [name, value] pairs.
@@ -29580,10 +29610,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 }
             }
             // Argument 11: a keepalive fetch, which stopping the document leaves running.
-            __http_fetch_async(parsed[0], "POST", bytes, contentType, headerWire, corsMode, "include", "beacon",
-                false, undefined, false, true)
-                .then(() => { if (bytes !== null) fetchAPI.releaseKeepalive(length); },
-                    () => { if (bytes !== null) fetchAPI.releaseKeepalive(length); });
+            const sent = __http_fetch_async(parsed[0], "POST", bytes, contentType, headerWire, corsMode, "include",
+                "beacon", false, undefined, false, true);
+            messageApply(platformPromiseThen, sent, [() => { if (bytes !== null) fetchAPI.releaseKeepalive(length); },
+                () => { if (bytes !== null) fetchAPI.releaseKeepalive(length); }]);
             return true;
         },
     };
@@ -30180,7 +30210,20 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const secure = !!g.isSecureContext;
         const define = Object.defineProperty, apply = Reflect.apply;
         const PromiseCtor = Promise, TypeErrorCtor = TypeError, Uint8ArrayCtor = Uint8Array;
+        const promiseResolve = Promise.resolve, promiseReject = Promise.reject;
         const isView = ArrayBuffer.isView, ArrayBufferCtor = ArrayBuffer;
+        // Views are read through their internal slots ([[ViewedArrayBuffer]],
+        // [[ByteOffset]], [[ByteLength]]), never the author-replaceable
+        // %TypedArray% and DataView prototype accessors.
+        const getOwn = Object.getOwnPropertyDescriptor, typedArrayProto = Object.getPrototypeOf(Uint8ArrayCtor.prototype);
+        const typedArrayName = getOwn(typedArrayProto, Symbol.toStringTag).get;
+        const typedArrayBuffer = getOwn(typedArrayProto, "buffer").get;
+        const typedArrayOffset = getOwn(typedArrayProto, "byteOffset").get;
+        const typedArrayByteLength = getOwn(typedArrayProto, "byteLength").get;
+        const typedArrayLength = getOwn(typedArrayProto, "length").get;
+        const dataViewBuffer = getOwn(DataView.prototype, "buffer").get;
+        const dataViewOffset = getOwn(DataView.prototype, "byteOffset").get;
+        const dataViewLength = getOwn(DataView.prototype, "byteLength").get;
         const KEY_SYSTEM = "org.w3.clearkey";
         const emeRecords = new WeakMap();
         function emeRecord(object, type) {
@@ -30195,19 +30238,26 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             const name = text.slice(0, colon), message = text.slice(colon + 1);
             return name === "TypeError" ? new TypeErrorCtor(message) : new DOMException(message, name);
         }
-        function arrayBuffer(bytes) { return new Uint8ArrayCtor(bytes).buffer; }
+        function arrayBuffer(bytes) { return apply(typedArrayBuffer, new Uint8ArrayCtor(bytes), []); }
         // Web IDL BufferSource: its bytes, for comparing key IDs.
         function bufferBytes(value, what) {
-            if (isView(value)) return new Uint8ArrayCtor(value.buffer, value.byteOffset, value.byteLength);
+            if (isView(value)) {
+                return apply(typedArrayName, value, []) !== undefined
+                    ? new Uint8ArrayCtor(apply(typedArrayBuffer, value, []), apply(typedArrayOffset, value, []),
+                        apply(typedArrayByteLength, value, []))
+                    : new Uint8ArrayCtor(apply(dataViewBuffer, value, []), apply(dataViewOffset, value, []),
+                        apply(dataViewLength, value, []));
+            }
             if (value instanceof ArrayBufferCtor) return new Uint8ArrayCtor(value);
             throw new TypeErrorCtor(what + " is not a BufferSource");
         }
+        function byteCount(bytes) { return apply(typedArrayLength, bytes, []); }
         function hex(bytes) {
             let out = "";
-            for (let i = 0; i < bytes.length; i++) out += (bytes[i] < 16 ? "0" : "") + bytes[i].toString(16);
+            for (let i = 0, length = byteCount(bytes); i < length; i++) out += (bytes[i] < 16 ? "0" : "") + bytes[i].toString(16);
             return out;
         }
-        const rejected = error => PromiseCtor.reject(error);
+        const rejected = error => apply(promiseReject, PromiseCtor, [error]);
         // Promise-returning operations report every error by rejection
         // (Web IDL #dfn-create-operation-function).
         function promised(body) {
@@ -30376,7 +30426,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                     emeRecord(this, "MediaKeys");
                     if (arguments.length < 1) throw new TypeErrorCtor("setServerCertificate requires a certificate");
                     bufferBytes(serverCertificate, "serverCertificate");
-                    return PromiseCtor.resolve(false);
+                    return apply(promiseResolve, PromiseCtor, [false]);
                 });
             }
         }
@@ -30385,9 +30435,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         function updateKeyStatuses(session, record, kids) {
             const entries = kids.map(kid => [new Uint8ArrayCtor(kid), "usable"]);
             entries.sort((a, b) => {
-                const n = Math.min(a[0].length, b[0].length);
+                const n = Math.min(byteCount(a[0]), byteCount(b[0]));
                 for (let i = 0; i < n; i++) if (a[0][i] !== b[0][i]) return a[0][i] - b[0][i];
-                return a[0].length - b[0].length;
+                return byteCount(a[0]) - byteCount(b[0]);
             });
             emeRecords.get(record.statuses).entries = entries;
             __queue_dom_task(() => fireMediaEvent(session, "keystatuseschange"));
@@ -30418,7 +30468,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                     if (!record.uninitialized) throw new DOMException("The session already has a request", "InvalidStateError");
                     record.uninitialized = false;
                     if (initDataType === "") throw new TypeErrorCtor("initDataType is empty");
-                    if (bytes.length === 0) throw new TypeErrorCtor("initData is empty");
+                    if (byteCount(bytes) === 0) throw new TypeErrorCtor("initData is empty");
                     if (initDataType !== "cenc" && initDataType !== "keyids" && initDataType !== "webm")
                         throw new DOMException(`Clear Key does not support "${initDataType}" initialization data`, "NotSupportedError");
                     const result = __eme("generate", record.keys.cdm, initDataType, new Uint8ArrayCtor(bytes));
@@ -30460,7 +30510,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                     const bytes = bufferBytes(response, "response");
                     if (record.closing) throw new DOMException("The session is closed", "InvalidStateError");
                     if (!record.callable) throw new DOMException("The session has no request", "InvalidStateError");
-                    if (bytes.length === 0) throw new TypeErrorCtor("response is empty");
+                    if (byteCount(bytes) === 0) throw new TypeErrorCtor("response is empty");
                     const result = __eme("update", record.keys.cdm, record.id, new Uint8ArrayCtor(bytes));
                     const session = this;
                     return new PromiseCtor(function (resolve, reject) {
@@ -30476,7 +30526,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             close() {
                 return promised(() => {
                     const record = emeRecord(this, "MediaKeySession");
-                    if (record.closing) return PromiseCtor.resolve(undefined);
+                    if (record.closing) return apply(promiseResolve, PromiseCtor, [undefined]);
                     if (!record.callable) throw new DOMException("The session has no request", "InvalidStateError");
                     record.closing = true;
                     __eme("close", record.keys.cdm, record.id);
@@ -30592,7 +30642,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 if (arguments.length < 1) throw new TypeErrorCtor("setMediaKeys requires a MediaKeys or null");
                 const keys = mediaKeys === null ? null : emeRecord(mediaKeys, "MediaKeys");
                 if (state.attachingMediaKeys) throw new DOMException("Media keys are being attached", "InvalidStateError");
-                if (mediaKeys === state.mediaKeys) return PromiseCtor.resolve(undefined);
+                if (mediaKeys === state.mediaKeys) return apply(promiseResolve, PromiseCtor, [undefined]);
                 state.attachingMediaKeys = true;
                 const element = this;
                 return new PromiseCtor(function (resolve) {
@@ -31453,11 +31503,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             (top === undefined ? (relative ? 0 : windowAttributes.scrollY) : normalizedScrollNumber(top));
         const oldX = windowAttributes.scrollX, oldY = windowAttributes.scrollY;
         trust.setScroll(x, y);
-        if (oldX === windowAttributes.scrollX && oldY === windowAttributes.scrollY) return Promise.resolve();
+        if (oldX === windowAttributes.scrollX && oldY === windowAttributes.scrollY) return resolvedPromise(undefined);
         const frame = trust.__activeFrame || realmRootFrame;
         if (frame) __dom_scroll_set(nodeIds.get(frame), windowAttributes.scrollY, windowAttributes.scrollX);
         else viewportScrollRequest = [windowAttributes.scrollX, windowAttributes.scrollY];
-        return new Promise(resolve => queueElementScroll(g.document, resolve));
+        return new PlatformPromise(resolve => queueElementScroll(g.document, resolve));
     }
     // CSSOM View #dom-window-scroll: scroll and scrollTo are distinct operations
     // with the same steps.
@@ -33212,7 +33262,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     function moEnqueue() {
         if (moQueued || moDisabled) return;
         moQueued = true;
-        Promise.resolve().then(moDeliver);
+        promiseJob(moDeliver);
     }
     function moRecomputeKinds() {
         moHasChildList = moHasAttributes = moHasCharacterData = false;
@@ -34708,9 +34758,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     const BLOCK_BITS = {"SHA-1": 512, "SHA-256": 512, "SHA-384": 1024, "SHA-512": 1024};
     // #dfn-byte-sequence-containing a bit sequence: the first `bits` bits.
     function firstBits(bytes, bits) {
-        const out = new Bytes(mathCeil(bits / 8));
-        for (let i = 0; i < out.length; i++) out[i] = bytes[i];
-        if (bits % 8) out[out.length - 1] &= (0xff << (8 - bits % 8)) & 0xff;
+        const out = new Bytes(mathCeil(bits / 8)), length = byteLength(out);
+        for (let i = 0; i < length; i++) out[i] = bytes[i];
+        if (bits % 8) out[length - 1] &= (0xff << (8 - bits % 8)) & 0xff;
         return out;
     }
 
@@ -34801,21 +34851,22 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // #concept-validate-rsa-key-generation-parameters.
     function validateRsaGeneration(normalized) {
         const modulusLength = normalized.modulusLength, exponent = normalized.publicExponent;
+        const exponentLength = byteLength(exponent);
         let start = 0;
-        while (start < exponent.length && exponent[start] === 0) start++;
-        const significant = exponent.length - start;
+        while (start < exponentLength && exponent[start] === 0) start++;
+        const significant = exponentLength - start;
         let bits = 0;
         if (significant) {
             bits = (significant - 1) * 8;
             for (let top = exponent[start]; top; top >>= 1) bits++;
         }
         const small = significant === 0 || (significant === 1 && exponent[start] < 3);
-        const even = significant === 0 || (exponent[exponent.length - 1] & 1) === 0;
+        const even = significant === 0 || (exponent[exponentLength - 1] & 1) === 0;
         // publicExponent ≥ 2^modulusLength − 1 without materializing 2^modulusLength.
         let tooLarge = bits > modulusLength;
         if (bits === modulusLength) {
             tooLarge = true;
-            for (let i = start; i < exponent.length && tooLarge; i++) {
+            for (let i = start; i < exponentLength && tooLarge; i++) {
                 const mask = i === start ? (1 << (bits - (significant - 1) * 8)) - 1 : 0xff;
                 if ((exponent[i] & mask) !== mask) tooLarge = false;
             }
@@ -37328,7 +37379,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // #exit-fullscreen. `fromFrontend` skips asking the frontend to restore
     // a viewport it already restored.
     function exitFullscreenDocument(document, fromFrontend = false) {
-        return new Promise((resolve, reject) => {
+        return new PlatformPromise((resolve, reject) => {
             syncPopoverRemovals();
             if (!documentFullyActive(document) || fullscreenElementOf(document) === null) {
                 reject(new TypeError("The Document is not in fullscreen"));
@@ -37384,13 +37435,14 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (fullscreen === null) return;
         for (const element of fullscreenElementsInTopLayer(document))
             if (element !== fullscreen) unfullscreenAnElement(element);
-        exitFullscreenDocument(document, fromFrontend).catch(() => {});
+        messageApply(platformPromiseThen, exitFullscreenDocument(document, fromFrontend), [undefined, () => {}]);
     }
     // #removing-steps for a removed node whose fullscreen flag is set (the
     // arena kept its flag and top-layer membership for these steps).
     function fullscreenRemovingSteps(node) {
         const document = node.ownerDocument;
-        if (node === fullscreenElementOf(document)) exitFullscreenDocument(document).catch(() => {});
+        if (node === fullscreenElementOf(document))
+            messageApply(platformPromiseThen, exitFullscreenDocument(document), [undefined, () => {}]);
         else unfullscreenAnElement(node);
     }
     // Frontend round trips: one request at a time per Realm tree, answered
@@ -37433,13 +37485,13 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     const fullscreenSupported = cfg.fullscreenSupported !== false;
     // #dom-element-requestfullscreen.
     function requestFullscreen(options = undefined) {
-        if (elementIdentity(this) === undefined) return Promise.reject(new TypeError("Illegal invocation"));
+        if (elementIdentity(this) === undefined) return rejectedPromise(new TypeError("Illegal invocation"));
         let dictionary;
         try { dictionary = fullscreenOptionsDictionary(options); }
-        catch (e) { return Promise.reject(e); }
+        catch (e) { return rejectedPromise(e); }
         const element = this;
         const pendingDoc = element.ownerDocument;
-        return new Promise((resolve, reject) => {
+        return new PlatformPromise((resolve, reject) => {
             if (!documentFullyActive(pendingDoc)) { reject(new TypeError("The Document is not fully active")); return; }
             let error = false;
             const namespace = element.namespaceURI, localName = element.localName;
@@ -37494,7 +37546,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         Object.defineProperty(Document.prototype, "exitFullscreen", {configurable: true, enumerable: true,
             writable: true, value: { exitFullscreen() {
                 let document;
-                try { document = documentReceiver(this); } catch (e) { return Promise.reject(e); }
+                try { document = documentReceiver(this); } catch (e) { return rejectedPromise(e); }
                 return exitFullscreenDocument(document);
             } }.exitFullscreen});
         // #dom-documentorshadowroot-fullscreenelement.
@@ -38602,7 +38654,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // `dispatch_fetch_done`). The resolver lives in this JS-side map — GC-rooted
     // by `trust` — so Rust never holds a GC object across threads.
     trust.pendingFetches = {};
-    trust.bgFetch = (id) => new Promise((resolve) => { trust.pendingFetches[id] = resolve; });
+    trust.bgFetch = (id) => new PlatformPromise((resolve) => { trust.pendingFetches[id] = resolve; });
     trust.settleFetch = function (id, value) {
         const resolve = trust.pendingFetches[id];
         if (resolve) { delete trust.pendingFetches[id]; resolve(value); }
@@ -39057,6 +39109,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     const viewBuffer = getOwn(Object.getPrototypeOf(Bytes.prototype), "buffer").get;
     const viewOffset = getOwn(Object.getPrototypeOf(Bytes.prototype), "byteOffset").get;
     const viewLength = getOwn(Object.getPrototypeOf(Bytes.prototype), "byteLength").get;
+    const bytesSet = Object.getPrototypeOf(Bytes.prototype).set;
+    // A decoder's empty I/O queue (never handed to author code).
+    const noBytes = new Bytes(0);
     // ECMA-262 #sec-get-%typedarray%.prototype-%symbol.tostringtag%: the
     // TypedArray name, and undefined (never an exception) for any other value.
     const typedArrayName = getOwn(Object.getPrototypeOf(Bytes.prototype), Symbol.toStringTag).get;
@@ -39162,7 +39217,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (encoding === null) throw new RangeErrorCtor(`The encoding label provided ('${label}') is invalid`);
             const slots = newSlots(this, decoderBrand);
             slots.encoding = encoding; slots.fatal = fatal; slots.ignoreBOM = ignoreBOM;
-            slots.doNotFlush = false; slots.pendingBytes = []; slots.bomSeen = false; slots.handle = 0;
+            slots.doNotFlush = false; slots.pendingBytes = noBytes; slots.bomSeen = false; slots.handle = 0;
         }
         get encoding() { return branded(this, decoderBrand).encoding; }
         get fatal() { return branded(this, decoderBrand).fatal; }
@@ -39175,7 +39230,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (!slots.doNotFlush) {
                 // A new decoder; release any stream a previous call left open.
                 if (slots.handle !== 0) decodeNative(slots.encoding, new Bytes(0), false, false, true, slots.handle);
-                slots.pendingBytes = []; slots.bomSeen = false; slots.handle = 0;
+                slots.pendingBytes = noBytes; slots.bomSeen = false; slots.handle = 0;
             }
             slots.doNotFlush = stream;
             if (slots.encoding !== "utf-8") {
@@ -39185,10 +39240,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 return result[0];
             }
             let queued = bytes;
-            if (slots.pendingBytes.length) {
-                queued = new Bytes(slots.pendingBytes.length + bytes.length);
-                queued.set(slots.pendingBytes); queued.set(bytes, slots.pendingBytes.length);
-                slots.pendingBytes = [];
+            const pending = slots.pendingBytes, pendingLength = apply(viewLength, pending, []);
+            if (pendingLength) {
+                queued = new Bytes(pendingLength + apply(viewLength, bytes, []));
+                apply(bytesSet, queued, [pending]); apply(bytesSet, queued, [bytes, pendingLength]);
+                slots.pendingBytes = noBytes;
             }
             const decoded = decodeUtf8(queued, stream, slots.fatal);
             let out;
@@ -39765,6 +39821,16 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     function copyDataBlockBytes(toBuffer, toIndex, fromBuffer, fromIndex, count) {
         apply(typedArraySet, new Uint8ArrayCtor(toBuffer, toIndex, count), [new Uint8ArrayCtor(fromBuffer, fromIndex, count)]);
+    }
+    // Bytes `begin` to `end` (clamped) of a Uint8Array, as a view of its buffer
+    // made from its internal slots: %TypedArray%.prototype.subarray and slice
+    // would consult the author-replaceable `constructor` and @@species
+    // (ECMA-262 TypedArraySpeciesCreate).
+    function bytesView(bytes, begin, end) {
+        const length = apply(typedArrayLength, bytes, []);
+        begin = MathMin(begin, length);
+        end = end < begin ? begin : MathMin(end, length);
+        return new Uint8ArrayCtor(apply(typedArrayBuffer, bytes, []), apply(typedArrayOffset, bytes, []) + begin, end - begin);
     }
     function isNonNegativeNumber(value) { return typeof value === "number" && value === value && value >= 0; }
 
@@ -42238,12 +42304,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     // #readablestream-pull-from-bytes: `bytes` is a Uint8Array; returns the rest.
     function pullFromBytes(stream, bytes) {
-        const available = bytes.length;
+        const available = apply(typedArrayLength, bytes, []);
         let desiredSize = available;
         const byobView = currentBYOBRequestView(stream);
         if (byobView !== null) desiredSize = viewInfo(byobView).byteLength;
         const pullSize = MathMin(available, desiredSize);
-        const pulled = bytes.subarray(0, pullSize);
+        const pulled = bytesView(bytes, 0, pullSize);
         if (byobView !== null) {
             const info = viewInfo(byobView);
             apply(typedArraySet, new Uint8ArrayCtor(info.buffer, info.byteOffset, pullSize), [pulled]);
@@ -42251,7 +42317,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         } else {
             readableByteStreamControllerEnqueue(stream.controller, viewInfo(new Uint8ArrayCtor(pulled)));
         }
-        return bytes.subarray(pullSize);
+        return bytesView(bytes, pullSize, available);
     }
     // #readablestream-close
     function closeStream(stream) {
@@ -42286,7 +42352,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                     let offset = 0;
                     for (let i = 0; i < chunks.length; i++) {
                         apply(typedArraySet, bytes, [chunks[i], offset]);
-                        offset += chunks[i].length;
+                        offset += apply(typedArrayLength, chunks[i], []);
                     }
                     successSteps(bytes);
                 },
@@ -42371,7 +42437,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 }
                 if (input.length === 0) return;
                 const output = apply(textEncode, encoder, [input]);
-                if (output.length > 0) transformEnqueue(state.transform, output);
+                if (apply(typedArrayLength, output, []) > 0) transformEnqueue(state.transform, output);
             }, function () {
                 // #encode-and-flush
                 if (state.leadingSurrogate !== null) {
@@ -42410,9 +42476,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         }
         function emit(output) {
             // Split the output into chunks of at most 64 KiB, each a Uint8Array.
-            const size = output.length;
+            const size = apply(typedArrayLength, output, []);
             for (let offset = 0; offset < size; offset += 65536)
-                transformEnqueue(state.transform, output.slice(offset, MathMin(size, offset + 65536)));
+                transformEnqueue(state.transform, new Uint8ArrayCtor(bytesView(output, offset, MathMin(size, offset + 65536))));
         }
         function process(bytes, finish) {
             if (state.handle === 0) throw new TypeErrorCtor("The compression context is no longer available");
@@ -42420,7 +42486,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             // end of the compressed data once the decoded output is enqueued.
             const result = compressionContext("write", state.handle, bytes, finish);
             if (finish || result[1]) release();
-            if (result[0].length > 0) emit(result[0]);
+            if (apply(typedArrayLength, result[0], []) > 0) emit(result[0]);
             if (result[1]) throw new TypeErrorCtor(decompress ? "The compressed data is invalid" : "Compression failed");
         }
         state.transform = setUpTransformStream(object, function (chunk) {
@@ -42640,7 +42706,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 this.onremove = null;
                 this._done = false;
                 let res;
-                this.finished = new Promise((r) => { res = r; });
+                this.finished = new PlatformPromise((r) => { res = r; });
                 const self = this;
                 this._settle = (kind) => {
                     if (self._done) return;
@@ -43422,7 +43488,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     const apply = Reflect.apply, define = Object.defineProperty, getOwn = Object.getOwnPropertyDescriptor;
     const ownKeys = Reflect.ownKeys, objectCreate = Object.create, getPrototypeOf = Object.getPrototypeOf;
     const weakGet = WeakMap.prototype.get, weakSet = WeakMap.prototype.set;
-    const PromiseCtor = Promise, promiseThen = Promise.prototype.then;
+    const PromiseCtor = Promise, promiseThen = Promise.prototype.then, promiseReject = Promise.reject;
     const TypeErrorCtor = TypeError, RangeErrorCtor = RangeError;
     const Uint8ArrayCtor = Uint8Array, ArrayBufferCtor = ArrayBuffer;
     const isView = ArrayBuffer.isView, iteratorSymbol = Symbol.iterator, toStringTag = Symbol.toStringTag;
@@ -43435,7 +43501,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     const typedArrayBuffer = getOwn(typedArrayProto, "buffer").get;
     const typedArrayOffset = getOwn(typedArrayProto, "byteOffset").get;
     const typedArrayByteLength = getOwn(typedArrayProto, "byteLength").get;
-    const typedArraySet = typedArrayProto.set, typedArraySubarray = typedArrayProto.subarray;
+    const typedArrayLength = getOwn(typedArrayProto, "length").get;
+    const typedArraySet = typedArrayProto.set;
     const dataViewBuffer = getOwn(DataView.prototype, "buffer").get;
     const dataViewOffset = getOwn(DataView.prototype, "byteOffset").get;
     const dataViewLength = getOwn(DataView.prototype, "byteLength").get;
@@ -43511,12 +43578,22 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         return new Uint8ArrayCtor(apply(arrayBufferSlice, buffer, [offset, offset + length]));
     }
     function utf8(string) { return apply(textEncode, encoder, [string]); }
+    // Bytes `begin` to `end` (clamped) of a Uint8Array, as a view of its buffer
+    // made from its internal slots: %TypedArray%.prototype.subarray would
+    // consult the author-replaceable `constructor` and @@species (ECMA-262
+    // TypedArraySpeciesCreate).
+    function bytesView(bytes, begin, end) {
+        const length = apply(typedArrayLength, bytes, []);
+        begin = MathMin(begin, length);
+        end = end < begin ? begin : MathMin(end, length);
+        return new Uint8ArrayCtor(apply(typedArrayBuffer, bytes, []), apply(typedArrayOffset, bytes, []) + begin, end - begin);
+    }
     function concatBytes(chunks, total) {
         const bytes = new Uint8ArrayCtor(total);
         let offset = 0;
         for (let i = 0; i < chunks.length; i++) {
             apply(typedArraySet, bytes, [chunks[i], offset]);
-            offset += chunks[i].length;
+            offset += apply(typedArrayLength, chunks[i], []);
         }
         return bytes;
     }
@@ -43649,7 +43726,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     function partLength(part) {
         const host = hostRange(part);
-        return host === undefined ? part.length : host.end - host.start;
+        return host === undefined ? apply(typedArrayLength, part, []) : host.end - host.start;
     }
     function latin1Bytes(string) {
         const bytes = new Uint8ArrayCtor(string.length);
@@ -43660,7 +43737,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // throw the File API's NotFoundError or NotReadableError.
     function readPart(part, from, to) {
         const host = hostRange(part);
-        if (host === undefined) return apply(typedArraySubarray, part, [from, to]);
+        if (host === undefined) return bytesView(part, from, to);
         if (to <= from) return new Uint8ArrayCtor(0);
         return latin1Bytes(host.read({id: host.id, start: host.start + from, end: host.start + to}));
     }
@@ -43681,13 +43758,13 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (hostRange(part) !== undefined) {
             flushPending(leaves, pending);
             leaves.push(part);
-        } else if (part.length) pending.push(part);
+        } else if (apply(typedArrayLength, part, [])) pending.push(part);
     }
     function flushPending(leaves, pending) {
         if (pending.length === 1) leaves.push(pending[0]);
         else if (pending.length > 1) {
             let total = 0;
-            for (let i = 0; i < pending.length; i++) total += pending[i].length;
+            for (let i = 0; i < pending.length; i++) total += apply(typedArrayLength, pending[i], []);
             leaves.push(concatBytes(pending, total));
         }
         pending.length = 0;
@@ -43700,7 +43777,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         record.parts = parts;
         return object;
     }
-    function bytesParts(bytes) { return bytes.length ? [bytes] : []; }
+    function bytesParts(bytes) { return apply(typedArrayLength, bytes, []) ? [bytes] : []; }
     function createBlob(bytes, type) { return initializeBlob(objectCreate(Blob.prototype), bytesParts(bytes), type); }
     function createFile(bytes, name, type, lastModified) {
         return createFileFromParts(bytesParts(bytes), name, type, lastModified);
@@ -43757,7 +43834,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 const host = hostRange(part);
                 if (from === 0 && to === length) leaves.push(part);
                 else if (host !== undefined) leaves.push(hostFilePart(host.id, host.start + from, host.start + to));
-                else leaves.push(new Uint8ArrayCtor(apply(typedArraySubarray, part, [from, to])));
+                else leaves.push(new Uint8ArrayCtor(bytesView(part, from, to)));
             }
             offset += length;
         }
@@ -43782,7 +43859,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                     const part = parts[index], length = partLength(part);
                     const view = streamsAPI.currentBYOBRequestView(stream);
                     const limit = hostRange(part) === undefined ? READ_CHUNK : HOST_READ_CHUNK;
-                    const room = view === null ? limit : MathMin(limit, view.byteLength);
+                    const room = view === null ? limit : MathMin(limit, apply(typedArrayByteLength, view, []));
                     const end = MathMin(length, offset + room);
                     let chunk;
                     try { chunk = readPart(part, offset, end); }
@@ -43804,7 +43881,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     function readAll(state, convert) {
         let reader;
         try { reader = streamsAPI.getReader(getStream(state)); }
-        catch (error) { return apply(Promise.reject, PromiseCtor, [error]); }
+        catch (error) { return apply(promiseReject, PromiseCtor, [error]); }
         return new PromiseCtor(function (resolve, reject) {
             streamsAPI.readAllBytes(reader, function (bytes) {
                 try { resolve(convert(bytes)); } catch (error) { reject(error); }
@@ -43812,8 +43889,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         });
     }
     function bytesToArrayBuffer(bytes) {
-        return bytes.byteOffset === 0 && bytes.byteLength === apply(bufferByteLength, bytes.buffer, [])
-            ? bytes.buffer : apply(arrayBufferSlice, bytes.buffer, [bytes.byteOffset, bytes.byteOffset + bytes.byteLength]);
+        const buffer = apply(typedArrayBuffer, bytes, []), offset = apply(typedArrayOffset, bytes, []);
+        const length = apply(typedArrayByteLength, bytes, []);
+        return offset === 0 && length === apply(bufferByteLength, buffer, [])
+            ? buffer : apply(arrayBufferSlice, buffer, [offset, offset + length]);
     }
     function utf8Decode(bytes) { return apply(textDecode, new TextDecoderCtor(), [bytes]); }
 
@@ -43835,17 +43914,17 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         stream() { return getStream(requireBlob(this)); }
         text() {
             const state = blobState(this);
-            if (state === undefined) return apply(Promise.reject, PromiseCtor, [new TypeErrorCtor("Illegal invocation")]);
+            if (state === undefined) return apply(promiseReject, PromiseCtor, [new TypeErrorCtor("Illegal invocation")]);
             return readAll(state, utf8Decode);
         }
         arrayBuffer() {
             const state = blobState(this);
-            if (state === undefined) return apply(Promise.reject, PromiseCtor, [new TypeErrorCtor("Illegal invocation")]);
+            if (state === undefined) return apply(promiseReject, PromiseCtor, [new TypeErrorCtor("Illegal invocation")]);
             return readAll(state, bytesToArrayBuffer);
         }
         bytes() {
             const state = blobState(this);
-            if (state === undefined) return apply(Promise.reject, PromiseCtor, [new TypeErrorCtor("Illegal invocation")]);
+            if (state === undefined) return apply(promiseReject, PromiseCtor, [new TypeErrorCtor("Illegal invocation")]);
             return readAll(state, function (bytes) { return bytes; });
         }
         textStream() {
@@ -44098,15 +44177,23 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     // Encoding #decode: a BOM selects its own encoding over the fallback.
     function decodeWithFallback(bytes, encoding) {
-        if (bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) encoding = "utf-8";
-        else if (bytes.length >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) encoding = "utf-16be";
-        else if (bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === 0xfe) encoding = "utf-16le";
+        const length = apply(typedArrayLength, bytes, []);
+        if (length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) encoding = "utf-8";
+        else if (length >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) encoding = "utf-16be";
+        else if (length >= 2 && bytes[0] === 0xff && bytes[1] === 0xfe) encoding = "utf-16le";
         return apply(textDecode, new TextDecoderCtor(encoding), [bytes]);
     }
     function binaryString(bytes) {
+        const length = apply(typedArrayLength, bytes, []);
         let result = "";
-        for (let i = 0; i < bytes.length; i += 8192)
-            result += apply(fromCharCode, null, apply(typedArraySubarray, bytes, [i, MathMin(bytes.length, i + 8192)]));
+        for (let i = 0; i < length; i += 8192) {
+            const end = MathMin(length, i + 8192), chunk = bytesView(bytes, i, end);
+            // Reflect.apply reads its argument list's "length" with [[Get]]
+            // (ECMA-262 CreateListFromArrayLike): an own data property keeps
+            // %TypedArray%.prototype's author-replaceable getter out of it.
+            define(chunk, "length", {__proto__: null, value: end - i});
+            result += apply(fromCharCode, null, chunk);
+        }
         return result;
     }
     // #packaging-data
@@ -44150,7 +44237,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                     if (isFirstChunk) queueTask(function () { fireProgressEvent(fr, "loadstart", 0, 0); });
                     isFirstChunk = false;
                     chunks.push(new Uint8ArrayCtor(chunk));
-                    total += chunk.length;
+                    total += apply(typedArrayLength, chunk, []);
                     const now = adapter.now();
                     if (now - lastProgress >= 50) {
                         lastProgress = now;
@@ -44488,17 +44575,21 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     const getPrototypeOf = Object.getPrototypeOf;
     const weakGet = WeakMap.prototype.get, weakSet = WeakMap.prototype.set;
     const PromiseCtor = Promise, promiseThen = Promise.prototype.then, promiseReject = Promise.reject;
+    const promiseResolve = Promise.resolve;
     const TypeErrorCtor = TypeError, RangeErrorCtor = RangeError;
     const Uint8ArrayCtor = Uint8Array, ArrayBufferCtor = ArrayBuffer;
     const isView = ArrayBuffer.isView, arrayBufferSlice = ArrayBuffer.prototype.slice;
     const bufferByteLength = getOwn(ArrayBuffer.prototype, "byteLength").get;
     const typedArrayProto = getPrototypeOf(Uint8Array.prototype);
-    const typedArraySubarray = typedArrayProto.subarray;
     const typedArrayTag = getOwn(typedArrayProto, Symbol.toStringTag).get;
     const serviceBufferTransfer=ArrayBuffer.prototype.transfer;
     const serviceViewBuffer=getOwn(typedArrayProto,"buffer").get;
     const serviceViewOffset=getOwn(typedArrayProto,"byteOffset").get;
     const serviceViewLength=getOwn(typedArrayProto,"byteLength").get;
+    // Byte sequences are Uint8Arrays read through these intrinsics, never the
+    // author-replaceable %TypedArray%.prototype accessors and methods.
+    const typedArrayLength = getOwn(typedArrayProto, "length").get;
+    const typedArraySet = typedArrayProto.set, typedArrayIndexOf = typedArrayProto.indexOf;
     const charCodeAt = String.prototype.charCodeAt, stringSlice = String.prototype.slice;
     const fromCharCode = String.fromCharCode, toWellFormed = String.prototype.toWellFormed;
     const arraySort = Array.prototype.sort, iteratorSymbol = Symbol.iterator, toStringTag = Symbol.toStringTag;
@@ -44533,6 +44624,18 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     function domException(message, name) { return new g.DOMException(message, name); }
     function isArrayBuffer(value) {
         try { apply(bufferByteLength, value, []); return true; } catch (_) { return false; }
+    }
+    // The length of a byte sequence (a Uint8Array).
+    function byteCount(bytes) { return apply(typedArrayLength, bytes, []); }
+    // Bytes `begin` to `end` (clamped) of a Uint8Array, as a view of its buffer
+    // made from its internal slots: %TypedArray%.prototype.subarray would
+    // consult the author-replaceable `constructor` and @@species (ECMA-262
+    // TypedArraySpeciesCreate).
+    function bytesView(bytes, begin, end) {
+        const length = byteCount(bytes);
+        begin = MathMin(begin, length);
+        end = end < begin ? begin : MathMin(end, length);
+        return new Uint8ArrayCtor(apply(serviceViewBuffer, bytes, []), apply(serviceViewOffset, bytes, []) + begin, end - begin);
     }
 
     // --- byte strings and HTTP tokens ------------------------------------------
@@ -44986,12 +45089,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (typeof body.onDone === "function") { const done = body.onDone; body.onDone = null; done(); }
         };
         stream = streamsAPI.setUpBytes(function () {
-            if (remaining.length === 0) { finish(); return undefined; }
+            if (byteCount(remaining) === 0) { finish(); return undefined; }
             remaining = streamsAPI.pullFromBytes(stream, remaining);
-            if (remaining.length === 0) finish();
+            if (byteCount(remaining) === 0) finish();
             return undefined;
         });
-        if (remaining.length === 0) finish();
+        if (byteCount(remaining) === 0) finish();
         body.stream = stream;
         if (body.streamError !== undefined) streamsAPI.error(stream, body.streamError);
         return stream;
@@ -45045,7 +45148,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         body.abortSteps = abortSteps;
         record.abort = weakRefDeref === null ? abortSteps : weakSteps(new WeakRefCtor(abortSteps));
         stream = streamsAPI.setUpBytes(function () {
-            if (pending !== null && pending.length) {
+            if (pending !== null && byteCount(pending)) {
                 pending = streamsAPI.pullFromBytes(stream, pending);
                 return undefined;
             }
@@ -45112,7 +45215,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             body.bytes = new Uint8ArrayCtor(0);
             const reader = streamsAPI.getReader(bodyStream(body));
             streamsAPI.readChunk(reader, {chunk() {}, close() {}, error() {}});
-            react(apply(PromiseCtor.resolve, PromiseCtor, [undefined]), function () { successSteps(bytes); });
+            react(apply(promiseResolve, PromiseCtor, [undefined]), function () { successSteps(bytes); });
             return;
         }
         let reader;
@@ -45143,7 +45246,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     function multipartBoundary() {
         const bytes = randomBytes(16);
         let boundary = "----TRustFormBoundary";
-        for (let i = 0; i < bytes.length; i++) boundary += "0123456789abcdef"[bytes[i] & 15];
+        for (let i = 0, length = byteCount(bytes); i < length; i++) boundary += "0123456789abcdef"[bytes[i] & 15];
         return boundary;
     }
     function normalizeNewlines(string) {
@@ -45161,7 +45264,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     function escapeMultipartName(bytes) {
         // Field names and filenames: LF, CR and " escape as %0A, %0D and %22.
         const escaped = [];
-        for (let i = 0; i < bytes.length; i++) {
+        for (let i = 0, length = byteCount(bytes); i < length; i++) {
             const b = bytes[i];
             if (b === 0x0a) escaped.push(0x25, 0x30, 0x41);
             else if (b === 0x0d) escaped.push(0x25, 0x30, 0x44);
@@ -45182,7 +45285,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             pending.length = 0;
             pendingLength = 0;
         };
-        const push = (bytes) => { pending.push(bytes); pendingLength += bytes.length; };
+        const push = (bytes) => { pending.push(bytes); pendingLength += byteCount(bytes); };
         for (let i = 0; i < entries.length; i++) {
             const name = entries[i][0], value = entries[i][1];
             push(utf8("--" + boundary + "\r\nContent-Disposition: form-data; name=\""));
@@ -45270,7 +45373,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             stream = converted.value;
             break;
         }
-        if (bytes !== null && length === null) length = bytes.length;
+        if (bytes !== null && length === null) length = byteCount(bytes);
         const body = stream !== null ? bodyFromStream(stream, null, null)
             : leaves !== null ? bodyFromLeaves(leaves, source, length) : bodyFromBytes(bytes, source, length);
         return {body, type};
@@ -45282,29 +45385,30 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (typeof boundary !== "string" || boundary.length < 1 || boundary.length > 70) fail();
         const decode = (view) => apply(textDecode, new TextDecoderCtor("utf-8", {ignoreBOM: true}), [view]);
         const find = (haystack, needle, from) => {
-            for (let i = haystack.indexOf(needle[0], from); i >= 0 && i + needle.length <= haystack.length;
-                i = haystack.indexOf(needle[0], i + 1)) {
+            const haystackLength = byteCount(haystack), needleLength = byteCount(needle);
+            for (let i = apply(typedArrayIndexOf, haystack, [needle[0], from]); i >= 0 && i + needleLength <= haystackLength;
+                i = apply(typedArrayIndexOf, haystack, [needle[0], i + 1])) {
                 let j = 1;
-                while (j < needle.length && haystack[i + j] === needle[j]) j++;
-                if (j === needle.length) return i;
+                while (j < needleLength && haystack[i + j] === needle[j]) j++;
+                if (j === needleLength) return i;
             }
             return -1;
         };
-        const data = new Uint8ArrayCtor(bytes.length + 2);
-        data[0] = 13; data[1] = 10; data.set(bytes, 2);
+        const data = new Uint8ArrayCtor(byteCount(bytes) + 2);
+        data[0] = 13; data[1] = 10; apply(typedArraySet, data, [bytes, 2]);
         const delimiter = utf8("\r\n--" + boundary), headerEnd = utf8("\r\n\r\n");
         const entries = [];
         let pos = find(data, delimiter, 0);
         if (pos < 0) fail();
         for (;;) {
-            pos += delimiter.length;
+            pos += byteCount(delimiter);
             if (data[pos] === 45 && data[pos + 1] === 45) return entries;
             while (data[pos] === 32 || data[pos] === 9) pos++;
             if (data[pos] !== 13 || data[pos + 1] !== 10) fail();
             pos += 2;
             const next = find(data, delimiter, pos);
             if (next < 0) fail();
-            const part = apply(typedArraySubarray, data, [pos, next]);
+            const part = bytesView(data, pos, next);
             let headersEnd = 0, contentStart = 2;
             if (part[0] !== 13 || part[1] !== 10) {
                 headersEnd = find(part, headerEnd, 0);
@@ -45313,7 +45417,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             }
             const fields = new Map();
             let last = null;
-            const lines = decode(apply(typedArraySubarray, part, [0, headersEnd])).split("\r\n");
+            const lines = decode(bytesView(part, 0, headersEnd)).split("\r\n");
             for (let l = 0; l < lines.length; l++) {
                 const line = lines[l];
                 if (!line) continue;
@@ -45359,7 +45463,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 if (name && !parameters.has(name)) parameters.set(name, value);
             }
             if (!parameters.has("name")) fail();
-            const content = apply(typedArraySubarray, part, [contentStart]);
+            const content = bytesView(part, contentStart, byteCount(part));
             const value = parameters.has("filename")
                 ? fileAPI.createFile(new Uint8ArrayCtor(content), parameters.get("filename"),
                     fields.has("content-type") ? fields.get("content-type") : "text/plain")
@@ -45408,8 +45512,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         });
     }
     function bytesToArrayBuffer(bytes) {
-        return bytes.byteOffset === 0 && bytes.byteLength === apply(bufferByteLength, bytes.buffer, [])
-            ? bytes.buffer : apply(arrayBufferSlice, bytes.buffer, [bytes.byteOffset, bytes.byteOffset + bytes.byteLength]);
+        const buffer = apply(serviceViewBuffer, bytes, []), offset = apply(serviceViewOffset, bytes, []);
+        const length = apply(serviceViewLength, bytes, []);
+        return offset === 0 && length === apply(bufferByteLength, buffer, [])
+            ? buffer : apply(arrayBufferSlice, buffer, [offset, offset + length]);
     }
     // #concept-body-mime-type
     function bodyMimeType(owner) { return extractMimeType(owner.headersList()); }
@@ -46010,9 +46116,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const output = [];
         const hex = c => (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x46) || (c >= 0x61 && c <= 0x66);
         const value = c => c <= 0x39 ? c - 0x30 : c <= 0x46 ? c - 0x37 : c - 0x57;
-        for (let i = 0; i < bytes.length; i++) {
+        for (let i = 0, length = byteCount(bytes); i < length; i++) {
             const b = bytes[i];
-            if (b === 0x25 && i + 2 < bytes.length && hex(bytes[i + 1]) && hex(bytes[i + 2])) {
+            if (b === 0x25 && i + 2 < length && hex(bytes[i + 1]) && hex(bytes[i + 2])) {
                 output.push(value(bytes[i + 1]) * 16 + value(bytes[i + 2]));
                 i += 2;
             } else output.push(b);
@@ -46050,7 +46156,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     function responseFromBytes(status, statusMessage, headerList, bytes, url) {
         return newResponseRecord({status, statusMessage, headerList, urlList: [url],
-            body: bodyFromBytes(bytes, null, bytes.length)});
+            body: bodyFromBytes(bytes, null, byteCount(bytes))});
     }
     // #scheme-fetch for about:, blob: and data:.
     function schemeFetch(request) {
@@ -46243,7 +46349,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (typeof result[8] === "number") body = bodyFromHost(result[8], request.keepalive);
         else {
             const bytes = isArrayBuffer(result[3]) ? new Uint8ArrayCtor(result[3]) : utf8(`${result[2] || ""}`);
-            body = bodyFromBytes(bytes, null, bytes.length);
+            body = bodyFromBytes(bytes, null, byteCount(bytes));
         }
         if (request.method === "HEAD" || NULL_BODY_STATUSES.indexOf(status) >= 0) {
             terminateBody(body);
@@ -46365,7 +46471,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     function integrityMatches(bytes, metadata) {
         const parsed = parseIntegrity(metadata);
-        if (parsed.length === 0) return apply(PromiseCtor.resolve, PromiseCtor, [true]);
+        if (parsed.length === 0) return apply(promiseResolve, PromiseCtor, [true]);
         let strongest = 0;
         for (let i = 0; i < parsed.length; i++) strongest = Math.max(strongest, SRI_ALGORITHMS[parsed[i].algorithm][1]);
         const candidates = parsed.filter(item => SRI_ALGORITHMS[item.algorithm][1] === strongest);
@@ -46383,14 +46489,14 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // the whole request before reading the response).
     function requestBodyBytes(request) {
         const body = request.body;
-        if (body === null) return apply(PromiseCtor.resolve, PromiseCtor, [null]);
+        if (body === null) return apply(promiseResolve, PromiseCtor, [null]);
         if (body.stream === null && body.leaves !== null && body.streamError === undefined) {
             // Taking the body disturbs it as reading it would.
             const leaves = body.leaves;
             body.leaves = [];
             const reader = streamsAPI.getReader(bodyStream(body));
             streamsAPI.readChunk(reader, {chunk() {}, close() {}, error() {}});
-            return apply(PromiseCtor.resolve, PromiseCtor, [leaves]);
+            return apply(promiseResolve, PromiseCtor, [leaves]);
         }
         return new PromiseCtor(function (resolve, reject) {
             fullyReadBody(body, resolve, reject);
@@ -46509,7 +46615,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         react(requestBodyBytes(request), function (bodyBytes) {
             removeFetchRecord(bodyRecord);
             if (locallyAborted || stopped) return;
-            const keepaliveLength = request.keepalive && bodyBytes !== null ? bodyBytes.length : 0;
+            const keepaliveLength = request.keepalive && bodyBytes !== null
+                ? (isArray(bodyBytes) ? bodyBytes.length : byteCount(bodyBytes)) : 0;
             if (request.keepalive && !reserveKeepalive(keepaliveLength)) { processResponse(networkError()); return; }
             // A response is handed over once its header section arrives and
             // its body streams (#concept-http-network-fetch). Integrity
@@ -46609,7 +46716,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 useCORSPreflight:fields.useCORSPreflight});
             if (fields.body !== null) {
                 const bytes = new Uint8ArrayCtor(fields.body);
-                request.body = bodyFromBytes(bytes, bytes, bytes.length);
+                request.body = bodyFromBytes(bytes, bytes, byteCount(bytes));
             }
             const signal = abortAPI.controllerSignal(controller);
             return {request:createRequestObject(request,"immutable",signal),opaque:false,
@@ -46635,11 +46742,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 headerList:response.headerList,urlList:response.urlList,hasBody:body !== null,
                 privateToken:response.privateResponse === null ? null : response.privateResponse.token};
             function piece(send) {
-                const end = MathMin(offset + 65536,pending.length);
+                const length = byteCount(pending), end = MathMin(offset + 65536,length);
                 const bytes = new Uint8ArrayCtor(end-offset);
                 for(let i=offset;i<end;i++)bytes[i-offset]=pending[i];
                 offset=end;
-                if(offset===pending.length){pending=null;offset=0;}
+                if(offset===length){pending=null;offset=0;}
                 send(bytes);
             }
             function cancelReader(reason) {
@@ -46677,7 +46784,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             const privateMetadata = fields.privateToken ? privateResponseMetadata(fields.privateToken) : null;
             const response = newResponseRecord(privateMetadata || fields);
             if (bytes !== null && response.type !== "opaque" && response.type !== "opaqueredirect")
-                response.body = bodyFromBytes(bytes, null, bytes.length);
+                response.body = bodyFromBytes(bytes, null, byteCount(bytes));
             if (privateMetadata !== null) adoptPrivateResponse(response, privateMetadata);
             return createResponseObject(response, fields.guard || "immutable");
         },
@@ -46931,7 +47038,26 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     function stringify(value) { return jsonStringify(jsonData(value)); }
     const weakGet = WeakMap.prototype.get, weakSet = WeakMap.prototype.set;
     const PromiseCtor = Promise, promiseResolve = Promise.resolve.bind(Promise);
-    const promiseReject = Promise.reject.bind(Promise), promiseAll = Promise.all.bind(Promise);
+    const promiseReject = Promise.reject.bind(Promise);
+    // Web IDL "react to a promise": PerformPromiseThen, never a `then` lookup.
+    const react = (promise, onFulfilled, onRejected) => __promise_react(promise, onFulfilled, onRejected);
+    // Web IDL #waiting-for-all-promise: each promise is reacted to, never
+    // Promise.all or Promise.resolve; the results keep the promises' order and
+    // the first rejection rejects.
+    function waitForAll(promises) {
+        let resolveAll, rejectAll;
+        const all = new PromiseCtor((resolve, reject) => { resolveAll = resolve; rejectAll = reject; });
+        const results = [];
+        let remaining = promises.length;
+        if (remaining === 0) resolveAll(results);
+        for (let index = 0; index < promises.length; index++) {
+            react(promises[index], value => {
+                define(results, index, {__proto__: null, value, writable: true, enumerable: true, configurable: true});
+                if (--remaining === 0) resolveAll(results);
+            }, rejectAll);
+        }
+        return all;
+    }
     const storageOrigin = adapter.origin;
     const cacheNamesKind = "cache-storage-names:" + storageOrigin;
     const cacheDataKind = "cache-storage-data:" + storageOrigin;
@@ -47109,7 +47235,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             return promiseReject(new TypeError("A response with Vary: * cannot be stored in a Cache"));
         if (fetchAPI.bodyUnusable(inner))
             return promiseReject(new TypeError("The response body is disturbed or locked"));
-        return fetchAPI.prepareCacheResponse(inner).then(() => fetchAPI.readBody(inner)).then((bytes) => ({
+        return react(react(fetchAPI.prepareCacheResponse(inner), () => fetchAPI.readBody(inner)), (bytes) => ({
             request: cacheRequestRecord(request),
             response: {
                 status: inner.status,
@@ -47155,7 +47281,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         }
         match(request, options) {
             if (arguments.length === 0) return promiseReject(new TypeError("Cache.match requires a request"));
-            return this.matchAll(request, options).then((responses) => responses[0]);
+            return react(apply(cacheMatchAll, this, [request, options]), (responses) => responses[0]);
         }
         matchAll(request, options) {
             try {
@@ -47189,7 +47315,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 if ((protocol !== "http:" && protocol !== "https:") || inner.method !== "GET")
                     return promiseReject(new TypeError("Cache.addAll only accepts HTTP(S) GET requests"));
             }
-            return promiseAll(list.map((request) => platformFetch(request))).then((responses) => {
+            return react(react(waitForAll(list.map((request) => platformFetch(request))), (responses) => {
                 for (let index = 0; index < responses.length; index++) {
                     const response = fetchAPI.response(responses[index]);
                     const vary = cacheHeader(response.headerList, "vary");
@@ -47197,9 +47323,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                         (vary !== null && vary.split(",").some((field) => field.trim() === "*")))
                         throw new TypeError("Cache.addAll received an uncacheable response");
                 }
-                return promiseAll(responses.map((response, index) =>
+                return waitForAll(responses.map((response, index) =>
                     cacheResponseRecord(list[index], response)));
-            }).then((records) => { cacheId(this); cacheCommit(id, records); return undefined; });
+            }), (records) => { cacheId(this); cacheCommit(id, records); return undefined; });
         }
         put(request, response) {
             if (arguments.length < 2) return promiseReject(new TypeError("Cache.put requires a request and response"));
@@ -47208,7 +47334,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 id = cacheId(this);
                 normalized = cacheRequest(request);
             } catch (error) { return promiseReject(error); }
-            return cacheResponseRecord(normalized, response).then((record) => {
+            return react(cacheResponseRecord(normalized, response), (record) => {
                 cacheId(this); // The pending operation retains its request/response list.
                 cacheCommit(id, [record]);
                 return undefined;
@@ -47251,6 +47377,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         }
         get [Symbol.toStringTag]() { return "Cache"; }
     }
+    // match() runs the matchAll steps itself, not the author-replaceable method.
+    const cacheMatchAll = Cache.prototype.matchAll;
 
     class CacheStorage {
         constructor(token) {
@@ -47265,7 +47393,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 for (let index = 0; index < entries.length; index++) {
                     const entry = entries[index];
                     const cache = new Cache(cacheToken, entry.id, entry.lease);
-                    promise = promise.then(response => response === undefined ? cache.match(request, options) : response);
+                    promise = react(promise, response => response === undefined ? cache.match(request, options) : response);
                 }
                 return promise;
             } catch (error) { return promiseReject(error); }
@@ -47369,6 +47497,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     const parse = JSON.parse, jsonStringify = JSON.stringify, isArray = Array.isArray;
     const keysOf = Object.keys, hasOwn = Object.prototype.hasOwnProperty, setPrototypeOf = Object.setPrototypeOf;
     const ArrayCtor = Array, StringCtor = String, arraySort = Array.prototype.sort;
+    const PromiseCtor = Promise, promiseResolve = Promise.resolve, promiseReject = Promise.reject;
     const min = Math.min, max = Math.max;
     // IndexedDB #clone-value / #object-store-storage-operation keep serialized
     // Records private, including WebCrypto [[Handle]]. A database envelope
@@ -47439,6 +47568,18 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     const isView = ArrayBuffer.isView, DateCtor = Date;
     const dateGetTime = Date.prototype.getTime;
     const bufferByteLength = getOwn(ArrayBuffer.prototype, "byteLength").get;
+    // A binary key's bytes come from the buffer source's internal slots
+    // (Web IDL #dfn-get-buffer-source-copy), never the author-replaceable
+    // %TypedArray% and DataView prototype accessors.
+    const Uint8ArrayCtor = Uint8Array, typedArrayProto = Object.getPrototypeOf(Uint8ArrayCtor.prototype);
+    const typedArrayName = getOwn(typedArrayProto, Symbol.toStringTag).get;
+    const typedArrayBuffer = getOwn(typedArrayProto, "buffer").get;
+    const typedArrayOffset = getOwn(typedArrayProto, "byteOffset").get;
+    const typedArrayByteLength = getOwn(typedArrayProto, "byteLength").get;
+    const typedArrayLength = getOwn(typedArrayProto, "length").get;
+    const dataViewBuffer = getOwn(DataView.prototype, "buffer").get;
+    const dataViewOffset = getOwn(DataView.prototype, "byteOffset").get;
+    const dataViewLength = getOwn(DataView.prototype, "byteLength").get;
     function internalsFor(object) {
         let record = apply(weakGet, internalSlots, [object]);
         if (record === undefined) {
@@ -47630,10 +47771,17 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (typeof value === "object" && value !== null && (idbIsBuffer(value) || isView(value))) {
             let bytes;
             try {
-                bytes = idbIsBuffer(value)
-                    ? new Uint8Array(value) : new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+                bytes = idbIsBuffer(value) ? new Uint8ArrayCtor(value)
+                    : apply(typedArrayName, value, []) !== undefined
+                        ? new Uint8ArrayCtor(apply(typedArrayBuffer, value, []), apply(typedArrayOffset, value, []),
+                            apply(typedArrayByteLength, value, []))
+                        : new Uint8ArrayCtor(apply(dataViewBuffer, value, []), apply(dataViewOffset, value, []),
+                            apply(dataViewLength, value, []));
             } catch (_) { throw idbException("DataError", "A detached buffer is not an IndexedDB key."); }
-            return { t: "b", v: Array.from(bytes) };
+            // The byte values by index: no %TypedArray%.prototype iterator.
+            const v = [];
+            for (let i = 0, length = apply(typedArrayLength, bytes, []); i < length; i++) listPush(v, bytes[i]);
+            return { t: "b", v };
         }
         if (isArray(value)) {
             seen = seen || new Set();
@@ -47665,7 +47813,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (key.t === "n") return idbDecodeNumber(key.v);
         if (key.t === "d") return new DateCtor(key.v);
         if (key.t === "s") return key.v;
-        if (key.t === "b") return new Uint8Array(key.v).buffer;
+        if (key.t === "b") return apply(typedArrayBuffer, new Uint8ArrayCtor(key.v), []);
         return listMap(key.v,idbKeyValue);
     }
     function idbCompare(a, b) {
@@ -48849,7 +48997,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             return request;
         }
         databases() {
-            try { idbCheckStorageKey(); } catch (error) { return Promise.reject(error); }
+            try { idbCheckStorageKey(); } catch (error) { return apply(promiseReject, PromiseCtor, [error]); }
             const result = [];
             const count = __storage_len(idbDataKind);
             for (let index = 0; index < count; index++) {
@@ -48858,7 +49006,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 const data = idbLoadData(name);
                 if (data && data.version) listPush(result,{ name: name, version: data.version });
             }
-            return Promise.resolve(result);
+            return apply(promiseResolve, PromiseCtor, [result]);
         }
         cmp(first, second) {
             if (arguments.length < 2) throw new TypeError("IDBFactory.cmp requires two keys.");
@@ -49302,7 +49450,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (opaqueKey === null) {
                 const bytes = __crypto_random_bytes(16);
                 opaqueKey = "opaque:";
-                for (let i = 0; i < bytes.length; i++) opaqueKey += (bytes[i] < 16 ? "0" : "") + bytes[i].toString(16);
+                // Its 16 bytes, without %TypedArray%.prototype's replaceable length getter.
+                for (let i = 0; i < 16; i++) opaqueKey += (bytes[i] < 16 ? "0" : "") + bytes[i].toString(16);
             }
             return opaqueKey;
         }
@@ -49662,11 +49811,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (isObject(value)) {
             if (fileAPI.isBlob(value)) {
                 const bytes = fileAPI.bytes(value);
-                return {binary: true, data: bytes, length: bytes.length};
+                return {binary: true, data: bytes, length: apply(typedLength, bytes, [])};
             }
             // A BufferSource's bytes are copied when send() is invoked.
             const copy = fileAPI.bufferSourceCopy(value);
-            if (copy !== null) return {binary: true, data: copy, length: copy.length};
+            if (copy !== null) return {binary: true, data: copy, length: apply(typedLength, copy, [])};
         }
         const text = usvString(value);
         return {binary: false, data: text, length: utf8Length(text)};
@@ -50377,12 +50526,17 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // survives postMessage instead of arriving empty. Self-contained
         // (the codec runs in both the page and worker realms).
         function blobBytes(b) {
-            var parts = codecSlots(b).parts || [], out = "", i, j, v, p;
+            var parts = codecSlots(b).parts || [], out = "", i, j, n, v, p;
             for (i = 0; i < parts.length; i++) {
                 p = parts[i];
-                if (typeof p === "string") { v = new G.TextEncoder().encode(p); for (j = 0; j < v.length; j++) out += String.fromCharCode(v[j]); }
-                else if (p instanceof ArrayBuffer) { v = new Uint8Array(p); for (j = 0; j < v.length; j++) out += String.fromCharCode(v[j]); }
-                else if (p && typeof p.byteLength === "number" && p.buffer) { v = new Uint8Array(p.buffer, p.byteOffset || 0, p.byteLength); for (j = 0; j < v.length; j++) out += String.fromCharCode(v[j]); }
+                // Byte parts are read through the intrinsic accessors, which
+                // author code cannot replace (Web IDL #dfn-get-buffer-source-copy).
+                if (typeof p === "string") { v = new G.TextEncoder().encode(p); for (j = 0, n = apply(typedLength, v, []); j < n; j++) out += String.fromCharCode(v[j]); }
+                else if (p instanceof ArrayBuffer) { v = new Uint8Array(p); for (j = 0, n = apply(typedLength, v, []); j < n; j++) out += String.fromCharCode(v[j]); }
+                else if (apply(typedName, p, []) !== undefined) {
+                    v = new RawBytes(apply(typedBuffer, p, []), apply(typedOffset, p, []), apply(typedBytes, p, []));
+                    for (j = 0, n = apply(typedLength, v, []); j < n; j++) out += String.fromCharCode(v[j]);
+                }
                 // File API #serialization-steps copy the byte sequence: a
                 // selected file's range is read now (in the page realm, which
                 // installed the read closure); a failed read is not cloneable.
@@ -51554,6 +51708,24 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         }
         function named(fn, name) { define(fn, "name", {value: name, configurable: true}); return fn; }
         function rejected(error) { return apply(promiseReject, PromiseCtor, [error]); }
+        // Web IDL #waiting-for-all-promise: each promise is reacted to with
+        // PerformPromiseThen (`__promise_react`), never Promise.all or
+        // Promise.resolve; the results keep the promises' order and the first
+        // rejection rejects.
+        function waitForAll(promises) {
+            let resolveAll, rejectAll;
+            const all = new PromiseCtor((resolve, reject) => { resolveAll = resolve; rejectAll = reject; });
+            const results = [];
+            let remaining = promises.length;
+            if (remaining === 0) resolveAll(results);
+            for (let index = 0; index < promises.length; index++) {
+                __promise_react(promises[index], value => {
+                    define(results, index, {__proto__: null, value, writable: true, enumerable: true, configurable: true});
+                    if (--remaining === 0) resolveAll(results);
+                }, rejectAll);
+            }
+            return all;
+        }
         function exception(message, name) { return new DOMException(message, name); }
         function fullyActive() { return __permissions_binding("active", storageContextId); }
         function dictionary(value, name) {
@@ -51858,7 +52030,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                                 settle(value instanceof BlobCtor ? value
                                     : new BlobCtor([new TextEncoderCtor().encode(`${value}`)], {type: representation.mimeType}));
                             }, fail])));
-                        apply(promiseThen, PromiseCtor.all(pending), [blobs => {
+                        apply(promiseThen, waitForAll(pending), [blobs => {
                             let text = null;
                             for (const blob of blobs) {
                                 const type = clipboardMimeType(blob.type);
@@ -52534,7 +52706,17 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     const fromCharCode = String.fromCharCode, mathMax = Math.max;
     const jsonParse = JSON.parse, toWellFormed = String.prototype.toWellFormed;
     const typedBuffer = getOwn(Object.getPrototypeOf(Bytes.prototype), "buffer").get;
-    const typedSubarray = Bytes.prototype.subarray, typedSet = Object.getPrototypeOf(Bytes.prototype).set;
+    const typedOffset = getOwn(Object.getPrototypeOf(Bytes.prototype), "byteOffset").get;
+    const typedLength = getOwn(Object.getPrototypeOf(Bytes.prototype), "length").get;
+    const typedSet = Object.getPrototypeOf(Bytes.prototype).set;
+    // The length of a byte sequence (a Uint8Array), without the
+    // author-replaceable %TypedArray%.prototype getter.
+    const byteCount = bytes => apply(typedLength, bytes, []);
+    // Bytes `begin` to `end` (within its length) of a Uint8Array, as a view of
+    // its buffer made from its internal slots: %TypedArray%.prototype.subarray
+    // would consult the author-replaceable `constructor` and @@species.
+    const bytesView = (bytes, begin, end) =>
+        new Bytes(apply(typedBuffer, bytes, []), apply(typedOffset, bytes, []) + begin, end - begin);
     const TextDecoderCtor = g.TextDecoder, textDecode = TextDecoderCtor.prototype.decode;
     const encodingName = __text_encoding_name;
     const URLCtor = g.URL, urlHref = getOwn(URLCtor.prototype, "href").get;
@@ -52764,7 +52946,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 let extractedContentType = null;
                 if (body.kind === "document") {
                     xhr.body = fileAPI.utf8(usvString(body.serialized));
-                    xhr.bodyLength = xhr.body.length;
+                    xhr.bodyLength = byteCount(xhr.body);
                 } else {
                     const extracted = fetchAPI.extract(body.value, false);
                     // Bytes, or leaves whose selected files the host reads as it sends.
@@ -52998,16 +53180,16 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // Append to the received bytes, growing their buffer geometrically so a
     // long incrementally read body costs linear copying.
     function appendReceived(xhr, bytes) {
-        const used = xhr.received.length, length = used + bytes.length;
+        const used = byteCount(xhr.received), length = used + byteCount(bytes);
         let store = xhr.receivedStore;
-        if (store === null || store.length < length) {
-            const grown = new Bytes(mathMax(length, store === null ? 0 : store.length * 2, 4096));
+        if (store === null || byteCount(store) < length) {
+            const grown = new Bytes(mathMax(length, store === null ? 0 : byteCount(store) * 2, 4096));
             apply(typedSet, grown, [xhr.received, 0]);
             store = grown;
             xhr.receivedStore = grown;
         }
         apply(typedSet, store, [bytes, used]);
-        xhr.received = apply(typedSubarray, store, [0, length]);
+        xhr.received = bytesView(store, 0, length);
     }
     function cancelTimeout(xhr) {
         if (xhr.timer !== null) { adapter.cancelDelay(xhr.timer); xhr.timer = null; }
@@ -53058,7 +53240,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 if (xhr.state === HEADERS_RECEIVED) xhr.state = LOADING;
                 fireReadyStateChange(target);
                 if (xhr.controller !== controller) return;
-                fireProgress(target, "progress", xhr.received.length, length);
+                fireProgress(target, "progress", byteCount(xhr.received), length);
             }, function () {
                 if (xhr.controller !== controller) return;
                 xhr.readingBody = null;
@@ -53073,12 +53255,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             return;
         }
         const bytes = xhr.response.body.bytes || new Bytes(0);
-        if (bytes.length) {
+        if (byteCount(bytes)) {
             xhr.received = bytes;
             if (xhr.state === HEADERS_RECEIVED) xhr.state = LOADING;
             fireReadyStateChange(target);
             if (xhr.controller !== controller) return;
-            fireProgress(target, "progress", xhr.received.length, length);
+            fireProgress(target, "progress", byteCount(xhr.received), length);
             if (xhr.controller !== controller) return;
         }
         handleResponseEndOfBody(target, xhr);
@@ -53087,7 +53269,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     function handleResponseEndOfBody(target, xhr) {
         if (handleErrors(target, xhr)) return;
         if (isNetworkError(xhr.response)) return;
-        const transmitted = xhr.received.length;
+        const transmitted = byteCount(xhr.received);
         let length = extractLength(xhr.response.headerList);
         if (length === null) length = 0;
         if (!xhr.sync) fireProgress(target, "progress", transmitted, length);
@@ -53162,25 +53344,27 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // fallback. A fatal decode (the XML parser's) throws a TypeError.
     function decode(bytes, fallback, fatal) {
         let encoding = fallback, start = 0;
-        if (bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) { encoding = "utf-8"; start = 3; }
-        else if (bytes.length >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) { encoding = "utf-16be"; start = 2; }
-        else if (bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === 0xfe) { encoding = "utf-16le"; start = 2; }
+        const length = byteCount(bytes);
+        if (length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) { encoding = "utf-8"; start = 3; }
+        else if (length >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) { encoding = "utf-16be"; start = 2; }
+        else if (length >= 2 && bytes[0] === 0xff && bytes[1] === 0xfe) { encoding = "utf-16le"; start = 2; }
         // #replacement-decoder: one error for any input, then the end.
         if (encoding === "replacement") {
-            if (fatal && bytes.length) throw new TypeErrorCtor("The replacement encoding cannot be decoded");
-            return bytes.length ? "\uFFFD" : "";
+            if (fatal && length) throw new TypeErrorCtor("The replacement encoding cannot be decoded");
+            return length ? "\uFFFD" : "";
         }
         const decoder = new TextDecoderCtor(encoding, {fatal, ignoreBOM: true});
-        return apply(textDecode, decoder, [start ? apply(typedSubarray, bytes, [start]) : bytes]);
+        return apply(textDecode, decoder, [start ? bytesView(bytes, start, length) : bytes]);
     }
     // XML 1.0 #sec-guessing-no-ext-info: the encoding of an entity without a
     // byte order mark, from its first bytes and encoding declaration.
     const XML_DECLARATION = /^<\?xml[\t\n\r ][^>]*?encoding[\t\n\r ]*=[\t\n\r ]*(["'])([A-Za-z][A-Za-z0-9._-]*)\1/;
     function xmlEncoding(bytes) {
-        if (bytes.length >= 2 && bytes[0] === 0 && bytes[1] === 0x3c) return "utf-16be";
-        if (bytes.length >= 2 && bytes[0] === 0x3c && bytes[1] === 0) return "utf-16le";
+        const length = byteCount(bytes);
+        if (length >= 2 && bytes[0] === 0 && bytes[1] === 0x3c) return "utf-16be";
+        if (length >= 2 && bytes[0] === 0x3c && bytes[1] === 0) return "utf-16le";
         let prolog = "";
-        for (let i = 0; i < bytes.length && i < 1024; i++) prolog += fromCharCode(bytes[i]);
+        for (let i = 0; i < length && i < 1024; i++) prolog += fromCharCode(bytes[i]);
         const match = apply(regexpExec, XML_DECLARATION, [prolog]);
         return match === null ? null : getEncoding(match[2]);
     }
@@ -53291,6 +53475,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
 /*__WASM_BEGIN__*/
 (function (g) {
     const apply = Reflect.apply;
+    // Web IDL #a-new-promise and #a-promise-resolved-with: the realm's
+    // intrinsic %Promise%, not the author-replaceable global or its statics.
+    const PromiseCtor = Promise, promiseResolve = Promise.resolve, promiseThen = Promise.prototype.then;
     const defineProperty = Object.defineProperty;
     const iteratorSymbol = Symbol.iterator;
     function isObject(value) {
@@ -53320,6 +53507,16 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     const RawBytes = Uint8Array;
     const bytesToBase64 = RawBytes.prototype.toBase64, bytesFromBase64 = RawBytes.fromBase64;
     const CloneException = g.DOMException;
+    // A view's [[ViewedArrayBuffer]], [[ByteOffset]] and [[ByteLength]], read
+    // through the intrinsic accessors that author code cannot replace.
+    const describe = Object.getOwnPropertyDescriptor, typedProto = Object.getPrototypeOf(RawBytes.prototype);
+    const typedName = describe(typedProto, Symbol.toStringTag).get;
+    const typedBuffer = describe(typedProto, "buffer").get;
+    const typedOffset = describe(typedProto, "byteOffset").get;
+    const typedBytes = describe(typedProto, "byteLength").get;
+    const viewBuffer = describe(DataView.prototype, "buffer").get;
+    const viewOffset = describe(DataView.prototype, "byteOffset").get;
+    const viewBytes = describe(DataView.prototype, "byteLength").get;
 
     // Normalize a `BufferSource` to an `ArrayBuffer` holding exactly its bytes:
     // an `ArrayBuffer` passes through; a typed-array/DataView view is sliced to
@@ -53328,7 +53525,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     function wasmBytes(src) {
         if (src instanceof ArrayBuffer) return src;
         if (ArrayBuffer.isView(src)) {
-            return src.buffer.slice(src.byteOffset, src.byteOffset + src.byteLength);
+            const typed = apply(typedName, src, []) !== undefined;
+            const offset = apply(typed ? typedOffset : viewOffset, src, []);
+            const length = apply(typed ? typedBytes : viewBytes, src, []);
+            return apply(bufferSlice, apply(typed ? typedBuffer : viewBuffer, src, []), [offset, offset + length]);
         }
         throw new TypeError(
             "WebAssembly: expected a BufferSource (ArrayBuffer or ArrayBuffer view)"
@@ -53399,7 +53599,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
 
     function compile(bufferSource) {
-        return new Promise(function (resolve, reject) {
+        return new PromiseCtor(function (resolve, reject) {
             try {
                 resolve(new Module(bufferSource));
             } catch (e) {
@@ -54077,7 +54277,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     function instantiate(source, importObject) {
         if (isObject(source) && apply(weakGet, moduleSlots, [source])) {
             // instantiate(moduleObject, importObject) → Promise<Instance>
-            return new Promise(function (resolve, reject) {
+            return new PromiseCtor(function (resolve, reject) {
                 try {
                     resolve(new Instance(source, importObject));
                 } catch (e) {
@@ -54086,7 +54286,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             });
         }
         // instantiate(bufferSource, importObject) → Promise<{module, instance}>
-        return new Promise(function (resolve, reject) {
+        return new PromiseCtor(function (resolve, reject) {
             try {
                 const module = new Module(source);
                 const instance = new Instance(module, importObject);
@@ -54100,7 +54300,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // Read the wasm bytes from a streaming source (a Response or a Promise of one),
     // validating it per the Web API: ok status + MIME type 'application/wasm'.
     function streamBytes(source) {
-        return Promise.resolve(source).then(function (resp) {
+        return apply(promiseThen, apply(promiseResolve, PromiseCtor, [source]), [function (resp) {
             if (!resp || typeof resp.arrayBuffer !== "function") {
                 throw new TypeError("WebAssembly streaming: expected a Response");
             }
@@ -54114,21 +54314,21 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 );
             }
             return resp.arrayBuffer();
-        });
+        }]);
     }
 
     function compileStreaming(source) {
-        return streamBytes(source).then(function (buf) {
+        return apply(promiseThen, streamBytes(source), [function (buf) {
             return new Module(buf);
-        });
+        }]);
     }
 
     function instantiateStreaming(source, importObject) {
-        return streamBytes(source).then(function (buf) {
+        return apply(promiseThen, streamBytes(source), [function (buf) {
             const module = new Module(buf);
             const instance = new Instance(module, importObject);
             return { module: module, instance: instance };
-        });
+        }]);
     }
 
     // Web IDL #namespace-object (JS API #webassembly-namespace and the Web

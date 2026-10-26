@@ -16,6 +16,8 @@
     const fround = Math.fround, finite = Number.isFinite;
     const Exception = g.DOMException;
     const typedArrayLength = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(F32.prototype), "length").get;
+    // The processor module runs in this realm and may replace the prototype's methods.
+    const typedArrayFill = Object.getPrototypeOf(F32.prototype).fill;
     const rate = fround(cfg.worklet.rate), quantum = cfg.worklet.quantum;
     const MAX_FLOAT = 3.4028234663852886e38;
     // [[node name to processor constructor map]] and the descriptors the
@@ -190,7 +192,7 @@
     control.workletRun = function (node) {
         const instance = instances.get(node);
         if (!instance) return {error: errorInfo(new TypeError("The processor is gone"))};
-        for (const output of instance.outputs) for (const channel of output) channel.fill(0);
+        for (const output of instance.outputs) for (const channel of output) apply(typedArrayFill, channel, [0]);
         try {
             const process = instance.processor.process;
             if (typeof process !== "function") throw new TypeError("process is not a function");
