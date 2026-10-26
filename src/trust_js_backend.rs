@@ -3326,12 +3326,6 @@ mod desktop {
     // ECMA-262 #sec-liveness permits servicing the request after input quiets.
     // TRust JS's allocation safepoints/limits remain active throughout this hint.
     const INPUT_GC_QUIET_INTERVAL: Duration = Duration::from_millis(150);
-    // How long a page stays parked with nothing scheduled before the actor
-    // collects fully. No browser collects fully when input stops: V8's memory
-    // reducer starts a full collection 8 s after the heap grew, once the
-    // allocation rate is low, and Firefox's shrinking collection waits for
-    // user inactivity. A timer-free page parks right after each input burst.
-    const IDLE_GC_DELAY: Duration = Duration::from_secs(8);
 
     /// Run the TRust JS page pipeline as a one-shot transformation.
     ///
@@ -4851,10 +4845,6 @@ mod desktop {
         let mut interaction_burst_started: Option<Instant> = None;
         let mut background_service: Option<(Instant, usize)> = None;
         let mut task_gc_defer_until: Option<Instant> = None;
-        // Whether work ran since the last idle collection, and when the
-        // current idle period's collection is due (see `IDLE_GC_DELAY`).
-        let mut idle_gc_due = true;
-        let mut idle_gc_at: Option<Instant> = None;
         // Whether anything happened since the actor last asked whether the
         // document has become inert (see `retire_if_inert`).
         let mut retirement_check_due = true;
@@ -5114,25 +5104,17 @@ mod desktop {
             let wake = match immediate {
                 Some(wake) => wake,
                 None => {
-                    // TRust JS's forced host collection is an idle hook, not a task-
-                    // boundary hook. A future timer/animation-frame deadline means
-                    // the realm still has active work; allocation-triggered task
-                    // checks retain responsibility there. Forcing a full tracing
-                    // collection before every 16 ms animation sleep made a large
-                    // YouTube heap consume a core while callbacks made no DOM
-                    // changes. Collect only once a genuinely indefinite park has
-                    // lasted `IDLE_GC_DELAY`, and once per idle period.
-                    if wait.is_none() && !defer_task_gc && idle_gc_due {
-                        let now = Instant::now();
-                        let at = *idle_gc_at.get_or_insert(now + IDLE_GC_DELAY);
-                        if at <= now {
-                            page.engine.collect_garbage_at_idle();
-                            idle_gc_due = false;
-                            idle_gc_at = None;
-                        } else {
-                            wait = Some(at - now);
-                            timeout_wake = Wake::Maintenance;
-                        }
+                    // As in Chrome, the only time-based full collection is V8's memory
+                    // reducer (TRust JS's `Engine::memory_reducer_deadline`): after a
+                    // major collection that left the heap noticeably larger, it waits 8 s,
+                    // then collects to give memory back if the page allocates slowly,
+                    // whether or not timers or animation frames are scheduled. No browser
+                    // collects fully when input stops or a page parks. The reducer waits
+                    // out input bursts with the task collections they defer.
+                    if !defer_task_gc {
+                        run_memory_reducer(&mut page.engine, &mut wait, || {
+                            timeout_wake = Wake::Maintenance
+                        });
                     }
                     interrupt.set_deadline(None);
                     let ready = runtime.block_on(wait_for_work(
@@ -5167,9 +5149,6 @@ mod desktop {
 
             if !matches!(wake, Wake::Maintenance) {
                 retirement_check_due = true;
-                // Work arrived: an idle collection waits for the next idle period.
-                idle_gc_due = true;
-                idle_gc_at = None;
             }
             // Remember whether this turn started inside the bounded background-service
             // window. A completed rendering opportunity may start that window, but it must
@@ -22637,9 +22616,11 @@ fn run_trust_js_worker(
                     wait = Some(idle);
                     timeout_task = WorkerTask::Checkpoint;
                 }
-                if wait.is_none() {
-                    engine.collect_garbage_at_idle();
-                }
+                // V8's memory reducer, as in the page actor; nothing else collects
+                // when a worker parks.
+                run_memory_reducer(&mut engine, &mut wait, || {
+                    timeout_task = WorkerTask::Checkpoint
+                });
                 match wait {
                     Some(wait) => match ctl_rx.recv_timeout(wait) {
                         Ok(command) => WorkerTask::Command(command),
@@ -30065,6 +30046,29 @@ fn host_promise_mark_outstanding<'s>(
 /// gives their jobs null job settings (HTML HostEnqueuePromiseJob with a null Realm), so a
 /// stream created in a since-discarded Document still completes, and no author-visible
 /// `then` or species lookup is involved.
+/// Run TRust JS's memory reducer (V8's) when it is due, between tasks, and shorten `wait`
+/// to its next deadline, calling `wake` to make that timeout a maintenance wake.
+fn run_memory_reducer(
+    engine: &mut trust_js::Engine,
+    wait: &mut Option<Duration>,
+    wake: impl FnOnce(),
+) {
+    let Some(due) = engine.memory_reducer_deadline() else {
+        return;
+    };
+    let now = Instant::now();
+    if due <= now {
+        engine.run_memory_reducer(now);
+    }
+    if let Some(due) = engine.memory_reducer_deadline().filter(|due| *due > now) {
+        let left = due - now;
+        if wait.is_none_or(|wait| left < wait) {
+            *wait = Some(left);
+            wake();
+        }
+    }
+}
+
 fn host_promise_react<'s>(
     ctx: &mut Ctx<'s>,
     _this: Value<'s>,

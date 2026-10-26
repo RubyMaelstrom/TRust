@@ -4,7 +4,7 @@ You'll need Rust, a C compiler, and the matching [TRust JS checkout](https://git
 next to TRust at `../trust-js`. The engine checkout must provide
 `crates/trust-js`; Cargo loads this package directly. TRust 0.3 uses TRust JS
 `main` revision `e33109935c25e291da71c082cfd03d2f24c12a12`; later TRust needs
-`main` at `487967dd5a79f36e4642214ae43ea5f3785cfbc1` or newer.
+`main` at `cdd5d3d43188c81e60e41086fc566a49988a6ab9` or newer.
 
 From the TRust directory:
 
