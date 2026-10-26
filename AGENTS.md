@@ -201,6 +201,12 @@ and the release build. Exercise affected sites with the release binaries;
 a debug test pass or release startup check does not verify rendering or
 performance. Documentation-only edits do not need a browser rebuild.
 
+Debug builds verify the engine's heap at every collection only with
+`TRUST_JS_GC_VERIFY=1` (see TRust JS's `DIAGNOSTICS.md`), since each check
+walks the whole heap. When a change alters what host state holds or traces
+(`Handle`, `ValueList`, `WeakHandle`, `HostTrace`, `HostGc`), also run the
+affected debug tests with it set.
+
 TRust JS is the only JavaScript engine and is always compiled. No backend-selection
 features or comparison targets exist. `--all-features` also enables the synthetic
 `trust-js-spike` benchmark harness.
