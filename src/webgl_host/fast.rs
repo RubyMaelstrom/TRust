@@ -76,7 +76,7 @@ pub(super) fn wrap<'s>(ctx: &mut Ctx<'s>, fallback: Value<'s>) -> Result<Value<'
     let ValueKind::Str(name) = name.kind() else {
         return Ok(fallback);
     };
-    let name = name.as_engine_text().to_owned();
+    let name = name.as_engine_text().into_owned();
     let method = match name.as_str() {
         "bindBuffer" => Method::BindBuffer,
         "vertexAttribPointer" => Method::AttribPointer,

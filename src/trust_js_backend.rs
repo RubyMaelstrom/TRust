@@ -113,7 +113,7 @@ impl TrustValue {
             ValueKind::Null => TrustValue::Null,
             ValueKind::Bool(value) => TrustValue::Bool(value),
             ValueKind::Num(value) => TrustValue::Num(value),
-            ValueKind::Str(text) => TrustValue::Str(text.as_engine_text().to_owned()),
+            ValueKind::Str(text) => TrustValue::Str(text.as_engine_text().into_owned()),
             _ => TrustValue::Held {
                 truthy: ctx.to_boolean(&value),
                 value: hold(ctx, &value),
@@ -16931,7 +16931,7 @@ fn live_child_collection_get<'s>(
         }
         Some(ValueKind::Str(name)) if elements && !name.as_engine_text().is_empty() => {
             // Attribute values are DOM engine text, like the payload (see `host_arg_string`).
-            collection_named_item(&dom, dom.child_iter(root), name.as_engine_text())
+            collection_named_item(&dom, dom.child_iter(root), &name.as_engine_text())
         }
         _ => None,
     };
@@ -16993,7 +16993,7 @@ fn host_install_live_collection<'s>(
 fn live_query_members<'s>(ctx: &Ctx<'s>, key: &Value<'s>) -> Option<Rc<[usize]>> {
     let key = key.as_engine_text()?;
     let state = ctx.host::<HostState>()?;
-    Some(arena_of_query(state, key).borrow().query_collection(key))
+    Some(arena_of_query(state, &key).borrow().query_collection(&key))
 }
 
 /// The arena a live query collection's members are in.
@@ -17001,7 +17001,7 @@ fn query_arena<'s>(ctx: &Ctx<'s>, key: &Value<'s>) -> Option<Rc<RefCell<Dom>>> {
     let (Some(key), Some(state)) = (key.as_engine_text(), ctx.host::<HostState>()) else {
         return None;
     };
-    Some(arena_of_query(state, key))
+    Some(arena_of_query(state, &key))
 }
 
 fn live_query_length<'s>(ctx: &Ctx<'s>, key: &Value<'s>) -> u32 {
@@ -17037,7 +17037,7 @@ fn live_query_collection_get<'s>(
             collection_named_item(
                 &arena.borrow(),
                 members.iter().copied(),
-                name.as_engine_text(),
+                &name.as_engine_text(),
             )
         }
         _ => None,
@@ -31002,7 +31002,7 @@ fn main_page_diagnostic_reporter<'s>(ctx: &mut Ctx<'s>) -> Value<'s> {
                     "diagnostic report exceeds the 4 MiB limit",
                 );
             }
-            let Ok(value @ serde_json::Value::Object(_)) = serde_json::from_str(text) else {
+            let Ok(value @ serde_json::Value::Object(_)) = serde_json::from_str(&text) else {
                 return error(
                     ctx,
                     &error_reported,

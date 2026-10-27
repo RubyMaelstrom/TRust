@@ -151,11 +151,11 @@ pub(super) fn call<'s>(
     ) else {
         return Ok(Value::Undefined);
     };
-    let Some(direction) = direction(from, to) else {
+    let Some(direction) = direction(&from, &to) else {
         return Ok(Value::Undefined);
     };
     if !matches!(
-        phase,
+        &*phase,
         "send" | "drop-origin" | "messageerror" | "dispatch" | "dispatched"
     ) {
         return Ok(Value::Undefined);
@@ -170,7 +170,7 @@ pub(super) fn call<'s>(
             crate::http::trace_ms(),
             source_frame as u64,
             receiver_frame as u64,
-            summarize(wire)
+            summarize(&wire)
         ),
         Ok(_) => eprintln!("[challenge-message] limit reached; further records omitted"),
         Err(_) => {}
