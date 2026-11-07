@@ -5115,6 +5115,9 @@ mod desktop {
                         run_memory_reducer(&mut page.engine, &mut wait, || {
                             timeout_wake = Wake::Maintenance
                         });
+                        advance_idle_marking(&mut page.engine, &mut wait, || {
+                            timeout_wake = Wake::Maintenance
+                        });
                     }
                     interrupt.set_deadline(None);
                     let ready = runtime.block_on(wait_for_work(
@@ -22621,6 +22624,11 @@ fn run_trust_js_worker(
                 run_memory_reducer(&mut engine, &mut wait, || {
                     timeout_task = WorkerTask::Checkpoint
                 });
+                // A running marking cycle's steps in the time the worker would wait, as
+                // in the page actor (each worker isolate has its own job in V8).
+                advance_idle_marking(&mut engine, &mut wait, || {
+                    timeout_task = WorkerTask::Checkpoint
+                });
                 match wait {
                     Some(wait) => match ctl_rx.recv_timeout(wait) {
                         Ok(command) => WorkerTask::Command(command),
@@ -30066,6 +30074,31 @@ fn run_memory_reducer(
             *wait = Some(left);
             wake();
         }
+    }
+}
+
+/// Advance TRust JS's running marking cycle by one step, a slice of at most a millisecond or its
+/// final pause (`Engine::advance_incremental_marking`), in time the actor would otherwise wait, as
+/// V8's incremental marking job posts a task for each step to the embedder's foreground task
+/// runner without delay and reposts it while major marking continues
+/// (src/heap/incremental-marking-job.cc: ScheduleTask's PostTask, Task::RunInternal's repost
+/// after AdvanceAndFinalizeIfComplete). While a cycle still runs, `wait` becomes zero and `wake`
+/// makes that timeout a maintenance wake: the loop takes whatever work arrived, and then the next
+/// step. Unlike V8's user-visible task, which interleaves with other tasks, a step runs only when
+/// the actor's queues are empty; on a page that never idles, allocation-driven slices and the
+/// cycle's final pause advance it as before.
+fn advance_idle_marking(
+    engine: &mut trust_js::Engine,
+    wait: &mut Option<Duration>,
+    wake: impl FnOnce(),
+) {
+    if !engine.incremental_marking_running() {
+        return;
+    }
+    engine.advance_incremental_marking();
+    if engine.incremental_marking_running() {
+        *wait = Some(Duration::ZERO);
+        wake();
     }
 }
 
