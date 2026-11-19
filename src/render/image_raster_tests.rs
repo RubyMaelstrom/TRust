@@ -149,6 +149,105 @@ fn repeated_svg_sizes_survive_scrolling_hybrid() {
     check_repeated_svg(|scene| renderer.render_rgba(scene).unwrap());
 }
 
+/// A cached bitmap must not reappear when the current scene has no sample.
+/// Cover both scene-owned canvas snapshots and decoded-store eviction, then
+/// restore each handle with new pixels to exercise its retained revision.
+fn check_missing_bitmap(
+    mut retained: impl FnMut(&Scene) -> super::vello_cpu::OwnedRgbaFrame,
+    mut fresh: impl FnMut(&Scene) -> super::vello_cpu::OwnedRgbaFrame,
+) {
+    for canvas in [true, false] {
+        let size = CssSize::new(40., 20.);
+        let mut scene = Scene {
+            viewport: ViewportMetrics::from_physical(
+                PhysicalSize::new(40, 20),
+                ScaleFactor::new(1.),
+            ),
+            primitives: Vec::new(),
+            controls: Vec::new(),
+            content_viewport: CssRect::new(0., 0., 40., 20.),
+            image_store: Default::default(),
+            canvas_images: Default::default(),
+            page_scroll_containers: Vec::new(),
+            page_size: size,
+        };
+        let handle = if canvas {
+            ImageHandle::for_canvas()
+        } else {
+            ImageHandle::for_source("test:missing-bitmap")
+        };
+        scene.primitives.push(DisplayCommand::Image {
+            rect: CssRect::new(10., 2., 20., 16.),
+            handle,
+            source_rect: None,
+            fit: ImageFit::Fill,
+            sampling: ImageSampling::Nearest,
+            clip: None,
+            node: 1,
+            link: None,
+        });
+        let image = |rgba| ImageResource {
+            svg_source: None,
+            width: 1,
+            height: 1,
+            rgba: Arc::from(rgba),
+            has_alpha: false,
+        };
+        if canvas {
+            scene
+                .canvas_images
+                .insert(handle, CanvasImage::new(handle, 1, image([255, 0, 0, 255])));
+        } else {
+            scene.image_store.insert(handle, image([255, 0, 0, 255]));
+        }
+        let original = retained(&scene);
+        if canvas {
+            scene.canvas_images.remove(&handle);
+        } else {
+            scene.image_store.remove(handle);
+        }
+        let missing = retained(&scene);
+        assert_ne!(original.pixels, missing.pixels, "canvas={canvas}");
+        assert_eq!(missing.pixels, fresh(&scene).pixels, "canvas={canvas}");
+        if canvas {
+            scene
+                .canvas_images
+                .insert(handle, CanvasImage::new(handle, 2, image([0, 0, 255, 255])));
+        } else {
+            scene.image_store.insert(handle, image([0, 0, 255, 255]));
+        }
+        let restored = retained(&scene);
+        assert_ne!(restored.pixels, missing.pixels, "canvas={canvas}");
+        assert_eq!(restored.pixels, fresh(&scene).pixels, "canvas={canvas}");
+    }
+}
+
+#[test]
+fn missing_bitmap_does_not_use_a_stale_cached_image_cpu() {
+    let mut retained = VelloCpuRenderer::new();
+    let mut fresh = VelloCpuRenderer::new();
+    check_missing_bitmap(
+        |scene| retained.render_rgba(scene).unwrap(),
+        |scene| fresh.render_rgba(scene).unwrap(),
+    );
+}
+
+#[test]
+fn missing_bitmap_does_not_use_a_stale_cached_image_hybrid() {
+    let Ok(mut retained) = futures::executor::block_on(VelloHybridRenderer::new_headless()) else {
+        eprintln!("Missing bitmap regression not exercised: no Hybrid adapter");
+        return;
+    };
+    let Ok(mut fresh) = futures::executor::block_on(VelloHybridRenderer::new_headless()) else {
+        eprintln!("Missing bitmap regression not exercised: no second Hybrid adapter");
+        return;
+    };
+    check_missing_bitmap(
+        |scene| retained.render_rgba(scene).unwrap(),
+        |scene| fresh.render_rgba(scene).unwrap(),
+    );
+}
+
 /// A source crop in natural image pixels is stretched over the command's
 /// rectangle (border-image slices draw this way).
 fn check_source_crop(mut render: impl FnMut(&Scene) -> super::vello_cpu::OwnedRgbaFrame) {

@@ -484,6 +484,15 @@ impl Dom {
             if affected.is_empty() {
                 return false;
             }
+            // CSS Conditional 5 #container-queries and #container-lengths:
+            // a size change can alter paint-only values on readers even when
+            // their fragment geometry is unchanged. Record each reader and
+            // its flat-tree descendants before adding geometry ancestors;
+            // the latter can span unrelated branches. The journal expands
+            // shadow and slot descendants and falls back globally on overflow.
+            for &node in &affected {
+                self.paint_journal.note(node);
+            }
             // Computed values inherit through the flat tree, including slots.
             let mut pending: Vec<_> = affected.iter().copied().collect();
             while let Some(node) = pending.pop() {
@@ -532,6 +541,7 @@ impl Dom {
             // Generated counter/quote state may reach later siblings. Until
             // it has its own read graph, retain the general geometry fallback.
             if self.generated_cache.borrow_mut().take().is_some() {
+                self.paint_journal.global();
                 layout.clear();
                 tree.clear();
             } else {
@@ -547,6 +557,7 @@ impl Dom {
         }
         // Every dependent value is about to expire. Start a fresh observed
         // graph, so one overflow does not permanently disable selective reuse.
+        self.paint_journal.global();
         let units = self.container_dependencies.borrow().units;
         *self.container_dependencies.borrow_mut() = Dependencies {
             epoch: self.style_value_epoch,

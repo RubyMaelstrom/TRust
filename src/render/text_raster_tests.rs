@@ -7,7 +7,7 @@ use super::vello_cpu::{OwnedRgbaFrame, VelloCpuRenderer};
 use super::vello_hybrid::VelloHybridRenderer;
 use super::*;
 use crate::core::ScaleFactor;
-use crate::text::{FontFace, ShapedGlyph, ShapedRun, ShapedText};
+use crate::text::{FontFace, ShapedGlyph, ShapedRun, ShapedText, ShapedTextData};
 
 const FONT: &[u8] = include_bytes!("fixtures/jetbrains-mono/Bold-ASCII.ttf");
 
@@ -33,7 +33,7 @@ fn glyph_scene(scale: f64) -> Scene {
 fn glyph_scene_with(scale: f64, synth_bold: bool) -> Scene {
     let size = crate::theme::TERMINAL_FONT_SIZE_CSS_PX;
     let advance = size * 0.6;
-    let shaped = ShapedText {
+    let shaped: ShapedText = ShapedTextData {
         text: "F".into(),
         advance,
         ascent: 16.0,
@@ -57,7 +57,8 @@ fn glyph_scene_with(scale: f64, synth_bold: bool) -> Scene {
             synth_skew_degrees: None,
         }],
         ..Default::default()
-    };
+    }
+    .into();
     Scene {
         viewport: ViewportMetrics::from_physical(
             PhysicalSize::new(128, 128),
@@ -86,6 +87,21 @@ fn glyph_scene_with(scale: f64, synth_bold: bool) -> Scene {
         page_scroll_containers: Vec::new(),
         page_size: CssSize::new(64.0, 64.0),
     }
+}
+
+#[test]
+fn mutated_glyph_snapshot_leaves_prior_scene_pixels_unchanged() {
+    let old = glyph_scene(1.0);
+    let mut changed = old.clone();
+    let DisplayCommand::GlyphRun { shaped, .. } = &mut changed.primitives[0] else {
+        unreachable!()
+    };
+    shaped.runs[0].glyphs[0].x += 8.0;
+    let mut renderer = VelloCpuRenderer::new();
+    let old_pixels = renderer.render_rgba(&old).unwrap().pixels;
+    let changed_pixels = renderer.render_rgba(&changed).unwrap().pixels;
+    assert_ne!(old_pixels, changed_pixels);
+    assert_eq!(renderer.render_rgba(&old).unwrap().pixels, old_pixels);
 }
 
 fn ink_height(frame: &OwnedRgbaFrame) -> usize {

@@ -31,6 +31,8 @@
 //!    ancestor (inheritance, `inert`, `href`, text decoration) dirties every
 //!    chunk below it. A chunk is clean when none of its nodes
 //!    ([`chunk_nodes`]) is in that set.
+//!    Container-size changes journal their recorded query/unit readers; an
+//!    unknown dependency graph or generated-content fallback is global.
 //! 5. Document-wide inputs ([`GlobalKey`]) and the global stamp. When either
 //!    changed, the whole cache is dropped.
 //!
@@ -406,7 +408,7 @@ struct Span {
 pub(super) fn begin(builder: &Builder<'_>) -> Option<Box<Session>> {
     let mode = mode();
     let dom = builder.dom;
-    if mode == Mode::Off || !dom.render_live() || dom.style_depends_on_layout() {
+    if mode == Mode::Off || !dom.render_live() {
         return None;
     }
     // Style invalidations are deferred to the first read; the journal only
@@ -2035,6 +2037,137 @@ mod tests {
         let stats = fuzz.frame();
         assert!(stats.hits >= stats.leaves - 3, "{stats:?}");
         assert!(stats.new + stats.dirty >= 1, "{stats:?}");
+    }
+
+    #[test]
+    fn container_query_changes_invalidate_cached_paint_without_global_bypass() {
+        let _inputs = crate::layout2::stable_global_layout_inputs();
+        let html = format!(
+            "<style>
+             #row{{display:flex;width:400px}} #reserve{{flex:none;width:200px}}
+             #container{{container-type:inline-size;flex:1;min-width:0}}
+             #target{{position:fixed;top:20px;left:20px;width:80px;height:20px;color:red}}
+             @container (width > 250px) {{ #target{{color:blue}} }}
+             </style><div id=row><div id=reserve></div><div id=container>
+             <p id=target>query color</p></div></div>{}",
+            "<p>unrelated retained text</p>".repeat(40)
+        );
+        let mut fuzz = Fuzz::from_html(Rng::new(0), 1000, html);
+        let target = by_id(&fuzz, "target");
+        let reserve = by_id(&fuzz, "reserve");
+        let color = |fuzz: &Fuzz| {
+            fuzz.dom
+                .computed_value_resolved(target, "color")
+                .and_then(|value| PaintColor::parse_css(&value))
+        };
+        fuzz.frame();
+        assert_eq!(color(&fuzz), PaintColor::parse_css("red"));
+        let warm = fuzz.frame();
+        assert!(
+            warm.hits > 20,
+            "container rules must not disable the cache: {warm:?}"
+        );
+        for (width, expected) in [(50, "blue"), (220, "red"), (50, "blue")] {
+            // Only the sibling is directly mutated; the query subject's
+            // fixed geometry stays unchanged while its container resizes.
+            fuzz.dom
+                .set_attr(reserve, "style", &format!("flex:none;width:{width}px"));
+            let stats = fuzz.frame(); // test-mode paint compares against full paint
+            assert_eq!(color(&fuzz), PaintColor::parse_css(expected));
+            assert!(
+                stats.hits > 10,
+                "unrelated paint should be reused: {stats:?}"
+            );
+            assert!(stats.dirty > 0 || stats.new > 0, "{stats:?}");
+        }
+    }
+
+    #[test]
+    fn container_units_and_generated_content_keep_cached_paint_correct() {
+        let _inputs = crate::layout2::stable_global_layout_inputs();
+        let html = format!(
+            "<style>
+             @property --ring {{syntax:'<length>';inherits:false;initial-value:0px}}
+             #row{{display:flex;width:400px}} #reserve{{flex:none;width:200px}}
+             #container{{container-type:inline-size;flex:1;min-width:0}}
+             #target{{position:fixed;top:30px;left:30px;width:70px;height:20px;
+                       --ring:2cqw;outline:solid red;outline-width:var(--ring)}}
+             #container{{counter-reset:item}} #target::before{{counter-increment:item;content:counter(item)}}
+             @container (width > 250px){{ #container > #target::before{{counter-increment:item 2}} }}
+             </style><div id=row><div id=reserve></div><div id=container>
+             <div id=target>item</div></div></div>{}",
+            "<p>retained sibling</p>".repeat(20)
+        );
+        let mut fuzz = Fuzz::from_html(Rng::new(0), 1000, html);
+        let target = by_id(&fuzz, "target");
+        let expected = |fuzz: &Fuzz, outline: f32, counter: &str| {
+            let value = fuzz
+                .dom
+                .computed_value_resolved(target, "outline-width")
+                .expect("outline width");
+            let pixels: f32 = value.trim_end_matches("px").parse().unwrap();
+            assert!((pixels - outline).abs() < 0.01, "{value}");
+            assert_eq!(
+                fuzz.dom.pseudo_content(target, PseudoEl::Before).as_deref(),
+                Some(counter)
+            );
+        };
+        fuzz.frame();
+        expected(&fuzz, 4.0, "1");
+        let warm = fuzz.frame();
+        assert!(warm.hits > 10, "{warm:?}");
+        let reserve = by_id(&fuzz, "reserve");
+        for (width, outline, counter) in [(50, 7.0, "2"), (220, 3.6, "1"), (50, 7.0, "2")] {
+            fuzz.dom
+                .set_attr(reserve, "style", &format!("flex:none;width:{width}px"));
+            // Generated counters may affect later siblings, so the query
+            // update advances the global journal and compares a fresh paint.
+            let stats = fuzz.frame();
+            expected(&fuzz, outline, counter);
+            assert!(stats.leaves > 0, "{stats:?}");
+        }
+    }
+
+    #[test]
+    fn container_query_paint_inheritance_crosses_assigned_slots() {
+        let _inputs = crate::layout2::stable_global_layout_inputs();
+        let html = format!(
+            "<style>#row{{display:flex;width:400px}} #reserve{{flex:none;width:200px}}
+             #container{{container-type:inline-size;flex:1;min-width:0}}
+             #target{{position:fixed;top:20px;left:20px;width:80px;height:20px}}</style>
+             <div id=row><div id=reserve></div><div id=container><div id=host>
+             <span id=target>slotted text</span></div></div></div>{}",
+            "<p>retained sibling</p>".repeat(20)
+        );
+        let mut fuzz = Fuzz::from_html(Rng::new(0), 1000, html);
+        let host = by_id(&fuzz, "host");
+        let target = by_id(&fuzz, "target");
+        let reserve = by_id(&fuzz, "reserve");
+        let shadow = fuzz.dom.attach_shadow(host);
+        let sheet = fuzz.dom.create_element("style");
+        fuzz.dom.append_text(
+            sheet,
+            "slot{color:red}@container (width > 250px){slot{color:blue}}",
+        );
+        fuzz.dom.insert_before(shadow, sheet, None);
+        let slot = fuzz.dom.create_element("slot");
+        fuzz.dom.insert_before(shadow, slot, None);
+        let color = |fuzz: &Fuzz| {
+            fuzz.dom
+                .computed_value_resolved(target, "color")
+                .and_then(|value| PaintColor::parse_css(&value))
+        };
+        fuzz.frame();
+        assert_eq!(color(&fuzz), PaintColor::parse_css("red"));
+        let warm = fuzz.frame();
+        assert!(warm.hits > 10, "{warm:?}");
+        for (width, expected) in [(50, "blue"), (220, "red")] {
+            fuzz.dom
+                .set_attr(reserve, "style", &format!("flex:none;width:{width}px"));
+            let stats = fuzz.frame(); // also compares the complete fresh paint
+            assert_eq!(color(&fuzz), PaintColor::parse_css(expected));
+            assert!(stats.leaves > 0, "{stats:?}");
+        }
     }
 
     #[test]

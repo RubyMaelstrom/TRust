@@ -20,6 +20,7 @@ use super::flow::{Flow, Frag, FragKind};
 use super::intrinsic::IMode;
 use super::style::{Align2, BOTTOM, InlineStyle, LEFT, RIGHT, TOP};
 use super::tree::{ColSpec, TableBox, declared_track_width};
+use super::value::{LENGTH_LIMIT, Len, Node};
 
 /// The resolved column geometry of a table.
 pub(super) struct TableCols {
@@ -73,27 +74,25 @@ impl Flow<'_> {
                 .sum()
         };
         let spacing = bs * (ncols + 1) as f32;
+        if tb.fixed_layout && !width_auto {
+            let specs = self.fixed_column_specs(tb, bs);
+            let widths = fixed_columns(&specs, (avail_w - spacing).max(0.0));
+            let table_w = (widths.iter().sum::<f32>() + spacing - hidden(&widths)).max(0.0);
+            return TableCols {
+                widths,
+                bs,
+                bs_y,
+                table_w,
+                collapsed,
+            };
+        }
+
         // Space available to the columns' content (the band, less spacing).
         let avail = (avail_w - spacing).max(1.0);
 
         // Per-column min/max content widths + explicit width preferences (the
         // shared metrics; a declared px cap clamps to the band for layout).
         let (col_min, col_max, col_w) = self.table_col_metrics(tb, bs, Some(avail), avail, inl);
-
-        // Fixed layout: a definite width + `table-layout:fixed` ignores
-        // content and divides by declared column widths (§17.5.2.1).
-        if tb.fixed_layout && !width_auto {
-            let widths = fixed_columns(&col_w, ncols, avail);
-            let removed = hidden(&widths);
-            return TableCols {
-                widths,
-                bs,
-                bs_y,
-                // `avail` already == the definite content width − spacing.
-                table_w: (avail + spacing - removed).max(0.0),
-                collapsed,
-            };
-        }
 
         let min_sum: f32 = col_min.iter().sum();
         let max_sum = percent_expanded_max(&col_max, &col_w);
@@ -119,6 +118,53 @@ impl Flow<'_> {
             table_w,
             collapsed,
         }
+    }
+
+    /// CSS 2.2 #fixed-table-layout and CSS Tables 3 #computing-column-measures:
+    /// column declarations take precedence over the first row's cells.
+    fn fixed_column_specs(&self, tb: &TableBox, spacing: f32) -> Vec<Option<FixedWidth>> {
+        let mut specs = vec![None; tb.ncols];
+        for (spec, &(column, group)) in specs.iter_mut().zip(&tb.col_boxes) {
+            if let Some(node) = column.or(group) {
+                let raw = self.dom.computed_value_resolved(node, "width");
+                let width = Len::parse_or(
+                    raw.as_deref(),
+                    Units::of(self.dom, node),
+                    self.vp,
+                    Len::Auto,
+                );
+                *spec = FixedWidth::from_len(&width, || declared_track_width(self.dom, node));
+            }
+        }
+        for cell in tb.cells.iter().take_while(|cell| cell.row == 0) {
+            let style = &cell.b.style;
+            let Some(mut width) =
+                FixedWidth::from_len(&style.width, || declared_track_width(self.dom, cell.b.node))
+            else {
+                continue;
+            };
+            // CSS Tables 3 #width-distribution-in-fixed-mode: percentage
+            // widths ignore cell edges. A length uses the cell's outer width.
+            if width.percent == 0.0 {
+                let edges = style.border[LEFT]
+                    + style.border[RIGHT]
+                    + self.pad(style, LEFT, 0.0)
+                    + self.pad(style, RIGHT, 0.0);
+                width.length = if style.border_box {
+                    width.length.max(edges)
+                } else {
+                    width.length + edges
+                };
+            }
+            let cols = &mut specs[cell.col..(cell.col + cell.colspan).min(tb.ncols)];
+            width.length = (width.length - spacing * cols.len().saturating_sub(1) as f32).max(0.0)
+                / cols.len() as f32;
+            width.percent /= cols.len() as f32;
+            for spec in cols {
+                spec.get_or_insert(width);
+            }
+        }
+        specs
     }
 
     /// CSS Tables 3 #visible-track: whether each track (or its group) has
@@ -208,8 +254,7 @@ impl Flow<'_> {
         for cell in &tb.cells {
             let end = (cell.col + cell.colspan).min(ncols);
             let span = end.saturating_sub(cell.col).max(1);
-            let cell_w =
-                (cols.widths[cell.col..end].iter().sum::<f32>() + bs * (span - 1) as f32).max(1.0);
+            let cell_w = cols.widths[cell.col..end].iter().sum::<f32>() + bs * (span - 1) as f32;
             let s = &cell.b.style;
             // The cell's own border+padding wrap its content (item_frag adds
             // them around the imposed content width).
@@ -366,6 +411,18 @@ impl Flow<'_> {
             let col_end = (cell.col + cell.colspan).min(ncols);
             let spans_collapsed =
                 (cell.row..end).any(hidden_row) || (cell.col..col_end).any(col_collapsed);
+            // CSS Tables 3 #bounding-box-assignment: the tracks set the
+            // cell's final width, even when its padding exceeds that width.
+            l.frag.w = if spans_collapsed {
+                visible_span(&cols.widths, &col_collapsed, cell.col, col_end, bs)
+            } else {
+                l.cell_w
+            };
+            if cell.b.style.border_box
+                && let Some(size) = &mut l.frag.css_size
+            {
+                size[0] = l.frag.w;
+            }
             let dy_valign = self.cell_valign_offset(cell.b.node, l.content_h, span_h);
             // §9.4.3 relative offset / transform translation — a cell's CB for
             // percentages is its own box.
@@ -380,7 +437,6 @@ impl Flow<'_> {
             if spans_collapsed {
                 // CSS 2.2 §17.5.5: the cell keeps only its visible tracks.
                 l.frag.h = span_h;
-                l.frag.w = visible_span(&cols.widths, &col_collapsed, cell.col, col_end, bs);
             } else {
                 l.frag.h = span_h.max(l.frag.h);
             }
@@ -484,40 +540,40 @@ impl Flow<'_> {
         let mut col_w: Vec<Option<ColSpec>> = (0..ncols)
             .map(|c| tb.col_specs.get(c).copied().flatten())
             .collect();
+        // A fixed width replaces the max-content preference of its column:
+        // the column's other cells then contribute only their min-content.
+        // Find those columns and each cell's width in one pass, rather than
+        // rescanning every cell once per column. Keep the first specified
+        // single-cell width as the column preference, even if a later cell
+        // contributes a fixed width to its constrainedness.
+        let mut fixed_cols: Vec<bool> = col_w
+            .iter()
+            .map(|width| matches!(width, Some(ColSpec::Px(_))))
+            .collect();
+        let mut single_widths = Vec::with_capacity(tb.cells.len());
         for cell in &tb.cells {
-            if cell.colspan == 1 && cell.col < ncols && col_w[cell.col].is_none() {
-                col_w[cell.col] = declared_track_width(self.dom, cell.b.node);
-            }
+            let width = if cell.colspan == 1 && cell.col < ncols {
+                let width = declared_track_width(self.dom, cell.b.node);
+                if col_w[cell.col].is_none() {
+                    col_w[cell.col] = width;
+                }
+                fixed_cols[cell.col] |= matches!(width, Some(ColSpec::Px(_)));
+                width
+            } else {
+                None
+            };
+            single_widths.push(width);
         }
 
         let mut col_min = vec![0.0f32; ncols];
         let mut col_max = vec![0.0f32; ncols];
-        // A fixed width replaces the max-content preference of its column:
-        // as in Gecko and Blink, the column's other cells then contribute
-        // only their min-content.
-        let fixed_cols: Vec<bool> = (0..ncols)
-            .map(|c| {
-                matches!(col_w[c], Some(ColSpec::Px(_)))
-                    || tb.cells.iter().any(|cell| {
-                        cell.colspan == 1
-                            && cell.col == c
-                            && matches!(
-                                declared_track_width(self.dom, cell.b.node),
-                                Some(ColSpec::Px(_))
-                            )
-                    })
-            })
-            .collect();
         // Single-column cells first.
-        for cell in &tb.cells {
+        for (cell, width) in tb.cells.iter().zip(single_widths) {
             if cell.colspan != 1 || cell.col >= ncols {
                 continue;
             }
-            let (mn, mx) = self.cell_min_max(cell, cap, pct_basis, inl);
-            let fixed = matches!(
-                declared_track_width(self.dom, cell.b.node),
-                Some(ColSpec::Px(_))
-            );
+            let (mn, mx) = self.cell_min_max(cell, width, cap, pct_basis, inl);
+            let fixed = matches!(width, Some(ColSpec::Px(_)));
             col_min[cell.col] = col_min[cell.col].max(mn);
             col_max[cell.col] = col_max[cell.col].max(if fixed_cols[cell.col] && !fixed {
                 mn
@@ -528,29 +584,30 @@ impl Flow<'_> {
         // CSS Tables 3 #computing-column-measures: cells spanning N columns
         // update the measures based on cells of span up to N-1, in order of
         // increasing span.
-        let mut spans: Vec<usize> = tb
+        let mut spans: Vec<_> = tb
             .cells
             .iter()
-            .map(|cell| {
-                (cell.col + cell.colspan)
+            .filter_map(|cell| {
+                let span = (cell.col + cell.colspan)
                     .min(ncols)
-                    .saturating_sub(cell.col)
+                    .saturating_sub(cell.col);
+                (span > 1).then_some((span, cell))
             })
-            .filter(|&span| span > 1)
             .collect();
-        spans.sort_unstable();
-        spans.dedup();
+        // Stable ordering preserves document order among equal spans. Both
+        // percentage and content sizing can now visit each spanning cell once,
+        // while still considering the preceding span's completed measures.
+        spans.sort_by_key(|(span, _)| *span);
         if !tb.fixed_layout {
-            span_percentages(self.dom, tb, &spans, &col_max, &mut col_w);
+            span_percentages(self.dom, &spans, &col_max, &mut col_w);
         }
-        for n in spans {
+        for group in spans.chunk_by(|a, b| a.0 == b.0) {
+            let n = group[0].0;
             let (base_min, base_max) = (col_min.clone(), col_max.clone());
-            for cell in &tb.cells {
+            for &(_, cell) in group {
                 let end = (cell.col + cell.colspan).min(ncols);
-                if end.saturating_sub(cell.col) != n {
-                    continue;
-                }
-                let (mn, mx) = self.cell_min_max(cell, cap, pct_basis, inl);
+                let width = declared_track_width(self.dom, cell.b.node);
+                let (mn, mx) = self.cell_min_max(cell, width, cap, pct_basis, inl);
                 let columns = cell.col..end;
                 let contributions = span_contributions(
                     &base_min[columns.clone()],
@@ -610,6 +667,7 @@ impl Flow<'_> {
     fn cell_min_max(
         &self,
         cell: &super::tree::TableCell,
+        width: Option<ColSpec>,
         cap: Option<f32>,
         pct_basis: f32,
         inl: &InlineStyle,
@@ -621,7 +679,7 @@ impl Flow<'_> {
             + self.pad(s, RIGHT, pct_basis);
         let mn = self.intrinsic_w(&cell.b, IMode::Min, inl) + bp;
         let mut mx = self.intrinsic_w(&cell.b, IMode::Max, inl) + bp;
-        if let Some(ColSpec::Px(px)) = declared_track_width(self.dom, cell.b.node) {
+        if let Some(ColSpec::Px(px)) = width {
             // CSS Tables 3 #outer-max-content: the declared width is the
             // cell's box-sizing box; outer widths include padding and border.
             let outer = if s.border_box { px } else { px + bp };
@@ -1292,38 +1350,81 @@ fn percent_expanded_max(max: &[f32], specs: &[Option<ColSpec>]) -> f32 {
     expanded
 }
 
-/// Fixed table layout column widths (§17.5.2.1): declared column widths are
-/// honored, remaining space is divided equally over the rest. `content` is the
-/// table's content width less inter-column spacing.
-fn fixed_columns(col_w: &[Option<ColSpec>], ncols: usize, content: f32) -> Vec<f32> {
-    let content = content.max(1.0);
-    let mut widths = vec![0.0f32; ncols];
-    let mut fixed_total = 0.0f32;
-    let mut autos = Vec::new();
-    for c in 0..ncols {
-        match col_w[c] {
-            Some(ColSpec::Px(px)) => {
-                widths[c] = px.min(content);
-                fixed_total += widths[c];
-            }
-            Some(ColSpec::Pct(p)) => {
-                widths[c] = (p * content).clamp(0.0, content);
-                fixed_total += widths[c];
-            }
-            None => autos.push(c),
+#[derive(Clone, Copy)]
+struct FixedWidth {
+    length: f32,
+    percent: f32,
+}
+
+impl FixedWidth {
+    fn from_len(width: &Len, fallback: impl FnOnce() -> Option<ColSpec>) -> Option<Self> {
+        // CSS Tables 3 treats a sum of a length and a percentage as separate
+        // length and percentage tracks for distribution.
+        if let Len::Val(Node::Lin { k, b }) = width
+            && *k > 0.0
+            && *b >= 0.0
+        {
+            return Some(Self {
+                length: b.min(LENGTH_LIMIT),
+                percent: k.min(LENGTH_LIMIT),
+            });
+        }
+        if let Some(length) = width.resolve(None) {
+            return Some(Self {
+                length: length.max(0.0),
+                percent: 0.0,
+            });
+        }
+        match fallback()? {
+            ColSpec::Px(length) => Some(Self {
+                length,
+                percent: 0.0,
+            }),
+            ColSpec::Pct(percent) => Some(Self {
+                length: 0.0,
+                percent: percent.clamp(0.0, LENGTH_LIMIT),
+            }),
         }
     }
-    let rest = (content - fixed_total).max(0.0);
-    if !autos.is_empty() {
-        let each = rest / autos.len() as f32;
-        for &c in &autos {
-            widths[c] = each;
-        }
-    }
-    for w in &mut widths {
-        *w = w.max(1.0);
-    }
-    widths
+}
+
+/// CSS Tables 3 #width-distribution-in-fixed-mode: keep the length widths
+/// and proportionally reduce any percentage claims that exceed the space
+/// left over. Distribute excess in order to auto, length, then percent tracks.
+fn fixed_columns(specs: &[Option<FixedWidth>], content: f32) -> Vec<f32> {
+    let autos = specs.iter().filter(|width| width.is_none()).count();
+    let lengths: f32 = specs.iter().flatten().map(|width| width.length).sum();
+    let percentages: f32 = specs.iter().flatten().map(|width| width.percent).sum();
+    let content = content.max(lengths);
+    let percent_width = (content * percentages).min(content - lengths);
+    let excess = content - lengths - percent_width;
+    let (length_width, percent_width, equal) = if autos > 0 {
+        (lengths, percent_width, excess / autos as f32)
+    } else if lengths > 0.0 {
+        (lengths + excess, percent_width, 0.0)
+    } else if percentages > 0.0 {
+        (0.0, content, 0.0)
+    } else {
+        return vec![content / specs.len() as f32; specs.len()];
+    };
+    let length_scale = if lengths > 0.0 {
+        length_width / lengths
+    } else {
+        0.0
+    };
+    let percent_scale = if percentages > 0.0 {
+        percent_width / percentages
+    } else {
+        0.0
+    };
+    specs
+        .iter()
+        .map(|spec| {
+            spec.map_or(equal, |w| {
+                w.length * length_scale + w.percent * percent_scale
+            })
+        })
+        .collect()
 }
 
 /// CSS Tables 3 #computing-column-measures, intrinsic percentage widths:
@@ -1335,8 +1436,7 @@ fn fixed_columns(col_w: &[Option<ColSpec>], ncols: usize, content: f32) -> Vec<f
 /// the columns before it. Columns with a length width keep it.
 fn span_percentages(
     dom: &crate::dom::Dom,
-    tb: &TableBox,
-    spans: &[usize],
+    spans: &[(usize, &super::tree::TableCell)],
     nonspan_max: &[f32],
     col_w: &mut [Option<ColSpec>],
 ) {
@@ -1345,13 +1445,10 @@ fn span_percentages(
         Some(ColSpec::Pct(p)) => *p,
         _ => 0.0,
     };
-    for &n in spans {
+    for group in spans.chunk_by(|a, b| a.0 == b.0) {
         let mut contributions: Vec<f32> = vec![0.0; ncols];
-        for cell in &tb.cells {
+        for &(_, cell) in group {
             let end = (cell.col + cell.colspan).min(ncols);
-            if end.saturating_sub(cell.col) != n {
-                continue;
-            }
             let Some(ColSpec::Pct(cell_pct)) = declared_track_width(dom, cell.b.node) else {
                 continue;
             };

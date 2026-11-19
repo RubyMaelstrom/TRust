@@ -473,7 +473,7 @@ impl ContextSlice {
                 }
             })
             .collect();
-        ShapedText {
+        super::ShapedTextData {
             text: context.text[self.range.clone()].to_owned(),
             advance: self.advance(),
             ascent: metrics.ascent,
@@ -486,6 +486,7 @@ impl ContextSlice {
             runs,
             clusters,
         }
+        .into()
     }
 }
 

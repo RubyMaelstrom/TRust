@@ -235,6 +235,7 @@ impl Dom {
             if let Some((_, index)) = self.style_cache.get_mut() {
                 retired_scope |= index.scopes.contains_key(&id)
                     || index.font_sets.contains_key(&id)
+                    || index.font_faces.contains_key(&id)
                     || index.counter_styles.contains_key(&id)
                     || index.properties.contains_key(&id);
             }
@@ -512,12 +513,13 @@ impl Dom {
                 .scopes
                 .keys()
                 .chain(index.font_sets.keys())
+                .chain(index.font_faces.keys())
                 .chain(index.counter_styles.keys())
                 .chain(index.properties.keys())
                 .any(|&scope| !valid(scope))
             {
-                // A removed document/shadow scope's parsed rules/font sets cannot be retained by
-                // the current style-index cache. Existing immutable snapshots own their own copy.
+                // A removed document/shadow scope's parsed rules and font data cannot be retained
+                // by the current style index. Existing immutable snapshots own their own copy.
                 *self.style_cache.get_mut() = None;
                 *self.slot_assignments.get_mut() = SlotAssignments::default();
                 // Matching memos contain indices into a particular rebuilt rule array.

@@ -7,7 +7,7 @@
 //! owns wgpu surface/device recovery without feeding capabilities back into
 //! DOM, style, layout, hit testing, or paint-order construction.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 use crate::core::{BrowserSnapshot, CssPoint, CssSize, PhysicalSize, ViewportMetrics};
@@ -16,6 +16,8 @@ use crate::doc::Link;
 mod command_panel;
 mod context_menu;
 pub mod documents;
+#[cfg(test)]
+mod editor_scopes_tests;
 pub mod filter_graph;
 mod frame_images;
 pub mod headless;
@@ -1123,7 +1125,11 @@ const MAX_IMAGE_RESOURCE_BYTES: usize = 256 * 1024 * 1024;
 struct ImageStoreState {
     svg_source_bytes: usize,
     entries: HashMap<ImageHandle, StoredImageResource>,
-    order: VecDeque<ImageHandle>,
+    /// Least and most recently used entries of the intrusive list in
+    /// `entries`. A page can draw thousands of images per frame; a linear
+    /// scan to move each image to the back makes that work quadratic.
+    oldest: Option<ImageHandle>,
+    newest: Option<ImageHandle>,
     bytes: usize,
     next_revision: u64,
 }
@@ -1135,6 +1141,86 @@ struct StoredImageResource {
     /// layout handle; retained backends compare this cheap integer and upload
     /// only when a frame actually changes.
     revision: u64,
+    older: Option<ImageHandle>,
+    newer: Option<ImageHandle>,
+}
+
+impl ImageStoreState {
+    /// Unlink an existing entry. No image data or revision is changed.
+    fn unlink(&mut self, handle: ImageHandle) {
+        let entry = self.entries.get_mut(&handle).expect("image entry missing");
+        let older = entry.older.take();
+        let newer = entry.newer.take();
+        if let Some(older) = older {
+            self.entries
+                .get_mut(&older)
+                .expect("older image missing")
+                .newer = newer;
+        } else {
+            self.oldest = newer;
+        }
+        if let Some(newer) = newer {
+            self.entries
+                .get_mut(&newer)
+                .expect("newer image missing")
+                .older = older;
+        } else {
+            self.newest = older;
+        }
+    }
+
+    /// Link an existing detached entry as the most recently used.
+    fn append_newest(&mut self, handle: ImageHandle) {
+        let entry = self.entries.get_mut(&handle).expect("image entry missing");
+        debug_assert!(entry.older.is_none() && entry.newer.is_none());
+        entry.older = self.newest;
+        if let Some(newest) = self.newest {
+            self.entries
+                .get_mut(&newest)
+                .expect("newest image missing")
+                .newer = Some(handle);
+        } else {
+            self.oldest = Some(handle);
+        }
+        self.newest = Some(handle);
+    }
+
+    fn touch(&mut self, handle: ImageHandle) {
+        if self.newest != Some(handle) {
+            self.unlink(handle);
+            self.append_newest(handle);
+        }
+    }
+
+    /// Remove an entry from both the list and the byte accounting.
+    fn remove(&mut self, handle: ImageHandle) -> Option<StoredImageResource> {
+        if !self.entries.contains_key(&handle) {
+            return None;
+        }
+        self.unlink(handle);
+        let old = self.entries.remove(&handle).expect("image entry missing");
+        self.bytes = self.bytes.saturating_sub(old.image.rgba.len());
+        self.svg_source_bytes = self
+            .svg_source_bytes
+            .saturating_sub(old.image.svg_source.as_ref().map_or(0, |s| s.len()));
+        Some(old)
+    }
+
+    #[cfg(test)]
+    fn lru_order(&self) -> Vec<ImageHandle> {
+        let mut order = Vec::with_capacity(self.entries.len());
+        let mut cursor = self.oldest;
+        while let Some(handle) = cursor {
+            assert!(order.len() < self.entries.len(), "cycle in image LRU");
+            let entry = self.entries.get(&handle).expect("image LRU entry missing");
+            assert_eq!(entry.older, order.last().copied());
+            order.push(handle);
+            cursor = entry.newer;
+        }
+        assert_eq!(order.last().copied(), self.newest);
+        assert_eq!(order.len(), self.entries.len());
+        order
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1143,35 +1229,31 @@ pub struct ImageStore(Arc<RwLock<ImageStoreState>>);
 impl ImageStore {
     pub fn insert(&self, handle: ImageHandle, image: ImageResource) -> Vec<ImageHandle> {
         let mut store = self.0.write().expect("image store poisoned");
-        if let Some(old) = store.entries.remove(&handle) {
-            store.bytes = store.bytes.saturating_sub(old.image.rgba.len());
-            store.svg_source_bytes = store
-                .svg_source_bytes
-                .saturating_sub(old.image.svg_source.as_ref().map_or(0, |s| s.len()));
-            store.order.retain(|candidate| *candidate != handle);
-        }
+        store.remove(handle);
         store.next_revision = store.next_revision.wrapping_add(1).max(1);
         let revision = store.next_revision;
         store.bytes = store.bytes.saturating_add(image.rgba.len());
         store.svg_source_bytes = store
             .svg_source_bytes
             .saturating_add(image.svg_source.as_ref().map_or(0, |s| s.len()));
-        store
-            .entries
-            .insert(handle, StoredImageResource { image, revision });
-        store.order.push_back(handle);
+        store.entries.insert(
+            handle,
+            StoredImageResource {
+                image,
+                revision,
+                older: None,
+                newer: None,
+            },
+        );
+        store.append_newest(handle);
         let mut evicted = Vec::new();
         while store.entries.len() > MAX_IMAGE_RESOURCES
             || store.bytes.saturating_add(store.svg_source_bytes) > MAX_IMAGE_RESOURCE_BYTES
         {
-            let Some(oldest) = store.order.pop_front() else {
+            let Some(oldest) = store.oldest else {
                 break;
             };
-            if let Some(old) = store.entries.remove(&oldest) {
-                store.bytes = store.bytes.saturating_sub(old.image.rgba.len());
-                store.svg_source_bytes = store
-                    .svg_source_bytes
-                    .saturating_sub(old.image.svg_source.as_ref().map_or(0, |s| s.len()));
+            if store.remove(oldest).is_some() {
                 evicted.push(oldest);
             }
         }
@@ -1194,8 +1276,7 @@ impl ImageStore {
             // Explicit LRU ownership: the shared decoded store is touched by
             // display-list construction/backends, while each backend owns its
             // own independent atlas eviction policy.
-            store.order.retain(|candidate| *candidate != handle);
-            store.order.push_back(handle);
+            store.touch(handle);
         }
         image
     }
@@ -1258,19 +1339,14 @@ impl ImageStore {
 
     pub fn remove(&self, handle: ImageHandle) -> Option<ImageResource> {
         let mut store = self.0.write().expect("image store poisoned");
-        let old = store.entries.remove(&handle)?;
-        store.bytes = store.bytes.saturating_sub(old.image.rgba.len());
-        store.svg_source_bytes = store
-            .svg_source_bytes
-            .saturating_sub(old.image.svg_source.as_ref().map_or(0, |s| s.len()));
-        store.order.retain(|candidate| *candidate != handle);
-        Some(old.image)
+        store.remove(handle).map(|old| old.image)
     }
 
     pub fn clear(&self) {
         let mut store = self.0.write().expect("image store poisoned");
         store.entries.clear();
-        store.order.clear();
+        store.oldest = None;
+        store.newest = None;
         store.bytes = 0;
         store.svg_source_bytes = 0;
     }
@@ -2311,7 +2387,8 @@ pub fn scene_damage(old: &Scene, new: &Scene) -> SceneDamage {
     scene_damage_with_image_changes(old, new, &HashSet::new())
 }
 
-/// Include decoded image replacements under stable display-list handles.
+/// Include decoded-image and canvas-bitmap replacements under stable
+/// display-list handles.
 /// CSS Images 3 #the-object-fit and CSS Overflow 3 #overflow-control bound
 /// their paint to the replaced content box and its ancestor clips. Updating
 /// an avatar or an offscreen animation need not repaint the entire viewport.
@@ -2320,9 +2397,28 @@ pub fn scene_damage_with_image_changes(
     new: &Scene,
     changed_images: &HashSet<ImageHandle>,
 ) -> SceneDamage {
-    if old.viewport != new.viewport || old.canvas_images != new.canvas_images {
+    if old.viewport != new.viewport {
         return SceneDamage::Full;
     }
+    // Canvas snapshots live on the scene, not in the decoded image store.
+    // Include added, removed, or replaced bitmaps as ordinary image damage;
+    // changed_command_bounds replays their transforms and clips and retains
+    // the full-frame fallback for effects that can spread beyond the box.
+    // HTML #the-canvas-element paints the context's output bitmap (local
+    // snapshot e5071a20c856); keep the complete display-list order.
+    let changed_canvas = (old.canvas_images != new.canvas_images).then(|| {
+        let mut all = changed_images.clone();
+        all.extend(old.canvas_images.iter().filter_map(|(handle, canvas)| {
+            (new.canvas_images.get(handle) != Some(canvas)).then_some(*handle)
+        }));
+        all.extend(
+            new.canvas_images
+                .keys()
+                .filter_map(|handle| (!old.canvas_images.contains_key(handle)).then_some(*handle)),
+        );
+        all
+    });
+    let changed_images = changed_canvas.as_ref().unwrap_or(changed_images);
     let old_commands = raster_commands(&old.primitives);
     let new_commands = raster_commands(&new.primitives);
     let prefix = old_commands
@@ -5151,6 +5247,316 @@ pub fn paint_pending_editor_text(
     true
 }
 
+/// The caret's composed window coordinates after a scoped editor paint,
+/// conservatively intersected with the available clip bounds.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScopedEditorPaint {
+    pub caret: Option<CssRect>,
+}
+
+struct ScopedEditorAnchor {
+    index: usize,
+    origin: CssPoint,
+    clip: Option<CssRect>,
+    transform: Affine2d,
+    clips: Vec<(PaintShape, Affine2d)>,
+    /// A conservative right edge in the untransformed text coordinates.
+    right: f32,
+}
+
+/// Resolve an existing single-line, plain editing run in the *composed*
+/// display list. CSS Transforms 1 #current-transformation-matrix-computation
+/// and CSS Overflow 3 #overflow-properties require the replacement to stay
+/// in the same transform, scroll, clip and compositing scope as the text.
+///
+/// Empty editors can paint authored pseudo-content which cannot be identified
+/// as an ephemeral placeholder from the display list alone. Multiple runs,
+/// rich/bidi text, and ambiguous geometry likewise stay actor-painted.
+fn scoped_editor_anchor(
+    primitives: &[Primitive],
+    node: usize,
+    presentation: &crate::layout2::RichEditorPresentation,
+    editor_text: &str,
+) -> Option<ScopedEditorAnchor> {
+    let pending = presentation.pending_text.as_ref()?;
+    if pending.nodes.first().copied() != Some(node)
+        || !simple_editor_text(&pending.text, pending.preserves_edge_spaces)
+        || !simple_editor_text(editor_text, pending.preserves_edge_spaces)
+    {
+        return None;
+    }
+    let mut transforms = vec![Affine2d::IDENTITY];
+    let mut clips = Vec::<(PaintShape, Affine2d)>::new();
+    let mut layer_clips = Vec::<Option<(PaintShape, Affine2d)>>::new();
+    let mut host = None;
+    let mut anchor = None;
+    for (index, command) in primitives.iter().enumerate() {
+        let transform = *transforms.last()?;
+        match command {
+            Primitive::PushTransform(next) => transforms.push(transform.then(*next)),
+            Primitive::PopTransform if transforms.len() > 1 => {
+                transforms.pop();
+            }
+            Primitive::PopTransform => return None,
+            Primitive::PushClip(shape) => clips.push((shape.clone(), transform)),
+            Primitive::PopClip => {
+                clips.pop()?;
+            }
+            Primitive::PushLayer(layer) => {
+                layer_clips.push(layer.clip.map(|clip| (PaintShape::Rect(clip), transform)))
+            }
+            Primitive::PopLayer => {
+                layer_clips.pop()?;
+            }
+            Primitive::HitRegion(hit) if hit.node == node => {
+                // A fragmented host needs fragment-aware editing placement.
+                if host
+                    .replace(hit.rect)
+                    .is_some_and(|previous| previous != hit.rect)
+                {
+                    return None;
+                }
+            }
+            Primitive::GlyphRun {
+                node: owner,
+                origin,
+                shaped,
+                clip,
+                link,
+                selection,
+                ..
+            } if pending.nodes.contains(owner) => {
+                // GlyphRun.node names the styling element, not its Text
+                // source. Generated ::before/::after content has no source
+                // spans, even when its glyphs happen to match the edit text.
+                let sources = selection
+                    .sources
+                    .as_deref()
+                    .or(selection.paint_timing_sources.as_deref())?;
+                if anchor.is_some()
+                    || sources.is_empty()
+                    || sources
+                        .iter()
+                        .any(|span| !pending.text_nodes.contains(&span.node))
+                    || link.is_some()
+                    || (shaped.text != pending.text && shaped.text != editor_text)
+                    || *shaped != crate::text::shape(&shaped.text, &presentation.style)
+                {
+                    return None;
+                }
+                let mut caret_clips = clips.clone();
+                caret_clips.extend(layer_clips.iter().flatten().cloned());
+                anchor = Some((index, *origin, *clip, transform, caret_clips));
+            }
+            // These layout-owned scopes must have been resolved by Scene
+            // composition before an editor can be placed within them.
+            Primitive::BeginSticky(_)
+            | Primitive::EndSticky
+            | Primitive::BeginScroll(_)
+            | Primitive::EndScroll
+            | Primitive::BeginFixed
+            | Primitive::EndFixed
+            | Primitive::BeginCssAnimation(_)
+            | Primitive::EndCssAnimation
+            | Primitive::BeginMarquee(_)
+            | Primitive::EndMarquee => return None,
+            _ => {}
+        }
+    }
+    if transforms.len() != 1 || !clips.is_empty() || !layer_clips.is_empty() {
+        return None;
+    }
+    let host = host?;
+    let (index, origin, clip, transform, clips) = anchor?;
+    if ![host.x, host.y, host.width, host.height, origin.x, origin.y]
+        .iter()
+        .all(|value| value.is_finite())
+        || origin.x < host.x - 1.0
+        || origin.y < host.y - 1.0
+    {
+        return None;
+    }
+    // A single-line preview only: crossing the existing content/clip edge
+    // would require re-running authored wrapping and inline layout.
+    let line_right = pending.line_right.filter(|right| right.is_finite())?;
+    let right = clip
+        .map_or(host.x + host.width, |clip| {
+            (host.x + host.width).min(clip.x + clip.width)
+        })
+        .min(line_right);
+    Some(ScopedEditorAnchor {
+        index,
+        origin,
+        clip,
+        transform,
+        clips,
+        right,
+    })
+}
+
+fn simple_editor_text(text: &str, preserves_edge_spaces: bool) -> bool {
+    !text.is_empty()
+        && text.is_ascii()
+        && (preserves_edge_spaces
+            || (!text.starts_with(' ') && !text.ends_with(' ') && !text.contains("  ")))
+        && text
+            .bytes()
+            .all(|byte| byte == b' ' || byte.is_ascii_graphic())
+}
+
+fn scoped_editor_replacement(
+    anchor: &ScopedEditorAnchor,
+    presentation: &crate::layout2::RichEditorPresentation,
+    text: &str,
+) -> Option<crate::text::ShapedText> {
+    if !simple_editor_text(
+        text,
+        presentation.pending_text.as_ref()?.preserves_edge_spaces,
+    ) {
+        return None;
+    }
+    let shaped = crate::text::shape(text, &presentation.style);
+    (shaped.advance.is_finite()
+        && shaped.advance <= presentation.width
+        && anchor.origin.x + shaped.advance + 2.0 <= anchor.right)
+        .then_some(shaped)
+}
+
+/// Whether a prospective key's complete text can be painted in the retained
+/// scene's unambiguous single-line scope. `editor_text` is the current local
+/// state; `prospective_text` includes the key that has not yet been applied.
+pub fn can_paint_scoped_editor(
+    primitives: &[Primitive],
+    node: usize,
+    presentation: &crate::layout2::RichEditorPresentation,
+    editor_text: &str,
+    prospective_text: &str,
+) -> bool {
+    if !presentation
+        .style
+        .allows_scoped_editor_preview(editor_text, prospective_text)
+    {
+        return false;
+    }
+    scoped_editor_anchor(primitives, node, presentation, editor_text)
+        .and_then(|anchor| scoped_editor_replacement(&anchor, presentation, prospective_text))
+        .is_some()
+}
+
+/// Paint a plain editor's speculative text, selection and caret at the
+/// original glyph's position in the composed scene. The page actor remains
+/// authoritative; unsupported cases return `None` without changing the scene.
+/// The caret result includes viewport offsets, nested scrolling and transforms.
+pub fn paint_scoped_editor(
+    primitives: &mut Vec<Primitive>,
+    node: usize,
+    editor: &EditorVisual,
+    presentation: &crate::layout2::RichEditorPresentation,
+    replace_text: bool,
+) -> Option<ScopedEditorPaint> {
+    if !presentation
+        .style
+        .allows_scoped_editor_preview(&editor.text, &editor.text)
+    {
+        return None;
+    }
+    let anchor = scoped_editor_anchor(primitives, node, presentation, &editor.text)?;
+    let Primitive::GlyphRun {
+        origin,
+        color,
+        decoration,
+        shadows,
+        clip,
+        node,
+        link,
+        selection,
+        ..
+    } = primitives[anchor.index].clone()
+    else {
+        return None;
+    };
+    let replacement = if replace_text {
+        Some(scoped_editor_replacement(
+            &anchor,
+            presentation,
+            &editor.text,
+        )?)
+    } else {
+        None
+    };
+    let mut commands = Vec::new();
+    if !editor.selection.is_empty() {
+        if let Some(clip) = clip {
+            commands.push(Primitive::PushClip(PaintShape::Rect(clip)));
+        }
+        for selection in &editor.selection {
+            commands.push(Primitive::FillRect {
+                rect: selection.translate(origin.x, origin.y),
+                color: PaintColor::Rgba(88, 148, 255, 90),
+            });
+        }
+        if clip.is_some() {
+            commands.push(Primitive::PopClip);
+        }
+    }
+    if let Some(shaped) = replacement {
+        commands.push(Primitive::GlyphRun {
+            origin,
+            shaped,
+            // The run may use -webkit-text-fill-color instead of CSS color.
+            color,
+            decoration,
+            shadows,
+            clip,
+            node,
+            link,
+            // Keep source *identity* for a later preview probe, but do not
+            // expose stale character offsets to document selection while the
+            // actor has not committed these speculative bytes.
+            selection: RunSelection {
+                paint_timing_sources: selection.sources.or(selection.paint_timing_sources),
+                unselectable: selection.unselectable,
+                ..Default::default()
+            },
+        });
+    } else {
+        commands.push(primitives[anchor.index].clone());
+    }
+    let mut caret_window = None;
+    if let Some(caret) = editor.caret {
+        let caret = caret.translate(anchor.origin.x, anchor.origin.y);
+        if let Some(clip) = clip {
+            commands.push(Primitive::PushClip(PaintShape::Rect(clip)));
+        }
+        commands.push(Primitive::FillRect {
+            rect: caret,
+            color: presentation.caret_color,
+        });
+        if clip.is_some() {
+            commands.push(Primitive::PopClip);
+        }
+        let mut visible = Some(transformed_css_bounds(caret, anchor.transform));
+        for (shape, transform) in &anchor.clips {
+            visible = visible.and_then(|rect| {
+                intersect_css_rect(
+                    rect,
+                    transformed_css_bounds(shape_css_bounds(shape)?, *transform),
+                )
+            });
+        }
+        if let Some(clip) = anchor.clip {
+            visible = visible.and_then(|rect| {
+                intersect_css_rect(rect, transformed_css_bounds(clip, anchor.transform))
+            });
+        }
+        caret_window = visible;
+    }
+    primitives.splice(anchor.index..=anchor.index, commands);
+    Some(ScopedEditorPaint {
+        caret: caret_window,
+    })
+}
+
 pub fn paint_text_editor(
     primitives: &mut Vec<Primitive>,
     editor: &EditorVisual,
@@ -7099,6 +7505,124 @@ mod tests {
     }
 
     #[test]
+    fn canvas_bitmap_damage_respects_clips_and_matches_full_raster() {
+        for scale in [1.0, 1.5, 2.0] {
+            let viewport = ViewportMetrics::from_physical(
+                PhysicalSize::new(200, 120),
+                ScaleFactor::new(scale),
+            );
+            let mut old = desktop_shell(viewport, &snapshot());
+            let visible = ImageHandle::for_canvas();
+            let offscreen = ImageHandle::for_canvas();
+            let command = |handle| DisplayCommand::Image {
+                rect: CssRect::new(0., 0., 100., 100.),
+                handle,
+                source_rect: None,
+                fit: ImageFit::Fill,
+                sampling: ImageSampling::Nearest,
+                clip: None,
+                node: 1,
+                link: None,
+            };
+            old.primitives.extend([
+                DisplayCommand::PushTransform(Affine2d::translate(10., 10.)),
+                DisplayCommand::PushClip(PaintShape::Rect(CssRect::new(0., 0., 20., 20.))),
+                command(visible),
+                DisplayCommand::PopClip,
+                DisplayCommand::PopTransform,
+                DisplayCommand::PushTransform(Affine2d::translate(0., 500.)),
+                command(offscreen),
+                DisplayCommand::PopTransform,
+            ]);
+            let canvas = |handle, generation, rgba| {
+                CanvasImage::new(
+                    handle,
+                    generation,
+                    ImageResource {
+                        svg_source: None,
+                        width: 1,
+                        height: 1,
+                        rgba: Arc::from(rgba),
+                        has_alpha: true,
+                    },
+                )
+            };
+            old.canvas_images
+                .insert(visible, canvas(visible, 1, [255, 0, 0, 255]));
+            old.canvas_images
+                .insert(offscreen, canvas(offscreen, 1, [255, 0, 0, 255]));
+            let mut new = old.clone();
+            new.canvas_images
+                .insert(visible, canvas(visible, 2, [0, 0, 255, 128]));
+            new.canvas_images
+                .insert(offscreen, canvas(offscreen, 2, [0, 0, 255, 128]));
+            assert_eq!(
+                scene_damage(&old, &new),
+                SceneDamage::Partial(CssRect::new(8., 8., 24., 24.))
+            );
+            let mut renderer = vello_cpu::VelloCpuRenderer::new();
+            let mut old_pixels = renderer.render_rgba(&old).unwrap();
+            let original_pixels = old_pixels.pixels.clone();
+            let SceneDamage::Partial(rect) = scene_damage(&old, &new) else {
+                unreachable!()
+            };
+            let crop = raster_damage(&new, rect).unwrap();
+            let patch = renderer.render_rgba(&crop.scene).unwrap();
+            for y in 0..patch.size.height as usize {
+                let from = y * patch.size.width as usize * 4;
+                let to =
+                    ((y + crop.y as usize) * old_pixels.size.width as usize + crop.x as usize) * 4;
+                let len = patch.size.width as usize * 4;
+                old_pixels.pixels[to..to + len].copy_from_slice(&patch.pixels[from..from + len]);
+            }
+            let full_pixels = renderer.render_rgba(&new).unwrap().pixels;
+            assert_ne!(
+                original_pixels, full_pixels,
+                "the canvas update must change pixels"
+            );
+            assert_eq!(old_pixels.pixels, full_pixels);
+
+            // Removing or first publishing a bitmap under an existing command is
+            // also a pixel change, even though the command itself is unchanged.
+            let mut missing = new.clone();
+            missing.canvas_images.remove(&visible);
+            assert_eq!(scene_damage(&missing, &new), SceneDamage::Partial(rect));
+            assert_eq!(scene_damage(&new, &missing), SceneDamage::Partial(rect));
+            let mut retained = renderer.render_rgba(&new).unwrap();
+            let crop = raster_damage(&missing, rect).unwrap();
+            let patch = renderer.render_rgba(&crop.scene).unwrap();
+            for y in 0..patch.size.height as usize {
+                let from = y * patch.size.width as usize * 4;
+                let to =
+                    ((y + crop.y as usize) * retained.size.width as usize + crop.x as usize) * 4;
+                let len = patch.size.width as usize * 4;
+                retained.pixels[to..to + len].copy_from_slice(&patch.pixels[from..from + len]);
+            }
+            assert_eq!(
+                retained.pixels,
+                renderer.render_rgba(&missing).unwrap().pixels
+            );
+            let mut only_offscreen = old.clone();
+            only_offscreen
+                .canvas_images
+                .insert(offscreen, canvas(offscreen, 3, [0, 255, 0, 255]));
+            assert_eq!(scene_damage(&old, &only_offscreen), SceneDamage::Unchanged);
+
+            // A filter can spread output beyond the replaced element's own box.
+            let layer = DisplayCommand::PushLayer(CompositingLayer::new(
+                1.0,
+                BlendMode::Normal,
+                Arc::from([CssFilter::Blur(3.0)]),
+            ));
+            old.primitives.insert(1, layer.clone());
+            old.primitives.push(DisplayCommand::PopLayer);
+            new.primitives.insert(1, layer);
+            new.primitives.push(DisplayCommand::PopLayer);
+            assert_eq!(scene_damage(&old, &new), SceneDamage::Full);
+        }
+    }
+
+    #[test]
     fn image_replacement_damage_respects_transformed_clips_and_matches_full_raster() {
         let viewport =
             ViewportMetrics::from_physical(PhysicalSize::new(200, 120), ScaleFactor::default());
@@ -7625,10 +8149,10 @@ mod tests {
         store.insert(ImageHandle(1), image(16, 8));
         store.insert(ImageHandle(2), image(8, 8));
         let generation = store.generation();
-        let order = store.0.read().unwrap().order.clone();
+        let order = store.0.read().unwrap().lru_order();
         assert_eq!(store.desktop_page_image_bytes(), 768);
         assert_eq!(store.generation(), generation);
-        assert_eq!(store.0.read().unwrap().order, order);
+        assert_eq!(store.0.read().unwrap().lru_order(), order);
 
         // Animation/redecoding replaces the current cached pixels under the
         // same handle; an old retained frame is no longer charged here.
@@ -7677,6 +8201,81 @@ mod tests {
             store.desktop_page_image_bytes(),
             MAX_IMAGE_RESOURCES * 4 + 4
         );
+    }
+
+    #[test]
+    fn image_store_lru_tracks_replacement_removal_and_reuse() {
+        let store = ImageStore::default();
+        let image = |value| ImageResource {
+            svg_source: Some(Arc::from([value; 3])),
+            width: 1,
+            height: 1,
+            rgba: Arc::from([value, 0, 0, 255]),
+            has_alpha: false,
+        };
+        let order = || store.0.read().unwrap().lru_order();
+        for id in 1..=4 {
+            store.insert(ImageHandle(id), image(id as u8));
+        }
+        assert_eq!(
+            order(),
+            vec![
+                ImageHandle(1),
+                ImageHandle(2),
+                ImageHandle(3),
+                ImageHandle(4)
+            ]
+        );
+        assert!(store.get(ImageHandle(2)).is_some());
+        assert_eq!(
+            order(),
+            vec![
+                ImageHandle(1),
+                ImageHandle(3),
+                ImageHandle(4),
+                ImageHandle(2)
+            ]
+        );
+        // Touching the tail or an absent handle does not disturb the list.
+        assert!(store.get(ImageHandle(2)).is_some());
+        assert!(store.get(ImageHandle(99)).is_none());
+        assert_eq!(
+            order(),
+            vec![
+                ImageHandle(1),
+                ImageHandle(3),
+                ImageHandle(4),
+                ImageHandle(2)
+            ]
+        );
+        let revision = store.revision(ImageHandle(3));
+        store.insert(ImageHandle(3), image(33));
+        assert_ne!(store.revision(ImageHandle(3)), revision);
+        assert_eq!(
+            order(),
+            vec![
+                ImageHandle(1),
+                ImageHandle(4),
+                ImageHandle(2),
+                ImageHandle(3)
+            ]
+        );
+        assert_eq!(store.remove(ImageHandle(1)).unwrap().rgba[0], 1); // head
+        assert_eq!(store.remove(ImageHandle(2)).unwrap().rgba[0], 2); // middle
+        assert_eq!(store.remove(ImageHandle(3)).unwrap().rgba[0], 33); // tail
+        assert_eq!(order(), vec![ImageHandle(4)]);
+        assert!(store.remove(ImageHandle(99)).is_none());
+        {
+            let state = store.0.read().unwrap();
+            assert_eq!((state.bytes, state.svg_source_bytes), (4, 3));
+        }
+        assert!(store.remove(ImageHandle(4)).is_some()); // only entry
+        assert!(order().is_empty());
+        store.insert(ImageHandle(5), image(5));
+        store.clear();
+        assert!(order().is_empty());
+        store.insert(ImageHandle(6), image(6));
+        assert_eq!(order(), vec![ImageHandle(6)]);
     }
 
     #[test]

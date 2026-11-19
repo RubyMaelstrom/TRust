@@ -1411,6 +1411,171 @@ mod tests {
         assert_eq!(sticky.insets[0], Some(3.0));
     }
 
+    /// Isolate native scene composition and damage after an editor update in
+    /// a long transcript. Run on a quiet machine with:
+    ///
+    /// `cargo test --release --lib transcript_composition_bench -- --ignored --nocapture`
+    ///
+    /// This synthetic diagnostic is not a chatgpt.com measurement. It keeps
+    /// all offscreen commands, as the production Scene does, and reports the
+    /// complete compose, damage, crop and CPU-raster stages separately.
+    #[test]
+    #[ignore = "synthetic long-transcript diagnostic"]
+    fn transcript_composition_bench() {
+        use crate::render::{
+            BackdropFilter, BlendMode, CompositingLayer, CssFilter, PagePaint, SceneDamage,
+            TextDecorationPaint, scene_damage,
+        };
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let iterations = std::env::var("TRUST_TRANSCRIPT_BENCH_ITERATIONS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(7)
+            .clamp(1, 100);
+        let viewport = CssSize::new(960.0, 640.0);
+        let metrics =
+            ViewportMetrics::from_physical(PhysicalSize::new(960, 640), ScaleFactor::default());
+        let style = crate::text::TextStyle::default();
+        let transcript = crate::text::shape(
+            "A representative transcript line with proportional glyphs, punctuation, and 0123456789.",
+            &style,
+        );
+        let empty_scene = || Scene {
+            viewport: metrics,
+            primitives: Vec::new(),
+            controls: Vec::new(),
+            content_viewport: CssRect::new(0.0, 0.0, viewport.width, viewport.height),
+            image_store: ImageStore::default(),
+            canvas_images: Default::default(),
+            page_scroll_containers: Vec::new(),
+            page_size: CssSize::default(),
+        };
+        let color = PaintColor::Rgba(24, 30, 36, 255);
+        let glyph = |text, x, y, node| DisplayCommand::GlyphRun {
+            origin: CssPoint::new(x, y),
+            shaped: text,
+            color,
+            decoration: TextDecorationPaint {
+                color,
+                style: super::super::DecorationStyle::Solid,
+                thickness: None,
+                underline_offset: None,
+            },
+            shadows: Vec::new(),
+            clip: None,
+            node,
+            link: None,
+            selection: Default::default(),
+        };
+
+        for rows in [1_000, 5_000] {
+            for backdrop in [false, true] {
+                let mut page = PagePaint {
+                    width: viewport.width,
+                    height: rows as f32 * 24.0 + 100.0,
+                    ..PagePaint::default()
+                };
+                for row in 0..rows {
+                    page.primitives.push(glyph(
+                        transcript.clone(),
+                        30.0,
+                        row as f32 * 24.0,
+                        row + 1,
+                    ));
+                }
+                if backdrop {
+                    // Filter Effects 2 #backdrop-filter-operation: a fixed
+                    // header reads the backdrop behind its own border box.
+                    // Its effects are intentionally separate from the editor.
+                    let mut layer = CompositingLayer::new(1.0, BlendMode::Normal, Arc::from([]));
+                    layer.backdrop = Some(Arc::new(BackdropFilter {
+                        filters: Arc::from([CssFilter::Blur(2.0)]),
+                        shape: PaintShape::Rect(CssRect::new(0.0, 0.0, 960.0, 35.0)),
+                    }));
+                    page.fixed_primitives.push(DisplayCommand::PushLayer(layer));
+                    page.fixed_primitives.push(DisplayCommand::FillRect {
+                        rect: CssRect::new(0.0, 0.0, 960.0, 35.0),
+                        color: PaintColor::Rgba(255, 255, 255, 180),
+                    });
+                    page.fixed_primitives.push(DisplayCommand::PopLayer);
+                }
+                let text_index = page.fixed_primitives.len();
+                page.fixed_primitives.push(glyph(
+                    crate::text::shape("Pending text", &style),
+                    36.0,
+                    570.0,
+                    rows + 1,
+                ));
+                let caret_index = page.fixed_primitives.len();
+                page.fixed_primitives.push(DisplayCommand::FillRect {
+                    rect: CssRect::new(136.0, 570.0, 1.5, 20.0),
+                    color,
+                });
+                let scroll = CssPoint::new(0.0, (page.height - viewport.height).max(0.0));
+                let mut old = empty_scene();
+                old.append_page(&page, scroll);
+                for edit in [false, true] {
+                    let mut next_page = page.clone();
+                    if edit {
+                        next_page.fixed_primitives[text_index] = glyph(
+                            crate::text::shape("Pending text!", &style),
+                            36.0,
+                            570.0,
+                            rows + 1,
+                        );
+                    }
+                    if let DisplayCommand::FillRect { rect, .. } =
+                        &mut next_page.fixed_primitives[caret_index]
+                    {
+                        rect.x += 8.0;
+                    }
+                    let mut composition = Vec::with_capacity(iterations);
+                    let mut comparison = Vec::with_capacity(iterations);
+                    let mut crop = Vec::with_capacity(iterations);
+                    let mut raster = Vec::with_capacity(iterations);
+                    let mut renderer = VelloCpuRenderer::new();
+                    let mut last_damage = SceneDamage::Unchanged;
+                    for _ in 0..iterations {
+                        let started = Instant::now();
+                        let mut next = empty_scene();
+                        next.append_page(&next_page, scroll);
+                        composition.push(started.elapsed());
+                        let started = Instant::now();
+                        last_damage = scene_damage(&old, &next);
+                        comparison.push(started.elapsed());
+                        let started = Instant::now();
+                        let partial = match last_damage {
+                            SceneDamage::Partial(rect) => raster_damage(&next, rect),
+                            _ => None,
+                        };
+                        crop.push(started.elapsed());
+                        let started = Instant::now();
+                        renderer
+                            .render_rgba(partial.as_ref().map_or(&next, |p| &p.scene))
+                            .unwrap();
+                        raster.push(started.elapsed());
+                    }
+                    assert!(matches!(last_damage, SceneDamage::Full) == backdrop);
+                    let median = |values: &mut [Duration]| {
+                        values.sort_unstable();
+                        values[values.len() / 2].as_secs_f64() * 1_000.0
+                    };
+                    eprintln!(
+                        "TRANSCRIPT rows={rows} backdrop={backdrop} edit={} cmds={} damage={last_damage:?} compose={:.3}ms compare={:.3}ms crop={:.3}ms cpu={:.3}ms",
+                        if edit { "text" } else { "caret" },
+                        old.primitives.len(),
+                        median(&mut composition),
+                        median(&mut comparison),
+                        median(&mut crop),
+                        median(&mut raster),
+                    );
+                }
+            }
+        }
+    }
+
     /// Repeatable end-to-end desktop pipeline benchmark.
     ///
     /// Run with:

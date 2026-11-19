@@ -612,6 +612,7 @@ scripts, dynamically inserted scripts and `fetch`/XHR requests fail offline. TRu
 | `TRUST_COOKIE_TRACE` | presence flag | Traces response receipt, jar accept/reject/delete, script access and selected request-cookie counts. Reports `cf_clearance` counts separately, with numeric status/time and a hashed origin identifier, never cookie values or arbitrary names/URLs. `[cookie-attributes]` reports only Secure/HttpOnly/Partitioned booleans and a normalized SameSite category for clearance cookies. `stored-cross-site-challenge` and `request-cross-site-challenge` identify the cross-site challenge-cookie exception; the latter can have count zero. `[cookie-integrity]` compares outgoing clearance values byte-for-byte against bounded in-process receipt copies (64 records, at most 8192 value bytes each); `unknown` includes altered, oversized or evicted receipts, not just mismatches. The flag itself does not change cookie policy. It does **not** redact URLs or other sensitive data emitted by other enabled diagnostics. |
 | `TRUST_DIAG_FRAME` | presence flag | Enables the terminal frame report (`DIAGFRAME`) and related page/layout reports (`DIAGGEOM`, `DIAGROUTE`, `DIAGRELAY`). It includes redraws, draw time, page-event work, full replacements, image relayout/render counts, load phases, scroll state, and cascade/layout costs. `DIAGINVALID` lines name each whole-document style invalidation (`all-styles caller=FILE:LINE`) and the attribute, child-list or live-state change that could not prove a narrower one. `DIAGGEOM projection` names the geometry read (and its element) that needed every box projected because the single-border-box index could not answer it. |
 | `TRUST_DIAG_PATCH` | presence flag | Adds timing output for incremental region/subtree layout patches. |
+| `TRUST_DIAG_INVALID_ROOTS` | presence flag | Adds bounded `DIAGINVALID` reports for queued and coalesced local style roots, large relational-selector invalidations, and input-name dependency fallbacks. Includes node IDs, tags and truncated class hints, but no input values. Use with `TRUST_DIAG_FRAME` to distinguish a cheap local edit from a local root that covers most of the document. |
 | `TRUST_STYLE_THREADS` | non-negative integer | Participants in parallel selector-matching passes, including the page thread. `0` disables the passes (every element is matched lazily on first style read); `1` runs them on the page thread alone. Default: the number of highest-capacity cores of a heterogeneous CPU (else all cores), at most 8. `DIAGGEOM`'s `pmatch=` field reports passes, elements, distinct rule lists, candidates, participants, and collect/match/merge wall times plus the participants' summed busy time. |
 | `TRUST_STYLE_CORES` | `all` | Lets style worker threads run on any CPU. By default, on a heterogeneous CPU (Linux `cpu_capacity`), they are confined to the highest-capacity cores. |
 | `TRUST_STYLE_VERIFY` | presence flag | After each parallel selector-matching pass, recomputes every result on the serial path and prints `STYLEVERIFY checked=N mismatches=M` (plus the first differing elements). Diagnostic only; doubles matching work. |
@@ -1146,6 +1147,28 @@ TRUST_AVIF_BENCH=photo.avif cargo test --release --lib avif_decode_bench -- --ig
 TRUST_AVIF_CORPUS=av1-avif/testFiles TRUST_AVIF_CORPUS_OUT=/tmp/avif-png \
   cargo test --release --lib avif_corpus -- --ignored --nocapture
 ```
+
+`target/release/trust-desktop src/fixtures/desktop_rendering_review.html`
+exercises implicit grid growth, occupied auto-fit spans, table sizing, clipped
+canvas updates and a finite CSS animation. The page should show
+`DESKTOP_REVIEW_OK`, four adjacent lettered cells and a green canvas. With
+`TRUST_DESKTOP_TRACE=1`, frames should stop after the animation and canvas
+updates finish. The existing `layout_reuse.html` fixture additionally checks
+mutation, nested layout, container queries and shadow-slot geometry.
+
+When measuring tab switches, account for decoded-image eviction: navigation
+currently clears the window-wide decoded store, so returning to another awake
+tab can require decoding its images again. Retaining pixels across that reset
+needs resource identities that distinguish request context and freshness; the
+current URL-based handles are insufficient for that change.
+
+`cargo test --release --lib transcript_composition_bench -- --ignored --nocapture`
+measures scene composition, damage comparison, crop construction and CPU raster
+after an editor update in a synthetic long transcript. Set
+`TRUST_TRANSCRIPT_BENCH_ITERATIONS` to choose 1–100 repetitions. It retains
+offscreen commands and includes a backdrop-filter case that requires full
+damage. The repeated shaped lines isolate command-copy costs; these numbers
+are not live chatgpt.com typing measurements.
 
 The engine matrix isolates style/box construction, flow, and retained CSSOM
 geometry from JavaScript and rasterization. It covers block/inline flow,

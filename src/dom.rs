@@ -4905,6 +4905,27 @@ impl Dom {
                 )
             });
 
+        // HTML #contained-text-auto-directionality takes the first strong
+        // direction of the descendant Text nodes in tree order. Replacing a
+        // text-only child list still creates/removes the actual nodes, but an
+        // unchanged first-strong contribution cannot change an automatic
+        // direction ancestor. Otherwise repeated textContent writes would
+        // restyle that ancestor's entire subtree for every character. A
+        // textarea's neutral nonempty value and its null auto direction both
+        // resolve to ltr; a dirty value is independent of its children.
+        let direction_changed = if text_only && self.auto_direction_root(parent).is_some() {
+            fn first_direction(dom: &Dom, mut nodes: impl Iterator<Item = NodeId>) -> Option<bool> {
+                nodes.find_map(|node| match &dom.nodes[node].data {
+                    NodeData::Text(text) => text_node_directionality(text),
+                    _ => None,
+                })
+            }
+            first_direction(self, self.child_iter(parent))
+                != first_direction(self, new_children.iter().copied())
+        } else {
+            true
+        };
+
         let mut style_changed = new_children
             .iter()
             .any(|&child| self.tree_mutation_changes_style(parent, child));
@@ -4988,7 +5009,7 @@ impl Dom {
             self.touch_text(
                 parent,
                 was_empty != self.is_element_empty(parent),
-                true,
+                direction_changed,
                 None,
             );
         } else {
@@ -10512,7 +10533,7 @@ impl Dom {
         // Keep its bytes even when one optional face has missed its deadline.
         let key = (document, url.to_string());
         self.downloaded_fonts.insert(key, bytes.map(Into::into));
-        self.touch_style();
+        self.touch_font_sets();
     }
 
     pub(crate) fn set_script_fonts(
@@ -10536,7 +10557,33 @@ impl Dom {
         } else {
             self.script_fonts.insert(document, fonts);
         }
-        self.touch_style();
+        self.touch_font_sets();
+    }
+
+    /// A font source or registration changed, not the stylesheet rules.
+    /// CSS Fonts 4 #font-display-timeline requires text to be re-rendered
+    /// when its selected face becomes available. Refresh the scope's font
+    /// environments while retaining the selector index when no other owner
+    /// can observe its old immutable state. Still invalidate all computed
+    /// values, geometry and paint: font-relative lengths and text metrics may
+    /// change everywhere. A stale/shared index takes the normal full rebuild.
+    fn touch_font_sets(&mut self) {
+        let Some((epoch, mut index)) = self.style_cache.get_mut().take() else {
+            self.touch_style();
+            return;
+        };
+        if epoch == self.style_epoch && std::rc::Rc::get_mut(&mut index).is_some() {
+            let mut sets = FxHashMap::default();
+            self.build_font_sets(index.font_faces.clone(), &mut sets);
+            // The unique ownership check above forbids changing a snapshot
+            // held by a pending invalidation or an active style consumer.
+            std::rc::Rc::get_mut(&mut index).unwrap().font_sets = sets;
+            *self.style_cache.get_mut() = Some((epoch, index));
+            self.touch();
+        } else {
+            *self.style_cache.get_mut() = Some((epoch, index));
+            self.touch_style();
+        }
     }
 
     /// Referrer Policy #integration-with-css (local W3C cc435b05ca4a):
@@ -10579,13 +10626,13 @@ impl Dom {
         demands: std::sync::Arc<crate::font_system::FontDemands>,
     ) {
         self.font_demands = demands;
-        self.touch_style();
+        self.touch_font_sets();
     }
 
     pub(crate) fn advance_font_display(&mut self) {
         self.font_demands.advance(std::time::Instant::now());
         if self.font_demands.take_changed() {
-            self.touch_style();
+            self.touch_font_sets();
         }
     }
 
@@ -10829,7 +10876,8 @@ impl Dom {
                 }
             }
         }
-        self.build_font_sets(font_faces, &mut index.font_sets);
+        self.build_font_sets(font_faces.clone(), &mut index.font_sets);
+        index.font_faces = font_faces;
         let mut seen = FxHashSet::default();
         let unique = index
             .scopes
@@ -22597,6 +22645,10 @@ struct SlotAssignments {
 struct StyleIndex {
     has_focus_rules: bool,
     font_sets: FxHashMap<NodeId, std::sync::Arc<crate::text::FontSet>>,
+    /// Parsed CSS @font-face descriptors, before script registrations or
+    /// downloaded bytes. Font availability can change independently of the
+    /// stylesheet's selectors, cascade layers and source ordering.
+    font_faces: FxHashMap<NodeId, Vec<crate::http::CssFontFace>>,
     has_container_queries: bool,
     /// Some declaration uses a container query length unit, whose computed
     /// value depends on laid-out container sizes (CSS Conditional 5
@@ -22898,6 +22950,7 @@ impl StyleIndex {
         let StyleIndex {
             has_focus_rules: _,
             font_sets,
+            font_faces,
             has_container_queries,
             has_container_units,
             has_revert_layer,
@@ -23070,6 +23123,15 @@ impl StyleIndex {
         }
         // Fontique owns immutable font bytes and collection metadata shared
         // with layout snapshots. Account for the map and report opaque storage.
+        bytes +=
+            font_faces.capacity() * std::mem::size_of::<(NodeId, Vec<crate::http::CssFontFace>)>();
+        for faces in font_faces.values() {
+            bytes += faces.capacity() * std::mem::size_of::<crate::http::CssFontFace>();
+            bytes += faces
+                .iter()
+                .map(crate::http::CssFontFace::retained_bytes)
+                .sum::<usize>();
+        }
         bytes += font_sets.capacity()
             * std::mem::size_of::<(NodeId, std::sync::Arc<crate::text::FontSet>)>();
         let opaque = !font_sets.is_empty()
@@ -31446,6 +31508,167 @@ mod tests {
     }
 
     #[test]
+    fn font_load_refreshes_layout_without_rebuilding_unchanged_selectors() {
+        // CSS Fonts 4 #font-display-timeline swaps the used face when it
+        // loads. Its glyph advances and intrinsic width can change, but the
+        // stylesheet's selectors are unchanged.
+        let base = url::Url::parse("https://font.test/").unwrap();
+        let url = "https://font.test/late.ttf";
+        let mut dom = Dom::parse_document(
+            "<style id=sheet>@font-face{font-family:Late;src:url(late.ttf)}\
+             .sample{display:inline-block;font-family:Late,monospace;font-size:20px;width:max-content;color:green}</style>\
+             <div id=sample class=sample>iiiiiiii</div>",
+        );
+        dom.set_doc_url(Some(base.clone()));
+        let node = dom.get_by_id("sample").unwrap();
+        let width = |dom: &Dom| {
+            crate::layout2::lay_out_graphical(
+                dom,
+                &base,
+                crate::layout2::Viewport::new(640., 480.),
+                &[],
+                &Default::default(),
+                &Default::default(),
+            )
+            .boxes[&node]
+                .width
+        };
+        let advance = |dom: &Dom| {
+            crate::text::shape(
+                "iiiiiiii",
+                &crate::text::TextStyle {
+                    family: "Late,monospace".into(),
+                    size: 20.,
+                    font_set: dom.scope_font_set(node),
+                    ..Default::default()
+                },
+            )
+            .advance
+        };
+        let fallback = width(&dom);
+        let fallback_advance = advance(&dom);
+        let old_index = std::rc::Rc::as_ptr(&dom.style_index());
+        let epoch = dom.style_epoch;
+        dom.install_downloaded_font(
+            url,
+            Some(include_bytes!("../assets/fonts/dejavu/DejaVuSerif.ttf").to_vec()),
+        );
+        assert_eq!(dom.style_epoch, epoch, "the sheet set did not change");
+        assert_eq!(std::rc::Rc::as_ptr(&dom.style_index()), old_index);
+        let loaded = width(&dom);
+        let loaded_advance = advance(&dom);
+        assert_ne!(fallback_advance, loaded_advance, "loaded glyph advances");
+        assert_ne!(fallback, loaded, "loaded font must update intrinsic width");
+        assert_eq!(dom.computed_value(node, "color").as_deref(), Some("green"));
+
+        // A forced complete index/layout rebuild is the reference for the
+        // retained path, including the newly selected font metrics.
+        dom.touch_style();
+        assert_eq!(width(&dom), loaded);
+        assert_eq!(advance(&dom), loaded_advance);
+        assert_eq!(dom.computed_value(node, "color").as_deref(), Some("green"));
+
+        // An existing immutable snapshot cannot be mutated out from under a
+        // caller. Fall back to a new index when a face becomes unavailable.
+        let shared = dom.style_index();
+        let shared_epoch = dom.style_epoch;
+        dom.install_downloaded_font(url, None);
+        assert_eq!(dom.style_epoch, shared_epoch + 1);
+        assert!(!std::rc::Rc::ptr_eq(&shared, &dom.style_index()));
+        assert_eq!(width(&dom), fallback);
+
+        // A sheet change already in flight still rebuilds its selectors before
+        // the font update is used; never bless a stale index as current.
+        let sheet = dom.get_by_id("sheet").unwrap();
+        dom.set_text(
+            sheet,
+            "@font-face{font-family:Late;src:url(late.ttf)}\
+             .sample{display:inline-block;font-family:Late,monospace;font-size:20px;width:max-content;color:blue}",
+        );
+        dom.install_downloaded_font(
+            url,
+            Some(include_bytes!("../assets/fonts/dejavu/DejaVuSerif.ttf").to_vec()),
+        );
+        assert_eq!(dom.computed_value(node, "color").as_deref(), Some("blue"));
+        assert_eq!(width(&dom), loaded);
+    }
+
+    #[test]
+    fn script_font_registrations_refresh_the_existing_selector_index() {
+        use crate::font_system::{FontKey, FontRegistration};
+        let base = url::Url::parse("https://font.test/").unwrap();
+        let mut dom = Dom::parse_document(
+            "<style>.sample{display:inline-block;font-family:ScriptFace,monospace;font-size:20px;width:max-content}</style>\
+             <div id=sample class=sample>iiiiiiii</div>",
+        );
+        dom.set_doc_url(Some(base.clone()));
+        let document = dom.document();
+        let node = dom.get_by_id("sample").unwrap();
+        let width = |dom: &Dom| {
+            crate::layout2::lay_out_graphical(
+                dom,
+                &base,
+                crate::layout2::Viewport::new(640., 480.),
+                &[],
+                &Default::default(),
+                &Default::default(),
+            )
+            .boxes[&node]
+                .width
+        };
+        let advance = |dom: &Dom| {
+            crate::text::shape(
+                "iiiiiiii",
+                &crate::text::TextStyle {
+                    family: "ScriptFace,monospace".into(),
+                    size: 20.,
+                    font_set: dom.scope_font_set(node),
+                    ..Default::default()
+                },
+            )
+            .advance
+        };
+        let fallback = width(&dom);
+        let fallback_advance = advance(&dom);
+        let old_index = std::rc::Rc::as_ptr(&dom.style_index());
+        let registration = FontRegistration {
+            key: FontKey {
+                scope: document,
+                member: 1,
+                script: true,
+            },
+            face: crate::http::CssFontFace {
+                family: "ScriptFace".into(),
+                sources: Vec::new(),
+                unicode_range: Vec::new(),
+                descriptors: Default::default(),
+            },
+            css: false,
+            failed: false,
+            data: Some(std::sync::Arc::from(
+                &include_bytes!("../assets/fonts/dejavu/DejaVuSerif.ttf")[..],
+            )),
+        };
+        dom.set_script_fonts(document, vec![registration.clone()]);
+        assert_eq!(std::rc::Rc::as_ptr(&dom.style_index()), old_index);
+        let loaded = width(&dom);
+        let loaded_advance = advance(&dom);
+        assert_ne!(fallback_advance, loaded_advance, "loaded glyph advances");
+        assert_ne!(fallback, loaded);
+
+        dom.set_script_fonts(document, Vec::new());
+        assert_eq!(std::rc::Rc::as_ptr(&dom.style_index()), old_index);
+        assert_eq!(width(&dom), fallback);
+        assert_eq!(advance(&dom), fallback_advance);
+
+        dom.set_script_fonts(document, vec![registration]);
+        assert_eq!(width(&dom), loaded);
+        dom.touch_style();
+        assert_eq!(width(&dom), loaded);
+        assert_eq!(advance(&dom), loaded_advance);
+    }
+
+    #[test]
     fn font_display_hides_only_ink_and_reveals_fallback_without_a_download() {
         let mut dom = Dom::parse_document(
             "<style>@font-face{font-family:Slow;src:url(slow.ttf);font-display:block;unicode-range:U+41-5A}</style><p id=p>Aaa</p>",
@@ -31469,8 +31692,15 @@ mod tests {
         let mut editor = crate::text::TextEditor::new("A", &style(&dom), 100., false);
         assert_eq!(glyphs(&editor.line_layout(false).shaped), 0);
         assert_eq!(dom.take_font_requests().len(), 1);
+        let index = std::rc::Rc::as_ptr(&dom.style_index());
+        let epoch = dom.style_epoch;
         dom.font_demands.elapse(std::time::Duration::from_secs(4));
         dom.advance_font_display();
+        assert_eq!(
+            dom.style_epoch, epoch,
+            "a display phase is not a sheet change"
+        );
+        assert_eq!(std::rc::Rc::as_ptr(&dom.style_index()), index);
         let after = crate::text::shape("Aaa", &style(&dom));
         assert_eq!(glyphs(&after), 3);
         assert_eq!(glyphs(&editor.line_layout(false).shaped), 1);

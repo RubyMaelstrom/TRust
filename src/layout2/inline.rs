@@ -1757,9 +1757,8 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
     }
 
     fn margin_px(&self, style: &BoxStyle, side: usize) -> f32 {
-        style.margin[side]
-            .resolve(Some(self.cb_w_px))
-            .unwrap_or(0.0)
+        let basis = if self.measuring { 0.0 } else { self.cb_w_px };
+        style.margin[side].resolve(Some(basis)).unwrap_or(0.0)
     }
 
     /// An inline box's border plus padding on `side`, in px.
@@ -2763,7 +2762,9 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                     self.dom,
                     a.node,
                     f,
-                    if self.measuring {
+                    if self.measuring_min {
+                        ControlWidthBasis::MinContribution
+                    } else if self.measuring {
                         ControlWidthBasis::Intrinsic
                     } else {
                         ControlWidthBasis::ContainingBlock(self.cb_w_px)
@@ -4766,12 +4767,27 @@ pub(crate) fn media_label(dom: &Dom, video: bool, src_node: Option<NodeId>) -> S
 pub(crate) enum ControlWidthBasis {
     /// A normal layout pass with a definite containing-block width.
     ContainingBlock(f32),
-    /// An intrinsic contribution. CSS Sizing 3 §5.2.1 treats a cyclic
-    /// percentage size as `auto` while calculating that contribution.
+    /// A max-content contribution, with cyclic preferred and maximum sizes
+    /// treated as their initial values.
     Intrinsic,
-    /// The min-content contribution, based on the displayed value or
-    /// placeholder rather than the control's preferred width.
+    /// A min-content contribution to the containing block, with cyclic
+    /// preferred and maximum sizes of compressible controls resolved at zero.
+    MinContribution,
+    /// The control's own min-content size based on its value or placeholder.
     MinContent,
+}
+
+/// CSS Sizing 3 #min-content-zero: these widgets can shrink like replaced
+/// elements when a cyclic percentage supplies their preferred or maximum size.
+pub(super) fn compressible_control(dom: &Dom, node: NodeId) -> bool {
+    match dom.tag_name(node) {
+        Some("input") => !matches!(
+            dom.input_type(node).as_str(),
+            "button" | "reset" | "submit" | "color" | "image"
+        ),
+        Some(tag) => matches!(tag, "select" | "textarea" | "progress" | "meter"),
+        None => false,
+    }
 }
 
 /// Whether a non-replaced inline box paints a background, border or shadow.
@@ -5021,12 +5037,23 @@ fn control_labels(
     let number_field = f.kind == FieldKind::Number;
     let basis = match width_basis {
         ControlWidthBasis::ContainingBlock(width) => Some(width),
-        ControlWidthBasis::Intrinsic | ControlWidthBasis::MinContent => None,
+        _ => None,
+    };
+    // CSS Sizing 3 #cyclic-percentage-contribution: the min-content probe
+    // resolves cyclic widths and max-widths of compressible controls at zero.
+    // Min-width and padding use zero under either intrinsic constraint.
+    let minimum_basis = basis.or(Some(0.0));
+    let preferred_basis = if matches!(width_basis, ControlWidthBasis::MinContribution)
+        && compressible_control(dom, node)
+    {
+        minimum_basis
+    } else {
+        basis
     };
     let box_style = BoxStyle::of(dom, node, vp);
     let padding = box_style
         .padding
-        .map(|length| length.resolve(basis).unwrap_or(0.0).max(0.0));
+        .map(|length| length.resolve(minimum_basis).unwrap_or(0.0).max(0.0));
     let horizontal_edges =
         padding[LEFT] + padding[RIGHT] + box_style.border[LEFT] + box_style.border[RIGHT];
     let vertical_edges =
@@ -5074,29 +5101,22 @@ fn control_labels(
         } else {
             shaped.advance
         };
-    let specified_width = box_style.width.resolve(basis);
-    let mut box_width = specified_width.map_or(intrinsic_content + horizontal_edges, |width| {
+    let to_border_box = |width| {
         if box_style.border_box {
             width
         } else {
             width + horizontal_edges
         }
-    });
-    if let Some(minimum) = box_style.min_width.resolve(basis) {
-        let minimum = if box_style.border_box {
-            minimum
-        } else {
-            minimum + horizontal_edges
-        };
-        box_width = box_width.max(minimum);
+    };
+    let mut box_width = box_style
+        .width
+        .resolve(preferred_basis)
+        .map_or(intrinsic_content + horizontal_edges, to_border_box);
+    if let Some(maximum) = box_style.max_width.resolve(preferred_basis) {
+        box_width = box_width.min(to_border_box(maximum));
     }
-    if let Some(maximum) = box_style.max_width.resolve(basis) {
-        let maximum = if box_style.border_box {
-            maximum
-        } else {
-            maximum + horizontal_edges
-        };
-        box_width = box_width.min(maximum);
+    if let Some(minimum) = box_style.min_width.resolve(minimum_basis) {
+        box_width = box_width.max(to_border_box(minimum));
     }
     box_width = box_width.min(cap).max(horizontal_edges);
     let content_width = (box_width - horizontal_edges).max(0.0);

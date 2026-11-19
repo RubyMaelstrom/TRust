@@ -89,6 +89,29 @@ impl Track {
     }
 }
 
+/// Collapse auto-fit tracks not crossed by an in-flow item (CSS Grid 2
+/// #auto-repeat). Record the furthest end at each start, then sweep the
+/// tracks once. Checking every item separately for every track makes a wide
+/// auto-fit grid quadratic even when each item occupies just one track.
+fn collapse_empty_auto_fit(tracks: &mut [Track], ranges: impl Iterator<Item = Range<usize>>) {
+    if !tracks.iter().any(|track| track.collapsible) {
+        return;
+    }
+    let mut ends = vec![0; tracks.len()];
+    for range in ranges {
+        if range.start < ends.len() && range.start < range.end {
+            ends[range.start] = ends[range.start].max(range.end);
+        }
+    }
+    let mut furthest = 0;
+    for (index, (track, end)) in tracks.iter_mut().zip(ends).enumerate() {
+        furthest = furthest.max(end);
+        if track.collapsible && index >= furthest {
+            track.collapsed = true;
+        }
+    }
+}
+
 /// Parse one track-size token into its §11.2 (min, max) pair.
 fn parse_track_size(tok: &str, u: Units, vp: Vp) -> Option<TrackSize> {
     let t = tok.trim();
@@ -515,23 +538,63 @@ fn resolve_axis(
     }
 }
 
-/// The dynamic occupancy grid for §8.5 (rows grow as needed).
+/// CSS Grid 2 #overlarge-grids permits a UA limit and recommends supporting
+/// line indices through 10,000. Bound automatic placement in each axis, then
+/// clamp areas that would cross or fall outside that limit.
+const MAX_PLACEMENT_TRACKS: usize = 10_000;
+
+/// The dynamic occupancy grid for §8.5 (rows grow as needed). A bit per cell
+/// keeps even the maximum 10,000 × 10,000 grid at about 12.5 MB.
 struct Occ {
     cols: usize,
-    rows: Vec<Vec<bool>>,
+    rows: Vec<Vec<u64>>,
 }
 
 impl Occ {
+    fn word_mask(c: usize, end: usize, word_index: usize) -> u64 {
+        let lo = c.saturating_sub(word_index * 64);
+        let hi = (end - word_index * 64).min(64);
+        (u64::MAX >> (64 - (hi - lo))) << lo
+    }
+
+    fn ensure_cols(&mut self, cols: usize) {
+        if cols > self.cols {
+            let words = cols.div_ceil(u64::BITS as usize);
+            for row in &mut self.rows {
+                row.resize(words, 0);
+            }
+            self.cols = cols;
+        }
+    }
+
+    /// The furthest occupied cell in the candidate, plus one. Every candidate
+    /// beginning before this point still overlaps that cell, so a row-locked
+    /// search can skip it without changing the first available placement.
+    fn conflict_end(&self, r: usize, c: usize, rs: usize, cs: usize) -> Option<usize> {
+        let mut next = None;
+        let end = c + cs;
+        for row in self.rows.iter().skip(r).take(rs) {
+            for (word_index, word) in row.iter().enumerate().take(end.div_ceil(64)).skip(c / 64) {
+                let hits = word & Self::word_mask(c, end, word_index);
+                if hits != 0 {
+                    let last = word_index * 64 + (63 - hits.leading_zeros() as usize);
+                    next = Some(next.map_or(last + 1, |old: usize| old.max(last + 1)));
+                }
+            }
+        }
+        next
+    }
+
     fn free(&self, r: usize, c: usize, rs: usize, cs: usize) -> bool {
         if c + cs > self.cols {
             return false;
         }
-        for rr in r..r + rs {
-            let Some(row) = self.rows.get(rr) else {
-                continue; // beyond current rows: empty
-            };
-            if row[c..(c + cs).min(self.cols)].iter().any(|&b| b) {
-                return false;
+        let end = c + cs;
+        for row in self.rows.iter().skip(r).take(rs) {
+            for (word_index, word) in row.iter().enumerate().take(end.div_ceil(64)).skip(c / 64) {
+                if word & Self::word_mask(c, end, word_index) != 0 {
+                    return false;
+                }
             }
         }
         true
@@ -539,11 +602,17 @@ impl Occ {
 
     fn mark(&mut self, r: usize, c: usize, rs: usize, cs: usize) {
         while self.rows.len() < r + rs {
-            self.rows.push(vec![false; self.cols]);
+            self.rows.push(vec![0; self.cols.div_ceil(64)]);
         }
-        for rr in r..r + rs {
-            for cell in self.rows[rr][c..(c + cs).min(self.cols)].iter_mut() {
-                *cell = true;
+        let end = (c + cs).min(self.cols);
+        for row in &mut self.rows[r..r + rs] {
+            for (word_index, word) in row
+                .iter_mut()
+                .enumerate()
+                .take(end.div_ceil(64))
+                .skip(c / 64)
+            {
+                *word |= Self::word_mask(c, end, word_index);
             }
         }
     }
@@ -570,8 +639,23 @@ fn auto_place(
             std::mem::swap(c, r);
         }
     }
+    for (c, r) in &mut items {
+        for axis in [c, r] {
+            axis.span = axis.span.clamp(1, MAX_PLACEMENT_TRACKS);
+            if let Some(start) = axis.start {
+                let start = start.max(0) as usize;
+                if start >= MAX_PLACEMENT_TRACKS {
+                    axis.start = Some((MAX_PLACEMENT_TRACKS - 1) as i32);
+                    axis.span = 1;
+                } else {
+                    axis.span = axis.span.min(MAX_PLACEMENT_TRACKS - start);
+                    axis.start = Some(start as i32);
+                }
+            }
+        }
+    }
     // Step 3: the implicit grid's column count.
-    let mut cols = explicit_cols.max(1);
+    let mut cols = explicit_cols.clamp(1, MAX_PLACEMENT_TRACKS);
     for (c, _) in &items {
         if let Some(s) = c.start.map(|n| n as usize) {
             cols = cols.max(s + c.span);
@@ -607,19 +691,26 @@ fn auto_place(
             *row_cursor.get(&rs).unwrap_or(&0)
         };
         let mut cc = from;
-        while !occ.free(rs, cc, r.span, c.span) {
-            cc += 1;
-            if cc + c.span > occ.cols {
-                // No room in the row: overlap is not allowed here; grow
-                // columns only for span overflow (kept within the row).
-                cc = occ.cols.saturating_sub(c.span);
-                break;
+        let (cs, span) = loop {
+            if cc >= MAX_PLACEMENT_TRACKS {
+                // The area lies wholly outside the limited grid: clamp it to
+                // its last track, even if that necessarily overlaps an item.
+                break (MAX_PLACEMENT_TRACKS - 1, 1);
             }
-        }
-        occ.mark(rs, cc, r.span, c.span);
-        row_cursor.insert(rs, cc + c.span);
+            let span = c.span.min(MAX_PLACEMENT_TRACKS - cc);
+            // Grid 2 #auto-placement-algo: row-locked items create implicit
+            // columns as needed, before the remaining items are positioned.
+            occ.ensure_cols(cc + span);
+            if let Some(next) = occ.conflict_end(rs, cc, r.span, span) {
+                cc = next;
+            } else {
+                break (cc, span);
+            }
+        };
+        occ.mark(rs, cs, r.span, span);
+        row_cursor.insert(rs, cs + span);
         out[i] = Some(Placed {
-            cols: cc..cc + c.span,
+            cols: cs..cs + span,
             rows: rs..rs + r.span,
         });
     }
@@ -633,7 +724,7 @@ fn auto_place(
             cur_r = 0;
             cur_c = 0;
         }
-        let (rs, cs) = if let Some(cs) = c.start.map(|n| n as usize) {
+        let (rs, cs, row_span) = if let Some(cs) = c.start.map(|n| n as usize) {
             // Definite column: walk rows at that column.
             if dense {
                 cur_r = 0;
@@ -641,15 +732,25 @@ fn auto_place(
                 cur_r += 1;
             }
             let mut rr = cur_r;
-            while !occ.free(rr, cs, r.span, c.span) {
+            while rr < MAX_PLACEMENT_TRACKS
+                && !occ.free(rr, cs, r.span.min(MAX_PLACEMENT_TRACKS - rr), c.span)
+            {
                 rr += 1;
             }
-            (rr, cs)
+            if rr == MAX_PLACEMENT_TRACKS {
+                (MAX_PLACEMENT_TRACKS - 1, cs, 1)
+            } else {
+                (rr, cs, r.span.min(MAX_PLACEMENT_TRACKS - rr))
+            }
         } else {
             // Fully auto: scan columns, overflow to the next row.
             loop {
-                if cur_c + c.span <= occ.cols && occ.free(cur_r, cur_c, r.span, c.span) {
-                    break (cur_r, cur_c);
+                if cur_r >= MAX_PLACEMENT_TRACKS {
+                    break (MAX_PLACEMENT_TRACKS - 1, 0, 1);
+                }
+                let span = r.span.min(MAX_PLACEMENT_TRACKS - cur_r);
+                if cur_c + c.span <= occ.cols && occ.free(cur_r, cur_c, span, c.span) {
+                    break (cur_r, cur_c, span);
                 }
                 if cur_c + c.span >= occ.cols {
                     cur_r += 1;
@@ -659,12 +760,12 @@ fn auto_place(
                 }
             }
         };
-        occ.mark(rs, cs, r.span, c.span);
+        occ.mark(rs, cs, row_span, c.span);
         cur_r = rs;
         cur_c = cs; // sparse flow continues from here
         out[i] = Some(Placed {
             cols: cs..cs + c.span,
-            rows: rs..rs + r.span,
+            rows: rs..rs + row_span,
         });
     }
     let mut placed: Vec<Placed> = out.into_iter().map(Option::unwrap).collect();
@@ -1142,24 +1243,17 @@ fn size_tracks_constrained(
             .iter()
             .any(|t| matches!(t.size.max, TrackFn::Fr(_)))
     };
-    let mut spans: Vec<usize> = items
-        .iter()
-        .filter(|c| !crosses_fr(&c.tracks, tracks))
-        .map(|c| c.tracks.len())
-        .collect();
-    spans.sort_unstable();
-    spans.dedup();
-    for span in spans {
-        let group: Vec<&Contrib> = items
-            .iter()
-            .filter(|c| c.tracks.len() == span && !crosses_fr(&c.tracks, tracks))
-            .collect();
-        if group.is_empty() {
-            continue;
-        }
+    let (mut non_flexible, fr_items): (Vec<&Contrib>, Vec<&Contrib>) =
+        items.iter().partition(|c| !crosses_fr(&c.tracks, tracks));
+    // Keep the original order within each span. In addition to respecting the
+    // algorithm's span order, this avoids rescanning all contributions (and
+    // their tracks) once for each distinct span.
+    non_flexible.sort_by_key(|c| c.tracks.len());
+    for group in non_flexible.chunk_by(|a, b| a.tracks.len() == b.tracks.len()) {
+        let span = group[0].tracks.len();
         if span == 1 {
             // "Size tracks to fit non-spanning items."
-            for c in &group {
+            for c in group {
                 let ti = c.tracks.start;
                 let t = &mut tracks[ti];
                 if t.collapsed {
@@ -1204,8 +1298,8 @@ fn size_tracks_constrained(
             continue;
         }
         // Spanning items (§11.5 steps 3+, with §11.5.1 distribution).
-        distribute_group(tracks, &group, span_gaps, false);
-        distribute_group(tracks, &group, span_gaps, true);
+        distribute_group(tracks, group, span_gaps, false);
+        distribute_group(tracks, group, span_gaps, true);
     }
     // Flexible-track spanners (§11.5, step 4): distribute the item's minimum
     // contribution to the spanned flexible tracks by flex-factor ratio (all
@@ -1217,10 +1311,6 @@ fn size_tracks_constrained(
     // own `max-width` shrink it to fit. Bare `1fr` = `minmax(auto, 1fr)` can
     // instead grow to an explicit item minimum. A multi-track flexible span
     // has a zero automatic item minimum (§6.6), not its min-content size.
-    let fr_items: Vec<&Contrib> = items
-        .iter()
-        .filter(|c| crosses_fr(&c.tracks, tracks))
-        .collect();
     for phase in 0..3 {
         let growable = |t: &Track| {
             matches!(t.size.max, TrackFn::Fr(_))
@@ -2014,19 +2104,11 @@ impl Flow<'_> {
         }
 
         // auto-fit: collapse repetition tracks no item spans (§7.2.3.2).
-        for (ci, t) in cols.iter_mut().enumerate() {
-            if inherited_columns.is_none()
-                && t.collapsible
-                && !placed.iter().any(|p| p.cols.contains(&ci))
-            {
-                t.collapsed = true;
-            }
+        if inherited_columns.is_none() {
+            collapse_empty_auto_fit(&mut cols, placed.iter().map(|p| p.cols.clone()));
         }
-        for (ri, t) in rows.iter_mut().enumerate() {
-            if inherited.is_none() && t.collapsible && !placed.iter().any(|p| p.rows.contains(&ri))
-            {
-                t.collapsed = true;
-            }
+        if inherited.is_none() {
+            collapse_empty_auto_fit(&mut rows, placed.iter().map(|p| p.rows.clone()));
         }
 
         GridSetup {
@@ -3036,6 +3118,75 @@ mod tests {
     use crate::layout2::Units;
 
     #[test]
+    fn auto_fit_collapses_only_empty_repetitions_across_item_ranges() {
+        // CSS Grid 2 #auto-repeat: overlapping and spanning in-flow items keep
+        // every crossed repetition, but gaps (and only repeated gaps) collapse.
+        let mut tracks = tpl("repeat(auto-fit, 100px)", 1000.0, 0.0);
+        tracks[4].collapsible = false;
+        collapse_empty_auto_fit(&mut tracks, [8..10, 2..6, 1..3, 7..7, 12..14].into_iter());
+        assert_eq!(
+            tracks
+                .iter()
+                .map(|track| track.collapsed)
+                .collect::<Vec<_>>(),
+            [
+                true, false, false, false, false, false, true, true, false, false
+            ]
+        );
+        let mut empty = tpl("repeat(auto-fit, 100px)", 300.0, 0.0);
+        empty[1].collapsible = false;
+        collapse_empty_auto_fit(&mut empty, std::iter::empty());
+        assert_eq!(
+            empty
+                .iter()
+                .map(|track| track.collapsed)
+                .collect::<Vec<_>>(),
+            [true, false, true]
+        );
+    }
+
+    #[test]
+    fn auto_fit_track_geometry_keeps_spans_but_ignores_absolute_items() {
+        let (dom, layout) = measured_grid(
+            "<!doctype html><style>
+             body{margin:0}#grid{position:relative;display:grid;width:400px;
+                 grid-template-columns:20px repeat(auto-fit,50px) 20px}
+             </style><div id=grid>
+             <div style='grid-column:3/5'></div><div style='grid-column:7/9'></div>
+             <div style='position:absolute;grid-column:5/6'></div></div>",
+        );
+        let columns = &layout.grid_tracks[&dom.get_by_id("grid").unwrap()].0;
+        assert_eq!(columns, &[20., 0., 50., 50., 0., 0., 50., 50., 20.]);
+    }
+
+    #[test]
+    fn intrinsic_grid_contributions_use_prior_spans_and_flexible_tracks_last() {
+        // #algo-spanning-items: both span-2 items see the same span-1 sizes;
+        // span-3 sees their combined result. Flexible-track items are separate.
+        let mut tracks = tpl("auto auto auto 1fr", 300.0, 0.0);
+        let item = |tracks, size| Contrib {
+            tracks,
+            minimum: size,
+            min: size,
+            max: size,
+        };
+        let items = [
+            item(0..3, 200.0),
+            item(1..4, 210.0),
+            item(0..2, 100.0),
+            item(0..1, 20.0),
+            item(1..3, 100.0),
+            item(1..2, 40.0),
+            item(2..3, 20.0),
+        ];
+        size_tracks(&mut tracks, &items, Some(300.0), 0.0, false);
+        let widths = tracks.iter().map(|track| track.base).collect::<Vec<_>>();
+        for (actual, expected) in widths.iter().zip([60.0, 80.0, 60.0, 100.0]) {
+            assert!((actual - expected).abs() < 0.01, "{widths:?}");
+        }
+    }
+
+    #[test]
     fn indefinite_flexible_tracks_use_spanning_max_content() {
         let u = Units {
             fs: 16.0,
@@ -4023,6 +4174,269 @@ mod tests {
             placed[2].rows,
             0..1,
             "dense fills the gap before the wide item"
+        );
+    }
+
+    #[test]
+    fn locked_axis_auto_placement_grows_implicit_tracks_without_overlap() {
+        // Grid 2 #auto-placement-algo steps 2–3: locked-row items make
+        // additional columns before the fully auto-positioned item is placed.
+        // Column flow exchanges the two axes and must do the same for rows.
+        let auto = AxisPlace {
+            start: None,
+            span: 1,
+        };
+        let two = AxisPlace {
+            start: None,
+            span: 2,
+        };
+        let locked = AxisPlace {
+            start: Some(0),
+            span: 1,
+        };
+        for (row_flow, dense) in [(true, false), (true, true), (false, false), (false, true)] {
+            let pair = |minor, major| {
+                if row_flow {
+                    (minor, major)
+                } else {
+                    (major, minor)
+                }
+            };
+            let items = vec![
+                pair(two, locked),
+                pair(auto, locked),
+                pair(auto, locked),
+                pair(auto, auto),
+            ];
+            let placed = auto_place(items, 2, row_flow, dense);
+            let axes = |p: &Placed| {
+                if row_flow {
+                    (p.cols.clone(), p.rows.clone())
+                } else {
+                    (p.rows.clone(), p.cols.clone())
+                }
+            };
+            assert_eq!(axes(&placed[0]), (0..2, 0..1));
+            assert_eq!(axes(&placed[1]), (2..3, 0..1));
+            assert_eq!(axes(&placed[2]), (3..4, 0..1));
+            assert_eq!(axes(&placed[3]), (0..1, 1..2));
+        }
+    }
+
+    #[test]
+    fn locked_axis_dense_placement_fills_holes_after_implicit_growth() {
+        let auto = AxisPlace {
+            start: None,
+            span: 1,
+        };
+        let two = AxisPlace {
+            start: None,
+            span: 2,
+        };
+        let locked = AxisPlace {
+            start: Some(0),
+            span: 1,
+        };
+        let fixed = AxisPlace {
+            start: Some(1),
+            span: 1,
+        };
+        for row_flow in [true, false] {
+            let pair = |minor, major| {
+                if row_flow {
+                    (minor, major)
+                } else {
+                    (major, minor)
+                }
+            };
+            // A definite item occupies track 1. The two-track item goes to
+            // tracks 2–3; the following single-track item fills track 0 only
+            // under dense packing, and goes to track 4 under sparse packing.
+            let items = vec![pair(fixed, locked), pair(two, locked), pair(auto, locked)];
+            for (dense, expected) in [(true, 0..1), (false, 4..5)] {
+                let placed = auto_place(items.clone(), 2, row_flow, dense);
+                let minor = |p: &Placed| {
+                    if row_flow {
+                        p.cols.clone()
+                    } else {
+                        p.rows.clone()
+                    }
+                };
+                assert_eq!(minor(&placed[1]), 2..4);
+                assert_eq!(minor(&placed[2]), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn locked_axis_implicit_tracks_position_boxes_in_both_flow_directions() {
+        for row_flow in [true, false] {
+            let (grid_style, locked, span) = if row_flow {
+                (
+                    "width:80px;grid-template-columns:20px 20px;grid-auto-columns:20px;grid-auto-rows:10px",
+                    "grid-row:1",
+                    "grid-column:span 2",
+                )
+            } else {
+                (
+                    "width:20px;height:80px;grid-auto-flow:column;grid-template-rows:20px 20px;grid-auto-rows:20px;grid-auto-columns:10px",
+                    "grid-column:1",
+                    "grid-row:span 2",
+                )
+            };
+            let (dom, layout) = measured_grid(&format!(
+                "<!doctype html><style>body{{margin:0}}#grid{{display:grid;{grid_style}}}</style>
+                 <div id=grid><div id=a style='{locked};{span}'></div>
+                 <div id=b style='{locked}'></div><div id=c style='{locked}'></div>
+                 <div id=d></div></div>"
+            ));
+            let point = |id| {
+                let b = layout.boxes[&dom.get_by_id(id).unwrap()];
+                if row_flow {
+                    (b.left, b.top)
+                } else {
+                    (b.top, b.left)
+                }
+            };
+            assert_eq!(point("a"), (0.0, 0.0));
+            assert_eq!(point("b"), (40.0, 0.0));
+            assert_eq!(point("c"), (60.0, 0.0));
+            assert_eq!(point("d"), (0.0, 10.0));
+        }
+    }
+
+    #[test]
+    fn grid_placement_limit_bounds_implicit_growth_in_both_directions() {
+        let auto = AxisPlace {
+            start: None,
+            span: 1000,
+        };
+        let far = AxisPlace {
+            start: Some((MAX_PLACEMENT_TRACKS - 1) as i32),
+            span: 1,
+        };
+        let first = AxisPlace {
+            start: Some(0),
+            span: 1,
+        };
+        for row_flow in [true, false] {
+            let pair = |minor, major| {
+                if row_flow {
+                    (minor, major)
+                } else {
+                    (major, minor)
+                }
+            };
+            // Force allocation through the last row before repeatedly growing
+            // columns. Both axes stay within the same UA limit.
+            let mut items = vec![pair(first, far)];
+            items.extend(std::iter::repeat_n(pair(auto, far), 12));
+            let placed = auto_place(items, 1, row_flow, false);
+            let minor = |p: &Placed| {
+                if row_flow {
+                    p.cols.clone()
+                } else {
+                    p.rows.clone()
+                }
+            };
+            let major = |p: &Placed| {
+                if row_flow {
+                    p.rows.clone()
+                } else {
+                    p.cols.clone()
+                }
+            };
+            assert_eq!(minor(&placed[1]), 1..1001);
+            assert_eq!(minor(&placed[10]), 9001..MAX_PLACEMENT_TRACKS);
+            assert_eq!(
+                minor(&placed[11]),
+                MAX_PLACEMENT_TRACKS - 1..MAX_PLACEMENT_TRACKS
+            );
+            assert!(placed.iter().all(|p| minor(p).end <= MAX_PLACEMENT_TRACKS));
+            assert!(
+                placed
+                    .iter()
+                    .all(|p| major(p) == (MAX_PLACEMENT_TRACKS - 1..MAX_PLACEMENT_TRACKS))
+            );
+        }
+    }
+
+    #[test]
+    fn grid_placement_limit_clamps_saturated_rows_and_outside_areas() {
+        let fixed = AxisPlace {
+            start: Some(0),
+            span: 1,
+        };
+        let whole = AxisPlace {
+            start: Some(0),
+            span: MAX_PLACEMENT_TRACKS,
+        };
+        let auto = AxisPlace {
+            start: None,
+            span: 2,
+        };
+        let outside = AxisPlace {
+            start: Some(MAX_PLACEMENT_TRACKS as i32 + 5),
+            span: 10,
+        };
+        for row_flow in [true, false] {
+            let pair = |minor, major| {
+                if row_flow {
+                    (minor, major)
+                } else {
+                    (major, minor)
+                }
+            };
+            let placed = auto_place(
+                vec![pair(fixed, whole), pair(fixed, auto), pair(fixed, outside)],
+                1,
+                row_flow,
+                false,
+            );
+            let major = |p: &Placed| {
+                if row_flow {
+                    p.rows.clone()
+                } else {
+                    p.cols.clone()
+                }
+            };
+            assert_eq!(
+                major(&placed[1]),
+                MAX_PLACEMENT_TRACKS - 1..MAX_PLACEMENT_TRACKS
+            );
+            assert_eq!(
+                major(&placed[2]),
+                MAX_PLACEMENT_TRACKS - 1..MAX_PLACEMENT_TRACKS
+            );
+        }
+    }
+
+    #[test]
+    fn grid_placement_limit_keeps_bits_across_word_and_column_growth() {
+        let mut occ = Occ {
+            cols: 1,
+            rows: Vec::new(),
+        };
+        occ.mark(0, 0, 1, 1);
+        occ.ensure_cols(130);
+        occ.mark(1, 63, 1, 2);
+        assert!(!occ.free(0, 0, 1, 1));
+        assert!(occ.free(0, 1, 1, 129));
+        assert!(!occ.free(1, 62, 1, 4));
+        assert_eq!(occ.conflict_end(1, 62, 1, 4), Some(65));
+        assert!(occ.free(1, 65, 1, 65));
+        assert_eq!(occ.rows.iter().map(Vec::len).sum::<usize>(), 6);
+
+        let mut maximum = Occ {
+            cols: 1,
+            rows: Vec::new(),
+        };
+        maximum.mark(MAX_PLACEMENT_TRACKS - 1, 0, 1, 1);
+        maximum.ensure_cols(MAX_PLACEMENT_TRACKS);
+        assert_eq!(maximum.rows.len(), MAX_PLACEMENT_TRACKS);
+        assert_eq!(
+            maximum.rows.iter().map(Vec::len).sum::<usize>(),
+            MAX_PLACEMENT_TRACKS * MAX_PLACEMENT_TRACKS.div_ceil(64)
         );
     }
 

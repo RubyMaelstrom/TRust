@@ -25,14 +25,49 @@ const DRAG_THRESHOLD: f32 = 4.0;
 pub(super) struct StripUi {
     pub(super) scroll: f32,
     pub(super) hovered: Option<TabStripPart>,
-    /// The part a press began on, and its button; its release acts on it.
-    pressed: Option<(TabStripPart, MouseButton)>,
+    /// The part a press began on, its button, and its tab's stable identity.
+    pressed: Option<StripPress>,
     drag: Option<TabDrag>,
     last_empty_press: Option<Instant>,
     /// Scroll the shown tab into view at the next paint.
     pub(super) reveal_active: bool,
     /// The edge under the pointer that resizes the window.
     edge: Option<ResizeDirection>,
+}
+
+#[derive(Clone, Copy)]
+struct StripPress {
+    part: TabStripPart,
+    button: MouseButton,
+    tab: Option<TabId>,
+}
+
+impl StripPress {
+    fn new(part: TabStripPart, button: MouseButton, order: &[TabId]) -> Self {
+        let tab = match part {
+            TabStripPart::Tab(index)
+            | TabStripPart::CloseTab(index)
+            | TabStripPart::Sound(index) => order.get(index).copied(),
+            _ => None,
+        };
+        Self { part, button, tab }
+    }
+
+    /// The strip can change asynchronously while a button is held. A tab
+    /// now occupying the old slot must not receive the original click.
+    fn matches_release(self, part: Option<TabStripPart>, order: &[TabId]) -> bool {
+        if part != Some(self.part) {
+            return false;
+        }
+        match self.part {
+            TabStripPart::Tab(index)
+            | TabStripPart::CloseTab(index)
+            | TabStripPart::Sound(index) => {
+                self.tab.is_some() && order.get(index).copied() == self.tab
+            }
+            _ => true,
+        }
+    }
 }
 
 /// A tab the pointer pressed, and how far it has been dragged.
@@ -78,7 +113,11 @@ impl DesktopWindow {
         let state = TabStripState {
             active,
             hovered: self.strip.hovered,
-            pressed: self.strip.pressed.map(|(part, _)| part),
+            pressed: self
+                .strip
+                .pressed
+                .filter(|press| press.matches_release(Some(press.part), &self.tabs.order))
+                .map(|press| press.part),
             maximized: self.window_maximized(),
             window_focused: self.window_focused,
             pulse: self
@@ -291,14 +330,14 @@ impl DesktopWindow {
                         moved: false,
                     });
                 }
-                self.strip.pressed = Some((part, button));
+                self.strip.pressed = Some(StripPress::new(part, button, &self.tabs.order));
             }
             (TabStripPart::ScrollBack | TabStripPart::ScrollForward, MouseButton::Left) => {
                 self.strip.scroll = self.strip_geometry().step(part == TabStripPart::ScrollBack);
-                self.strip.pressed = Some((part, button));
+                self.strip.pressed = Some(StripPress::new(part, button, &self.tabs.order));
             }
             (_, MouseButton::Left | MouseButton::Middle) => {
-                self.strip.pressed = Some((part, button));
+                self.strip.pressed = Some(StripPress::new(part, button, &self.tabs.order));
             }
             _ => {}
         }
@@ -308,23 +347,25 @@ impl DesktopWindow {
     }
 
     fn release_strip_press(&mut self, button: MouseButton, point: CssPoint) -> bool {
-        let Some((part, pressed_button)) = self.strip.pressed else {
+        let Some(press) = self.strip.pressed else {
             return false;
         };
-        if pressed_button != button {
+        if press.button != button {
             return true;
         }
         self.strip.pressed = None;
         let drag = self.strip.drag.take();
-        self.request_redraw();
+        self.request_strip_redraw();
         if drag.is_some_and(|drag| drag.moved) {
+            // The strip order is also the accessibility tree's child order.
+            self.update_accessibility(false);
             return true;
         }
         let released_on = self.strip_geometry().part_at(point);
-        if released_on != Some(part) {
+        if !press.matches_release(released_on, &self.tabs.order) {
             return true;
         }
-        match (part, button) {
+        match (press.part, button) {
             (
                 TabStripPart::CloseTab(index)
                 | TabStripPart::Tab(index)
@@ -613,5 +654,31 @@ pub(super) fn tab_strip_access_nodes(
         button.add_action(AccessAction::Click);
         nodes.push((id, button));
         children.push(id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_press_keeps_the_identity_of_its_tab() {
+        let a = TabId(1);
+        let b = TabId(2);
+        let original = [a, b];
+        for part in [
+            TabStripPart::Tab(0),
+            TabStripPart::CloseTab(0),
+            TabStripPart::Sound(0),
+        ] {
+            let press = StripPress::new(part, MouseButton::Left, &original);
+            assert!(press.matches_release(Some(part), &original));
+            assert!(!press.matches_release(Some(part), &[b, a]));
+            assert!(!press.matches_release(Some(part), &[b]));
+            assert!(!press.matches_release(None, &original));
+        }
+        let new_tab = StripPress::new(TabStripPart::NewTab, MouseButton::Left, &original);
+        assert!(new_tab.matches_release(Some(TabStripPart::NewTab), &[b, a]));
+        assert!(!new_tab.matches_release(Some(TabStripPart::Close), &original));
     }
 }

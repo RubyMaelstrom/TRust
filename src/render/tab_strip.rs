@@ -6,6 +6,7 @@
 //! of it reaches a page's DOM or layout.
 
 use super::*;
+use std::collections::VecDeque;
 
 /// The strip's height: the system title bar it replaces. labwc's themes size
 /// theirs to the window button height (26 px by default); Windows draws a

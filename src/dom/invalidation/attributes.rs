@@ -286,6 +286,9 @@ pub(super) struct Dependencies {
     /// A validity pseudo-class or `:default` occurs: changes that move a
     /// control between form owners or radio groups take the fallback.
     form_state: bool,
+    /// `:indeterminate` reads radio-group checkedness, so a radio's name
+    /// change can affect other group members outside the compiled routes.
+    indeterminate_group: bool,
     /// The rule being recorded (its data's address), for `HostScope` steps.
     rule: usize,
 }
@@ -394,8 +397,10 @@ impl Dependencies {
         }];
         let path = if compound.host { &host_scope[..] } else { path };
         // `:host:has()` reads the shadow tree as the host's children, which
-        // the reverse light-tree axes below cannot climb back out of.
-        let broad = broad || (compound.host && !compound.has.is_empty());
+        // the reverse light-tree axes below cannot climb back out of. This
+        // also applies when :is/:where exposes the host in the compound.
+        let broad =
+            broad || (!compound.has.is_empty() && (compound.host || compound.allows_shadow_host()));
         let mut guard = Step::compound(Axis::SelfOnly, compound);
         if !compound.host {
             guard.ancestors = ancestors;
@@ -537,7 +542,10 @@ impl Dependencies {
                 StatePseudo::Indeterminate => {
                     // Radio form/name associations can cross subtrees. Keep
                     // this explicit until the form-owner graph owns this edge.
-                    for name in ["checked", "name", "type", "value", "form", "id"] {
+                    // A nonradio input's name cannot change a radio group;
+                    // authored [name] selectors still have their own routes.
+                    self.indeterminate_group = true;
+                    for name in ["checked", "type", "value", "form", "id"] {
                         self.add(name, false, &None, &[], true);
                     }
                     continue;
@@ -651,8 +659,28 @@ impl Dependencies {
         old_class: Option<&str>,
     ) -> Option<Vec<NodeId>> {
         let name = name.to_ascii_lowercase();
+        if name == "name" && trace_large_invalidation() {
+            static EVENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            if EVENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 128 {
+                eprintln!(
+                    "DIAGINVALID name-dependency node={node} tag={:?} input_type={:?} overflow={} broad={} routes={} steps={} form_state={} indeterminate={}",
+                    dom.tag_name(node),
+                    (dom.tag_name(node) == Some("input")).then(|| dom.input_type(node)),
+                    self.overflow,
+                    self.broad.contains(&name),
+                    self.routes,
+                    self.steps,
+                    self.form_state,
+                    self.indeterminate_group,
+                );
+            }
+        }
         if self.overflow
             || self.broad.contains(&name)
+            || (self.indeterminate_group
+                && name == "name"
+                && dom.tag_name(node) == Some("input")
+                && dom.input_type(node) == "radio")
             || (self.direction
                 && ((name == "value" && dom.text_may_change_direction(node))
                     || (name == "type" && dom.tag_name(node) == Some("input"))))
@@ -661,8 +689,9 @@ impl Dependencies {
             || (self.form_state
                 && (name == "form"
                     || (name == "id" && dom.tag_name(node) == Some("form"))
-                    || (matches!(name.as_str(), "name" | "type")
-                        && dom.tag_name(node) == Some("input"))))
+                    || (dom.tag_name(node) == Some("input")
+                        && (name == "type"
+                            || (name == "name" && dom.input_type(node) == "radio")))))
         {
             return None;
         }

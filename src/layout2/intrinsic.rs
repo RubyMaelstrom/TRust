@@ -19,7 +19,7 @@
 use crate::layout2::{NO_NODE, Units};
 
 use super::flow::Flow;
-use super::inline::{AtomBoxSize, Ifc, media_label, media_source};
+use super::inline::{AtomBoxSize, Ifc, compressible_control, media_label, media_source};
 use super::style::{Align2, InlineStyle};
 use super::tree::{AtomKind, BoxNode, Content};
 use super::value::Len;
@@ -415,25 +415,14 @@ impl Flow<'_> {
             && (matches!(self.dom.tag_name(b.node), Some("iframe" | "frame"))
                 || super::tree::embedded_representation(self.dom, b.node)
                     == Some(super::tree::Embedded::Replaced));
-        // CSS Sizing 3 #min-content-zero: non-button-like inputs, select,
-        // textarea, progress and meter compress like replaced elements.
-        let compressible_control = |atom: &super::tree::Atom| {
-            matches!(&atom.kind, AtomKind::Control { .. })
-                && match self.dom.tag_name(atom.node) {
-                    Some("input") => !matches!(
-                        self.dom.input_type(atom.node).as_str(),
-                        "button" | "reset" | "submit" | "color" | "image"
-                    ),
-                    Some(tag) => matches!(tag, "select" | "textarea" | "progress" | "meter"),
-                    None => false,
-                }
-        };
         let compressible_min = mode == IMode::Min
             && (frame
                 || matches!(
                     &b.content,
                     Content::Atomic(atom)
-                        if matches!(&atom.kind, AtomKind::Img { .. }) || compressible_control(atom)
+                        if matches!(&atom.kind, AtomKind::Img { .. })
+                            || matches!(&atom.kind, AtomKind::Control { .. })
+                                && compressible_control(self.dom, atom.node)
                 ));
         let preferred_basis = compressible_min.then_some(0.0);
         let bp = s.border[super::style::LEFT]

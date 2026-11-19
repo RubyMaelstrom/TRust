@@ -1,0 +1,79 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Desktop rendering review</title>
+<style>
+  body { margin:24px; font:16px/1.5 sans-serif; color:#17324a; background:#edf3f8 }
+  h1 { margin:0 0 16px; font-size:24px }
+  main { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px }
+  section { padding:12px; background:white; border:1px solid #a5b8c8 }
+  h2 { margin:0 0 8px; font-size:18px }
+  .locked { display:grid; width:320px; grid-template-columns:80px 80px; grid-auto-columns:80px }
+  .locked > div { grid-row:1; height:40px; background:#bfe9df }
+  .locked > div:nth-child(even) { background:#bad7f3 }
+  .fit { display:grid; width:400px; grid-template-columns:repeat(auto-fit,50px); gap:0 }
+  .fit > div { height:30px; background:#edcc85 }
+  .fit > div:first-child { grid-column:2 / 4 }
+  .fit > div:last-child { grid-column:6 / 8 }
+  table { width:400px; border-collapse:collapse }
+  td { border:1px solid #7d94aa; padding:5px }
+  .clip { overflow:hidden; width:210px; height:90px }
+  canvas { transform:translate(12px,4px); width:180px; height:80px }
+  .pulse { width:120px; padding:4px; background:#d5e8ff; animation:slide .6s linear forwards }
+  @keyframes slide { from { transform:translateX(0) } to { transform:translateX(40px) } }
+  #result { white-space:pre-wrap; padding:12px; background:#d9eee2 }
+</style>
+<h1>Desktop rendering review</h1>
+<main>
+<section>
+  <h2>Row-locked items create implicit columns</h2>
+  <div class="locked" id="locked"><div>A</div><div>B</div><div>C</div><div>D</div></div>
+</section>
+<section>
+  <h2>Auto-fit retains occupied spans</h2>
+  <div class="fit" id="fit"><div>Span one</div><div>Span two</div></div>
+</section>
+<section>
+  <h2>Table widths and spanning cells</h2>
+  <table><tr><td style="width:100px">Fixed</td><td>Content width</td><td>Third</td></tr>
+    <tr><td colspan="2">Spanning cell preserves the column geometry</td><td>Last</td></tr></table>
+</section>
+<section>
+  <h2>Clipped canvas updates and a finite CSS animation</h2>
+  <div class="clip"><canvas id="canvas" width="180" height="80"></canvas></div>
+  <div class="pulse">Animation ends</div>
+</section>
+</main>
+<pre id="result">Running…</pre>
+<script>
+  // CSS Grid 2 #auto-placement-algo and #auto-repeat; local CSSWG snapshot
+  // 81c27f686901. HTML canvas paints its current output bitmap.
+  try {
+    const near = (a, b) => Math.abs(a - b) < .1;
+    const boxes = document.getElementById('locked').children;
+    const first = boxes[0].getBoundingClientRect();
+    for (let i = 0; i < boxes.length; ++i) {
+      const box = boxes[i].getBoundingClientRect();
+      if (!near(box.x - first.x, i * 80) || !near(box.y, first.y))
+        throw Error('Implicit column placement: item ' + i);
+    }
+    const spans = document.getElementById('fit').children;
+    if (!near(spans[0].getBoundingClientRect().width, 100) ||
+        !near(spans[1].getBoundingClientRect().width, 100))
+      throw Error('Occupied auto-fit spans collapsed');
+    const ctx = document.getElementById('canvas').getContext('2d');
+    let frames = 0;
+    const timer = setInterval(() => {
+      ctx.fillStyle = ++frames === 4 ? '#16765b' : '#355f9d';
+      ctx.fillRect(0, 0, 180, 80);
+      ctx.fillStyle = 'white';
+      ctx.font = '16px sans-serif';
+      ctx.fillText('Canvas update ' + frames, 12, 44);
+      if (frames === 4) {
+        clearInterval(timer);
+        document.getElementById('result').textContent = 'DESKTOP_REVIEW_OK';
+      }
+    }, 100);
+  } catch (error) {
+    document.getElementById('result').textContent = 'DESKTOP_REVIEW_FAILED: ' + error.message;
+  }
+</script>

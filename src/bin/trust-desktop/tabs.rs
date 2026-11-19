@@ -45,9 +45,8 @@ pub(super) struct Tab {
     pub(super) page_layout: Option<PageLayoutCache>,
     pub(super) protocol_page: Option<ProtocolPageCache>,
     pub(super) image_sizes: trust::layout2::ImageSizes,
-    /// Number of decoded intrinsic sizes successfully queued to the resident
-    /// page actor. `try_send` can legitimately find the command queue full;
-    /// retain the unsent map and retry from the native draw/event loop.
+    /// Number of decoded intrinsic sizes accepted by the controller's bounded
+    /// actor-command queue; the controller waits for transport capacity.
     pub(super) image_sizes_sent: usize,
     pub(super) image_loads: ImageLoadScheduler,
     pub(super) image_tasks: HashMap<ImageHandle, tokio::task::JoinHandle<()>>,
@@ -198,6 +197,11 @@ impl TabSet {
         if matches!(self.hidden.get(&tab), Some(Hidden::Awake(_))) && !self.woken.contains(&tab) {
             self.woken.push(tab);
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn wake_pending(&self, tab: TabId) -> bool {
+        self.woken.contains(&tab)
     }
 
     pub(super) fn index_of(&self, tab: TabId) -> Option<usize> {
@@ -353,6 +357,7 @@ pub(super) struct Presentation {
     pub(super) screen_position: (i32, i32),
     pub(super) focused: bool,
     pub(super) visible: bool,
+    pub(super) occluded: bool,
 }
 
 impl Presentation {
@@ -363,6 +368,10 @@ impl Presentation {
             self.screen_position.0,
             self.screen_position.1,
         ));
+        // Update the native visibility before exposing a newly shown tab:
+        // otherwise stale per-controller occlusion can reveal it briefly or
+        // leave it hidden after the window was restored (HTML #page-visibility).
+        browser.handle_action(UserAction::Occluded(self.occluded));
         browser.handle_action(UserAction::Focus(self.focused));
         browser.handle_action(UserAction::Visible(self.visible));
     }
@@ -469,6 +478,7 @@ impl DesktopWindow {
             screen_position: self.screen_origin,
             focused: visible && self.window_focused,
             visible,
+            occluded: self.window_occluded,
         }
     }
 
@@ -526,7 +536,7 @@ impl DesktopWindow {
             let mut tab = self.create_tab(Some(source), false);
             tab.browser.open_link_from(link, initiator);
             self.tabs.order.insert(index, tab.id);
-            self.tabs.park(tab);
+            self.park_background_tab(tab);
             self.request_redraw();
         }
     }
@@ -561,7 +571,7 @@ impl DesktopWindow {
                         self.show_new_tab(tab, index);
                     } else {
                         self.tabs.order.insert(index, tab.id);
-                        self.tabs.park(tab);
+                        self.park_background_tab(tab);
                     }
                     self.request_redraw();
                     continue;
@@ -585,7 +595,7 @@ impl DesktopWindow {
                 self.show_new_tab(tab, index);
             } else {
                 self.tabs.order.insert(index, tab.id);
-                self.tabs.park(tab);
+                self.park_background_tab(tab);
             }
             self.request_redraw();
         }
@@ -637,8 +647,24 @@ impl DesktopWindow {
     fn swap_shown(&mut self, incoming: Box<Tab>) {
         self.hide_shown_tab();
         let outgoing = std::mem::replace(&mut self.tab, incoming);
-        self.tabs.park(outgoing);
+        self.park_background_tab(outgoing);
         self.show_current_tab();
+    }
+
+    /// A tab can enter the background without ever being shown, for example
+    /// when a link opens in a background tab. Schedule its sleep check too.
+    fn park_background_tab(&mut self, mut tab: Box<Tab>) {
+        let sleep_at = tab.last_shown + SLEEP_AFTER;
+        let id = tab.id;
+        // A wake may already have reached the window just before the user
+        // switched tabs. Transfer that pending work to the background queue.
+        let pending = std::mem::take(&mut tab.browser_events_pending);
+        self.tabs.park(tab);
+        if pending {
+            self.tabs.wake(id);
+        }
+        self.schedule_sleep_check(sleep_at);
+        self.track_background_loading();
     }
 
     pub(super) fn run_tab_shortcut(&mut self, shortcut: TabShortcut) {
@@ -721,7 +747,6 @@ impl DesktopWindow {
         self.set_active_animations(HashSet::new());
         self.tab.browser.handle_action(UserAction::Focus(false));
         self.tab.browser.handle_action(UserAction::Visible(false));
-        self.schedule_sleep_check(Instant::now() + SLEEP_AFTER);
     }
 
     /// `self.tab` was just swapped in: present it.
@@ -823,7 +848,12 @@ impl DesktopWindow {
                 continue;
             };
             let due = tab.last_shown + SLEEP_AFTER;
-            if asked || Self::keeps_awake(tab) {
+            // A picker result belongs to its original document even after a
+            // tab switch; do not discard that document while it is open.
+            let picking = self.file_dialog.is_some_and(|owner| {
+                owner.tab == id && owner.generation == tab.browser.document_generation()
+            });
+            if asked || picking || Self::keeps_awake(tab) {
                 // Check again later: the exemption may end.
                 let later = now + SLEEP_AFTER;
                 next = Some(next.map_or(later, |next| next.min(later)));
@@ -853,9 +883,16 @@ impl DesktopWindow {
             opened_from: tab.opened_from,
             muted: tab.browser.is_audio_muted(),
         };
-        // Decoded pixels only this tab showed go with it.
+        // Decoded pixels only this tab showed go with it. Other awake tabs
+        // can have the same source handle, so preserve their shared pixels.
+        let mut retained = self.tab.image_loads.completed.clone();
+        for hidden in self.tabs.hidden.values() {
+            if let Hidden::Awake(other) = hidden {
+                retained.extend(other.image_loads.completed.iter().copied());
+            }
+        }
         for handle in &tab.image_loads.completed {
-            if !self.tab.image_loads.completed.contains(handle) {
+            if !retained.contains(handle) {
                 self.image_store.remove(*handle);
             }
         }
@@ -875,18 +912,22 @@ impl DesktopWindow {
 
     /// Wake the event loop at `at` to put unseen tabs to sleep.
     pub(super) fn schedule_sleep_check(&mut self, at: Instant) {
+        self.sleep_check_scheduled = Some(
+            self.sleep_check_scheduled
+                .map_or(at, |scheduled| scheduled.min(at)),
+        );
+    }
+
+    /// The native event loop services the earliest deadline directly. A
+    /// replaced deadline leaves no stale task that could clear a later check.
+    pub(super) fn service_sleep_check(&mut self) {
         if self
             .sleep_check_scheduled
-            .is_some_and(|scheduled| scheduled <= at)
+            .is_some_and(|scheduled| scheduled <= Instant::now())
         {
-            return;
+            self.sleep_check_scheduled = None;
+            self.sleep_unseen_tabs();
         }
-        self.sleep_check_scheduled = Some(at);
-        let proxy = self.event_proxy.clone();
-        self.runtime.spawn(async move {
-            tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await;
-            let _ = proxy.send_event(DesktopEvent::SleepCheck);
-        });
     }
 
     /// Close tab `id` once its page allowed it (`close_tab`): its page
@@ -941,6 +982,7 @@ impl DesktopWindow {
                 }),
                 None => {}
             }
+            self.track_background_loading();
             self.request_redraw();
         }
     }
@@ -975,6 +1017,13 @@ impl DesktopWindow {
     /// are refused.
     pub(super) fn service_background_tabs(&mut self) {
         let woken = std::mem::take(&mut self.tabs.woken);
+        if woken.is_empty() {
+            // A shown tab that has just finished loading no longer supplies
+            // the strip's heartbeat. Keep its timer going without rescanning
+            // every background controller on every window event-loop turn.
+            self.schedule_strip_tick();
+            return;
+        }
         let mut strip_changed = false;
         for id in woken {
             let Some(tab) = self.tabs.awake_mut(id) else {

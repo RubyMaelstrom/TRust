@@ -83,6 +83,24 @@ impl Default for TextStyle {
 }
 
 impl TextStyle {
+    /// Whether the plain editor's fast single-line preview can use this
+    /// style for both the retained text and the prospective replacement.
+    /// Full text shaping applies per-face settings and synthetic variants
+    /// that the editing layout does not yet reproduce; those cases need the
+    /// authoritative page layout for both text and caret placement.
+    pub fn allows_scoped_editor_preview(&self, current: &str, prospective: &str) -> bool {
+        self.size.is_finite()
+            && self.size >= 1.0
+            && current.is_ascii()
+            && prospective.is_ascii()
+            && !crate::font_system::has_face_renderings(self.font_set.as_ref())
+            && self.typography.as_deref().is_none_or(|t| {
+                t.caps == typography::Caps::Normal
+                    && t.position == typography::Position::Normal
+                    && t.size_adjust.is_none()
+            })
+    }
+
     /// #font-style-prop as Parley's style: the oblique angle, else italic.
     pub(crate) fn font_style(&self) -> FontStyle {
         match self.typography.as_ref().and_then(|t| t.oblique) {
@@ -200,8 +218,17 @@ pub struct Cluster {
 }
 
 /// A shaped single-line text piece. `baseline` is measured from its top.
+///
+/// Page paint, retained leaf paint and native scenes hold the same immutable
+/// glyph data. Clones share it; an edit obtains a private copy before
+/// changing any field. This retains old snapshots for partial repaint.
+#[derive(Clone, Default)]
+pub struct ShapedText(Arc<SharedShapedText>);
+
+/// The public shaped values. Field reads through [`ShapedText`] dereference to
+/// this data; field writes copy it first when another snapshot still owns it.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct ShapedText {
+pub struct ShapedTextData {
     pub text: String,
     pub advance: f32,
     pub ascent: f32,
@@ -213,6 +240,73 @@ pub struct ShapedText {
     pub strikethrough: bool,
     pub runs: Vec<ShapedRun>,
     pub clusters: Vec<Cluster>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SharedShapedText {
+    data: ShapedTextData,
+    /// A same-allocation comparison is fast only if the value is reflexive:
+    /// retained metrics can contain NaNs, which are unequal even to themselves.
+    reflexive: std::sync::OnceLock<bool>,
+}
+
+impl From<ShapedTextData> for ShapedText {
+    fn from(data: ShapedTextData) -> Self {
+        Self(Arc::new(SharedShapedText {
+            data,
+            reflexive: Default::default(),
+        }))
+    }
+}
+
+impl std::ops::Deref for ShapedText {
+    type Target = ShapedTextData;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0.data
+    }
+}
+
+impl std::ops::DerefMut for ShapedText {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        let shared = Arc::make_mut(&mut self.0);
+        // A caller can now mutate any field, so recompute reflexivity on the
+        // next equality check even when this allocation was already unique.
+        shared.reflexive.take();
+        &mut shared.data
+    }
+}
+
+impl std::fmt::Debug for ShapedText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let data = &self.0.data;
+        f.debug_struct("ShapedText")
+            .field("text", &data.text)
+            .field("advance", &data.advance)
+            .field("ascent", &data.ascent)
+            .field("descent", &data.descent)
+            .field("leading", &data.leading)
+            .field("line_height", &data.line_height)
+            .field("baseline", &data.baseline)
+            .field("underline", &data.underline)
+            .field("strikethrough", &data.strikethrough)
+            .field("runs", &data.runs)
+            .field("clusters", &data.clusters)
+            .finish()
+    }
+}
+
+impl PartialEq for ShapedText {
+    fn eq(&self, other: &Self) -> bool {
+        if Arc::ptr_eq(&self.0, &other.0) {
+            *self
+                .0
+                .reflexive
+                .get_or_init(|| self.0.data.eq(&self.0.data))
+        } else {
+            self.0.data == other.0.data
+        }
+    }
 }
 
 impl ShapedText {
@@ -366,7 +460,7 @@ impl ShapedText {
             .iter()
             .map(|cluster| cluster.x + cluster.advance)
             .fold(0.0f32, f32::max);
-        ShapedText {
+        ShapedTextData {
             text,
             advance,
             ascent: self.ascent,
@@ -379,6 +473,7 @@ impl ShapedText {
             runs,
             clusters,
         }
+        .into()
     }
 
     /// This cell-font text (logical clusters, no glyph runs) laid out right
@@ -424,7 +519,7 @@ impl ShapedText {
     }
 
     pub(crate) fn retained_bytes(&self) -> usize {
-        let ShapedText {
+        let ShapedTextData {
             text,
             advance,
             ascent,
@@ -436,7 +531,7 @@ impl ShapedText {
             strikethrough,
             runs,
             clusters,
-        } = self;
+        } = &self.0.data;
         let _ = (
             advance,
             ascent,
@@ -459,6 +554,8 @@ impl ShapedText {
                 .saturating_add(run.glyphs.capacity() * std::mem::size_of::<ShapedGlyph>());
         }
         bytes
+            .saturating_add(std::mem::size_of::<SharedShapedText>())
+            .saturating_add(2 * std::mem::size_of::<usize>())
     }
 }
 
@@ -492,8 +589,11 @@ pub struct EditorLine {
 pub struct TextEditor {
     editor: PlainEditor<()>,
     font_set: Option<Arc<FontSet>>,
+    font_revisions: (u64, u64),
     style: TextStyle,
     multiline: bool,
+    width: Option<f32>,
+    quantized: bool,
     line_cache: Option<(parley::editing::Generation, bool, u64, Arc<EditorLine>)>,
 }
 
@@ -512,9 +612,49 @@ impl TextEditor {
     pub fn new(text: &str, style: &TextStyle, width: f32, multiline: bool) -> Self {
         let mut editor = PlainEditor::new(style.size.max(1.0));
         editor.set_text(text);
-        editor.set_width(multiline.then_some(width.max(1.0)));
+        let width = multiline.then_some(width.max(1.0));
+        editor.set_width(width);
         editor.set_quantize(false);
+        Self::apply_style(&mut editor, style);
+        let mut this = Self {
+            editor,
+            font_set: style.font_set.clone(),
+            font_revisions: Self::font_revisions(style.font_set.as_ref()),
+            style: style.clone(),
+            multiline,
+            width,
+            quantized: false,
+            line_cache: None,
+        };
+        this.move_to_end(false, false);
+        this
+    }
+
+    /// Apply a new CSS text style without replacing the editing buffer. Parley
+    /// preserves its selection and active composition when its styles change;
+    /// rebuilding the editor would cancel the IME's current text passage.
+    pub fn set_style(&mut self, style: &TextStyle) {
+        if self.style != *style {
+            Self::apply_style(&mut self.editor, style);
+            self.font_set = style.font_set.clone();
+            self.font_revisions = Self::font_revisions(self.font_set.as_ref());
+            self.style = style.clone();
+            self.line_cache = None;
+        } else {
+            self.refresh_font_revisions();
+        }
+    }
+
+    /// Whether this editor uses the requested style and its current fonts.
+    pub fn has_style(&self, style: &TextStyle) -> bool {
+        self.style == *style && self.font_revisions == Self::font_revisions(self.font_set.as_ref())
+    }
+
+    fn apply_style(editor: &mut PlainEditor<()>, style: &TextStyle) {
         let styles = editor.edit_styles();
+        // A property omitted by the new style must not retain an old value,
+        // e.g. a previous non-default width, variation, or feature setting.
+        styles.clear();
         let family = font_family_source(&style.family).into_owned();
         styles.insert(StyleProperty::FontFamily(FontFamily::Source(family.into())));
         styles.insert(StyleProperty::Locale(text_language(style)));
@@ -546,15 +686,24 @@ impl TextEditor {
             CssLineHeight::Number(number) => LineHeight::FontSizeRelative(number.max(0.0)),
             CssLineHeight::Length(px) => LineHeight::Absolute(px.max(0.0)),
         }));
-        let mut this = Self {
-            editor,
-            font_set: style.font_set.clone(),
-            style: style.clone(),
-            multiline,
-            line_cache: None,
-        };
-        this.move_to_end(false, false);
-        this
+    }
+
+    fn font_revisions(fonts: Option<&Arc<FontSet>>) -> (u64, u64) {
+        (
+            crate::font_system::page_font_epoch(),
+            fonts.map_or(0, |fonts| fonts.display_revision()),
+        )
+    }
+
+    fn refresh_font_revisions(&mut self) {
+        let revisions = Self::font_revisions(self.font_set.as_ref());
+        if self.font_revisions != revisions {
+            // Editing styles marks Parley's existing layout dirty without
+            // changing text, selection, or an in-progress composition.
+            self.editor.edit_styles();
+            self.font_revisions = revisions;
+            self.line_cache = None;
+        }
     }
 
     pub fn text(&self) -> String {
@@ -574,8 +723,27 @@ impl TextEditor {
         // Single-line fields scroll their presentation; setting an unused
         // width on every frame would needlessly invalidate Parley's layout.
         if self.multiline {
-            self.editor.set_width(Some(width.max(1.0)));
+            let width = Some(width.max(1.0));
+            if self.width != width {
+                self.width = width;
+                self.editor.set_width(width);
+            }
         }
+    }
+
+    /// Match the line metrics used by the paint being edited. Native input
+    /// fields retain fractional metrics; an authored DOM text run can use
+    /// quantized line metrics and needs its caret to use the same metrics.
+    pub fn set_quantize(&mut self, quantize: bool) {
+        if self.quantized != quantize {
+            self.editor.set_quantize(quantize);
+            self.quantized = quantize;
+            self.line_cache = None;
+        }
+    }
+
+    pub fn is_quantized(&self) -> bool {
+        self.quantized
     }
 
     pub fn is_composing(&self) -> bool {
@@ -758,6 +926,9 @@ impl TextEditor {
     }
 
     pub fn geometry(&mut self) -> (Vec<EditorRect>, Option<EditorRect>, EditorRect) {
+        self.refresh_font_revisions();
+        let font_size = self.style.size.max(1.0);
+        let width = self.width;
         TEXT.with_borrow_mut(|system| {
             system.select_fonts(self.font_set.as_ref());
             let mut driver = self.editor.driver(&mut system.fonts, &mut system.layouts);
@@ -769,7 +940,7 @@ impl TextEditor {
                 .map(|(rect, _)| editor_rect(rect))
                 .collect();
             let caret = driver.editor.cursor_geometry(1.5).map(editor_rect);
-            let ime = editor_rect(driver.editor.ime_cursor_area());
+            let ime = editor_ime_rect(driver.editor, font_size, width);
             (selection, caret, ime)
         })
     }
@@ -830,8 +1001,11 @@ impl TextEditor {
         let mut display = Self {
             editor: self.editor.clone(),
             font_set: self.font_set.clone(),
+            font_revisions: self.font_revisions,
             style: self.style.clone(),
             multiline: false,
+            width: self.width,
+            quantized: self.quantized,
             line_cache: None,
         };
         let selection = self.editor.raw_selection();
@@ -852,6 +1026,8 @@ impl TextEditor {
     }
 
     fn retain_editor_line(&mut self) -> EditorLine {
+        let font_size = self.style.size.max(1.0);
+        let width = self.width;
         TEXT.with_borrow_mut(|system| {
             let blocked = self.font_set.as_ref().map_or_else(Vec::new, |fonts| {
                 fonts.request_fonts(self.editor.raw_text(), &self.style)
@@ -882,13 +1058,16 @@ impl TextEditor {
             // its byte range does not refer to the zero-length input string.
             let shaped = if self.editor.raw_text().is_empty() {
                 let metrics = layout.lines().next().map(|line| *line.metrics());
-                metrics.map_or_else(ShapedText::default, |metrics| ShapedText {
-                    ascent: metrics.ascent,
-                    descent: metrics.descent,
-                    leading: metrics.leading,
-                    line_height: metrics.line_height,
-                    baseline: css_baseline(&metrics),
-                    ..Default::default()
+                metrics.map_or_else(ShapedText::default, |metrics| {
+                    ShapedTextData {
+                        ascent: metrics.ascent,
+                        descent: metrics.descent,
+                        leading: metrics.leading,
+                        line_height: metrics.line_height,
+                        baseline: css_baseline(&metrics),
+                        ..Default::default()
+                    }
+                    .into()
                 })
             } else {
                 retain_first_line(self.editor.raw_text(), layout, &blocked)
@@ -902,7 +1081,7 @@ impl TextEditor {
                     .map(|(rect, _)| editor_rect(rect))
                     .collect(),
                 caret: self.editor.cursor_geometry(1.5).map(editor_rect),
-                ime: editor_rect(self.editor.ime_cursor_area()),
+                ime: editor_ime_rect(&self.editor, font_size, width),
                 underlines,
             }
         })
@@ -960,12 +1139,25 @@ impl TextEditor {
     }
 
     fn drive(&mut self, operation: impl FnOnce(&mut parley::editing::PlainEditorDriver<'_, ()>)) {
+        self.refresh_font_revisions();
         TEXT.with_borrow_mut(|system| {
             system.select_fonts(self.font_set.as_ref());
             let mut driver = self.editor.driver(&mut system.fonts, &mut system.layouts);
             operation(&mut driver);
         });
     }
+}
+
+fn editor_ime_rect(editor: &PlainEditor<()>, font_size: f32, width: Option<f32>) -> EditorRect {
+    let mut rect = editor_rect(editor.ime_cursor_area());
+    if editor.raw_text().is_empty() && editor.get_font_size() != font_size {
+        // Parley uses its original construction-time font size to inflate the
+        // IME candidate area when no glyph clusters exist. Its editor does not
+        // expose a font-size setter, so use the current CSS size for that one
+        // empty-line fallback. The text area's alignment is always Start.
+        rect.width = (font_size * 1.8).min(width.unwrap_or(f32::INFINITY));
+    }
+    rect
 }
 
 fn editor_rect(rect: parley::BoundingBox) -> EditorRect {
@@ -2218,8 +2410,9 @@ fn emoji_presentation_runs(text: &str, variant: typography::Emoji) -> Vec<Range<
 }
 
 fn shape_cost(key: &ShapeKey, shaped: &ShapedText) -> usize {
-    key.text
-        .len()
+    std::mem::size_of::<SharedShapedText>()
+        .saturating_add(2 * std::mem::size_of::<usize>())
+        .saturating_add(key.text.len())
         .saturating_add(key.style.family.len())
         .saturating_add(key.style.language.as_ref().map_or(0, String::len))
         .saturating_add(shaped.text.len())
@@ -2256,13 +2449,14 @@ fn zero_size_shape(text: &str, style: &TextStyle) -> ShapedText {
     } else {
         0.0
     };
-    ShapedText {
+    ShapedTextData {
         text: text.to_string(),
         line_height,
         leading: line_height,
         baseline: line_height / 2.0,
-        ..ShapedText::default()
+        ..ShapedTextData::default()
     }
+    .into()
 }
 
 thread_local! {
@@ -2671,10 +2865,11 @@ fn css_baseline(metrics: &parley::LineMetrics) -> f32 {
 
 fn retain_first_line(text: &str, layout: &Layout<()>, blocked: &[Range<usize>]) -> ShapedText {
     let Some(line) = layout.lines().next() else {
-        return ShapedText {
+        return ShapedTextData {
             text: text.to_string(),
-            ..ShapedText::default()
-        };
+            ..ShapedTextData::default()
+        }
+        .into();
     };
     let mut shaped = retain_line(text, &line, &SynthesisPolicy::default(), blocked, None);
     shaped.text = text.to_string();
@@ -2850,7 +3045,7 @@ fn retain_line_with_sources<B: parley::Brush>(
             sources.push(retained_sources);
         }
     }
-    ShapedText {
+    ShapedTextData {
         text: line_text.to_string(),
         // Whitespace processing already happened in the CSS inline formatter.
         // Retain the actual shaped advance here: preserved/trailing spaces and
@@ -2867,11 +3062,46 @@ fn retain_line_with_sources<B: parley::Brush>(
         runs,
         clusters,
     }
+    .into()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shaped_text_snapshots_share_until_mutated_and_preserve_value_equality() {
+        let original = shape("Caret and العربية text", &TextStyle::default());
+        let mut changed = original.clone();
+        assert!(Arc::ptr_eq(&original.0, &changed.0));
+        assert_eq!(original, changed);
+        assert_eq!(original.0.reflexive.get(), Some(&true));
+
+        let previous_advance = original.advance;
+        let previous_text = original.text.clone();
+        let previous_cluster = original.clusters[0].x;
+        changed.advance += 1.0;
+        changed.text.push('!');
+        changed.clusters[0].x += 3.0;
+        assert!(!Arc::ptr_eq(&original.0, &changed.0));
+        assert_eq!(original.advance, previous_advance);
+        assert_eq!(original.text, previous_text);
+        assert_eq!(original.clusters[0].x, previous_cluster);
+        assert_ne!(original, changed);
+        assert_eq!(original, original.clone());
+
+        // A same-allocation shortcut must preserve float PartialEq semantics,
+        // including after an already-unique snapshot is mutated.
+        let mut non_reflexive = ShapedText::default();
+        assert_eq!(non_reflexive, non_reflexive.clone());
+        assert_eq!(non_reflexive.0.reflexive.get(), Some(&true));
+        non_reflexive.advance = f32::NAN;
+        assert_eq!(non_reflexive.0.reflexive.get(), None);
+        let alias = non_reflexive.clone();
+        assert!(Arc::ptr_eq(&non_reflexive.0, &alias.0));
+        assert_ne!(non_reflexive, alias);
+        assert_eq!(non_reflexive.0.reflexive.get(), Some(&false));
+    }
 
     /// CSS Overflow 3 #bidi-ellipsis: the characters hidden for an ellipsis
     /// are those visually at the end edge, which in a right-to-left run are
@@ -2887,7 +3117,7 @@ mod tests {
             advance: 1.0,
             rtl,
         };
-        let shaped = ShapedText {
+        let shaped: ShapedText = ShapedTextData {
             text,
             advance: 4.0,
             ascent: 1.0,
@@ -2904,7 +3134,8 @@ mod tests {
                 cluster(2..4, 3.0, true),
                 cluster(4..6, 2.0, true),
             ],
-        };
+        }
+        .into();
         let cut = shaped.visual_elision_cut(3.0, false).unwrap();
         assert_eq!(cut, 3.0);
         let prefix = shaped.visual_prefix(cut);
@@ -3221,15 +3452,16 @@ mod tests {
                     "split grapheme in {text} at {end}"
                 );
             }
-            let mut original: Vec<_> = shape(text, &style)
+            let original_shape = shape(text, &style);
+            let mut original: Vec<_> = original_shape
                 .runs
-                .into_iter()
-                .flat_map(|run| run.glyphs.into_iter().map(|glyph| glyph.id))
+                .iter()
+                .flat_map(|run| run.glyphs.iter().map(|glyph| glyph.id))
                 .collect();
             let mut wrapped: Vec<_> = lines
-                .into_iter()
-                .flat_map(|line| line.runs)
-                .flat_map(|run| run.glyphs.into_iter().map(|glyph| glyph.id))
+                .iter()
+                .flat_map(|line| line.runs.iter())
+                .flat_map(|run| run.glyphs.iter().map(|glyph| glyph.id))
                 .collect();
             original.sort_unstable();
             wrapped.sort_unstable();
@@ -3494,6 +3726,112 @@ mod tests {
     }
 
     #[test]
+    fn editor_restyles_while_preserving_selection_and_composition() {
+        let _inputs = crate::layout2::stable_global_layout_inputs();
+        let base = TextStyle::default();
+        let mut typography = FontTypography::default();
+        typography.width = 1.25;
+        typography.feature_settings.push((*b"liga", 0));
+        typography.variation_settings.push((*b"wght", 525.0));
+        let mut enlarged = base.clone();
+        enlarged.size = 32.0;
+        enlarged.typography = Some(Arc::new(typography));
+
+        let mut editor = TextEditor::new("ab cd", &base, 300.0, false);
+        editor.select_byte_range(1, 4);
+        let old_line = editor.line_layout(false);
+        editor.set_style(&enlarged);
+        assert!(editor.has_style(&enlarged));
+        let new_line = editor.line_layout(false);
+        assert!(new_line.shaped.advance > old_line.shaped.advance * 1.5);
+        assert_eq!(editor.selection(), 1..4);
+        assert_eq!(editor.selected_text(), Some("b c"));
+        assert!(!Arc::ptr_eq(&old_line, &new_line));
+
+        editor.set_style(&base);
+        let fresh = TextEditor::new("ab cd", &base, 300.0, false);
+        assert_eq!(
+            editor.editor.get_styles().inner(),
+            fresh.editor.get_styles().inner(),
+            "old width, feature and variation properties must be removed"
+        );
+        editor.select_byte_range(2, 2);
+        editor.handle_ime(&ImeAction::Preedit {
+            text: "にほん".into(),
+            cursor: Some((9, 9)),
+        });
+        let raw = editor.raw_text().to_owned();
+        let selection = editor.selection();
+        editor.set_style(&enlarged);
+        editor.set_quantize(true);
+        assert!(editor.is_composing());
+        assert_eq!(editor.text(), "ab cd");
+        assert_eq!(editor.raw_text(), raw);
+        assert!(!editor.line_layout(false).underlines.is_empty());
+        assert_eq!(editor.selection(), selection);
+        editor.handle_ime(&ImeAction::Commit("日本".into()));
+        assert_eq!(editor.text(), "ab日本 cd");
+        assert!(!editor.is_composing());
+    }
+
+    #[test]
+    fn editor_reuses_unchanged_width_and_refreshes_changed_font_revisions() {
+        let _inputs = crate::layout2::stable_global_layout_inputs();
+        let style = TextStyle::default();
+        let mut editor = TextEditor::new("some text that wraps", &style, 120.0, true);
+        editor.geometry();
+        let generation = editor.editor.generation();
+        editor.set_width(120.0);
+        editor.geometry();
+        assert_eq!(editor.editor.generation(), generation);
+
+        editor.set_width(80.0);
+        editor.geometry();
+        let resized = editor.editor.generation();
+        assert_ne!(resized, generation);
+
+        // Font readiness and display deadlines can change independently of
+        // CSS style equality or the editor's width.
+        editor.font_revisions.0 = editor.font_revisions.0.wrapping_sub(1);
+        assert!(!editor.has_style(&style));
+        editor.geometry();
+        let refreshed = editor.editor.generation();
+        assert_ne!(refreshed, resized);
+        assert!(editor.has_style(&style));
+        editor.font_revisions.1 = editor.font_revisions.1.wrapping_add(1);
+        editor.set_style(&style);
+        editor.geometry();
+        assert_ne!(editor.editor.generation(), refreshed);
+        assert!(editor.has_style(&style));
+
+        editor.set_quantize(true);
+        assert!(editor.is_quantized());
+        editor.geometry();
+        let quantized = editor.editor.generation();
+        editor.set_quantize(true);
+        editor.geometry();
+        assert_eq!(editor.editor.generation(), quantized);
+        editor.set_quantize(false);
+        assert!(!editor.is_quantized());
+        editor.geometry();
+        assert_ne!(editor.editor.generation(), quantized);
+    }
+
+    #[test]
+    fn editor_empty_ime_area_uses_restyled_font_size() {
+        let _inputs = crate::layout2::stable_global_layout_inputs();
+        let base = TextStyle::default();
+        let mut editor = TextEditor::new("", &base, 50.0, true);
+        let initial = editor.geometry().2;
+        let mut larger = base;
+        larger.size = 32.0;
+        editor.set_style(&larger);
+        let updated = editor.geometry().2;
+        assert!(updated.width > initial.width);
+        assert!((updated.width - 50.0).abs() < 0.01);
+    }
+
+    #[test]
     fn editor_visual_motion_uses_bidi_shaped_clusters() {
         let mut editor = TextEditor::new("abc שלום", &TextStyle::default(), 300.0, false);
         editor.handle_key(&KeyInput {
@@ -3543,6 +3881,114 @@ mod tests {
         let mut typography = FontTypography::default();
         apply(&mut typography);
         Some(Arc::new(typography))
+    }
+
+    #[test]
+    fn scoped_editor_preview_rejects_shaping_that_differs_from_editor_geometry() {
+        let _inputs = crate::layout2::stable_global_layout_inputs();
+        let bytes = dejavu("DejaVuSans.ttf");
+        let normal = TextStyle {
+            family: "Web".into(),
+            font_set: Some(web_fonts(vec![("Web", bytes.clone(), Default::default())])),
+            ..TextStyle::default()
+        };
+        let accepts = |style: &TextStyle| style.allows_scoped_editor_preview("Hello", "Hello!");
+        assert!(accepts(&normal));
+        let supported_features = TextStyle {
+            typography: typed(|t| t.kerning = typography::Kerning::None),
+            ..normal.clone()
+        };
+        assert!(accepts(&supported_features));
+        for typography in [
+            typed(|t| t.caps = typography::Caps::SmallCaps),
+            typed(|t| t.position = typography::Position::Super),
+            typed(|t| t.size_adjust = Some((typography::SizeAdjustMetric::ExHeight, 0.5))),
+        ] {
+            assert!(!accepts(&TextStyle {
+                typography,
+                ..normal.clone()
+            }));
+        }
+        for size in [0.0, 0.5, f32::INFINITY, f32::NAN] {
+            assert!(!accepts(&TextStyle {
+                size,
+                ..normal.clone()
+            }));
+        }
+        assert!(!normal.allows_scoped_editor_preview("Hello", "Hello😀"));
+        assert!(!normal.allows_scoped_editor_preview("你好", "Hello"));
+
+        let descriptors = crate::font_system::FaceDescriptors {
+            size_adjust: 0.8,
+            ..Default::default()
+        };
+        let with_face_adjust = TextStyle {
+            font_set: Some(web_fonts(vec![("Web", bytes, descriptors)])),
+            ..normal
+        };
+        assert!(!accepts(&with_face_adjust));
+    }
+
+    #[test]
+    fn scoped_editor_synthesis_policies_preserve_canonical_caret_geometry() {
+        let _inputs = crate::layout2::stable_global_layout_inputs();
+        // One regular face forces both bold and italic to be synthesized.
+        let fonts = web_fonts(vec![("Web", dejavu("DejaVuSans.ttf"), Default::default())]);
+        let style = TextStyle {
+            family: "Web".into(),
+            font_set: Some(fonts),
+            weight: 700.0,
+            italic: true,
+            typography: typed(|t| {
+                t.synthesis.weight = false;
+                t.synthesis.style = typography::SynthesisStyle::None;
+            }),
+            ..TextStyle::default()
+        };
+        let text = "Hello there";
+        assert!(style.allows_scoped_editor_preview(text, "Hello there!"));
+        let canonical = shape(text, &style);
+        let mut editor = TextEditor::new(text, &style, 300.0, false);
+        editor.set_quantize(true);
+        let line = editor.line_layout(false);
+        let editor_shape = &line.shaped;
+        assert_eq!(editor_shape.advance, canonical.advance);
+        assert_eq!(editor_shape.baseline, canonical.baseline);
+        assert_eq!(editor_shape.line_height, canonical.line_height);
+        assert_eq!(editor_shape.clusters, canonical.clusters);
+        assert_eq!(editor_shape.runs.len(), canonical.runs.len());
+        for (editor_run, painted_run) in editor_shape.runs.iter().zip(&canonical.runs) {
+            assert_eq!(editor_run.font, painted_run.font);
+            assert_eq!(editor_run.font_size, painted_run.font_size);
+            assert_eq!(editor_run.glyphs, painted_run.glyphs);
+            assert_eq!(editor_run.text_range, painted_run.text_range);
+            assert!(!painted_run.synth_bold);
+            assert!(painted_run.synth_skew_degrees.is_none());
+        }
+        assert!(editor_shape.runs.iter().any(|run| run.synth_bold));
+        assert!(
+            editor_shape
+                .runs
+                .iter()
+                .any(|run| run.synth_skew_degrees.is_some())
+        );
+
+        // A focused editor can be restyled after the original scene. Its
+        // quantization and caret/selection indices must survive that change.
+        editor.select_byte_range(3, 3);
+        let mut resized = style.clone();
+        resized.size = 23.0;
+        editor.set_style(&resized);
+        let repainted = shape(text, &resized);
+        let restyled = editor.line_layout(false);
+        assert!(editor.is_quantized());
+        assert_eq!(editor.selection(), 3..3);
+        assert_eq!(restyled.shaped.advance, repainted.advance);
+        assert_eq!(restyled.shaped.ascent, repainted.ascent);
+        assert_eq!(restyled.shaped.descent, repainted.descent);
+        assert_eq!(restyled.shaped.baseline, repainted.baseline);
+        assert_eq!(restyled.shaped.line_height, repainted.line_height);
+        assert_eq!(restyled.shaped.clusters, repainted.clusters);
     }
 
     fn glyph_count(shaped: &ShapedText) -> usize {

@@ -675,6 +675,11 @@ enum CoreEvent {
     },
     UserInputReady {
         generation: u64,
+        epoch: u64,
+        permit: Option<tokio::sync::mpsc::OwnedPermit<crate::js::PageCmd>>,
+    },
+    LiveCommandReady {
+        epoch: u64,
         permit: Option<tokio::sync::mpsc::OwnedPermit<crate::js::PageCmd>>,
     },
     FetchFinished {
@@ -835,6 +840,12 @@ pub struct BrowserController {
     /// Preserve native input FIFO while the actor's bounded channel is full.
     pending_user_input: VecDeque<(crate::js::PageCmd, bool)>,
     user_input_retry: Option<JoinHandle<()>>,
+    /// Preserve ordering on the actor's bounded command lane, including
+    /// viewport-before-fullscreen and successive visibility transitions.
+    pending_live_commands: VecDeque<crate::js::PageCmd>,
+    live_command_retry: Option<JoinHandle<()>>,
+    /// Changes even when a new actor is attached to the same document.
+    live_page_epoch: u64,
     pending_fragment: Option<String>,
     pending_pointer_lock: VecDeque<(u64, Option<usize>, bool)>,
     /// Fullscreen API viewport changes for a frontend that declared it can
@@ -991,6 +1002,9 @@ impl BrowserController {
             pending_form_values: Default::default(),
             pending_user_input: VecDeque::new(),
             user_input_retry: None,
+            pending_live_commands: VecDeque::new(),
+            live_command_retry: None,
+            live_page_epoch: 0,
             pending_fragment: None,
             pending_pointer_lock: VecDeque::new(),
             fullscreen_available: false,
@@ -1561,8 +1575,8 @@ impl BrowserController {
     }
 
     /// Keep new documents and the live page in step with the traversable's
-    /// presentation. The live page hears of each change once; a full
-    /// command channel leaves it unsent, so a later round retries.
+    /// presentation. Each change is queued once, including when the actor's
+    /// bounded command channel is full.
     fn sync_traversable(&mut self) {
         let state = self.traversable_state();
         if let Some(page) = &self.current
@@ -1630,40 +1644,26 @@ impl BrowserController {
         });
         // The live page knows the presentation it was created with
         // (`attach_live_page`); it hears of each change from then on.
-        let (Some(page), Some(mut sent)) = (&self.live_page, self.live_traversable) else {
+        let Some(mut sent) = self.live_traversable else {
             return;
         };
         if sent.hidden != state.hidden
-            && page
-                .cmds
-                .try_send(crate::js::PageCmd::SystemVisibility(state.hidden))
-                .is_ok()
+            && self.send_live(crate::js::PageCmd::SystemVisibility(state.hidden))
         {
             sent.hidden = state.hidden;
         }
         if sent.focused != state.focused
-            && page
-                .cmds
-                .try_send(crate::js::PageCmd::SystemFocus(state.focused))
-                .is_ok()
+            && self.send_live(crate::js::PageCmd::SystemFocus(state.focused))
         {
             sent.focused = state.focused;
         }
         if sent.audio_muted != state.audio_muted
-            && page
-                .cmds
-                .try_send(crate::js::PageCmd::AudioMuted(state.audio_muted))
-                .is_ok()
+            && self.send_live(crate::js::PageCmd::AudioMuted(state.audio_muted))
         {
             sent.audio_muted = state.audio_muted;
         }
-        self.live_traversable = Some(sent);
-        if sent.hidden != state.hidden
-            || sent.focused != state.focused
-            || sent.audio_muted != state.audio_muted
-        {
-            // Retry once the actor drains its channel.
-            self.invalidation.request_redraw();
+        if self.live_page.is_some() {
+            self.live_traversable = Some(sent);
         }
     }
 
@@ -1885,7 +1885,7 @@ impl BrowserController {
 
     /// Ask the resident page actor for the always-correct complete typed render.
     /// Retained for compatibility with the legacy patch protocol.
-    pub fn request_live_resync(&self) {
+    pub fn request_live_resync(&mut self) {
         self.send_live(crate::js::PageCmd::Resync);
     }
 
@@ -2197,24 +2197,14 @@ impl BrowserController {
         self.pending_file_pickers.pop_front()
     }
 
-    /// Queue the decoded intrinsic-size map for the resident page. The native
-    /// frontend calls this from an event loop and must never block; a full
-    /// command queue is therefore a normal retry condition, not a successful
-    /// delivery. This mirrors the terminal frontend's `image_sizes_sent`
-    /// acknowledgement discipline and keeps CSSOM/layout geometry convergent
-    /// with the decoded image resources (CSSOM View + HTML image update).
-    pub fn send_image_sizes(&self, sizes: &crate::layout2::ImageSizes) -> bool {
-        let Some(handle) = &self.live_page else {
-            return false;
-        };
+    /// Queue decoded intrinsic sizes without blocking the native event loop.
+    /// A full actor channel retains the handoff and retries on capacity.
+    pub fn send_image_sizes(&mut self, sizes: &crate::layout2::ImageSizes) -> bool {
         let values = sizes
             .iter()
             .map(|(source, size)| (source.clone(), *size))
             .collect();
-        handle
-            .cmds
-            .try_send(crate::js::PageCmd::ImageSizes(values))
-            .is_ok()
+        self.send_live(crate::js::PageCmd::ImageSizes(values))
     }
 
     pub fn handle_action(&mut self, action: UserAction) -> ActionOutcome {
@@ -2630,8 +2620,12 @@ impl BrowserController {
                     self.service_window_action(action);
                     changed = true;
                 }
-                CoreEvent::UserInputReady { generation, permit } => {
-                    if generation == self.document_generation {
+                CoreEvent::UserInputReady {
+                    generation,
+                    epoch,
+                    permit,
+                } => {
+                    if generation == self.document_generation && epoch == self.live_page_epoch {
                         self.user_input_retry = None;
                         if let (Some(page), Some(permit)) = (&self.live_page, permit) {
                             if let Some((command, _navigation)) =
@@ -2642,6 +2636,19 @@ impl BrowserController {
                             self.flush_user_input();
                         } else {
                             changed |= self.stop();
+                        }
+                    }
+                }
+                CoreEvent::LiveCommandReady { epoch, permit } => {
+                    if epoch == self.live_page_epoch {
+                        self.live_command_retry = None;
+                        if let (Some(_), Some(permit)) = (&self.live_page, permit) {
+                            if let Some(command) = self.pending_live_commands.pop_front() {
+                                permit.send(command);
+                            }
+                            self.flush_live_commands();
+                        } else {
+                            changed |= self.stop_after_live_command_failure();
                         }
                     }
                 }
@@ -4007,17 +4014,95 @@ impl BrowserController {
         }));
     }
 
-    fn send_live(&self, command: crate::js::PageCmd) -> bool {
-        self.live_page
-            .as_ref()
-            .is_some_and(|handle| handle.cmds.try_send(command).is_ok())
+    /// Enqueue in actor-lane order without blocking the native thread. The
+    /// return value acknowledges acceptance into this bounded queue, not that
+    /// the actor has processed the command. HTML #page-visibility requires
+    /// each system-visibility transition; do not collapse these transitions.
+    fn send_live(&mut self, command: crate::js::PageCmd) -> bool {
+        if self.live_page.is_none() {
+            return false;
+        }
+        // Consecutive viewport sizes not yet seen by the actor share the next
+        // CSSOM View #resizing-viewports rendering opportunity. The actor's
+        // ImageSizes command updates individual URLs rather than replacing its
+        // map; merge successive batches with latest dimensions for each URL.
+        // Intervening commands, especially fullscreen results and resyncs,
+        // are FIFO barriers.
+        use crate::js::PageCmd;
+        let command = match (self.pending_live_commands.back_mut(), command) {
+            (Some(PageCmd::Viewport(previous)), PageCmd::Viewport(next)) => {
+                *previous = next;
+                return true;
+            }
+            (Some(PageCmd::ImageSizes(previous)), PageCmd::ImageSizes(next)) => {
+                let newer: std::collections::HashSet<_> =
+                    next.iter().map(|(source, _)| source.as_str()).collect();
+                previous.retain(|(source, _)| !newer.contains(source.as_str()));
+                drop(newer);
+                previous.extend(next);
+                return true;
+            }
+            (_, command) => command,
+        };
+        const MAX_PENDING_COMMANDS: usize = 4096;
+        if self.pending_live_commands.len() == MAX_PENDING_COMMANDS {
+            self.stop_after_live_command_failure();
+            self.status = String::from("Stopped — page command backlog exceeded its limit.");
+            return false;
+        }
+        self.pending_live_commands.push_back(command);
+        self.flush_live_commands();
+        self.live_page.is_some()
+    }
+
+    fn flush_live_commands(&mut self) {
+        use tokio::sync::mpsc::error::TrySendError;
+        if self.live_command_retry.is_some() {
+            return;
+        }
+        while let Some(command) = self.pending_live_commands.pop_front() {
+            let Some(page) = &self.live_page else {
+                return;
+            };
+            match page.cmds.try_send(command) {
+                Ok(()) => {}
+                Err(TrySendError::Closed(_)) => {
+                    self.stop_after_live_command_failure();
+                    return;
+                }
+                Err(TrySendError::Full(command)) => {
+                    self.pending_live_commands.push_front(command);
+                    let sender = page.cmds.clone();
+                    let tx = self.tx.clone();
+                    let epoch = self.live_page_epoch;
+                    // Wait for real capacity; carry the reservation back to
+                    // prevent another producer stealing the FIFO's next slot.
+                    self.live_command_retry = Some(self.runtime.spawn(async move {
+                        let permit = sender.reserve_owned().await.ok();
+                        let _ = tx.send(CoreEvent::LiveCommandReady { epoch, permit }).await;
+                    }));
+                    return;
+                }
+            }
+        }
+    }
+
+    /// `stop` normally dismisses an open input prompt first. A broken actor
+    /// cannot accept its commands after that dismissal, so retire it as well.
+    fn stop_after_live_command_failure(&mut self) -> bool {
+        let stopped = self.stop();
+        if self.live_page.is_some() {
+            self.stop() | stopped
+        } else {
+            stopped
+        }
     }
 
     /// Report the session history (the current entry's index among the back
     /// and forward entries, and their number) to the live page when it
     /// changed: `history.length` and `window.close()` read it (HTML
-    /// #dom-history-length, #script-closable). A full channel leaves it
-    /// unsent, so the next round retries.
+    /// #dom-history-length, #script-closable). A full actor channel retains
+    /// the report in the controller's bounded command queue.
     fn sync_session_history(&mut self) {
         let command = crate::js::PageCmd::SessionHistory {
             index: self.back.len(),
@@ -4104,13 +4189,18 @@ impl BrowserController {
                     let sender = page.user_input_sender();
                     let tx = self.tx.clone();
                     let generation = self.document_generation;
+                    let epoch = self.live_page_epoch;
                     // Sleep on real channel capacity, not a timer/poll loop. The
                     // reserved slot crosses back with the wake so it cannot be
                     // stolen by a later input. Only one retry task exists per page.
                     self.user_input_retry = Some(self.runtime.spawn(async move {
                         let permit = sender.reserve_owned().await.ok();
                         let _ = tx
-                            .send(CoreEvent::UserInputReady { generation, permit })
+                            .send(CoreEvent::UserInputReady {
+                                generation,
+                                epoch,
+                                permit,
+                            })
                             .await;
                     }));
                     return;
@@ -4169,6 +4259,11 @@ impl BrowserController {
             retry.abort();
         }
         self.pending_user_input.clear();
+        self.live_page_epoch = self.live_page_epoch.wrapping_add(1);
+        if let Some(retry) = self.live_command_retry.take() {
+            retry.abort();
+        }
+        self.pending_live_commands.clear();
         if let Some(page) = self.live_page.take() {
             match end {
                 PageEnd::Unload => page.unload(&self.runtime),
@@ -4323,7 +4418,9 @@ impl BrowserController {
         match event {
             PageEvt::Updated { html, mut outcome } => {
                 self.page_text_control_state = None;
-                self.last_js_outcome = Some(outcome.clone());
+                // The page owns the authoritative rendering; diagnostics do
+                // not need a second copy of its forms, semantics and maps.
+                let rendered = outcome.rendered.take();
                 // The native frontends do not pass through `App`, so mirror its
                 // gated live-render diagnostic here. Keeping this at the shared
                 // controller boundary captures the exact authoritative HTML
@@ -4338,7 +4435,7 @@ impl BrowserController {
                     );
                 }
                 if let Some(page) = &mut self.current {
-                    if let Some(rendered) = outcome.rendered.take() {
+                    if let Some(rendered) = rendered {
                         page.rendered = Some(*rendered);
                     }
                     page.revision = page.revision.wrapping_add(1);
@@ -4350,11 +4447,12 @@ impl BrowserController {
                 } else {
                     format!("Page updated · JS:{}", outcome.errors.len())
                 };
+                self.last_js_outcome = Some(outcome);
                 true
             }
             PageEvt::Static { html, mut outcome } => {
                 self.page_text_control_state = None;
-                self.last_js_outcome = Some(outcome.clone());
+                let rendered = outcome.rendered.take();
                 if let Some(page) = &mut self.current {
                     // HTML #meta-referrer: navigations this controller starts
                     // from the retired Document use its final policy.
@@ -4374,7 +4472,7 @@ impl BrowserController {
                     {
                         response.body = html.into_bytes();
                     }
-                    if let Some(rendered) = outcome.rendered.take() {
+                    if let Some(rendered) = rendered {
                         page.rendered = Some(*rendered);
                     }
                     page.revision = page.revision.wrapping_add(1);
@@ -4388,6 +4486,7 @@ impl BrowserController {
                 } else {
                     format!("Page updated · JS:{}", outcome.errors.len())
                 };
+                self.last_js_outcome = Some(outcome);
                 true
             }
             PageEvt::Patched {
@@ -4397,10 +4496,10 @@ impl BrowserController {
                 if outcome.rendered.is_some() {
                     self.page_text_control_state = None;
                 }
-                self.last_js_outcome = Some(outcome.clone());
+                let rendered = outcome.rendered.take();
                 let _ = patches;
                 if let Some(page) = &mut self.current {
-                    if let Some(rendered) = outcome.rendered.take() {
+                    if let Some(rendered) = rendered {
                         page.rendered = Some(*rendered);
                         page.revision = page.revision.wrapping_add(1);
                         page.rendered_revision = page.revision;
@@ -4411,6 +4510,7 @@ impl BrowserController {
                 if !outcome.errors.is_empty() {
                     self.status = format!("Page JS:{}", outcome.errors.len());
                 }
+                self.last_js_outcome = Some(outcome);
                 true
             }
             PageEvt::Navigate(address, initiator) => {
@@ -7462,23 +7562,55 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn native_input_backpressure_retires_stale_capacity_and_bounds_overload() {
-        let mut browser =
-            BrowserController::new(Handle::current(), || {}, CssSize::new(640.0, 480.0));
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let wake_count = wakes.clone();
+        let mut browser = BrowserController::new(
+            Handle::current(),
+            move || {
+                wake_count.fetch_add(1, Ordering::Relaxed);
+            },
+            CssSize::new(640.0, 480.0),
+        );
         let (old_tx, mut old_rx) = tokio::sync::mpsc::channel(1);
         browser.live_page = Some(crate::js::PageHandle::from_test_sender(old_tx));
         browser.send_user(crate::js::PageCmd::Focus(Some(1)));
         browser.send_user(crate::js::PageCmd::Focus(Some(2)));
         assert!(old_rx.try_recv().is_ok());
-        tokio::task::yield_now().await; // The old generation now owns a reserved slot/wake.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while wakes.load(Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("old actor input capacity did not wake the controller");
+        let generation = browser.document_generation;
         browser.stop();
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         browser.live_page = Some(crate::js::PageHandle::from_test_sender(tx));
+        assert_eq!(browser.document_generation, generation);
         browser.send_user(crate::js::PageCmd::Focus(Some(3)));
+        browser.send_user(crate::js::PageCmd::Focus(Some(4)));
         browser.process_async_events();
+        assert!(
+            browser.user_input_retry.is_some(),
+            "old wake cleared new waiter"
+        );
         assert!(matches!(
             rx.try_recv(),
             Ok(crate::js::PageCmd::Focus(Some(3)))
         ));
+        let command = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                tokio::task::yield_now().await;
+                browser.process_async_events();
+                if let Ok(command) = rx.try_recv() {
+                    break command;
+                }
+            }
+        })
+        .await
+        .expect("replacement actor did not receive input");
+        assert!(matches!(command, crate::js::PageCmd::Focus(Some(4))));
         assert!(
             old_rx.try_recv().is_err(),
             "retired input must not be delivered"
@@ -7582,29 +7714,210 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn image_size_delivery_reports_a_full_page_queue_for_retry() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let mut browser =
-            BrowserController::new(runtime.handle().clone(), || {}, CssSize::new(640.0, 480.0));
+    #[tokio::test(flavor = "current_thread")]
+    async fn live_commands_wait_for_capacity_preserving_rendering_and_visibility_order() {
+        use crate::js::PageCmd;
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let wake_count = wakes.clone();
+        let mut browser = BrowserController::new(
+            Handle::current(),
+            move || {
+                wake_count.fetch_add(1, Ordering::Relaxed);
+            },
+            CssSize::new(640.0, 480.0),
+        );
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        tx.try_send(crate::js::PageCmd::Click(0)).unwrap();
+        tx.try_send(PageCmd::Click(0)).unwrap();
         browser.live_page = Some(crate::js::PageHandle::from_test_sender(tx));
-        let sizes = crate::layout2::ImageSizes::from([(
-            String::from("https://example.test/hero.jpg"),
-            (640, 360),
-        )]);
-
-        assert!(!browser.send_image_sizes(&sizes));
-        assert!(matches!(rx.try_recv(), Ok(crate::js::PageCmd::Click(0))));
+        browser.live_traversable = Some(browser.traversable_state());
+        browser.handle_action(UserAction::Resize(CssSize::new(800.0, 600.0)));
+        browser.handle_action(UserAction::Resize(CssSize::new(1024.0, 768.0)));
+        browser.handle_action(UserAction::FullscreenResult {
+            request: 17,
+            ok: true,
+        });
+        browser.handle_action(UserAction::Resize(CssSize::new(1111.0, 777.0)));
+        browser.handle_action(UserAction::Visible(false));
+        browser.handle_action(UserAction::Visible(true));
+        browser.handle_action(UserAction::Focus(true));
+        browser.handle_action(UserAction::DevicePixelRatio(2.0));
+        browser.handle_action(UserAction::ScreenPosition(5, 7));
+        browser.session_history_unsent = true;
+        browser.process_async_events();
+        let sizes = crate::layout2::ImageSizes::from([
+            (String::from("https://example.test/hero.jpg"), (640, 360)),
+            (String::from("https://example.test/icon.png"), (10, 10)),
+        ]);
         assert!(browser.send_image_sizes(&sizes));
+        assert!(
+            browser.send_image_sizes(&crate::layout2::ImageSizes::from([(
+                String::from("https://example.test/hero.jpg"),
+                (800, 450),
+            )]))
+        );
+        browser.request_live_resync();
+        assert!(
+            browser.send_image_sizes(&crate::layout2::ImageSizes::from([(
+                String::from("https://example.test/icon.png"),
+                (20, 20),
+            )]))
+        );
+        assert!(browser.live_command_retry.is_some());
+
+        // No actor capacity and no page events: repeated native turns must not
+        // request their own wake or lose transitions.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+            browser.process_async_events();
+        }
+        assert_eq!(wakes.load(Ordering::Relaxed), 0);
+        assert!(matches!(rx.try_recv(), Ok(PageCmd::Click(0))));
+
+        let received = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut received = Vec::new();
+            while received.len() < 12 {
+                tokio::task::yield_now().await;
+                browser.process_async_events();
+                if let Ok(command) = rx.try_recv() {
+                    received.push(command);
+                }
+            }
+            received
+        })
+        .await
+        .expect("command queue failed to wake on actor capacity");
+
+        assert!(
+            matches!(received[0], PageCmd::Viewport(v) if v.width == 1024.0 && v.height == 768.0)
+        );
         assert!(matches!(
-            rx.try_recv(),
-            Ok(crate::js::PageCmd::ImageSizes(_))
+            received[1],
+            PageCmd::FullscreenResult {
+                request: 17,
+                ok: true
+            }
         ));
+        assert!(
+            matches!(received[2], PageCmd::Viewport(v) if v.width == 1111.0 && v.height == 777.0)
+        );
+        assert!(matches!(received[3], PageCmd::SystemVisibility(true)));
+        assert!(matches!(received[4], PageCmd::SystemVisibility(false)));
+        assert!(matches!(received[5], PageCmd::SystemFocus(true)));
+        assert!(matches!(received[6], PageCmd::DevicePixelRatio(2.0)));
+        assert!(matches!(received[7], PageCmd::ScreenPosition(5, 7)));
+        assert!(matches!(
+            received[8],
+            PageCmd::SessionHistory {
+                index: 0,
+                length: 1,
+                applied: 0
+            }
+        ));
+        assert!(matches!(&received[9], PageCmd::ImageSizes(values)
+            if values.len() == 2
+                && values.iter().any(|(source, size)| source.ends_with("hero.jpg") && *size == (800, 450))
+                && values.iter().any(|(source, size)| source.ends_with("icon.png") && *size == (10, 10))));
+        assert!(matches!(received[10], PageCmd::Resync));
+        assert!(matches!(&received[11], PageCmd::ImageSizes(values)
+            if values.len() == 1 && values[0].1 == (20, 20)));
+        assert!(browser.pending_live_commands.is_empty());
+        assert!(browser.live_command_retry.is_none());
+        assert!(wakes.load(Ordering::Relaxed) > 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_live_command_permit_cannot_disturb_replacement_actor() {
+        use crate::js::PageCmd;
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let wake_count = wakes.clone();
+        let mut browser = BrowserController::new(
+            Handle::current(),
+            move || {
+                wake_count.fetch_add(1, Ordering::Relaxed);
+            },
+            CssSize::new(640.0, 480.0),
+        );
+        let (old_tx, mut old_rx) = tokio::sync::mpsc::channel(1);
+        old_tx.try_send(PageCmd::Click(0)).unwrap();
+        browser.live_page = Some(crate::js::PageHandle::from_test_sender(old_tx));
+        assert!(
+            browser.send_live(PageCmd::Viewport(crate::layout2::Viewport::new(
+                800.0, 600.0
+            )))
+        );
+        assert!(matches!(old_rx.try_recv(), Ok(PageCmd::Click(0))));
+        // The old actor's reserved slot and wake have crossed to the queue.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while wakes.load(Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("old actor capacity did not wake the controller");
+        assert!(browser.live_command_retry.is_some());
+        let generation = browser.document_generation;
+        browser.end_live_page(PageEnd::Retire);
+        let (new_tx, mut new_rx) = tokio::sync::mpsc::channel(1);
+        new_tx.try_send(PageCmd::Click(1)).unwrap();
+        browser.live_page = Some(crate::js::PageHandle::from_test_sender(new_tx));
+        assert_eq!(browser.document_generation, generation);
+        assert!(
+            browser.send_live(PageCmd::Viewport(crate::layout2::Viewport::new(
+                1024.0, 768.0
+            )))
+        );
+        browser.process_async_events();
+        assert!(
+            browser.live_command_retry.is_some(),
+            "old wake cleared new waiter"
+        );
+        assert!(matches!(new_rx.try_recv(), Ok(PageCmd::Click(1))));
+
+        let command = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                tokio::task::yield_now().await;
+                browser.process_async_events();
+                if let Ok(command) = new_rx.try_recv() {
+                    break command;
+                }
+            }
+        })
+        .await
+        .expect("replacement actor did not receive command");
+        assert!(matches!(command, PageCmd::Viewport(v) if v.width == 1024.0));
+        assert!(
+            old_rx.try_recv().is_err(),
+            "retired command reached old actor"
+        );
+        assert!(browser.live_command_retry.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn live_command_backlog_is_bounded_and_closed_actor_is_retired() {
+        use crate::js::PageCmd;
+        let mut browser =
+            BrowserController::new(Handle::current(), || {}, CssSize::new(640.0, 480.0));
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(PageCmd::Click(0)).unwrap();
+        browser.live_page = Some(crate::js::PageHandle::from_test_sender(tx));
+        for _ in 0..4096 {
+            assert!(browser.send_live(PageCmd::Resync));
+        }
+        assert!(!browser.send_live(PageCmd::Resync));
+        assert!(!browser.page_is_live());
+        assert!(browser.pending_live_commands.is_empty());
+        assert!(browser.live_command_retry.is_none());
+        assert!(browser.status.contains("command backlog"));
+
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(PageCmd::Click(0)).unwrap();
+        browser.live_page = Some(crate::js::PageHandle::from_test_sender(tx));
+        assert!(browser.send_live(PageCmd::Resync));
+        drop(rx);
+        tokio::task::yield_now().await;
+        browser.process_async_events();
+        assert!(!browser.page_is_live());
+        assert!(browser.live_command_retry.is_none());
     }
 
     #[test]
@@ -7670,6 +7983,112 @@ mod tests {
             response.body,
             b"<html><body><p>settled DOM</p></body></html>"
         );
+    }
+
+    #[test]
+    fn render_events_keep_one_current_presentation_and_all_diagnostics() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut browser =
+            BrowserController::new(runtime.handle().clone(), || {}, CssSize::new(640.0, 480.0));
+        let url = url::Url::parse("https://example.com/").unwrap();
+        browser.current = Some(desktop_page(&url, None));
+
+        for kind in 0..3 {
+            let dom = crate::dom::Dom::parse_document(
+                "<p id=message>current frame</p><form><input name=query value=hello></form>",
+            );
+            let rendered = http::render_arena(
+                &dom,
+                &url,
+                crate::layout2::Viewport {
+                    width: 640.0,
+                    height: 480.0,
+                },
+                1.0,
+                None,
+                &Default::default(),
+            );
+            let form_count = rendered.forms.len();
+            let semantic_count = rendered.semantics.nodes.len();
+            assert!(form_count > 0 && semantic_count > 0);
+            let expected_layout = Arc::downgrade(&rendered.layout);
+            let outcome = crate::js::Outcome {
+                errors: vec!["script error".into()],
+                elapsed: std::time::Duration::from_millis(12),
+                modules_skipped: 2,
+                panicked: true,
+                fetches: 3,
+                console: vec!["console line".into()],
+                rendered: Some(Box::new(rendered)),
+                animation_frame: true,
+                referrer_policy: Some(crate::referrer_policy::ReferrerPolicy::Origin),
+            };
+            let event = match kind {
+                0 => crate::js::PageEvt::Updated {
+                    html: "updated".into(),
+                    outcome,
+                },
+                1 => crate::js::PageEvt::Patched {
+                    patches: Vec::new(),
+                    outcome,
+                },
+                _ => crate::js::PageEvt::Static {
+                    html: "settled".into(),
+                    outcome,
+                },
+            };
+            assert!(browser.handle_page_event(event));
+
+            let page = browser.current_page().unwrap().rendered_page().unwrap();
+            assert!(std::ptr::eq(
+                expected_layout.as_ptr(),
+                Arc::as_ptr(&page.layout)
+            ));
+            assert_eq!(page.forms.len(), form_count);
+            assert_eq!(page.semantics.nodes.len(), semantic_count);
+            assert_eq!(Arc::strong_count(&page.layout), 1, "kind {kind}");
+            let diagnostic = browser.last_js_outcome().unwrap();
+            assert!(diagnostic.rendered.is_none(), "kind {kind}");
+            assert_eq!(diagnostic.errors, ["script error"]);
+            assert_eq!(diagnostic.elapsed, std::time::Duration::from_millis(12));
+            assert_eq!(diagnostic.modules_skipped, 2);
+            assert!(diagnostic.panicked);
+            assert_eq!(diagnostic.fetches, 3);
+            assert_eq!(diagnostic.console, ["console line"]);
+            assert!(diagnostic.animation_frame);
+            assert_eq!(
+                diagnostic.referrer_policy,
+                Some(crate::referrer_policy::ReferrerPolicy::Origin)
+            );
+        }
+
+        // An event without a new rendering retains the current presentation.
+        let previous = Arc::downgrade(
+            &browser
+                .current_page()
+                .unwrap()
+                .rendered_page()
+                .unwrap()
+                .layout,
+        );
+        assert!(browser.handle_page_event(crate::js::PageEvt::Patched {
+            patches: Vec::new(),
+            outcome: Default::default(),
+        }));
+        assert!(std::ptr::eq(
+            previous.as_ptr(),
+            Arc::as_ptr(
+                &browser
+                    .current_page()
+                    .unwrap()
+                    .rendered_page()
+                    .unwrap()
+                    .layout
+            )
+        ));
     }
 
     #[test]

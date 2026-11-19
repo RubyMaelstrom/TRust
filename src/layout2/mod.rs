@@ -454,6 +454,15 @@ pub struct NativeInputPresentation {
 pub struct PendingEditorText {
     pub text: String,
     pub nodes: Vec<NodeId>,
+    /// Glyph owners that represent the editable value itself. Unlike `nodes`,
+    /// this excludes generated before/after content on an editing host.
+    /// A textarea's text is painted under the control node.
+    pub text_nodes: Vec<NodeId>,
+    /// Right edge of the first laid line's actual available band, in the
+    /// untransformed paint coordinates. `None` denies line-local preview.
+    pub line_right: Option<f32>,
+    /// CSS Text 4 modes where edge spaces neither collapse nor hang.
+    pub preserves_edge_spaces: bool,
     pub color: crate::render::PaintColor,
 }
 
@@ -624,6 +633,9 @@ pub(crate) fn rich_editor_presentation(
             pending_text: Some(PendingEditorText {
                 text: dom.text_content(node),
                 nodes: vec![node],
+                text_nodes: vec![node],
+                line_right: None,
+                preserves_edge_spaces: false,
                 color,
             }),
             native_input: None,
@@ -637,8 +649,15 @@ pub(crate) fn rich_editor_presentation(
         .or_else(|| cache.fixed.iter().find_map(|f| find(f, node)))
         .or_else(|| cache.top_layer.iter().find_map(|f| find(&f.fragment, node)))?;
     let (line, style_node) = first_line(host, node).unwrap_or((host, node));
-    let style =
-        style::InlineStyle::derive(dom, style_node, &style::InlineStyle::root(), base).text_style();
+    let inline_style =
+        style::InlineStyle::derive(dom, style_node, &style::InlineStyle::root(), base);
+    let preserves_edge_spaces = matches!(
+        inline_style.ws,
+        contract::WhiteSpace::Pre
+            | contract::WhiteSpace::BreakSpaces
+            | contract::WhiteSpace::BreakSpacesNoWrap
+    );
+    let style = inline_style.text_style();
     let color = dom
         .computed_value_resolved(style_node, "caret-color")
         .filter(|v| !matches!(v.trim(), "auto" | "currentcolor" | "currentColor"))
@@ -648,6 +667,27 @@ pub(crate) fn rich_editor_presentation(
         .unwrap_or(crate::render::CANVAS_TEXT);
     let nodes: Vec<_> = std::iter::once(node).chain(dom.descendants(node)).collect();
     let mut paragraphs = 0;
+    // CSS Pseudo 4 #first-letter-pseudo and CSS Backgrounds 4
+    // #valdef-background-clip-text can make a separate paint depend on the
+    // glyphs. Replacing one run cannot update those paints, including an
+    // ancestor's text-clipped background or first-letter pseudo-element.
+    let glyph_dependent_paint = nodes
+        .iter()
+        .copied()
+        .chain(std::iter::successors(dom.parent_flat(node), |&id| {
+            dom.parent_flat(id)
+        }))
+        .filter(|&id| dom.tag_name(id).is_some())
+        .any(|id| {
+            dom.has_first_letter_style(id)
+                || dom
+                    .computed_value_resolved(id, "background-clip")
+                    .is_some_and(|value| {
+                        value
+                            .split(|c: char| !c.is_ascii_alphanumeric() && c != '-')
+                            .any(|token| token.eq_ignore_ascii_case("text"))
+                    })
+        });
     let plain = nodes.iter().all(|&id| {
         if id == node {
             return true;
@@ -676,10 +716,34 @@ pub(crate) fn rich_editor_presentation(
             && dom
                 .computed_value_resolved(id, "writing-mode")
                 .is_none_or(|v| v == "horizontal-tb")
-    });
+            // WHATWG Compatibility #the-webkit-text-stroke-width: graphics
+            // emits glyph outlines separately from the fill run. The
+            // computed value is normalized to px by the style system.
+            && dom
+                .computed_value_resolved(id, "-webkit-text-stroke-width")
+                .is_none_or(|value| {
+                    value
+                        .trim()
+                        .strip_suffix("px")
+                        .and_then(|number| number.parse::<f32>().ok())
+                        .is_some_and(|width| width == 0.0)
+                })
+    }) && !glyph_dependent_paint;
+    let text_nodes = nodes
+        .iter()
+        .copied()
+        .filter(|&id| matches!(&dom.node(id).data, crate::dom::NodeData::Text(_)))
+        .collect();
+    let line_right = match &line.kind {
+        FragKind::Line(line_data) if !line_data.sideways => Some(line.x + line_data.band[1]),
+        _ => None,
+    };
     let pending_text = plain.then(|| PendingEditorText {
         text: dom.text_content(node),
         nodes,
+        text_nodes,
+        line_right,
+        preserves_edge_spaces,
         color: dom
             .computed_value_resolved(style_node, "color")
             .as_deref()
@@ -5195,6 +5259,34 @@ mod tests {
     }
 
     #[test]
+    fn table_column_preferences_and_later_fixed_cells_preserve_span_geometry() {
+        // CSS Tables 3 #computing-column-measures: columns and single-span
+        // cells contribute before the spanning cell's percentage. A later
+        // fixed cell must still constrain its column's max-content sizing.
+        let html = r#"<!doctype html><style>body{margin:0}table{width:500px;border-spacing:0}td{padding:0;font:10px monospace}</style>
+            <table id=a><col width="25%"><col width="100"><col>
+            <tr><td id=a0>alpha beta gamma delta</td><td id=a1>red blue green</td><td id=a2>last column words</td></tr>
+            <tr><td style="width:80px">short</td><td>x</td><td>y</td></tr>
+            <tr><td id=as colspan=2 width="70%">long spanning item here</td><td>z</td></tr></table>
+            <table id=b><tr><td width="25%" id=b0>alpha beta gamma delta</td><td width="100" id=b1>red blue green</td><td id=b2>last column words</td></tr>
+            <tr><td style="width:80px">short</td><td>x</td><td>y</td></tr>
+            <tr><td id=bs colspan=2 width="70%">long spanning item here</td><td>z</td></tr></table>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 800.0, &HashMap::new());
+        for (a, b) in [("a0", "b0"), ("a1", "b1"), ("a2", "b2"), ("as", "bs")] {
+            let first = layout.boxes[&dom.get_by_id(a).unwrap()];
+            let second = layout.boxes[&dom.get_by_id(b).unwrap()];
+            assert!(first.width > 0.0, "{a}");
+            assert!(
+                (first.width - second.width).abs() < 0.01,
+                "{a}: {}, {b}: {}",
+                first.width,
+                second.width
+            );
+        }
+    }
+
+    #[test]
     fn content_of_a_cell_taller_than_it_is_vertically_aligned() {
         // CSS 2.2 §17.5.3/§17.5.4: a cell's 'height' makes the cell taller,
         // and its content is aligned in the extra space (middle by default).
@@ -9188,6 +9280,46 @@ b</xmp></body>"#;
     }
 
     #[test]
+    fn inline_controls_contribute_cyclic_percentages_at_the_correct_basis() {
+        // CSS Sizing 3 #cyclic-percentage-contribution and #min-content-zero.
+        let dom = Dom::parse_document(
+            r#"<!doctype html><style>
+            body { margin:0; font:16px/22px monospace }
+            div { width:min-content }
+            .max-content { width:max-content }
+            input { font:inherit; margin:0; border:0; padding:0; box-sizing:content-box }
+            </style>
+            <div id=width><input type=search size=20 style="width:calc(50% + 18px);
+                padding:0 calc(2px + 10%); margin:0 calc(3px + 10%)"></div>
+            <div id=max-width><input size=20 style="max-width:calc(50% + 24px)"></div>
+            <div id=min-width><input size=20 style="width:100%; max-width:100%;
+                min-width:calc(50% + 16px)"></div>
+            <div id=button><input type=button value="A button label" style="width:25%"></div>
+            <div id=button-auto><input type=button value="A button label"></div>
+            <div id=preferred class=max-content><input size=20 style="width:calc(50% + 18px)"></div>
+            <div id=preferred-auto class=max-content><input size=20></div>"#,
+        );
+        let base = Url::parse("https://example.test/").unwrap();
+        let (forms, controls) = crate::http::extract_forms_arena(&dom, &base, None);
+        let layout = lay_out_graphical(
+            &dom,
+            &base,
+            Viewport::new(640., 480.),
+            &forms,
+            &controls,
+            &HashMap::new(),
+        );
+        let width = |id| rect(&dom, &layout.boxes, id).width;
+        assert_eq!(width("width"), 18. + 2. * (2. + 3.));
+        assert_eq!(width("max-width"), 24.);
+        assert_eq!(width("min-width"), 16.);
+        assert!(width("button-auto") > 0.);
+        assert_eq!(width("button"), width("button-auto"));
+        assert!(width("preferred-auto") > 18.);
+        assert_eq!(width("preferred"), width("preferred-auto"));
+    }
+
+    #[test]
     fn formless_icon_button_paints_its_sized_svg_child() {
         // WHATWG HTML §4.10.6/Rendering §15.5.3: a <button> is labeled by
         // its contents, whose child boxes form the anonymous button content
@@ -13158,6 +13290,131 @@ b</xmp></body>"#;
         assert_eq!(cell_at(&out, "InnerL").0, cell_at(&out, "Outer").0);
         assert!(cell_at(&out, "InnerR").1 > cell_at(&out, "InnerL").1);
         assert!(cell_at(&out, "Outer").1 > cell_at(&out, "InnerR").1);
+    }
+
+    #[test]
+    fn percentage_search_input_fits_its_table_column() {
+        for (layout_mode, cell_width, sizing, adjacent_width) in [
+            ("auto", "auto", "content-box", 52.),
+            ("fixed", "100%", "content-box", 52.),
+            ("fixed", "100%", "border-box", 48.),
+        ] {
+            // CSS Sizing 3 #replaced-percentage-min-contribution lets the
+            // input shrink in automatic table layout. CSS Tables 3
+            // #width-distribution-in-fixed-mode reserves the length column
+            // before scaling a conflicting percentage column to fit.
+            let dom = Dom::parse_document(&format!(
+                r#"<!doctype html><style>
+                body {{ margin:0; font:16px/22px monospace }}
+                #frame {{ box-sizing:border-box; width:180px; height:35px; border:1px solid blue }}
+                table {{ width:100%; border-collapse:collapse; table-layout:{layout_mode} }}
+                #field {{ width:{cell_width}; padding:4px 10px 0 56px }}
+                #clear {{ box-sizing:{sizing}; width:48px; height:48px; padding:4px 4px 0 0 }}
+                input {{ width:100%; height:24px; border:0; padding:0; margin:0; font:inherit }}
+                </style><div id=frame><table id=table><tr>
+                <td id=field><input id=query type=search name=q size=20
+                    placeholder="A deliberately long search hint"></td>
+                <td id=clear></td></tr></table></div>"#
+            ));
+            let base = Url::parse("https://example.test/").unwrap();
+            let (forms, controls) = crate::http::extract_forms_arena(&dom, &base, None);
+            let layout = lay_out_graphical(
+                &dom,
+                &base,
+                Viewport::new(640., 480.),
+                &forms,
+                &controls,
+                &HashMap::new(),
+            );
+            let bounds = |id| rect(&dom, &layout.boxes, id);
+            let (frame, table, field, query, clear) = (
+                bounds("frame"),
+                bounds("table"),
+                bounds("field"),
+                bounds("query"),
+                bounds("clear"),
+            );
+            assert_eq!((frame.width, frame.height), (180., 35.));
+            assert_eq!((table.left - frame.left, table.width), (1., 178.));
+            assert_eq!(clear.width, adjacent_width, "{layout_mode}/{sizing}");
+            assert_eq!(field.left, table.left);
+            assert_eq!(field.width, 178. - adjacent_width);
+            assert_eq!(query.left, field.left + 56.);
+            assert_eq!(query.width, field.width - 66.);
+            assert_eq!(query.left + query.width + 10., clear.left);
+            assert_eq!(clear.left + clear.width, table.left + table.width);
+        }
+    }
+
+    #[test]
+    fn fixed_table_distributes_space_from_columns_and_first_row() {
+        // CSS 2.2 #fixed-table-layout and CSS Tables 3
+        // #width-distribution-in-fixed-mode / #distributing-width-to-columns.
+        for (case, width, rows, expected) in [
+            (
+                "column precedence and later rows",
+                200,
+                r#"<col style="width:40px"><col><col>
+                <tr><td id=a width=120>A</td><td id=b width=60>B</td><td id=c>C</td></tr>
+                <tr><td>A</td><td>B</td><td width=500>C</td></tr>"#,
+                &[40., 60., 100.][..],
+            ),
+            (
+                "proportional reduction of percentages",
+                180,
+                r#"<tr><td id=a style="width:80%">A</td><td id=b style="width:40%">B</td>
+                <td id=c style="width:60px">C</td></tr>"#,
+                &[80., 40., 60.][..],
+            ),
+            (
+                "lengths expand the table",
+                100,
+                r#"<tr><td id=a style="width:70px">A</td><td id=b style="width:60px">B</td></tr>"#,
+                &[70., 60.][..],
+            ),
+            (
+                "excess goes to length columns when no column is auto",
+                200,
+                r#"<tr><td id=a style="width:25px">A</td><td id=b style="width:75px">B</td>
+                <td id=c style="width:25%">C</td></tr>"#,
+                &[37.5, 112.5, 50.][..],
+            ),
+            (
+                "percentage and length components distribute separately",
+                200,
+                r#"<tr><td id=a style="width:calc(50% + 20px)">A</td>
+                <td id=b style="width:80%">B</td><td id=c style="width:50px">C</td></tr>"#,
+                &[70., 80., 50.][..],
+            ),
+            (
+                "percentage cell padding does not widen its assigned box",
+                200,
+                r#"<tr><td id=a style="width:5%;padding:0 20px;box-sizing:border-box">A</td>
+                <td id=b style="width:60px">B</td><td id=c>C</td></tr>"#,
+                &[10., 60., 130.][..],
+            ),
+        ] {
+            let (dom, boxes) = collapsed_fixture(&format!(
+                r#"<style>td {{ padding:0 }}</style>
+                    <table id=table style="table-layout:fixed; border-collapse:collapse; width:{width}px">
+                    {rows}</table>"#
+            ));
+            let table = rect(&dom, &boxes, "table");
+            let mut left = table.left;
+            for (id, width) in ["a", "b", "c"].into_iter().zip(expected) {
+                let cell = rect(&dom, &boxes, id);
+                assert!((cell.left - left).abs() < 0.01, "{case}/{id}: {cell:?}");
+                assert!(
+                    (cell.width - width).abs() < 0.01,
+                    "{case}/{id}: {cell:?}, expected width {width}"
+                );
+                left += width;
+            }
+            assert!(
+                (table.left + table.width - left).abs() < 0.01,
+                "{case}: {table:?}"
+            );
+        }
     }
 
     #[test]

@@ -136,7 +136,6 @@ enum DesktopEvent {
     /// A tab's controller has asynchronous events (`None`: the shown tab's
     /// shared services, such as site storage notices).
     BrowserWake(Option<tabs::TabId>),
-    ChromeTick,
     /// The tab strip's loading jewels need their next frame.
     StripTick,
     ImageLoaded {
@@ -178,8 +177,6 @@ enum DesktopEvent {
     /// Ctrl+N's window opens even when the window manager does not answer
     /// its request for an activation token in time (`windowing`).
     NewWindowDue(winit::event_loop::AsyncRequestSerial),
-    /// A background tab may have stayed unseen long enough to sleep.
-    SleepCheck,
 }
 
 /// A drag of native files from another application over the window. winit reports the files
@@ -619,6 +616,30 @@ fn animation_frame_delay(delay: Duration) -> Duration {
     delay.max(MIN_ANIMATION_FRAME_DELAY)
 }
 
+/// One native event-loop deadline shared by loading chrome, CSS animation and
+/// terminal blink. HTML #update-the-rendering permits coalescing rendering
+/// tasks (local snapshot e5071a20c856). Replacing a later wake must not leave a
+/// sleeping task that can subsequently clear or duplicate the new timer.
+#[derive(Default)]
+struct FrameWake {
+    deadline: Option<Instant>,
+}
+
+impl FrameWake {
+    fn schedule(&mut self, deadline: Instant) {
+        self.deadline = Some(self.deadline.map_or(deadline, |old| old.min(deadline)));
+    }
+
+    fn take_due(&mut self, now: Instant) -> bool {
+        if self.deadline.is_some_and(|deadline| deadline <= now) {
+            self.deadline = None;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 fn publish_animation_update(
     output: &Arc<Mutex<AnimationOutput>>,
     proxy: &WindowProxy,
@@ -890,6 +911,48 @@ fn native_text_feedback_key(
             )
             || (control.kind == FieldKind::Textarea
                 && matches!(input.key, Key::Enter | Key::ArrowUp | Key::ArrowDown)))
+}
+
+/// Preview only an unmodified single-character insertion into a plain
+/// contenteditable. The actor still runs the cancelable key and beforeinput
+/// events, then reports the authoritative DOM selection for reconciliation.
+/// Input Events 2 #event-type-beforeinput, Selection API #definition.
+fn native_contenteditable_feedback_key(input: &KeyInput, text: Option<&str>) -> bool {
+    let Key::Character(key) = &input.key else {
+        return false;
+    };
+    input.state == KeyState::Pressed
+        && !input.composing
+        && !input.modifiers.control
+        && !input.modifiers.meta
+        && !input.modifiers.alt
+        && text == Some(key.as_str())
+        // A neutral or Latin ASCII insertion cannot turn an existing LTR
+        // `dir=auto` editing paragraph into RTL before the actor renders it.
+        && key.is_ascii()
+        && key.chars().count() == 1
+        && !key.chars().any(char::is_control)
+}
+
+/// A contenteditable uses the document Selection rather than a text
+/// control's selection. Its latest actor state may change after a key's
+/// acknowledgement when script changes the selection or contents.
+fn canonical_editor_state<'a>(
+    browser: &'a BrowserController,
+    control: &trust::doc::Field,
+) -> Option<&'a trust::js::EditableState> {
+    let node = control.live_node?;
+    if control.kind == FieldKind::Textarea && control.selection.is_none() {
+        browser.page_editable_state(node)
+    } else {
+        browser
+            .page_text_control_state(node)
+            .or_else(|| browser.page_editable_state(node))
+    }
+}
+
+fn editor_state_ahead_of_paint(state: &str, painted: &str) -> bool {
+    state != painted && !state.chars().filter(|&ch| ch != '\n').eq(painted.chars())
 }
 
 fn actor_text_key(input: &KeyInput, text: Option<&str>, control: &trust::doc::Field) -> bool {
@@ -1876,6 +1939,13 @@ impl SelectPopup {
     }
 }
 
+/// The document that owns the one native file dialog in a window.
+#[derive(Clone, Copy)]
+struct FileDialogOwner {
+    tab: tabs::TabId,
+    generation: u64,
+}
+
 struct DesktopWindow {
     /// The tab shown in the window. Every other tab is in `tabs`.
     tab: Box<tabs::Tab>,
@@ -1897,12 +1967,10 @@ struct DesktopWindow {
     swallowed_keys: HashSet<winit::keyboard::PhysicalKey>,
     /// The hyperlink the middle button was pressed on.
     aux_press_link: Option<String>,
-    /// When the next `SleepCheck` is due, if one is scheduled.
+    /// When background tabs next need an eligibility check.
     sleep_check_scheduled: Option<Instant>,
-    /// A page's file prompt is showing in the native dialog (one at a time),
-    /// for the document of this generation.
-    file_dialog_open: bool,
-    file_dialog_generation: u64,
+    /// The page waiting for the native file dialog, if one is open.
+    file_dialog: Option<FileDialogOwner>,
     file_drag: Option<NativeFileDrag>,
     next_file_drag: u64,
     renderer: Option<DesktopRenderer>,
@@ -1915,6 +1983,12 @@ struct DesktopWindow {
     accessibility: Option<AccessAdapter>,
     metrics: ViewportMetrics,
     scene: Option<Scene>,
+    /// Selection already baked into the retained scene. The live selection
+    /// can change before the old scene is replaced by the next draw.
+    scene_has_page_selection: bool,
+    /// The retained scene has preview glyphs without canonical DOM offsets.
+    /// Recompose the page's real text before pointer selection hit-testing.
+    scene_has_speculative_editor_text: bool,
     pointer: CssPoint,
     pointer_inside: bool,
     /// Pointer hover owns line-page selection until the next keyboard input.
@@ -1939,12 +2013,18 @@ struct DesktopWindow {
     command_history: trust::command::History,
     downloads_in_flight: usize,
     composing: bool,
+    /// Last scoped editable caret sent to the window manager. The tab and
+    /// document identity prevent an equal rectangle in another page from
+    /// suppressing its initial IME update.
+    scoped_ime_cursor: Option<(tabs::TabId, u64, CssRect)>,
     runtime: Handle,
     /// This window's events go through it (`windowing`).
     event_proxy: WindowProxy,
     image_store: ImageStore,
     animations: AnimationPlayer,
     window_focused: bool,
+    /// Native visibility belongs to the window, not to the selected tab.
+    window_occluded: bool,
     /// The page's context menu, while it shows (`context_menu`).
     context_menu: Option<context_menu::PageContextMenu>,
     /// A secondary click or the menu key asked a live page whether the
@@ -1982,10 +2062,7 @@ struct DesktopWindow {
     initial_size: Option<(f64, f64)>,
     bookmarks: Option<trust::bookmarks::Worker>,
     pressed_control: Option<ControlId>,
-    chrome_tick_scheduled: bool,
-    /// When the earliest scheduled `ChromeTick` fires, if `schedule_chrome_tick`
-    /// set it. A request for an earlier tick schedules another.
-    chrome_tick_deadline: Option<Instant>,
+    chrome_tick: FrameWake,
     /// winit/Softbuffer may deliver platform exposure/redraw notifications
     /// after a present. Only browser/UI invalidation is allowed to consume CPU
     /// and build a new frame; this latch prevents an idle presentation loop.
@@ -2292,8 +2369,7 @@ impl DesktopWindow {
             swallowed_keys: HashSet::new(),
             aux_press_link: None,
             sleep_check_scheduled: None,
-            file_dialog_open: false,
-            file_dialog_generation: 0,
+            file_dialog: None,
             file_drag: None,
             next_file_drag: 1,
             renderer: None,
@@ -2308,6 +2384,8 @@ impl DesktopWindow {
                 ScaleFactor::default(),
             ),
             scene: None,
+            scene_has_page_selection: false,
+            scene_has_speculative_editor_text: false,
             pointer: CssPoint::default(),
             pointer_inside: false,
             protocol_pointer_selection: false,
@@ -2326,11 +2404,13 @@ impl DesktopWindow {
             command_history: trust::command::History::default(),
             downloads_in_flight: 0,
             composing: false,
+            scoped_ime_cursor: None,
             runtime,
             event_proxy,
             image_store,
             animations,
             window_focused: true,
+            window_occluded: false,
             context_menu: None,
             context_menu_request: None,
             context_menu_swallow: None,
@@ -2350,8 +2430,7 @@ impl DesktopWindow {
             initial_size: None,
             bookmarks: None,
             pressed_control: None,
-            chrome_tick_scheduled: false,
-            chrome_tick_deadline: None,
+            chrome_tick: FrameWake::default(),
             redraw_pending: false,
             presented_image_revisions: HashMap::new(),
             force_full_raster: true,
@@ -2464,6 +2543,7 @@ impl DesktopWindow {
     /// discards their queued tasks; the epoch makes already-queued native
     /// completion events equally inert.
     fn retire_page_loading(&mut self) {
+        self.scoped_ime_cursor = None;
         if let Some(cache) = &mut self.tab.page_layout {
             cache.frozen = true;
         }
@@ -2646,21 +2726,29 @@ impl DesktopWindow {
     }
 
     fn schedule_chrome_tick(&mut self, delay: Duration) {
-        let deadline = Instant::now() + delay;
-        if self.chrome_tick_scheduled
-            && self
-                .chrome_tick_deadline
-                .is_none_or(|scheduled| scheduled <= deadline)
-        {
+        self.chrome_tick.schedule(Instant::now() + delay);
+    }
+
+    fn service_chrome_tick(&mut self) {
+        if !self.chrome_tick.take_due(Instant::now()) {
             return;
         }
-        self.chrome_tick_scheduled = true;
-        self.chrome_tick_deadline = Some(deadline);
-        let proxy = self.event_proxy.clone();
-        self.runtime.spawn(async move {
-            tokio::time::sleep(delay).await;
-            let _ = proxy.send_event(DesktopEvent::ChromeTick);
-        });
+        let snapshot = self.tab.browser.snapshot();
+        let css_wake = self.css_animation_wake();
+        if self.chrome_loading(&snapshot)
+            || self.tab.heart_glide.is_some()
+            || css_wake.is_some_and(|wake| wake <= CSS_ANIMATION_FRAME_DELAY)
+            || (self.window_focused
+                && self
+                    .tab
+                    .terminal
+                    .as_ref()
+                    .is_some_and(|terminal| terminal.view.animation_delay().is_some()))
+        {
+            self.request_redraw();
+        } else if let Some(wake) = css_wake {
+            self.schedule_chrome_tick(wake);
+        }
     }
 
     /// When the page's CSS animations next change what it paints: zero while
@@ -3339,6 +3427,7 @@ impl DesktopWindow {
     }
 
     fn update_metrics(&mut self, scale_factor: Option<f64>) {
+        self.scoped_ime_cursor = None;
         let Some(window) = &self.window else { return };
         let size = window.inner_size();
         let scale = ScaleFactor::new(scale_factor.unwrap_or_else(|| window.scale_factor()));
@@ -4006,9 +4095,8 @@ impl DesktopWindow {
         let generation = self.tab.browser.document_generation();
         // The actor owns the canonical layout, so decoded native pixels become
         // paintable at the actor's next geometry pass. `BrowserController`
-        // deliberately uses a nonblocking send; retry a full command queue on
-        // the next redraw instead of silently leaving image boxes at their
-        // pending intrinsic size.
+        // accepts the nonblocking handoff into its bounded queue and waits
+        // for actor capacity without repeatedly waking the native renderer.
         if self.tab.browser.page_is_live() && self.tab.image_sizes.len() > self.tab.image_sizes_sent
         {
             if self.tab.browser.send_image_sizes(&self.tab.image_sizes) {
@@ -4112,7 +4200,8 @@ impl DesktopWindow {
                 }
             }
         }
-        self.paint_focused_form(&mut scene);
+        self.scene_has_speculative_editor_text = false;
+        let scoped_editor_caret = self.paint_focused_form(&mut scene);
         if let Some(page) = &self.tab.page_layout {
             scene.append_browser_media_with_scroll_offsets(
                 &page.layout.paint,
@@ -4277,24 +4366,24 @@ impl DesktopWindow {
             };
             self.schedule_chrome_tick(delay);
         }
-        if !self.chrome_tick_scheduled
-            && self.window_focused
+        if self.window_focused
             && let Some(delay) = self
                 .tab
                 .terminal
                 .as_ref()
                 .and_then(|terminal| terminal.view.animation_delay())
         {
-            self.chrome_tick_scheduled = true;
-            let proxy = self.event_proxy.clone();
-            self.runtime.spawn(async move {
-                tokio::time::sleep(delay).await;
-                let _ = proxy.send_event(DesktopEvent::ChromeTick);
-            });
+            self.schedule_chrome_tick(delay);
         }
+        self.scene_has_page_selection =
+            self.tab.terminal.is_none() && self.tab.text_selection.selects();
         self.scene = Some(scene);
-        if self.tab.terminal.is_some() && self.tab.focus == FocusTarget::Page {
+        if let Some(caret) = scoped_editor_caret {
+            self.update_scoped_ime_cursor_area(caret);
+        } else if self.tab.terminal.is_some() && self.tab.focus == FocusTarget::Page {
             self.update_ime_cursor_area();
+        } else {
+            self.scoped_ime_cursor = None;
         }
         // UI Events `mouseout`/`mouseover` target the element currently under
         // the pointing device, not the element that occupied that coordinate
@@ -4317,24 +4406,17 @@ impl DesktopWindow {
         Ok(())
     }
 
-    fn paint_focused_form(&mut self, scene: &mut Scene) {
+    fn paint_focused_form(&mut self, scene: &mut Scene) -> Option<CssRect> {
         let FocusTarget::Form { form, field } = self.tab.focus else {
-            return;
+            return None;
         };
-        let Some(cache) = &self.tab.page_layout else {
-            return;
-        };
-        let Some((&node, _)) = cache
+        let cache = self.tab.page_layout.as_ref()?;
+        let (&node, _) = cache
             .document
             .controls
             .iter()
-            .find(|(_, indices)| **indices == (form, field))
-        else {
-            return;
-        };
-        let Some(bounds) = cache.layout.boxes.get(&node) else {
-            return;
-        };
+            .find(|(_, indices)| **indices == (form, field))?;
+        let bounds = cache.layout.boxes.get(&node)?;
         let rect = CssRect::new(
             scene.content_viewport.x + bounds.left as f32 - self.tab.browser.interaction().scroll.x,
             scene.content_viewport.y + bounds.top as f32 - self.tab.browser.interaction().scroll.y,
@@ -4343,6 +4425,16 @@ impl DesktopWindow {
         );
         if let Some(presentation) = cache.document.rich_editors.get(&node) {
             if let Some(editor) = &mut self.tab.form_editor {
+                let control = &cache.document.forms[form].fields[field];
+                // CSS and the page's font environment can change while the
+                // editing host stays focused. Keep its selection and any IME
+                // composition while updating the geometry used for painting.
+                editor.set_style(&presentation.style);
+                // DOM text uses the page shaper's quantized line metrics;
+                // native controls keep their existing unquantized editor.
+                editor.set_quantize(
+                    control.kind == FieldKind::Textarea && control.selection.is_none(),
+                );
                 editor.set_width(presentation.width);
                 if presentation.native_input.is_some() {
                     let password =
@@ -4354,19 +4446,78 @@ impl DesktopWindow {
                         presentation,
                         &mut self.tab.form_scroll_x,
                     );
-                    return;
+                    return None;
                 }
                 let visual = Self::editor_visual(editor, false);
-                if cache.document.forms[form].fields[field]
-                    .live_node
-                    .is_some_and(|actor| self.tab.browser.form_value_pending(actor))
-                {
-                    trust::render::paint_pending_editor_text(
+                if control.kind == FieldKind::Textarea && control.selection.is_some() {
+                    // Textareas use native-control paint rather than DOM Text
+                    // spans. Preserve their existing pending-value path; the
+                    // scoped DOM-text proof below is for editing hosts.
+                    if control
+                        .live_node
+                        .is_some_and(|actor| self.tab.browser.form_value_pending(actor))
+                    {
+                        trust::render::paint_pending_editor_text(
+                            &mut scene.primitives,
+                            &visual.text,
+                            rect,
+                            presentation,
+                        );
+                    }
+                    trust::render::paint_rich_editor_overlay(
                         &mut scene.primitives,
-                        &visual.text,
+                        &visual,
                         rect,
                         presentation,
                     );
+                    return None;
+                }
+                if self.tab.text_selection.selects() {
+                    // The page's highlight is already in the composed scene,
+                    // including author ::selection colors. Replacing its
+                    // glyph or adding a native selection would leave stale or
+                    // duplicate highlight paint behind.
+                    return None;
+                }
+                let previewed_key = self
+                    .tab
+                    .pending_page_keys
+                    .iter()
+                    .chain(self.tab.queued_form_keys.iter())
+                    .any(|key| key.previewed && key.form == Some((form, field)));
+                let actor_ahead_of_paint = canonical_editor_state(&self.tab.browser, control)
+                    .zip(presentation.pending_text.as_ref())
+                    // A contenteditable's Selection model includes line
+                    // breaks from <br>, while textContent does not. A
+                    // structural line-break change waits for its real paint;
+                    // don't leave a synthetic overlay permanently active.
+                    .is_some_and(|(state, painted)| {
+                        editor_state_ahead_of_paint(&state.text, &painted.text)
+                    });
+                let replace_text = previewed_key
+                    || actor_ahead_of_paint
+                    || control
+                        .live_node
+                        .is_some_and(|actor| self.tab.browser.form_value_pending(actor));
+                if editor.selection().is_empty()
+                    && editor.has_style(&presentation.style)
+                    && editor.is_quantized()
+                    && let Some(scoped) = trust::render::paint_scoped_editor(
+                        &mut scene.primitives,
+                        node,
+                        &visual,
+                        presentation,
+                        replace_text,
+                    )
+                {
+                    self.scene_has_speculative_editor_text = replace_text;
+                    return scoped.caret;
+                }
+                if replace_text {
+                    // The scene cannot place the pending text in its original
+                    // scope. Keep canonical text until the actor renders it,
+                    // rather than paint a caret ahead of those glyphs.
+                    return None;
                 }
                 trust::render::paint_rich_editor_overlay(
                     &mut scene.primitives,
@@ -4375,7 +4526,7 @@ impl DesktopWindow {
                     presentation,
                 );
             }
-            return;
+            return None;
         }
         if let Some(editor) = &mut self.tab.form_editor {
             let control = cache
@@ -4408,6 +4559,49 @@ impl DesktopWindow {
             brush: PaintBrush::Solid(PaintColor::Accent),
             style: StrokeStyle::solid(2.0),
         });
+        None
+    }
+
+    /// Preview glyphs intentionally have no selectable DOM offsets. Restore
+    /// a scene composed from the actor's retained paint before routing real
+    /// pointer input, so a drag cannot resolve to unrelated nearby text.
+    fn rollback_editor_preview_for_pointer(&mut self) {
+        if !self.scene_has_speculative_editor_text {
+            return;
+        }
+        self.scene_has_speculative_editor_text = false;
+        let snapshot = self.tab.browser.snapshot();
+        let mut chrome = self.chrome_model(&snapshot);
+        let mut scene = desktop_chrome(self.metrics, &snapshot, &chrome);
+        scene.image_store = self.image_store.clone();
+        let elapsed = self.css_animation_elapsed();
+        if let Some(page) = &self.tab.page_layout {
+            scene.append_page_with_selection(
+                &page.layout.paint,
+                self.tab.browser.interaction().scroll,
+                elapsed,
+                &page.scroll_offsets,
+                self.tab.text_selection.paint.as_ref(),
+            );
+            scene.append_browser_media_with_scroll_offsets(
+                &page.layout.paint,
+                self.tab.browser.interaction().scroll,
+                elapsed,
+                &page.scroll_offsets,
+            );
+        }
+        self.paint_keyboard_focus(&mut scene);
+        self.paint_tab_strip(&mut scene);
+        self.paint_select_popup(&mut scene);
+        chrome.heart = self.heart_visual(&scene, &snapshot);
+        paint_desktop_overlay(&mut scene, &snapshot, &chrome);
+        self.paint_page_context_menu(&mut scene);
+        self.scene_has_page_selection = self.tab.text_selection.selects();
+        self.scene = Some(scene);
+        // The retained scene changed without being presented. Compare the
+        // next frame against the actual window pixels with a full repaint.
+        self.force_full_raster = true;
+        self.request_redraw();
     }
 
     fn paint_keyboard_focus(&self, scene: &mut Scene) {
@@ -4438,6 +4632,9 @@ impl DesktopWindow {
     }
 
     fn set_focus(&mut self, focus: FocusTarget) {
+        if focus != self.tab.focus {
+            self.scoped_ime_cursor = None;
+        }
         // The drop-down box belongs to its focused select (closes on blur).
         if self.tab.select_popup.as_ref().is_some_and(|popup| {
             focus
@@ -4742,12 +4939,7 @@ impl DesktopWindow {
             return;
         }
         let editable = control.kind == FieldKind::Textarea && control.selection.is_none();
-        let state = control.live_node.and_then(|node| {
-            self.tab
-                .browser
-                .page_text_control_state(node)
-                .or_else(|| self.tab.browser.page_editable_state(node))
-        });
+        let state = canonical_editor_state(&self.tab.browser, control);
         let previous = state.map_or_else(|| control.editing_value(), |state| state.text.as_str());
         let previous_selection = state.map_or(control.selection, |state| Some(state.selection));
         let selection = if editable {
@@ -4839,12 +5031,7 @@ impl DesktopWindow {
                 .is_some_and(|node| self.tab.browser.form_value_pending(node))
             && let Some(editor) = self.tab.form_editor.as_mut()
         {
-            let state = control.live_node.and_then(|node| {
-                self.tab
-                    .browser
-                    .page_text_control_state(node)
-                    .or_else(|| self.tab.browser.page_editable_state(node))
-            });
+            let state = canonical_editor_state(&self.tab.browser, control);
             sync_editor_value(
                 editor,
                 state.map_or_else(|| control.editing_value(), |state| state.text.as_str()),
@@ -4854,6 +5041,36 @@ impl DesktopWindow {
             {
                 editor.set_control_selection(selection);
             }
+        }
+    }
+
+    /// CSS changes need not change the focused control or its value. Refresh
+    /// the editor's metrics in place before native input or IME geometry uses
+    /// them, without disturbing the live selection or composition.
+    fn sync_focused_form_style(&mut self) {
+        let FocusTarget::Form { form, field } = self.tab.focus else {
+            return;
+        };
+        let Some(page) = &self.tab.page_layout else {
+            return;
+        };
+        let Some(control) = page
+            .document
+            .forms
+            .get(form)
+            .and_then(|form| form.fields.get(field))
+        else {
+            return;
+        };
+        let Some(node) = control.live_node else {
+            return;
+        };
+        if let (Some(editor), Some(presentation)) = (
+            self.tab.form_editor.as_mut(),
+            page.document.rich_editors.get(&node),
+        ) {
+            editor.set_style(&presentation.style);
+            editor.set_quantize(control.kind == FieldKind::Textarea && control.selection.is_none());
         }
     }
 
@@ -5093,8 +5310,67 @@ impl DesktopWindow {
             self.stop_current_page();
             return true;
         }
+        self.sync_focused_form_style();
         let actor_default = actor_text_key(input, text.as_deref(), &control);
-        let previewed = native_text_feedback_key(input, text.as_deref(), &control)
+        let plain_contenteditable =
+            native_contenteditable_feedback_key(input, text.as_deref())
+                && control.kind == FieldKind::Textarea
+                && control.selection.is_none()
+                && !self.tab.text_selection.selects()
+                && !self.scene_has_page_selection
+                && canonical_editor_state(&self.tab.browser, &control).is_some_and(|state| {
+                    state.text.is_ascii() && state.selection.start == state.selection.end
+                })
+                && !self
+                    .tab
+                    .pending_page_keys
+                    .iter()
+                    .chain(self.tab.queued_form_keys.iter())
+                    .any(|key| {
+                        key.form == Some((form, field))
+                            && key.input.state == KeyState::Pressed
+                            && !key.previewed
+                    })
+                && self
+                    .tab
+                    .form_editor
+                    .as_ref()
+                    .zip(self.scene.as_ref())
+                    .zip(self.tab.page_layout.as_ref())
+                    .is_some_and(|((editor, scene), page)| {
+                        let selection = editor.selection();
+                        if !selection.is_empty() {
+                            return false;
+                        }
+                        let Some(before) = editor.raw_text().get(..selection.start) else {
+                            return false;
+                        };
+                        let Some(after) = editor.raw_text().get(selection.end..) else {
+                            return false;
+                        };
+                        let Some(text) = text.as_deref() else {
+                            return false;
+                        };
+                        let prospective = [before, text, after].concat();
+                        page.document.controls.iter().any(|(node, indices)| {
+                            *indices == (form, field)
+                                && page.document.rich_editors.get(node).is_some_and(
+                                    |presentation| {
+                                        editor.has_style(&presentation.style)
+                                            && editor.is_quantized()
+                                            && trust::render::can_paint_scoped_editor(
+                                                &scene.primitives,
+                                                *node,
+                                                presentation,
+                                                editor.raw_text(),
+                                                &prospective,
+                                            )
+                                    },
+                                )
+                        })
+                    });
+        let previewed = (native_text_feedback_key(input, text.as_deref(), &control)
+            || plain_contenteditable)
             && self.tab.form_editor.is_some();
         if previewed {
             apply_editor_key(
@@ -5834,7 +6110,30 @@ impl DesktopWindow {
         self.request_redraw();
     }
 
+    /// Publish the editor caret after scene composition. The scoped painter
+    /// already resolved the page's transforms, scroll offsets and clips, so
+    /// this needs no second layout or shaping pass.
+    fn update_scoped_ime_cursor_area(&mut self, area: CssRect) {
+        let key = (self.tab.id, self.tab.browser.document_generation(), area);
+        if self.scoped_ime_cursor != Some(key)
+            && let Some(window) = &self.window
+        {
+            window.set_ime_cursor_area(
+                LogicalPosition::new(f64::from(area.x), f64::from(area.y)),
+                LogicalSize::new(
+                    f64::from(area.width.max(1.0)),
+                    f64::from(area.height.max(1.0)),
+                ),
+            );
+            self.scoped_ime_cursor = Some(key);
+        }
+    }
+
     fn update_ime_cursor_area(&mut self) {
+        // This fallback can publish a different rectangle; the next scoped
+        // paint must republish its own caret even when its geometry is equal.
+        self.scoped_ime_cursor = None;
+        self.sync_focused_form_style();
         if self.tab.focus == FocusTarget::Page
             && let Some(terminal) = &mut self.tab.terminal
             && terminal.connected
@@ -7901,14 +8200,16 @@ impl DesktopWindow {
     /// runs on the tokio runtime, so the event loop keeps rendering; its answer returns as
     /// `DesktopEvent::FilesPicked`. Prompts are shown one at a time.
     fn sync_file_pickers(&mut self) {
-        if self.file_dialog_open {
+        if self.file_dialog.is_some() {
             return;
         }
         let Some(request) = self.tab.browser.take_file_picker() else {
             return;
         };
-        self.file_dialog_open = true;
-        self.file_dialog_generation = self.tab.browser.document_generation();
+        self.file_dialog = Some(FileDialogOwner {
+            tab: self.tab.id,
+            generation: self.tab.browser.document_generation(),
+        });
         let mut dialog = rfd::AsyncFileDialog::new().set_title(if request.directory {
             "Choose a folder"
         } else if request.multiple {
@@ -8338,6 +8639,9 @@ impl DesktopWindow {
         if self.pointer_lock.is_none() && self.chrome_pointer_moved(point) {
             return;
         }
+        if event_loop.is_some() {
+            self.rollback_editor_preview_for_pointer();
+        }
         let dragging_input = self
             .tab
             .terminal
@@ -8581,6 +8885,7 @@ impl DesktopWindow {
             });
             return;
         }
+        self.rollback_editor_preview_for_pointer();
         let dragging_input = self
             .tab
             .terminal
@@ -9254,8 +9559,14 @@ impl DesktopWindow {
         // A fullscreen request the window manager never resized for is
         // answered at its deadline.
         self.answer_fullscreen_request(false);
+        self.service_chrome_tick();
+        self.service_sleep_check();
         self.fullscreen_reply
             .map(|(_, since)| since + FULLSCREEN_REPLY_DEADLINE)
+            .into_iter()
+            .chain(self.chrome_tick.deadline)
+            .chain(self.sleep_check_scheduled)
+            .min()
     }
 
     /// The event loop resumed, or this window was just opened: create its
@@ -9334,6 +9645,7 @@ impl DesktopWindow {
     }
 
     fn suspended(&mut self) {
+        self.scoped_ime_cursor = None;
         self.release_native_pointer_lock(true);
         self.force_full_raster = true;
         self.window_focused = false;
@@ -9389,36 +9701,25 @@ impl DesktopWindow {
                     self.request_strip_redraw();
                 }
             }
-            DesktopEvent::ChromeTick => {
-                self.chrome_tick_scheduled = false;
-                self.chrome_tick_deadline = None;
-                let snapshot = self.tab.browser.snapshot();
-                let css_wake = self.css_animation_wake();
-                if self.chrome_loading(&snapshot)
-                    || self.tab.heart_glide.is_some()
-                    || css_wake.is_some_and(|wake| wake <= CSS_ANIMATION_FRAME_DELAY)
-                    || (self.window_focused
-                        && self
-                            .tab
-                            .terminal
-                            .as_ref()
-                            .is_some_and(|terminal| terminal.view.animation_delay().is_some()))
-                {
-                    self.request_redraw();
-                } else if let Some(wake) = css_wake {
-                    // A delayed animation starts later than this tick.
-                    self.schedule_chrome_tick(wake);
-                }
-            }
             DesktopEvent::DownloadFinished { path, result, open } => {
                 self.finish_download(path, result, open);
             }
             DesktopEvent::FilesPicked { request, files } => {
-                self.file_dialog_open = false;
-                // A prompt belongs to its page: files chosen after the user
-                // left it must never reach the next document's actor.
-                if self.file_dialog_generation == self.tab.browser.document_generation() {
-                    self.dispatch(UserAction::FilePickerResult { request, files });
+                // HTML #show-the-picker,-if-applicable: the selection or
+                // cancellation belongs to the element that opened the picker.
+                // Generations are local to a controller, so identify the tab as
+                // well as its document, including while that tab is hidden.
+                if let Some(owner) = self.file_dialog.take() {
+                    if owner.tab == self.tab.id
+                        && owner.generation == self.tab.browser.document_generation()
+                    {
+                        self.dispatch(UserAction::FilePickerResult { request, files });
+                    } else if let Some(tab) = self.tabs.awake_mut(owner.tab)
+                        && owner.generation == tab.browser.document_generation()
+                    {
+                        tab.browser
+                            .handle_action(UserAction::FilePickerResult { request, files });
+                    }
                 }
                 self.sync_file_pickers();
                 self.request_redraw();
@@ -9426,10 +9727,6 @@ impl DesktopWindow {
             DesktopEvent::FileDragTick { session } => self.file_drag_iteration(session),
             DesktopEvent::SelectionAutoscroll => self.selection_autoscroll_tick(),
             DesktopEvent::NewWindowDue(serial) => self.open_pending_new_window(serial, None),
-            DesktopEvent::SleepCheck => {
-                self.sleep_check_scheduled = None;
-                self.sleep_unseen_tabs();
-            }
             DesktopEvent::ImageLoaded {
                 generation,
                 image_epoch,
@@ -9541,8 +9838,8 @@ impl DesktopWindow {
                     && self.tab.image_sizes.len() > self.tab.image_sizes_sent
                     && !self.tab.browser.send_image_sizes(&self.tab.image_sizes)
                 {
-                    // Keep the dirty bit set. The next redraw retries the
-                    // nonblocking handoff after the actor drains its queue.
+                    // The controller could not retain the handoff and retired
+                    // the actor. Keep the dirty bit for the next static draw.
                     self.tab.decoded_images_pending_layout = true;
                     self.request_redraw();
                     return;
@@ -9686,6 +9983,13 @@ impl DesktopWindow {
         }
     }
 
+    /// Keep the native window's visibility independent of whichever tab is
+    /// selected. A background tab picks up this state before it is shown.
+    fn set_window_occluded(&mut self, occluded: bool) {
+        self.window_occluded = occluded;
+        self.dispatch(UserAction::Occluded(occluded));
+    }
+
     fn window_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
         if self.closed {
             return;
@@ -9756,6 +10060,7 @@ impl DesktopWindow {
                 }
             }
             WindowEvent::Focused(focused) => {
+                self.scoped_ime_cursor = None;
                 self.window_focused = focused;
                 if !focused {
                     self.cancel_touches();
@@ -9778,7 +10083,7 @@ impl DesktopWindow {
             WindowEvent::Occluded(occluded) => {
                 // Paint-only CSS animations stop requesting actor frames
                 // while the window cannot be seen.
-                self.dispatch(UserAction::Occluded(occluded));
+                self.set_window_occluded(occluded);
             }
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.modifiers = modifiers.state();
@@ -9839,7 +10144,10 @@ impl DesktopWindow {
                 native_pointer::release();
             }
             WindowEvent::MouseWheel { delta, .. } => self.handle_scroll(delta),
-            WindowEvent::Touch(touch) => self.handle_touch(touch),
+            WindowEvent::Touch(touch) => {
+                self.rollback_editor_preview_for_pointer();
+                self.handle_touch(touch);
+            }
             _ => {}
         }
     }
@@ -10823,6 +11131,47 @@ mod tests {
     }
 
     #[test]
+    fn plain_contenteditable_feedback_is_limited_to_unmodified_insertions() {
+        let mut input = KeyInput {
+            key: Key::Character("a".into()),
+            code: "KeyA".into(),
+            location: 0,
+            state: KeyState::Pressed,
+            modifiers: Default::default(),
+            repeat: false,
+            composing: false,
+        };
+        assert!(native_contenteditable_feedback_key(&input, Some("a")));
+        input.modifiers.shift = true;
+        input.key = Key::Character("A".into());
+        assert!(native_contenteditable_feedback_key(&input, Some("A")));
+        assert!(!native_contenteditable_feedback_key(&input, Some("a")));
+        input.modifiers.control = true;
+        assert!(!native_contenteditable_feedback_key(&input, Some("A")));
+        input.modifiers.control = false;
+        input.composing = true;
+        assert!(!native_contenteditable_feedback_key(&input, Some("A")));
+        input.composing = false;
+        input.state = KeyState::Released;
+        assert!(!native_contenteditable_feedback_key(&input, Some("A")));
+        input.state = KeyState::Pressed;
+        input.key = Key::Backspace;
+        assert!(!native_contenteditable_feedback_key(&input, None));
+        input.key = Key::Character("é".into());
+        assert!(!native_contenteditable_feedback_key(&input, Some("é")));
+        input.key = Key::Character("👩‍👩‍👧‍👦".into());
+        assert!(!native_contenteditable_feedback_key(&input, Some("👩‍👩‍👧‍👦")));
+    }
+
+    #[test]
+    fn editor_paint_ahead_accounts_for_contenteditable_breaks() {
+        assert!(!editor_state_ahead_of_paint("hello", "hello"));
+        assert!(editor_state_ahead_of_paint("hello!", "hello"));
+        assert!(!editor_state_ahead_of_paint("a\nb", "ab"));
+        assert!(editor_state_ahead_of_paint("a\nbc", "ab"));
+    }
+
+    #[test]
     fn text_feedback_rebases_unacknowledged_keys_after_cancellation_and_script_edits() {
         let mut editor = TextEditor::new("old", &TextStyle::default(), 300., false);
         editor.set_control_selection(trust::doc::ControlSelection {
@@ -10894,6 +11243,377 @@ mod tests {
         // remains pending and is replayed at the canonical caret.
         reconcile_text_preview(&mut editor, &state, replacement[1..].iter(), (0, 0));
         assert_eq!(editor.text(), "[QbBZ]");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires Wayland for the native event-loop proxy; creates no window"]
+    async fn plain_contenteditable_preview_reconciles_cancellation_and_selection() {
+        use winit::platform::wayland::EventLoopBuilderExtWayland;
+        let mut builder = EventLoop::<AppEvent>::with_user_event();
+        builder.with_any_thread(true).with_wayland();
+        let event_loop = builder.build().unwrap();
+        // Input Events 2: beforeinput can cancel or move Selection before the
+        // DOM edit. Native feedback is reversible and never edits the DOM.
+        const PAGE: &str = r#"<style>
+          #editor { width: 240px; min-height: 36px; color: #123456; }
+          #editor p { margin: 0; white-space: pre-wrap; }
+          #editor p:empty:before { content: 'Placeholder'; color: gray; }
+          #editor p::selection { background: #ff00aa; color: #ffdd33; }
+          </style><div id=rich contenteditable><p><strong>Styled</strong></p></div>
+          <div id=empty contenteditable><p></p></div>
+          <div id=editor contenteditable><p>old</p></div>
+          <script>
+          const editor = document.getElementById('editor');
+          editor.addEventListener('beforeinput', e => {
+            if (e.data === 'x') e.preventDefault();
+            if (e.data === 'b') getSelection().collapse(editor.firstChild.firstChild, 0);
+            if (e.data === 's') {
+              e.preventDefault();
+              const text = editor.firstChild.firstChild;
+              getSelection().setBaseAndExtent(text, 0, text, text.length);
+            }
+          });
+          editor.addEventListener('input', () => {
+            document.title = editor.textContent;
+            if (editor.textContent === 'bolda') editor.style.fontSize = '32px';
+          });
+          </script>"#;
+        static PAGES: [(&str, &str); 1] = [("/editor", PAGE)];
+        let (base, _requests) = serve_pages(&PAGES).await;
+        let mut app = static_page_app(&event_loop, "<p>Before</p>");
+        // The static helper fabricates generation 1 without committing it to
+        // BrowserController. Discard that synthetic cache before the first
+        // real navigation also commits generation 1.
+        app.tab.page_layout = None;
+        app.scene = None;
+        app.navigate(format!("{base}/editor"));
+        wait_for_app(&mut app, "the editor's first render", |app| {
+            app.tab.browser.page_is_live()
+                && app
+                    .tab
+                    .browser
+                    .current_page()
+                    .and_then(|page| page.rendered_page())
+                    .is_some_and(|page| {
+                        page.controls.iter().any(|(_, &(form, field))| {
+                            let control = &page.forms[form].fields[field];
+                            control.kind == FieldKind::Textarea
+                                && control.selection.is_none()
+                                && control.editing_value() == "old"
+                        })
+                    })
+        })
+        .await;
+        app.ensure_page_layout(app.browser_viewport());
+        let (node, form, field) = {
+            let page = app.tab.page_layout.as_ref().unwrap();
+            page.document
+                .controls
+                .iter()
+                .find_map(|(&node, &(form, field))| {
+                    let control = &page.document.forms[form].fields[field];
+                    (control.kind == FieldKind::Textarea
+                        && control.selection.is_none()
+                        && control.editing_value() == "old")
+                        .then_some((node, form, field))
+                })
+                .unwrap()
+        };
+        assert!(
+            app.tab.page_layout.as_ref().unwrap().document.rich_editors[&node]
+                .pending_text
+                .is_some(),
+            "the unformatted editor must have a pending-text presentation"
+        );
+        app.focus_form(form, field);
+        wait_for_app(&mut app, "the canonical editing selection", |app| {
+            app.tab.browser.page_editable_state(node).is_some()
+        })
+        .await;
+        recompose(&mut app);
+        let editor_text_node = app.tab.page_layout.as_ref().unwrap().document.rich_editors[&node]
+            .pending_text
+            .as_ref()
+            .unwrap()
+            .text_nodes[0];
+        let pointer_on_editor = text_at(&app, "old", 1);
+
+        for text in ["a", "b", "x"] {
+            let input = KeyInput {
+                key: Key::Character(text.into()),
+                code: String::new(),
+                location: 0,
+                state: KeyState::Pressed,
+                modifiers: Default::default(),
+                repeat: false,
+                composing: false,
+            };
+            assert!(app.dispatch_live_form_key(&input, Some(text.into())));
+        }
+        assert_eq!(app.tab.form_editor.as_ref().unwrap().text(), "oldabx");
+        assert_eq!(app.tab.pending_page_keys.len(), 1);
+        assert_eq!(app.tab.queued_form_keys.len(), 2);
+        // The existing CSS surface is kept while both text and caret use the
+        // same immediate native preview, before any actor acknowledgement.
+        let mut scene = desktop_chrome(
+            app.metrics,
+            &app.tab.browser.snapshot(),
+            &ChromeModel {
+                tab_strip_height: app.strip_height(),
+                ..ChromeModel::default()
+            },
+        );
+        let page = app.tab.page_layout.as_ref().unwrap();
+        scene.append_page(&page.layout.paint, CssPoint::default());
+        let scoped_caret = app.paint_focused_form(&mut scene);
+        assert!(scoped_caret.is_some(), "the preview has a scoped caret");
+        assert!(scene.primitives.iter().any(|command| matches!(command,
+            DisplayCommand::GlyphRun { shaped, .. } if shaped.text == "oldabx")));
+        assert!(!scene.primitives.iter().any(|command| matches!(command,
+            DisplayCommand::GlyphRun { shaped, .. } if shaped.text.contains("Placeholder"))));
+        // A preview has no selectable DOM offsets. Real pointer input first
+        // restores the retained canonical scene so selection targets this
+        // editor's Text node instead of unrelated nearby text.
+        app.scene = Some(scene);
+        app.pointer = pointer_on_editor;
+        assert!(app.scene_has_speculative_editor_text);
+        app.rollback_editor_preview_for_pointer();
+        let point = app.begin_selection_gesture(false).unwrap().point().unwrap();
+        assert_eq!(point.node, editor_text_node);
+        assert!(!app.scene_has_speculative_editor_text);
+        assert!(app.force_full_raster);
+        app.clear_text_selection();
+        app.tab.text_selection.serial = 0;
+
+        wait_for_app(&mut app, "the cancelled and retargeted keys", |app| {
+            app.tab.pending_page_keys.is_empty()
+                && app.tab.queued_form_keys.is_empty()
+                && app
+                    .tab
+                    .browser
+                    .page_editable_state(node)
+                    .is_some_and(|state| state.text == "bolda")
+                && app.tab.browser.page_title() == Some("bolda")
+        })
+        .await;
+        let editor = app.tab.form_editor.as_ref().unwrap();
+        assert_eq!(editor.text(), "bolda");
+        assert_eq!(editor.control_selection().start, 1);
+        assert_eq!(editor.control_selection().end, 1);
+        assert_eq!(app.tab.browser.page_title(), Some("bolda"));
+
+        // A focused editor must follow an authored font change without
+        // changing its live selection. Compare its caret with the canonical
+        // glyph cluster, not only with a second native-editor calculation.
+        wait_for_app(&mut app, "the focused editor's new CSS font size", |app| {
+            app.tab
+                .browser
+                .current_page()
+                .and_then(|page| page.rendered_page())
+                .and_then(|page| page.rich_editors.get(&node))
+                .is_some_and(|presentation| presentation.style.size == 32.0)
+        })
+        .await;
+        app.ensure_page_layout(app.browser_viewport());
+        let mut scene = desktop_chrome(
+            app.metrics,
+            &app.tab.browser.snapshot(),
+            &ChromeModel {
+                tab_strip_height: app.strip_height(),
+                ..ChromeModel::default()
+            },
+        );
+        let page = app.tab.page_layout.as_ref().unwrap();
+        scene.append_page(&page.layout.paint, CssPoint::default());
+        let canonical_caret_x = scene
+            .primitives
+            .iter()
+            .find_map(|command| match command {
+                DisplayCommand::GlyphRun { shaped, .. } if shaped.text == "bolda" => shaped
+                    .clusters
+                    .iter()
+                    .find(|cluster| cluster.text_range.start == 1)
+                    .map(|cluster| cluster.x),
+                _ => None,
+            })
+            .expect("the changed font has a canonical glyph cluster");
+        assert!(app.paint_focused_form(&mut scene).is_some());
+        let editor = app.tab.form_editor.as_mut().unwrap();
+        let (_, caret, _) = editor.geometry();
+        assert_eq!(editor.control_selection().start, 1);
+        assert_eq!(editor.control_selection().end, 1);
+        assert!(
+            (caret.unwrap().x - canonical_caret_x).abs() < 1.0,
+            "the focused caret must use the changed glyph metrics"
+        );
+
+        // beforeinput can select the entire editing host. Its authored
+        // ::selection background and foreground remain canonical while the
+        // replacement key awaits the actor, including when an old selected
+        // scene survives a later collapsed selection report.
+        let input = |text: &str| KeyInput {
+            key: Key::Character(text.into()),
+            code: String::new(),
+            location: 0,
+            state: KeyState::Pressed,
+            modifiers: Default::default(),
+            repeat: false,
+            composing: false,
+        };
+        assert!(app.dispatch_live_form_key(&input("s"), Some("s".into())));
+        wait_for_app(&mut app, "the script-selected editor text", |app| {
+            app.tab.pending_page_keys.is_empty()
+                && app.tab.queued_form_keys.is_empty()
+                && app
+                    .tab
+                    .browser
+                    .page_editable_state(node)
+                    .is_some_and(|state| {
+                        state.text == "bolda"
+                            && state.selection.start == 0
+                            && state.selection.end == 5
+                    })
+                && app
+                    .tab
+                    .browser
+                    .page_selection()
+                    .1
+                    .is_some_and(|report| !report.segments.is_empty())
+        })
+        .await;
+        app.sync_page_selection();
+        app.sync_page_selection();
+        assert!(app.tab.text_selection.selects());
+        app.ensure_page_layout(app.browser_viewport());
+        recompose(&mut app);
+        assert!(app.scene_has_page_selection);
+        let mut selected_scene = app.scene.as_ref().unwrap().clone();
+        assert!(selected_scene.primitives.iter().any(|command| matches!(
+            command,
+            DisplayCommand::FillRect {
+                color: PaintColor::Rgba(255, 0, 170, 255),
+                ..
+            }
+        )));
+        let selected_paint = selected_scene.primitives.clone();
+        assert!(app.paint_focused_form(&mut selected_scene).is_none());
+        assert_eq!(selected_scene.primitives, selected_paint);
+        assert!(app.dispatch_live_form_key(&input("z"), Some("z".into())));
+        assert!(!app.tab.pending_page_keys.back().unwrap().previewed);
+        assert_eq!(app.tab.form_editor.as_ref().unwrap().text(), "bolda");
+        wait_for_app(&mut app, "the selected text replacement", |app| {
+            app.tab.pending_page_keys.is_empty()
+                && app.tab.queued_form_keys.is_empty()
+                && app
+                    .tab
+                    .browser
+                    .page_editable_state(node)
+                    .is_some_and(|state| state.text == "z")
+                && app
+                    .tab
+                    .browser
+                    .page_selection()
+                    .1
+                    .is_some_and(|report| report.segments.is_empty())
+        })
+        .await;
+        app.sync_page_selection();
+        assert!(!app.tab.text_selection.selects());
+        assert!(
+            app.scene_has_page_selection,
+            "the retained scene is still selected"
+        );
+        assert!(app.dispatch_live_form_key(&input("q"), Some("q".into())));
+        assert!(!app.tab.pending_page_keys.back().unwrap().previewed);
+        wait_for_app(&mut app, "the key behind a stale selected scene", |app| {
+            app.tab.pending_page_keys.is_empty()
+                && app.tab.queued_form_keys.is_empty()
+                && app
+                    .tab
+                    .browser
+                    .page_editable_state(node)
+                    .is_some_and(|state| state.text == "zq")
+        })
+        .await;
+
+        let (rich_node, rich_form, rich_field) = {
+            let page = app.tab.page_layout.as_ref().unwrap();
+            page.document
+                .controls
+                .iter()
+                .find_map(|(&node, &(form, field))| {
+                    page.document
+                        .rich_editors
+                        .get(&node)
+                        .is_some_and(|presentation| presentation.pending_text.is_none())
+                        .then_some((node, form, field))
+                })
+                .unwrap()
+        };
+        app.focus_form(rich_form, rich_field);
+        wait_for_app(&mut app, "the rich editor's selection", |app| {
+            app.tab.browser.page_editable_state(rich_node).is_some()
+        })
+        .await;
+        let input = KeyInput {
+            key: Key::Character("z".into()),
+            code: String::new(),
+            location: 0,
+            state: KeyState::Pressed,
+            modifiers: Default::default(),
+            repeat: false,
+            composing: false,
+        };
+        assert!(app.dispatch_live_form_key(&input, Some("z".into())));
+        assert_eq!(app.tab.form_editor.as_ref().unwrap().text(), "Styled");
+        assert!(!app.tab.pending_page_keys.back().unwrap().previewed);
+        wait_for_app(&mut app, "the rich editor's key", |app| {
+            app.tab.pending_page_keys.is_empty() && app.tab.queued_form_keys.is_empty()
+        })
+        .await;
+
+        app.ensure_page_layout(app.browser_viewport());
+        let (empty_node, empty_form, empty_field) = {
+            let page = app.tab.page_layout.as_ref().unwrap();
+            page.document
+                .controls
+                .iter()
+                .find_map(|(&node, &(form, field))| {
+                    let control = &page.document.forms[form].fields[field];
+                    (control.kind == FieldKind::Textarea
+                        && control.selection.is_none()
+                        && control.editing_value().is_empty())
+                    .then_some((node, form, field))
+                })
+                .unwrap()
+        };
+        app.focus_form(empty_form, empty_field);
+        wait_for_app(&mut app, "the empty editor's selection", |app| {
+            app.tab.browser.page_editable_state(empty_node).is_some()
+        })
+        .await;
+        recompose(&mut app);
+        assert!(app.dispatch_live_form_key(&input, Some("z".into())));
+        assert_eq!(app.tab.form_editor.as_ref().unwrap().text(), "");
+        assert!(!app.tab.pending_page_keys.back().unwrap().previewed);
+
+        // A reused screen rectangle is not proof that a new focus, scale or
+        // document kept the window manager's previous IME state.
+        let cached = (
+            app.tab.id,
+            app.tab.browser.document_generation(),
+            CssRect::new(20.0, 30.0, 1.0, 18.0),
+        );
+        app.scoped_ime_cursor = Some(cached);
+        app.set_focus(FocusTarget::Page);
+        assert!(app.scoped_ime_cursor.is_none());
+        app.scoped_ime_cursor = Some(cached);
+        app.update_metrics(None);
+        assert!(app.scoped_ime_cursor.is_none());
+        app.scoped_ime_cursor = Some(cached);
+        app.retire_page_loading();
+        assert!(app.scoped_ime_cursor.is_none());
     }
 
     /// A desktop app showing `html` as a static page (no live Document),
@@ -10976,6 +11696,9 @@ mod tests {
         );
         app.paint_tab_strip(&mut scene);
         app.paint_page_context_menu(&mut scene);
+        app.scene_has_page_selection =
+            app.tab.terminal.is_none() && app.tab.text_selection.selects();
+        app.scene_has_speculative_editor_text = false;
         app.scene = Some(scene);
     }
 
@@ -11093,8 +11816,12 @@ mod tests {
         the_context_menu_repaints_only_itself(&event_loop);
         the_strip_repaints_only_itself(&event_loop);
         tabs_open_switch_close_and_reopen(&event_loop);
+        background_tab_work_sleep_and_shared_images(&event_loop);
         the_strip_switches_closes_and_reorders_tabs(&event_loop);
+        strip_release_keeps_its_target_and_only_repaints_chrome(&event_loop);
         links_open_in_new_tabs(&event_loop);
+        occlusion_follows_the_window_across_tab_switches(&event_loop).await;
+        file_picker_results_stay_with_their_document(&event_loop).await;
         pages_open_tabs_for_new_targets(&event_loop).await;
         pages_that_ask_keep_their_tab_or_the_browser_open(&event_loop).await;
         windows_open_and_the_browser_quits_with_all_of_them(&event_loop).await;
@@ -11746,6 +12473,329 @@ mod tests {
         assert!(!app.closed);
         app.close_tab(app.tab.id);
         assert!(app.closed);
+    }
+
+    fn background_tab_work_sleep_and_shared_images(event_loop: &EventLoop<AppEvent>) {
+        let mut app = static_page_app(event_loop, "<p>Tab</p>");
+        let first = app.tab.id;
+        // A BrowserWake delivered before a switch belongs to the old tab.
+        app.tab.browser_events_pending = true;
+        app.open_blank_tab();
+        assert!(app.tabs.wake_pending(first));
+        assert!(app.sleep_check_scheduled.is_some());
+
+        // The event loop retains one earliest check; a later request must
+        // not postpone it and an earlier one replaces it.
+        let sooner = Instant::now() + Duration::from_secs(20);
+        app.schedule_sleep_check(sooner);
+        app.schedule_sleep_check(sooner + Duration::from_secs(20));
+        assert_eq!(app.sleep_check_scheduled, Some(sooner));
+        app.service_sleep_check();
+        assert_eq!(app.sleep_check_scheduled, Some(sooner));
+
+        let second = app.tab.id;
+        app.open_blank_tab();
+        let shared = ImageHandle::for_source("https://example.test/shared.png");
+        let exclusive = ImageHandle::for_source("https://example.test/only-first.png");
+        let image = ImageResource {
+            svg_source: None,
+            width: 1,
+            height: 1,
+            rgba: Arc::from([255, 0, 0, 255]),
+            has_alpha: false,
+        };
+        app.image_store.insert(shared, image.clone());
+        app.image_store.insert(exclusive, image);
+        let first_tab = app.tabs.awake_mut(first).unwrap();
+        first_tab.image_loads.completed.extend([shared, exclusive]);
+        first_tab.last_shown = Instant::now() - tabs::SLEEP_AFTER - Duration::from_secs(1);
+        let generation = first_tab.browser.document_generation();
+        app.tabs
+            .awake_mut(second)
+            .unwrap()
+            .image_loads
+            .completed
+            .insert(shared);
+
+        // A dialog keeps the document that opened it in memory, even when
+        // a sleep check finds the tab old enough to discard.
+        app.file_dialog = Some(FileDialogOwner {
+            tab: first,
+            generation,
+        });
+        app.sleep_check_scheduled = Some(Instant::now());
+        app.service_sleep_check();
+        assert!(matches!(
+            app.tabs.hidden(first),
+            Some(tabs::Hidden::Awake(_))
+        ));
+        assert!(app.image_store.contains(exclusive));
+        assert!(app.sleep_check_scheduled.is_some());
+
+        app.file_dialog = None;
+        app.sleep_check_scheduled = Some(Instant::now());
+        app.service_sleep_check();
+        assert!(matches!(
+            app.tabs.hidden(first),
+            Some(tabs::Hidden::Asleep(_))
+        ));
+        assert!(matches!(
+            app.tabs.hidden(second),
+            Some(tabs::Hidden::Awake(_))
+        ));
+        assert!(
+            app.image_store.contains(shared),
+            "the other tab still uses it"
+        );
+        assert!(!app.image_store.contains(exclusive));
+
+        // Opening directly into the background also arms a sleep check.
+        let mut app = static_page_app(event_loop, "<p>Tab</p>");
+        assert!(app.sleep_check_scheduled.is_none());
+        app.open_link_in_new_tab(
+            Link::Http(url::Url::parse("https://example.test/background").unwrap()),
+            false,
+        );
+        assert!(app.sleep_check_scheduled.is_some());
+        assert!(app.background_loading_since.is_some());
+        let background = app.tabs.order[1];
+        app.finish_close_tab(background);
+        assert!(app.background_loading_since.is_none());
+    }
+
+    fn strip_release_keeps_its_target_and_only_repaints_chrome(event_loop: &EventLoop<AppEvent>) {
+        let mut app = static_page_app(event_loop, "<p>Tab</p>");
+        app.open_blank_tab();
+        let active_index = app.tabs.index_of(app.tab.id).unwrap();
+        let tab = app.strip_geometry().tabs[active_index];
+        app.pointer = center(tab);
+        app.redraw_pending = false;
+        app.strip_redraw_pending = false;
+        assert!(app.chrome_pointer_button(ElementState::Pressed, MouseButton::Left));
+        assert!(app.chrome_pointer_button(ElementState::Released, MouseButton::Left));
+        assert!(app.strip_redraw_pending);
+        assert!(
+            !app.redraw_pending,
+            "release of an unchanged tab does not repaint its page"
+        );
+
+        // While a close button is held, a background change can put a
+        // different tab in its slot. The release must not close that tab.
+        let close = app.strip_geometry().close_button(0).unwrap();
+        app.pointer = center(close);
+        assert!(app.chrome_pointer_button(ElementState::Pressed, MouseButton::Left));
+        app.tabs.order.swap(0, 1);
+        assert!(app.chrome_pointer_button(ElementState::Released, MouseButton::Left));
+        assert_eq!(app.tabs.order.len(), 2);
+    }
+
+    async fn occlusion_follows_the_window_across_tab_switches(event_loop: &EventLoop<AppEvent>) {
+        // HTML #page-visibility: window occlusion and background selection
+        // both make a document hidden. Record each transition so that an
+        // incorrectly exposed tab cannot hide again before the assertion.
+        const PAGE: &str = r#"<title>starting</title><script>
+            let states = [];
+            function record() {
+                states.push(document.visibilityState);
+                document.title = states.join(',');
+            }
+            document.addEventListener('visibilitychange', record);
+            record(); setInterval(() => {}, 1000);
+            </script>"#;
+        static PAGES: [(&str, &str); 1] = [("/visibility", PAGE)];
+        let (base, _log) = serve_pages(&PAGES).await;
+        let mut app = static_page_app(event_loop, "<p>Before</p>");
+        app.navigate(format!("{base}/visibility"));
+        wait_for_app(&mut app, "the visible first page", |app| {
+            app.tab.browser.title().as_deref() == Some("visible")
+        })
+        .await;
+        let first = app.tab.id;
+        app.set_window_occluded(true);
+        wait_for_app(&mut app, "the occluded first page", |app| {
+            app.tab.browser.title().as_deref() == Some("visible,hidden")
+        })
+        .await;
+
+        app.open_blank_tab();
+        app.navigate(format!("{base}/visibility"));
+        wait_for_app(&mut app, "the second page, opened occluded", |app| {
+            app.tab.browser.title().as_deref() == Some("hidden")
+        })
+        .await;
+        let second = app.tab.id;
+        app.set_window_occluded(false);
+        wait_for_app(&mut app, "the restored second page", |app| {
+            app.tab.browser.title().as_deref() == Some("hidden,visible")
+        })
+        .await;
+        app.activate_tab(first);
+        wait_for_app(&mut app, "the restored first page", |app| {
+            app.tab.browser.title().as_deref() == Some("visible,hidden,visible")
+        })
+        .await;
+        wait_for_app(&mut app, "the background second page", |app| {
+            matches!(app.tabs.hidden(second), Some(tabs::Hidden::Awake(tab))
+                if tab.browser.title().as_deref() == Some("hidden,visible,hidden"))
+        })
+        .await;
+
+        app.set_window_occluded(true);
+        wait_for_app(&mut app, "the first page hidden again", |app| {
+            app.tab.browser.title().as_deref() == Some("visible,hidden,visible,hidden")
+        })
+        .await;
+        app.activate_tab(second);
+        app.set_window_occluded(false);
+        wait_for_app(
+            &mut app,
+            "the second page shown only after restoration",
+            |app| app.tab.browser.title().as_deref() == Some("hidden,visible,hidden,visible"),
+        )
+        .await;
+    }
+
+    async fn file_picker_results_stay_with_their_document(event_loop: &EventLoop<AppEvent>) {
+        // HTML #show-the-picker,-if-applicable queues the selection/cancel
+        // for the originating element. Both actors here issue request 1 and
+        // have equal per-controller document generations.
+        const PAGE: &str = r#"<title>waiting</title><form><input id=up type=file></form>
+            <script>const up = document.getElementById('up');
+            up.addEventListener('cancel', () => document.title = 'cancelled');
+            up.addEventListener('change', () => document.title = 'selected');
+            setInterval(() => {}, 1000);</script>"#;
+        static PAGES: [(&str, &str); 1] = [("/file", PAGE)];
+        let (base, _log) = serve_pages(&PAGES).await;
+        let mut app = static_page_app(event_loop, "<p>Before</p>");
+        app.tab.browser.set_file_picker_available(true);
+        app.navigate(format!("{base}/file"));
+        wait_for_app(&mut app, "the first file page", |app| {
+            app.tab.browser.page_is_live()
+                && app
+                    .tab
+                    .browser
+                    .current_page()
+                    .and_then(|page| page.rendered_page())
+                    .is_some_and(|rendered| !rendered.controls.is_empty())
+        })
+        .await;
+
+        async fn pick_without_native_dialog(app: &mut DesktopWindow) -> u64 {
+            let rendered = app
+                .tab
+                .browser
+                .current_page()
+                .unwrap()
+                .rendered_page()
+                .unwrap();
+            let node = *rendered
+                .controls
+                .iter()
+                .find_map(|(node, &(form, field))| {
+                    matches!(rendered.forms[form].fields[field].kind, FieldKind::File(_))
+                        .then_some(node)
+                })
+                .unwrap();
+            app.tab
+                .browser
+                .handle_action(UserAction::Activate(Link::JsClick {
+                    node,
+                    href: String::new(),
+                }));
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for file picker"
+                );
+                // Consume the prompt ourselves so the test opens no native dialog.
+                app.tab.browser.process_async_events();
+                if let Some(request) = app.tab.browser.take_file_picker() {
+                    return request.request;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        let first = app.tab.id;
+        let first_generation = app.tab.browser.document_generation();
+        let first_request = pick_without_native_dialog(&mut app).await;
+        app.file_dialog = Some(FileDialogOwner {
+            tab: first,
+            generation: first_generation,
+        });
+        app.open_blank_tab();
+        app.navigate(format!("{base}/file"));
+        wait_for_app(&mut app, "the second file page", |app| {
+            app.tab.browser.page_is_live()
+                && app
+                    .tab
+                    .browser
+                    .current_page()
+                    .and_then(|page| page.rendered_page())
+                    .is_some_and(|rendered| !rendered.controls.is_empty())
+        })
+        .await;
+        let second = app.tab.id;
+        let second_generation = app.tab.browser.document_generation();
+        let second_request = pick_without_native_dialog(&mut app).await;
+        assert_eq!(first_generation, second_generation);
+        assert_eq!(first_request, second_request);
+
+        app.user_event(DesktopEvent::FilesPicked {
+            request: first_request,
+            files: None,
+        });
+        wait_for_app(&mut app, "the hidden page's cancel event", |app| {
+            matches!(app.tabs.hidden(first), Some(tabs::Hidden::Awake(tab))
+                if tab.browser.title().as_deref() == Some("cancelled"))
+        })
+        .await;
+        assert_eq!(app.tab.id, second);
+        assert_eq!(app.tab.browser.title().as_deref(), Some("waiting"));
+
+        // The shown tab navigates while its old dialog is still open. A
+        // later document can reuse request 1, but cannot receive that old
+        // dialog's answer either.
+        app.file_dialog = Some(FileDialogOwner {
+            tab: second,
+            generation: second_generation,
+        });
+        app.navigate(format!("{base}/file"));
+        wait_for_app(&mut app, "the replacement file page", |app| {
+            app.tab.browser.document_generation() != second_generation
+                && app.tab.browser.page_is_live()
+                && app
+                    .tab
+                    .browser
+                    .current_page()
+                    .and_then(|page| page.rendered_page())
+                    .is_some_and(|rendered| !rendered.controls.is_empty())
+        })
+        .await;
+        let replacement_generation = app.tab.browser.document_generation();
+        let replacement_request = pick_without_native_dialog(&mut app).await;
+        assert_eq!(replacement_request, second_request);
+        app.user_event(DesktopEvent::FilesPicked {
+            request: second_request,
+            files: None,
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("picked.txt");
+        std::fs::write(&path, b"file").unwrap();
+        app.file_dialog = Some(FileDialogOwner {
+            tab: second,
+            generation: replacement_generation,
+        });
+        app.user_event(DesktopEvent::FilesPicked {
+            request: replacement_request,
+            files: Some(vec![path]),
+        });
+        wait_for_app(&mut app, "the shown page's change event", |app| {
+            app.tab.browser.title().as_deref() == Some("selected")
+        })
+        .await;
     }
 
     fn the_strip_switches_closes_and_reorders_tabs(event_loop: &EventLoop<AppEvent>) {
@@ -12563,6 +13613,33 @@ mod tests {
                 .unwrap();
         assert!(options.new_instance);
         assert_eq!(options.address.as_deref(), Some("page.html"));
+    }
+
+    #[test]
+    fn frame_wake_coalesces_loading_animation_and_terminal_deadlines() {
+        let now = Instant::now();
+        let loading = now + Duration::from_millis(250);
+        let animation = now + Duration::from_millis(16);
+        let terminal = now + Duration::from_millis(8);
+        let mut wake = FrameWake::default();
+        assert!(!wake.take_due(now));
+        wake.schedule(loading);
+        wake.schedule(animation);
+        wake.schedule(loading);
+        assert_eq!(wake.deadline, Some(animation));
+        // Terminal blink uses the same earliest-deadline rule, even while
+        // loading chrome or a delayed CSS animation already has a wake.
+        wake.schedule(terminal);
+        assert!(!wake.take_due(terminal - Duration::from_nanos(1)));
+        assert!(wake.take_due(terminal));
+        assert_eq!(wake.deadline, None);
+        // The superseded loading timer cannot fire later and create another
+        // frame stream. An idle page has no task left to wake it.
+        assert!(!wake.take_due(loading));
+        wake.schedule(loading + Duration::from_secs(1));
+        assert!(!wake.take_due(loading));
+        assert!(wake.take_due(loading + Duration::from_secs(2)));
+        assert!(!wake.take_due(loading + Duration::from_secs(2)));
     }
 
     #[test]

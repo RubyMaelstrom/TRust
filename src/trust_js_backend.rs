@@ -8154,7 +8154,20 @@ mod desktop {
             })
         } else {
             None
-        };
+        }
+        .or_else(|| {
+            // Input Events 2 #events-inputevents / Selection API: acknowledge
+            // the editing host's text and live selection after its input
+            // checkpoint, including canceled edits. finish_internal_task has
+            // already sampled this state without waiting for a painted frame.
+            // Reuse it instead of leaving native text/caret feedback waiting
+            // for the next layout. A focus change must not acknowledge a
+            // different host as the original key target.
+            page.last_sent_editable_state
+                .as_ref()
+                .filter(|state| Some(state.node) == node)
+                .cloned()
+        });
         events
             .blocking_send(PageEvt::KeyDefault {
                 prevented: prevented || edit_key.is_some(),
@@ -44383,7 +44396,9 @@ mod tests {
         assert_ne!(old_image.generation, new_image.generation);
         assert_eq!(
             crate::render::scene_damage(&first, &second),
-            crate::render::SceneDamage::Full
+            // Repaint the 64×48 canvas plus its conservative antialiasing
+            // margin, clipped to the viewport.
+            crate::render::SceneDamage::Partial(crate::render::CssRect::new(0., 0., 66., 50.))
         );
         let changed = renderer.render_rgba(&second).unwrap();
         assert_eq!(
@@ -44444,7 +44459,7 @@ mod tests {
         let resized_scene = make_scene(&resized.layout.paint);
         assert_eq!(
             crate::render::scene_damage(&second, &resized_scene),
-            crate::render::SceneDamage::Full
+            crate::render::SceneDamage::Partial(crate::render::CssRect::new(0., 0., 66., 50.))
         );
         let resized_frame = renderer.render_rgba(&resized_scene).unwrap();
         assert_eq!(

@@ -1233,6 +1233,14 @@ impl VelloCpuRenderer {
             .map_or((None, None), |(image, revision)| {
                 (Some(image), Some(revision))
             });
+        if resource.is_none() {
+            // A previous frame's registration is not a substitute for a
+            // missing current sample (canvas removal or decoded eviction).
+            // Keep the registration subject to normal bounded cache eviction.
+            self.context.set_paint(LIGHT_GRAY);
+            self.context.fill_rect(&vello_rect(rect));
+            return Ok(());
+        }
         let svg_size = resource
             .as_ref()
             .filter(|image| image.svg_source.is_some())

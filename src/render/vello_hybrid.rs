@@ -1390,6 +1390,14 @@ impl VelloHybridRenderer {
             .map_or((None, None), |(image, revision)| {
                 (Some(image), Some(revision))
             });
+        if resource.is_none() {
+            // The retained atlas entry belongs to an older sample. Treat a
+            // missing current bitmap like a fresh renderer, and leave the
+            // old slot to ordinary eviction so queued draws remain valid.
+            target.set_paint(vello_color(PaintColor::Muted));
+            target.fill_rect(&vello_rect(rect));
+            return Ok(());
+        }
         let svg_size = resource
             .as_ref()
             .filter(|image| image.svg_source.is_some())

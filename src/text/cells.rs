@@ -91,7 +91,7 @@ pub(super) fn shape(text: &str, style: &TextStyle, cells: CellMetrics) -> Shaped
         x += advance;
     }
     let ascent = cells.ascent();
-    ShapedText {
+    super::ShapedTextData {
         text: text.to_string(),
         advance: x,
         ascent,
@@ -104,6 +104,7 @@ pub(super) fn shape(text: &str, style: &TextStyle, cells: CellMetrics) -> Shaped
         runs: Vec::new(),
         clusters,
     }
+    .into()
 }
 
 /// CSS `ch`: the advance of U+0030 in the cell font is one cell.

@@ -797,6 +797,10 @@ mod tests {
                 }
                 _ => {}
             }
+            // Local structural changes queue invalidations, unlike the old
+            // document-wide fallback. Count stale entries after the same
+            // flush that match_stale_with performs before deciding its work.
+            dom.flush_style_invalidations();
             let stale = elements(&dom)
                 .into_iter()
                 .filter(|&n| {
