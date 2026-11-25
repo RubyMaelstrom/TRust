@@ -18799,14 +18799,16 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // HTML #update-a-style-block removes and recreates the associated sheet
     // on child-list/connection changes, even when its source text is equal.
     function elementSheet(owner) {
-        const raw=__css_sheet(nodeIds.get(owner), "");
         const slots = internalsFor(owner);
+        const raw = __css_sheet(nodeIds.get(owner), slots.sheet ? slots.sheetVersion : -1, slots.sheetEpoch);
+        if (raw === true) return slots.sheet;
         if (raw===null) {
             detachStyleSheet(slots.sheet);
             slots.sheet=null; return null;
         }
         const source=JSON.parse(raw);
         const [version,text,location]=source;
+        slots.sheetEpoch = source[5];
         if (!slots.sheet || slots.sheetVersion!==version || slots.sheetText!==text || slots.sheetLocation!==location) {
             detachStyleSheet(slots.sheet);
             slots.sheet=makeStyleSheet(owner, source); slots.sheetVersion=version; slots.sheetText=text; slots.sheetLocation=location;

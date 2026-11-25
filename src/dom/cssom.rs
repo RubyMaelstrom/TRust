@@ -178,47 +178,53 @@ impl Dom {
     /// HTML #update-a-style-block: a style sheet exists for a connected
     /// style element (or stylesheet link), whose shadow-including root is any
     /// Document, a DOMParser document included (CSSOM #dom-document-stylesheets).
-    ///
-    /// The source is `[version, text, location, origin-clean, base]`: the
-    /// sheet's own text (its `@import` rules remain), its CSSOM location
-    /// (null when embedded), its origin-clean flag, and the URL its
-    /// `@import` URLs resolve against (HTML #update-a-style-block: the
-    /// document base URL; #link-type-stylesheet: the response URL).
-    pub(crate) fn cssom_sheet_source(&self, id: NodeId) -> Option<String> {
+    pub(crate) fn cssom_sheet_version(&self, id: NodeId) -> Option<u64> {
         if !self.is_dom_connected(id) {
             return None;
         }
-        let version = self.cssom_sheet_versions.get(&id).copied().unwrap_or(0);
-        let source = match self.tag_name(id)? {
-            "style"
-                if self
-                    .attr(id, "type")
-                    .is_none_or(|v| v.is_empty() || v.eq_ignore_ascii_case("text/css")) =>
-            {
-                let base = self
-                    .doc_url
-                    .as_ref()
-                    .map(|page| self.resource_base_url(id, page).to_string());
-                json!([version, self.text_content(id), null, true, base])
+        let associated = match self.tag_name(id)? {
+            "style" => self
+                .attr(id, "type")
+                .is_none_or(|v| v.is_empty() || v.eq_ignore_ascii_case("text/css")),
+            "link" => {
+                self.external_sheets.contains_key(&id)
+                    && self.attr(id, "rel").is_some_and(|rel| {
+                        rel.split_ascii_whitespace()
+                            .any(|v| v.eq_ignore_ascii_case("stylesheet"))
+                    })
             }
-            "link"
-                if self.attr(id, "rel").is_some_and(|v| {
-                    v.split_ascii_whitespace()
-                        .any(|v| v.eq_ignore_ascii_case("stylesheet"))
-                }) =>
-            {
-                let sheet = self.external_sheets.get(&id)?;
-                json!([
-                    version,
-                    sheet.text,
-                    sheet.location,
-                    sheet.origin_clean,
-                    sheet.base
-                ])
-            }
-            _ => return None,
+            _ => false,
         };
-        Some(source.to_string())
+        associated.then(|| self.cssom_sheet_versions.get(&id).copied().unwrap_or(0))
+    }
+
+    /// CSSOM #dom-linkstyle-sheet. Transfer source and creation metadata
+    /// only when the caller needs to construct or revalidate the wrapper.
+    pub(crate) fn cssom_sheet_source(&self, id: NodeId, version: u64) -> String {
+        if let Some(sheet) = self.external_sheets.get(&id) {
+            serde_json::to_string(&(
+                version,
+                &sheet.text,
+                &sheet.location,
+                sheet.origin_clean,
+                &sheet.base,
+                self.epoch(),
+            ))
+        } else {
+            let base = self
+                .doc_url
+                .as_ref()
+                .map(|page| self.resource_base_url(id, page));
+            serde_json::to_string(&(
+                version,
+                self.text_content(id),
+                Option::<&str>::None,
+                true,
+                base.as_ref().map(url::Url::as_str),
+                self.epoch(),
+            ))
+        }
+        .expect("CSS sheet source is JSON serializable")
     }
 
     /// The imported sheet fetched for an absolute request URL, as

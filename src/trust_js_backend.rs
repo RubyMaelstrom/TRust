@@ -15272,7 +15272,7 @@ host_functions! {
     ("__dom_adopt_styles", 2, guarded_adopt_styles, [0]),
     ("__css_parse", 1, host_css_parse, []),
     ("__css_style", 3, host_css_style, []),
-    ("__css_sheet", 2, guarded_css_sheet, [0]),
+    ("__css_sheet", 3, guarded_css_sheet, [0]),
     ("__css_supports_selector", 1, host_css_supports_selector, []),
     ("__cookie_store", 5, cookie_store_host::operation, []),
     ("__service_worker", 3, service_worker_host::operation, []),
@@ -27791,19 +27791,34 @@ fn host_css_sheet<'s>(
     _this: Value<'s>,
     args: &[Value<'s>],
 ) -> Result<Value<'s>, Value<'s>> {
-    let update = host_arg_string(ctx, args, 1);
+    let cached_version = args.get(1).and_then(|v| v.as_num_opt());
+    let update = cached_version
+        .is_none()
+        .then(|| host_arg_string(ctx, args, 1));
     let dom = host_dom(ctx);
     let mut dom = dom.borrow_mut();
     let Some(id) = host_arg_node(&dom, args, 0) else {
         return Ok(Value::Null);
     };
-    if let Ok((text, media, disabled)) = serde_json::from_str::<(String, String, bool)>(&update) {
-        dom.set_cssom_sheet(id, text, media, disabled);
+    if let Some(update) = update {
+        if let Ok((text, media, disabled)) = serde_json::from_str::<(String, String, bool)>(&update)
+        {
+            dom.set_cssom_sheet(id, text, media, disabled);
+        }
+        return Ok(Value::Undefined);
     }
-    Ok(dom
-        .cssom_sheet_source(id)
-        .map(|text| ctx.string(text))
-        .unwrap_or(Value::Null))
+    let Some(version) = dom.cssom_sheet_version(id) else {
+        return Ok(Value::Null);
+    };
+    // A fetched sheet's source is immutable until replacement. Embedded
+    // sheets read live DOM text, so recheck it after a DOM revision too.
+    if cached_version == Some(version as f64)
+        && (dom.tag_name(id) == Some("link")
+            || args.get(2).and_then(|v| v.as_num_opt()) == Some(dom.epoch() as f64))
+    {
+        return Ok(Value::Bool(true));
+    }
+    Ok(ctx.string(dom.cssom_sheet_source(id, version)))
 }
 
 fn host_css_supports_selector<'s>(

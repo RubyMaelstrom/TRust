@@ -93,5 +93,23 @@
     check(thrown(() => { 'use strict'; media.conditionText = 'print'; }) === 'TypeError', 'conditionText is readonly');
     check(constructed.href === document.baseURI && constructed.ownerNode === null, 'constructed location ' + constructed.href);
     check(thrown(() => constructed.insertRule('@import url(x.css);')) === 'SyntaxError', 'constructed import');
+    // CSSOM #dom-linkstyle-sheet and HTML #update-a-style-block. Cached
+    // lookups preserve CSSOM edits until the owner gets a new style block.
+    check(inline.ownerNode.sheet === inline && sheets[2] === inline, 'edited sheet identity');
+    const owner = document.createElement('style');
+    owner.textContent = '.sample { color: blue }';
+    document.head.append(owner);
+    const original = owner.sheet;
+    original.insertRule('.inserted {}', 0);
+    check(owner.sheet === original && sheets[4].cssRules.length === 2, 'live rule insertion');
+    owner.textContent = owner.textContent;
+    const replacement = owner.sheet;
+    check(replacement !== original && replacement.cssRules.length === 1, 'new style block');
+    owner.remove();
+    check(owner.sheet === null && sheets.length === 4, 'disconnected style block');
+    document.head.append(owner);
+    check(owner.sheet !== replacement && sheets.length === 5, 'reconnected style block');
+    owner.remove();
+    check(link.sheet === main && foreign === sheets[1], 'unrelated mutation preserves linked sheets');
     return 'cssom-imported-sheets-ok';
 })()
