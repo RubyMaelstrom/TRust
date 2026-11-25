@@ -738,6 +738,10 @@ cargo test --lib -- --test-threads=1 --nocapture \
   archive_svg_pixels_survive_hover_and_resource_key_changes \
   hybrid_recycles_image_slots_without_erasing_replacement_pixels \
   hybrid_atlas_growth_preserves_upload_order_and_row_padding \
+  hybrid_startup_uses_small_gpu_memory_blocks \
+  hybrid_atlas_retirement_releases_a_texture_without_another_submit \
+  hybrid_adaptive_atlas_grows_around_a_retained_image_and_reclaims_space \
+  hybrid_reclaims_replaced_bitmap_after_invalid_pixels \
   hybrid_reuploads_reinserted_stable_image_handle_without_erasing_it
 ```
 
@@ -745,6 +749,11 @@ The Archive fixture contains the actual book/Wayback SVG geometry and compares
 GPU readback with the CPU renderer, including each image's own rectangle,
 after repeated hover and resource-key changes. The other gates cover recycled
 atlas slots, same-handle updates, atlas growth, and aligned/padded upload rows.
+The adaptive atlas test checks pixels after releasing a large image, moving
+the surviving image within its texture, and retrying an abandoned frame.
+The startup check reads wgpu's allocator report on backends that provide one.
+The retirement check lets the last submission finish without another frame
+and checks that the device releases the old texture.
 An unavailable adapter means **not exercised**, not a visual pass; the new gates
 print that explicitly. SVG decoding and `trust-headless` text dumps alone do
 not cover the Hybrid GPU upload path.

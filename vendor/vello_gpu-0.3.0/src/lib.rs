@@ -138,6 +138,9 @@ pub enum RenderError {
     /// An image atlas allocation failed.
     #[error("Atlas allocation failed: {0}")]
     AtlasError(#[from] AtlasError),
+    /// Directly rendering into an atlas requires fixed texture backing.
+    #[error("Cannot render directly into an adaptive image atlas")]
+    AdaptiveAtlasRenderTarget,
     /// A draw referenced a [`TextureId`] that was not provided at render time.
     #[error("Missing texture binding for {0:?}")]
     MissingTextureBinding(TextureId),

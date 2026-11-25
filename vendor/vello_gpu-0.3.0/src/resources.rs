@@ -20,6 +20,8 @@ pub struct Resources {
     pub(crate) glyph_prep_cache: GlyphPrepCache,
     #[cfg(feature = "text")]
     pub(crate) glyph_resources: Option<GlyphAtlasResources>,
+    #[cfg(feature = "text")]
+    pub(crate) glyph_atlas_enabled: bool,
 }
 
 impl Resources {
@@ -31,6 +33,8 @@ impl Resources {
             // Will be initialized lazily.
             #[cfg(feature = "text")]
             glyph_resources: None,
+            #[cfg(feature = "text")]
+            glyph_atlas_enabled: true,
         }
     }
 

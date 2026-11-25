@@ -232,7 +232,7 @@ impl<'a> GpuGlyphRunBackend<'a> {
     where
         Glyphs: Iterator<Item = Glyph> + Clone,
     {
-        let atlas_cacher = if self.atlas_cache_enabled {
+        let atlas_cacher = if self.atlas_cache_enabled && self.resources.glyph_atlas_enabled {
             self.resources.ensure_glyph_resources();
             let glyph_resources = self
                 .resources

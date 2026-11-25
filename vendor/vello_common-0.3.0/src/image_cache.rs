@@ -91,6 +91,11 @@ impl ImageCache {
         self.slots.get(id.as_u32() as usize)?.as_ref()
     }
 
+    /// Iterate over the live image allocations.
+    pub fn allocated_images(&self) -> impl Iterator<Item = &ImageResource> {
+        self.slots.iter().flatten()
+    }
+
     /// Allocate an image in the cache, with optional transparent padding.
     #[expect(
         clippy::cast_possible_truncation,

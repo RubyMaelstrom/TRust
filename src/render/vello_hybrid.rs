@@ -21,7 +21,7 @@
 use std::collections::{HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use vello_common::kurbo::{Affine, BezPath, Rect};
 use vello_common::paint::ImageSource;
@@ -30,6 +30,8 @@ use vello_gpu::{
     ClearSettings, RenderSize, RenderTargetConfig, Resources, TargetInit, TextureBindings,
 };
 use wgpu::{CurrentSurfaceTexture, SurfaceConfiguration, TextureFormat, TextureView};
+use winit::event_loop::OwnedDisplayHandle;
+use winit::raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
 use winit::window::Window;
 
 use super::vello_cpu::{
@@ -51,6 +53,8 @@ use super::{
 use crate::core::{CssPoint, PhysicalSize};
 
 const GPU_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+const ATLAS_RETIREMENT_FIRST_POLL: Duration = Duration::from_millis(16);
+const ATLAS_RETIREMENT_MAX_INTERVAL: Duration = Duration::from_millis(256);
 // Vello GPU 0.3's default image atlases are 4096x4096. Keep uploads within
 // that allocation boundary even on devices advertising larger 2D textures.
 const HYBRID_IMAGE_ATLAS_LIMIT: u32 = 4096;
@@ -87,6 +91,70 @@ pub enum PresentOutcome {
     Skipped,
 }
 
+/// One retirement ticket covers all submitted atlas changes on a device.
+#[derive(Default)]
+struct AtlasRetirements {
+    pending: Mutex<Option<AtlasRetirement>>,
+}
+
+struct AtlasRetirement {
+    submission: wgpu::SubmissionIndex,
+    next_poll: Instant,
+    expires: Instant,
+    interval: Duration,
+}
+
+impl AtlasRetirements {
+    fn schedule(&self, submission: wgpu::SubmissionIndex, now: Instant) {
+        let mut pending = self.pending.lock().unwrap();
+        let first_poll = now + ATLAS_RETIREMENT_FIRST_POLL;
+        // The desktop submits through one event loop. The latest submission
+        // also covers work from older atlas changes on the shared queue.
+        *pending = Some(AtlasRetirement {
+            submission,
+            next_poll: pending
+                .as_ref()
+                .map_or(first_poll, |ticket| ticket.next_poll.min(first_poll)),
+            expires: now + GPU_WAIT_TIMEOUT,
+            interval: ATLAS_RETIREMENT_FIRST_POLL,
+        });
+    }
+
+    fn poll(
+        &self,
+        device: &wgpu::Device,
+        lost: &Mutex<Option<String>>,
+        now: Instant,
+    ) -> Option<Instant> {
+        let mut pending = self.pending.lock().unwrap();
+        let ticket = pending.as_mut()?;
+        if lost.lock().unwrap().is_some() {
+            *pending = None;
+            return None;
+        }
+        if now < ticket.next_poll {
+            return Some(ticket.next_poll);
+        }
+        // A submit only retires work already complete at that moment. Check
+        // this fence without waiting for the GPU or for another repaint.
+        // wgpu-core can panic after reporting a device loss to its callback.
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            device.poll(wgpu::PollType::Wait {
+                submission_index: Some(ticket.submission.clone()),
+                timeout: Some(Duration::ZERO),
+            })
+        }));
+        if matches!(result, Ok(Err(wgpu::PollError::Timeout))) && now < ticket.expires {
+            ticket.interval = (ticket.interval * 2).min(ATLAS_RETIREMENT_MAX_INTERVAL);
+            ticket.next_poll = (now + ticket.interval).min(ticket.expires);
+            Some(ticket.next_poll)
+        } else {
+            *pending = None;
+            None
+        }
+    }
+}
+
 /// The GPU device Hybrid renderers share: a browser's windows draw with one
 /// device, queue and driver context, as one GPU process serves every window
 /// of Chromium and Firefox. Each renderer keeps its own surface, pipelines
@@ -101,6 +169,7 @@ pub struct HybridDevice {
     failure: Arc<Mutex<Option<String>>>,
     /// Why the device was lost: every renderer on it fails over.
     lost: Arc<Mutex<Option<String>>>,
+    atlas_retirements: Arc<AtlasRetirements>,
 }
 
 impl HybridDevice {
@@ -127,11 +196,18 @@ impl HybridDevice {
             queue,
             failure,
             lost,
+            atlas_retirements: Arc::default(),
         }
     }
 
     pub fn is_lost(&self) -> bool {
         self.lost.lock().unwrap().is_some()
+    }
+
+    /// Service outstanding atlas retirement even after its window changes
+    /// renderers or closes while this shared device remains cached.
+    pub fn poll_atlas_retirement(&self, now: Instant) -> Option<Instant> {
+        self.atlas_retirements.poll(&self.device, &self.lost, now)
     }
 }
 
@@ -156,6 +232,9 @@ pub struct VelloHybridRenderer {
     images: HashMap<ImageCacheKey, CachedImage>,
     frame_images: super::frame_images::FrameImages,
     frame_id: u64,
+    /// Image revisions and atlas moves become valid together when the frame
+    /// encoder is submitted successfully. An error or panic can interrupt it.
+    frame_incomplete: bool,
     headless: Option<HeadlessTarget>,
     window_target: Option<WindowTarget>,
     damage_target: Option<WindowTarget>,
@@ -165,6 +244,7 @@ pub struct VelloHybridRenderer {
     presented: Vec<u32>,
     device_failure: Arc<Mutex<Option<String>>>,
     device_lost: Arc<Mutex<Option<String>>>,
+    atlas_retirements: Arc<AtlasRetirements>,
     adapter_name: String,
     /// The CPU reference renderer that rasterizes effects the GPU path does
     /// not run (SVG filter graphs, Backdrop Root Images), created only while
@@ -179,22 +259,20 @@ impl VelloHybridRenderer {
     /// covers adapter/device negotiation; rendering remains synchronous with
     /// the winit redraw callback and does not create a polling loop.
     pub async fn new_window(window: Arc<Window>) -> Result<Self, String> {
-        let instance = crate::native_gpu::initialize(wgpu::Instance::default);
-        let surface = instance
-            .create_surface(Arc::clone(&window))
-            .map_err(|error| format!("could not create Hybrid surface: {error}"))?;
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                force_fallback_adapter: false,
-                compatible_surface: Some(&surface),
-                apply_limit_buckets: false,
-            })
-            .await
-            .map_err(|error| format!("no compatible Hybrid adapter: {error}"))?;
-        let (device, queue) = request_device(&adapter).await?;
-        let gpu = HybridDevice::new(instance, adapter, device, queue);
-        Self::for_surface(gpu, surface, window)
+        request_hybrid_renderer(Some(&window), None).await
+    }
+
+    /// Initialize with the compositor connection for the Wayland EGL fallback.
+    /// The event-loop handle is independent of the window's surface lifetime.
+    pub async fn new_window_with_display(
+        window: Arc<Window>,
+        display: OwnedDisplayHandle,
+    ) -> Result<Self, String> {
+        let wayland_display = display
+            .display_handle()
+            .is_ok_and(|handle| matches!(handle.as_raw(), RawDisplayHandle::Wayland(_)))
+            .then_some(&display);
+        request_hybrid_renderer(Some(&window), wayland_display).await
     }
 
     /// A renderer for `window` on the device `gpu` that another window's
@@ -224,7 +302,14 @@ impl VelloHybridRenderer {
             queue: self.queue.clone(),
             failure: Arc::clone(&self.device_failure),
             lost: Arc::clone(&self.device_lost),
+            atlas_retirements: Arc::clone(&self.atlas_retirements),
         }
+    }
+
+    /// Service outstanding atlas retirement and return its next wake deadline.
+    pub fn poll_atlas_retirement(&self, now: Instant) -> Option<Instant> {
+        self.atlas_retirements
+            .poll(&self.device, &self.device_lost, now)
     }
 
     fn for_surface(
@@ -233,6 +318,7 @@ impl VelloHybridRenderer {
         window: Arc<Window>,
     ) -> Result<Self, String> {
         let size = physical_size(window.inner_size().width, window.inner_size().height);
+        ensure_device_size(&gpu.device, size)?;
         let capabilities = surface.get_capabilities(&gpu.adapter);
         let format = preferred_surface_format(&capabilities.formats)
             .ok_or_else(|| String::from("Hybrid surface reports no texture formats"))?;
@@ -263,26 +349,7 @@ impl VelloHybridRenderer {
     /// Initialize a window-free renderer. Used only by parity/regression tools;
     /// production Hybrid presentation never performs a GPU-to-CPU readback.
     pub async fn new_headless() -> Result<Self, String> {
-        let instance = crate::native_gpu::initialize(wgpu::Instance::default);
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                force_fallback_adapter: false,
-                compatible_surface: None,
-                apply_limit_buckets: false,
-            })
-            .await
-            .map_err(|error| format!("no headless Hybrid adapter: {error}"))?;
-        let (device, queue) = request_device(&adapter).await?;
-        Self::from_device(
-            HybridDevice::new(instance, adapter, device, queue),
-            TextureFormat::Rgba8Unorm,
-            PhysicalSize::new(1, 1),
-            None,
-            None,
-            None,
-            false,
-        )
+        request_hybrid_renderer(None, None).await
     }
 
     fn from_device(
@@ -301,16 +368,10 @@ impl VelloHybridRenderer {
             queue,
             failure,
             lost,
+            atlas_retirements,
         } = gpu;
         ensure_device_size(&device, size)?;
-        let (renderer, resources) = vello_gpu::Renderer::new(
-            &device,
-            &RenderTargetConfig {
-                format,
-                width: vello_extent(size.width)?,
-                height: vello_extent(size.height)?,
-            },
-        );
+        let (renderer, resources) = Self::create_painter(&device, format, size)?;
         let adapter_name = adapter.get_info().name;
         Ok(Self {
             instance,
@@ -329,6 +390,7 @@ impl VelloHybridRenderer {
             images: HashMap::new(),
             frame_images: super::frame_images::FrameImages::default(),
             frame_id: 0,
+            frame_incomplete: false,
             headless: None,
             window_target: None,
             damage_target: None,
@@ -338,10 +400,48 @@ impl VelloHybridRenderer {
             presented: Vec::new(),
             device_failure: failure,
             device_lost: lost,
+            atlas_retirements,
             adapter_name,
             effects: None,
             video: None,
         })
+    }
+
+    fn create_painter(
+        device: &wgpu::Device,
+        format: TextureFormat,
+        size: PhysicalSize,
+    ) -> Result<(vello_gpu::Renderer, Resources), String> {
+        Ok(vello_gpu::Renderer::new_with_adaptive_image_atlases(
+            device,
+            &RenderTargetConfig {
+                format,
+                width: vello_extent(size.width)?,
+                height: vello_extent(size.height)?,
+            },
+            vello_gpu::RenderSettings::default(),
+        ))
+    }
+
+    fn begin_frame(
+        &mut self,
+        size: PhysicalSize,
+        label: &str,
+    ) -> Result<wgpu::CommandEncoder, String> {
+        if self.frame_incomplete {
+            // Cached IDs can name texels whose upload or relocation was
+            // discarded. Replay from the scene's sources on the next draw.
+            (self.renderer, self.resources) =
+                Self::create_painter(&self.device, self.format, size)?;
+            self.images.clear();
+            self.video = None;
+            self.headless = None;
+            self.retained_window_valid = false;
+        }
+        self.frame_incomplete = true;
+        Ok(self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) }))
     }
 
     pub fn kind(&self) -> RendererKind {
@@ -480,11 +580,7 @@ impl VelloHybridRenderer {
             let view = texture
                 .texture
                 .create_view(&wgpu::TextureViewDescriptor::default());
-            let mut encoder = self
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("TRust Vello Hybrid frame"),
-                });
+            let mut encoder = self.begin_frame(self.size, "TRust Vello Hybrid frame")?;
             if self.surface_copy_dst {
                 self.ensure_window_target(self.size);
                 let partial = damage
@@ -550,7 +646,10 @@ impl VelloHybridRenderer {
                 let hybrid_scene = self.build_scene(scene, &mut encoder)?;
                 self.render_to_view(&hybrid_scene, &view, &mut encoder)?;
             }
-            self.queue.submit([encoder.finish()]);
+            let submission = self.queue.submit([encoder.finish()]);
+            if self.renderer.take_retired_image_atlas_textures() {
+                self.atlas_retirements.schedule(submission, Instant::now());
+            }
             // wl_surface.frame paces subsequent winit redraws. A completely
             // obscured Wayland surface may receive no frame callbacks; without
             // this notification we keep entering present on the UI thread,
@@ -567,6 +666,7 @@ impl VelloHybridRenderer {
                 self.configure_surface()?;
             }
             self.check_device()?;
+            self.frame_incomplete = false;
             return Ok(PresentOutcome::Presented);
         }
         Err(String::from("could not acquire Hybrid surface"))
@@ -650,13 +750,9 @@ impl VelloHybridRenderer {
             return Err(String::from("cannot render an empty Hybrid framebuffer"));
         }
         ensure_device_size(&self.device, size)?;
+        let mut encoder = self.begin_frame(size, "TRust Vello Hybrid headless frame")?;
         self.ensure_headless_target(size);
         let view = self.headless.as_ref().unwrap().view.clone();
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("TRust Vello Hybrid headless frame"),
-            });
         let hybrid_scene = self.build_scene(scene, &mut encoder)?;
         self.render_to_view(&hybrid_scene, &view, &mut encoder)?;
         let target = self.headless.as_ref().unwrap();
@@ -724,6 +820,7 @@ impl VelloHybridRenderer {
         drop(mapped);
         target.readback.unmap();
         self.check_device()?;
+        self.frame_incomplete = false;
         Ok(OwnedRgbaFrame {
             size,
             pixels: self.rgba.clone(),
@@ -1409,7 +1506,6 @@ impl VelloHybridRenderer {
             .images
             .get(&key)
             .is_some_and(|image| store_revision.is_some_and(|revision| revision != image.revision));
-        let mut stale = None;
         if changed {
             // SVG revisions/sizes have separate immutable cache entries.
             // Bitmap animations can update their stable atlas slot in place.
@@ -1463,12 +1559,18 @@ impl VelloHybridRenderer {
                 } else {
                     false
                 };
-            if !updated_in_place {
-                // Animated formats retain one canvas size and take the
-                // in-place path above; this is the general size-change
-                // fallback. Atlas uploads, copies and clears share the same
-                // encoder order, including when later images reuse this slot.
-                stale = self.images.remove(&key);
+            if !updated_in_place
+                && let Some(CachedImage {
+                    source: ImageSource::OpaqueId { id, .. },
+                    ..
+                }) = self.images.remove(&key)
+            {
+                // FrameImages samples a single bitmap revision per frame,
+                // and SVG revisions have separate keys. This slot belongs
+                // to a previous frame. Record its clear even if the new
+                // pixels are invalid, before any upload that reuses it.
+                self.renderer
+                    .destroy_image(&mut self.resources, encoder, id);
             }
         }
         if !self.images.contains_key(&key) && !self.make_room_for_image(encoder) {
@@ -1513,14 +1615,6 @@ impl VelloHybridRenderer {
                     last_used_frame: self.frame_id,
                 },
             );
-        }
-        if let Some(CachedImage {
-            source: ImageSource::OpaqueId { id, .. },
-            ..
-        }) = stale
-        {
-            self.renderer
-                .destroy_image(&mut self.resources, encoder, id);
         }
         self.fill_cached_image(target, key, rect, source_rect, fit, sampling);
         Ok(())
@@ -1764,8 +1858,9 @@ impl VelloHybridRenderer {
         self.configure_surface()
     }
 
-    fn check_device(&self) -> Result<(), String> {
+    fn check_device(&mut self) -> Result<(), String> {
         if let Some(error) = self.take_device_failure() {
+            self.frame_incomplete = true;
             Err(error)
         } else {
             Ok(())
@@ -1797,11 +1892,168 @@ impl RasterBackend for VelloHybridRenderer {
     }
 }
 
+struct HybridAdapter {
+    instance: wgpu::Instance,
+    adapter: wgpu::Adapter,
+    presentation: Option<(wgpu::Surface<'static>, Arc<Window>)>,
+}
+
+impl HybridAdapter {
+    async fn request(
+        backends: wgpu::Backends,
+        window: Option<&Arc<Window>>,
+        display: Option<&OwnedDisplayHandle>,
+    ) -> Result<Self, String> {
+        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        descriptor.backends = backends;
+        // EGL uses the platform display when choosing a presentation config.
+        // The event-loop handle can outlive the first window and its surface.
+        if backends.contains(wgpu::Backends::GL)
+            && let Some(display) = display
+        {
+            descriptor = descriptor.with_display_handle(Box::new(display.clone()));
+        }
+        let instance = crate::native_gpu::initialize(|| {
+            // Some EGL drivers return no display without an EGL error, which
+            // the loader wrapper turns into a panic during initialization.
+            catch_unwind(AssertUnwindSafe(|| wgpu::Instance::new(descriptor)))
+        })
+        .map_err(|payload| {
+            format!(
+                "could not initialize Hybrid backends {backends:?}: {}",
+                panic_message(payload)
+            )
+        })?;
+        let presentation = window
+            .map(|window| {
+                instance
+                    .create_surface(Arc::clone(window))
+                    .map(|surface| (surface, Arc::clone(window)))
+            })
+            .transpose()
+            .map_err(|error| {
+                format!("could not create Hybrid surface with {backends:?}: {error}")
+            })?;
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                force_fallback_adapter: false,
+                compatible_surface: presentation.as_ref().map(|(surface, _)| surface),
+                apply_limit_buckets: false,
+            })
+            .await
+            .map_err(|error| format!("no compatible Hybrid adapter with {backends:?}: {error}"))?;
+        Ok(Self {
+            instance,
+            adapter,
+            presentation,
+        })
+    }
+
+    async fn open(self) -> Result<VelloHybridRenderer, String> {
+        let backend = self.adapter.get_info().backend;
+        let (device, queue) = request_device(&self.adapter)
+            .await
+            .map_err(|error| format!("{backend:?}: {error}"))?;
+        let gpu = HybridDevice::new(self.instance, self.adapter, device, queue);
+        let mut renderer = match self.presentation {
+            Some((surface, window)) => VelloHybridRenderer::for_surface(gpu, surface, window),
+            None => VelloHybridRenderer::from_device(
+                gpu,
+                TextureFormat::Rgba8Unorm,
+                PhysicalSize::new(1, 1),
+                None,
+                None,
+                None,
+                false,
+            ),
+        }
+        .map_err(|error| format!("{backend:?}: {error}"))?;
+        renderer
+            .check_device()
+            .map_err(|error| format!("{backend:?}: {error}"))?;
+        Ok(renderer)
+    }
+
+    fn device_type(&self) -> wgpu::DeviceType {
+        self.adapter.get_info().device_type
+    }
+}
+
+fn adapter_preference(device_type: wgpu::DeviceType) -> u8 {
+    // Match wgpu-core's HighPerformance ordering when choosing between
+    // adapters reported by separate instances.
+    match device_type {
+        wgpu::DeviceType::DiscreteGpu => 0,
+        wgpu::DeviceType::IntegratedGpu => 1,
+        wgpu::DeviceType::Other => 2,
+        wgpu::DeviceType::VirtualGpu => 3,
+        wgpu::DeviceType::Cpu => 4,
+    }
+}
+
+async fn request_hybrid_renderer(
+    window: Option<&Arc<Window>>,
+    display: Option<&OwnedDisplayHandle>,
+) -> Result<VelloHybridRenderer, String> {
+    let enabled = wgpu::Instance::enabled_backend_features();
+    if enabled.is_empty() {
+        return Err("no Hybrid backends enabled in wgpu".into());
+    }
+    let primary_backends = enabled & wgpu::Backends::PRIMARY;
+    let secondary_backends = enabled - primary_backends;
+    if primary_backends.is_empty() || secondary_backends.is_empty() {
+        return HybridAdapter::request(enabled, window, display)
+            .await?
+            .open()
+            .await;
+    }
+
+    // EGL probing opens a driver context. Defer it when a primary hardware
+    // adapter wins wgpu's ordering, since GLES reports at most IntegratedGpu
+    // and the primary backends win ties. Keep a successful software or
+    // virtual candidate for comparison without probing primary backends twice.
+    let primary = match HybridAdapter::request(primary_backends, window, display).await {
+        Ok(candidate)
+            if matches!(
+                candidate.device_type(),
+                wgpu::DeviceType::DiscreteGpu | wgpu::DeviceType::IntegratedGpu
+            ) =>
+        {
+            match candidate.open().await {
+                Ok(renderer) => return Ok(renderer),
+                Err(error) => Err(error),
+            }
+        }
+        result => result,
+    };
+    let secondary = HybridAdapter::request(secondary_backends, window, display).await;
+    let (first, second) = match (&primary, &secondary) {
+        (Ok(primary_adapter), Ok(secondary_adapter))
+            if adapter_preference(secondary_adapter.device_type())
+                < adapter_preference(primary_adapter.device_type()) =>
+        {
+            (secondary, primary)
+        }
+        _ => (primary, secondary),
+    };
+    let open = async |candidate: Result<HybridAdapter, String>| candidate?.open().await;
+    match open(first).await {
+        Ok(renderer) => Ok(renderer),
+        Err(first_error) => open(second)
+            .await
+            .map_err(|second_error| format!("{first_error}. {second_error}")),
+    }
+}
+
 async fn request_device(adapter: &wgpu::Adapter) -> Result<(wgpu::Device, wgpu::Queue), String> {
     adapter
         .request_device(&wgpu::DeviceDescriptor {
             label: Some("TRust Vello Hybrid device"),
             required_features: wgpu::Features::empty(),
+            // Start with small GPU and staging blocks for light pages. wgpu
+            // can grow the pools or allocate large resources individually.
+            memory_hints: wgpu::MemoryHints::MemoryUsage,
             ..Default::default()
         })
         .await
@@ -2140,6 +2392,93 @@ mod tests {
     use super::*;
 
     #[test]
+    fn hybrid_atlas_retirement_releases_a_texture_without_another_submit() {
+        let Ok(renderer) = futures::executor::block_on(VelloHybridRenderer::new_headless()) else {
+            eprintln!("GPU retirement regression not exercised: no Hybrid adapter");
+            return;
+        };
+        let device = &renderer.device;
+        let now = Instant::now();
+        assert_eq!(renderer.poll_atlas_retirement(now), None);
+
+        let label = "Retired image atlas test texture";
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d {
+                width: 512,
+                height: 512,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let allocation_exists = |report: wgpu::AllocatorReport| {
+            report.allocations.iter().any(|entry| entry.name == label)
+        };
+        let has_report = device
+            .generate_allocator_report()
+            .is_some_and(allocation_exists);
+        renderer.queue.write_texture(
+            texture.as_image_copy(),
+            &[255; 4],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: None,
+                rows_per_image: None,
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        let submission = renderer.queue.submit([]);
+        drop(texture);
+
+        let now = Instant::now();
+        let first_poll = now + ATLAS_RETIREMENT_FIRST_POLL;
+        renderer.atlas_retirements.schedule(submission.clone(), now);
+        renderer
+            .atlas_retirements
+            .schedule(submission, now + Duration::from_millis(1));
+        assert_eq!(renderer.poll_atlas_retirement(now), Some(first_poll));
+        while let Some(next) = renderer.poll_atlas_retirement(Instant::now()) {
+            std::thread::sleep(next.saturating_duration_since(Instant::now()));
+        }
+        if has_report {
+            assert!(
+                !device
+                    .generate_allocator_report()
+                    .is_some_and(allocation_exists),
+                "the retired atlas still has live GPU memory"
+            );
+        }
+        assert_eq!(renderer.poll_atlas_retirement(Instant::now()), None);
+    }
+
+    #[test]
+    fn hybrid_startup_uses_small_gpu_memory_blocks() {
+        let Ok(renderer) = futures::executor::block_on(VelloHybridRenderer::new_headless()) else {
+            eprintln!("GPU allocation regression not exercised: no Hybrid adapter");
+            return;
+        };
+        let Some(report) = renderer.device.generate_allocator_report() else {
+            eprintln!("GPU allocation regression not exercised: no allocator report");
+            return;
+        };
+        // A fresh renderer only needs its initial buffers and tiny textures.
+        // Allow room for backend-specific alignment and memory types.
+        assert!(
+            report.total_reserved_bytes <= 32 * 1024 * 1024,
+            "initial renderer resources reserve excessive GPU memory: {report:?}"
+        );
+    }
+
+    #[test]
     fn hybrid_concurrent_headless_construction_keeps_independent_readbacks() {
         use crate::core::{CssSize, ScaleFactor, ViewportMetrics};
 
@@ -2413,6 +2752,196 @@ mod tests {
                     &[0, 255, 0, 255],
                     "new allocation after growth, row width {width}, y={y}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn hybrid_adaptive_atlas_grows_around_a_retained_image_and_reclaims_space() {
+        use crate::core::{CssSize, ScaleFactor, ViewportMetrics};
+        use vello_common::multi_atlas::AtlasId;
+
+        let Ok(mut hybrid) = futures::executor::block_on(VelloHybridRenderer::new_headless())
+        else {
+            eprintln!("Adaptive atlas pixel regression not exercised: no Hybrid adapter");
+            return;
+        };
+        let small = ImageHandle::for_source("test:adaptive-atlas-small");
+        let large = ImageHandle::for_source("test:adaptive-atlas-large");
+        let command = |handle, x| DisplayCommand::Image {
+            rect: CssRect::new(x, 0.0, 32.0, 32.0),
+            handle,
+            source_rect: None,
+            fit: ImageFit::Fill,
+            sampling: ImageSampling::Smooth,
+            clip: None,
+            node: 0,
+            link: None,
+        };
+        let image = |width, height, rgba: [u8; 4]| ImageResource {
+            svg_source: None,
+            width,
+            height,
+            rgba: Arc::from(rgba.repeat((width * height) as usize)),
+            has_alpha: false,
+        };
+        let pixel = |frame: &OwnedRgbaFrame, x: usize, y: usize| -> [u8; 4] {
+            let start = (y * 64 + x) * 4;
+            frame.pixels[start..start + 4].try_into().unwrap()
+        };
+        let atlas_size = |hybrid: &VelloHybridRenderer| {
+            let texture = hybrid.renderer.atlas_texture(AtlasId::new(0));
+            (texture.width(), texture.height())
+        };
+        let red = [255, 0, 0, 255];
+        let green = [0, 255, 0, 255];
+        let blue = [0, 0, 255, 255];
+        // A full-width, 129-row image occupies the start of the page, and
+        // cannot fit after the 30-row image placed on the page behind it.
+        // Removing it therefore moves the backing origin. Re-inserting it
+        // forces the backing to grow towards a lower logical coordinate.
+        for width in [64, 65] {
+            let mut settings = vello_gpu::RenderSettings::default();
+            settings.memory_settings.image_atlas_config.atlas_size = (width as u16, 192);
+            (hybrid.renderer, hybrid.resources) =
+                vello_gpu::Renderer::new_with_adaptive_image_atlases(
+                    &hybrid.device,
+                    &RenderTargetConfig {
+                        format: hybrid.format,
+                        width: 64,
+                        height: 32,
+                    },
+                    settings,
+                );
+            hybrid.images.clear();
+            let mut scene = Scene {
+                viewport: ViewportMetrics::from_physical(
+                    PhysicalSize::new(64, 32),
+                    ScaleFactor::default(),
+                ),
+                primitives: vec![command(small, 0.0)],
+                controls: Vec::new(),
+                content_viewport: CssRect::new(0.0, 0.0, 64.0, 32.0),
+                image_store: Default::default(),
+                canvas_images: Default::default(),
+                page_scroll_containers: Vec::new(),
+                page_size: CssSize::new(64.0, 32.0),
+            };
+            scene.image_store.insert(small, image(30, 30, red));
+            hybrid.render_rgba(&scene).unwrap();
+            assert_eq!(atlas_size(&hybrid), (64, 64));
+            scene.image_store.insert(large, image(width, 129, green));
+            scene.primitives = vec![command(large, 32.0)];
+            hybrid.render_rgba(&scene).unwrap();
+            scene.primitives.push(command(small, 0.0));
+            let frame = hybrid.render_rgba(&scene).unwrap();
+            assert_eq!(atlas_size(&hybrid), (width, 192));
+            assert_eq!(pixel(&frame, 16, 16), red);
+            assert_eq!(pixel(&frame, 48, 16), green);
+
+            scene.primitives = vec![command(small, 0.0)];
+            let frame = hybrid.render_rgba(&scene).unwrap();
+            assert_eq!(atlas_size(&hybrid), (64, 64));
+            assert_eq!(pixel(&frame, 16, 16), red);
+
+            scene.image_store.insert(small, image(30, 30, blue));
+            // An update to the old allocation must survive a resize both
+            // before and after the new image triggers the copy.
+            scene
+                .primitives
+                .insert(usize::from(width == 64), command(large, 32.0));
+            let frame = hybrid.render_rgba(&scene).unwrap();
+            assert_eq!(atlas_size(&hybrid), (width, 192));
+            for y in [1, 16, 30] {
+                assert_eq!(pixel(&frame, 16, y), blue);
+                assert_eq!(pixel(&frame, 48, y), green);
+            }
+
+            // Abandon an encoder after it recorded a new image revision.
+            // A subsequent frame must replay that upload even though the
+            // scene still contains the very same image revision.
+            scene.image_store.insert(small, image(30, 30, red));
+            let mut abandoned = hybrid
+                .begin_frame(scene.viewport.physical, "abandoned frame")
+                .unwrap();
+            hybrid.build_scene(&scene, &mut abandoned).unwrap();
+            drop(abandoned);
+            let frame = hybrid.render_rgba(&scene).unwrap();
+            assert_eq!(pixel(&frame, 16, 16), red);
+            assert_eq!(pixel(&frame, 48, 16), green);
+        }
+    }
+
+    #[test]
+    fn hybrid_reclaims_replaced_bitmap_after_invalid_pixels() {
+        use crate::core::{CssSize, ScaleFactor, ViewportMetrics};
+
+        let Ok(mut hybrid) = futures::executor::block_on(VelloHybridRenderer::new_headless())
+        else {
+            eprintln!("Bitmap replacement regression not exercised: no Hybrid adapter");
+            return;
+        };
+        let mut settings = vello_gpu::RenderSettings::default();
+        settings.memory_settings.image_atlas_config.atlas_size = (64, 64);
+        settings.memory_settings.image_atlas_config.max_atlases = 1;
+        (hybrid.renderer, hybrid.resources) = vello_gpu::Renderer::new_with_adaptive_image_atlases(
+            &hybrid.device,
+            &RenderTargetConfig {
+                format: hybrid.format,
+                width: 32,
+                height: 16,
+            },
+            settings,
+        );
+        let handle = ImageHandle::for_source("test:bitmap-replacement");
+        let command = |x| DisplayCommand::Image {
+            rect: CssRect::new(x, 0., 16., 16.),
+            handle,
+            source_rect: None,
+            fit: ImageFit::Fill,
+            sampling: ImageSampling::Nearest,
+            clip: None,
+            node: 0,
+            link: None,
+        };
+        let scene = Scene {
+            viewport: ViewportMetrics::from_physical(
+                PhysicalSize::new(32, 16),
+                ScaleFactor::default(),
+            ),
+            primitives: vec![command(0.), command(16.)],
+            controls: Vec::new(),
+            content_viewport: CssRect::new(0., 0., 32., 16.),
+            image_store: Default::default(),
+            canvas_images: Default::default(),
+            page_scroll_containers: Vec::new(),
+            page_size: CssSize::new(32., 16.),
+        };
+        for (width, color) in [
+            (64, Some([255, 0, 0, 255])),
+            (48, Some([0, 0, 255, 255])),
+            (64, None),
+            (64, Some([0, 255, 0, 255])),
+        ] {
+            scene.image_store.insert(
+                handle,
+                ImageResource {
+                    width,
+                    height: 64,
+                    rgba: Arc::from(
+                        color.map_or_else(Vec::new, |rgba| rgba.repeat(width as usize * 64)),
+                    ),
+                    has_alpha: false,
+                    svg_source: None,
+                },
+            );
+            let frame = hybrid.render_rgba(&scene).unwrap();
+            assert_eq!(hybrid.images.len(), usize::from(color.is_some()));
+            if let Some(color) = color {
+                for x in [8, 24] {
+                    let pixel = (8 * 32 + x) * 4;
+                    assert_eq!(&frame.pixels[pixel..pixel + 4], &color);
+                }
             }
         }
     }

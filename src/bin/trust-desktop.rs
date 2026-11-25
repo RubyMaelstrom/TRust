@@ -3920,7 +3920,7 @@ impl DesktopWindow {
         }
     }
 
-    fn initialize_renderer(&mut self) -> Result<(), String> {
+    fn initialize_renderer(&mut self, event_loop: &ActiveEventLoop) -> Result<(), String> {
         if self.renderer.is_some() {
             return Ok(());
         }
@@ -3945,7 +3945,10 @@ impl DesktopWindow {
                     .map_or_else(
                         || {
                             self.runtime
-                                .block_on(VelloHybridRenderer::new_window(window))
+                                .block_on(VelloHybridRenderer::new_window_with_display(
+                                    window,
+                                    event_loop.owned_display_handle(),
+                                ))
                         },
                         Ok,
                     );
@@ -9557,11 +9560,18 @@ impl DesktopWindow {
         self.answer_fullscreen_request(false);
         self.service_chrome_tick();
         self.service_sleep_check();
+        let atlas_retirement = match &self.renderer {
+            Some(DesktopRenderer::Hybrid(renderer)) => {
+                renderer.poll_atlas_retirement(Instant::now())
+            }
+            _ => None,
+        };
         self.fullscreen_reply
             .map(|(_, since)| since + FULLSCREEN_REPLY_DEADLINE)
             .into_iter()
             .chain(self.chrome_tick.deadline)
             .chain(self.sleep_check_scheduled)
+            .chain(atlas_retirement)
             .min()
     }
 
@@ -9606,7 +9616,7 @@ impl DesktopWindow {
             }
         }
         if self.renderer.is_none() {
-            if let Err(error) = self.initialize_renderer() {
+            if let Err(error) = self.initialize_renderer(event_loop) {
                 eprintln!("trust-desktop: could not initialize renderer: {error}");
                 self.close_now();
                 return;

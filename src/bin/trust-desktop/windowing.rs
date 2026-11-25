@@ -330,6 +330,17 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
             .filter_map(DesktopWindow::about_to_wait)
             .min();
         self.settle(event_loop);
+        if self.windows.is_empty() {
+            return;
+        }
+        // The cached device may still have in-flight textures from a closed
+        // window or from one that has switched to the software renderer.
+        let gpu_deadline = self
+            .gpu
+            .borrow()
+            .as_ref()
+            .and_then(|gpu| gpu.poll_atlas_retirement(Instant::now()));
+        let deadline = deadline.into_iter().chain(gpu_deadline).min();
         event_loop.set_control_flow(match deadline {
             Some(at) => ControlFlow::WaitUntil(at),
             None => ControlFlow::Wait,
