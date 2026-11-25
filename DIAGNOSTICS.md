@@ -346,10 +346,11 @@ Each navigation runs its document in a new TRust JS engine. `trust`,
 own page thread (see [`src/page_spare.rs`](src/page_spare.rs)): it bootstraps
 the platform prelude once in a throwaway `about:blank` Realm, discards that
 Realm, and waits; the next navigation creates its Window in the spare's
-untouched default Realm, reusing only the compiled prelude. The interactive
-frontends warm the first spare at startup and another after each navigation's
-first rendering; `trust-headless` warms one at startup, and another only when
-`--click` may navigate again. Compare a navigation with and without it:
+untouched default Realm, reusing only the compiled prelude. At startup, the
+frontends warm a spare only for an explicit address that can run page scripts.
+Interactive frontends refill the spare after a page actor's first event.
+`trust-headless` refills it when `--click` may lead to another navigation.
+Compare a navigation with and without it:
 
 ```sh
 TRUST_NET_TRACE=1 target/release/trust-headless --click 100,20 http://127.0.0.1:8000/a.html
@@ -357,10 +358,10 @@ TRUST_NET_TRACE=1 TRUST_NO_SPARE_ENGINE=1 target/release/trust-headless --click 
 ```
 
 Measure from `prefetch done; spawning page` to `first PageEvt received`. The
-trace also reports `claimed spare page engine (warm|preparing|cold)`, `spare
-page engine still warming; this navigation runs cold` (a navigation never waits
-for the warm-up bootstrap; the spare stays for the next one), and `spare page
-engine warm after N ms`. An idle spare costs about 22 MiB of resident memory.
+trace also reports `claimed spare page engine (warm|preparing)` and `spare page
+engine warm after N ms`. A navigation arriving during warm-up starts cold
+while the spare finishes in the background. A failed warm-up releases its
+engine and ends the worker.
 
 Every tab whose page is live runs its own engine, so the warmed engine's
 resident cost bounds what each additional tab pays before its document. Report

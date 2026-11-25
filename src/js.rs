@@ -1476,17 +1476,15 @@ pub fn prewarm_page_engine() {
     crate::trust_js_backend::prewarm_spare_engine();
 }
 
-/// Whether a frontend's start address can lead to a scripted HTML document,
-/// so that warming a spare page engine at startup may serve it. A syntactic
-/// guess: `http`, `https`, `file` and scheme-less addresses (bare hosts and
-/// paths) qualify; other protocols never use a page engine. A wrong guess
-/// costs only an idle spare.
+/// Whether the startup target can lead to a scripted HTML document. Reuse
+/// the navigation parser so a bare hostname, local path, or explicit service
+/// port is classified the same way here as at navigation time.
 pub fn start_address_may_use_page_engine(address: &str) -> bool {
-    address.split_once("://").is_none_or(|(scheme, _)| {
-        ["http", "https", "file"]
-            .iter()
-            .any(|web| scheme.eq_ignore_ascii_case(web))
-    })
+    match crate::core::parse_navigation_target(address) {
+        Ok((crate::doc::Link::Http(url), _)) => matches!(url.scheme(), "http" | "https" | "file"),
+        Ok((crate::doc::Link::Gopher(url), _)) => url.is_html() && !url.needs_query(),
+        _ => false,
+    }
 }
 
 /// A navigation's document rendered: warm the next navigation's engine.

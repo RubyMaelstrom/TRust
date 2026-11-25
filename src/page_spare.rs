@@ -28,7 +28,7 @@
 //! * the engine's default Realm, which becomes the page's Window, is untouched
 //!   until the claim;
 //! * no job, unhandled rejection, host state or Realm of the warm-up survives
-//!   it; a warm-up that cannot prove this hands the claim a new engine.
+//!   it; an unsuccessful warm-up releases its engine and ends the worker.
 
 use super::*;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -42,8 +42,8 @@ const PREPARING: u8 = 0;
 const WARMING: u8 = 1;
 /// The shared program table is warm and the warm-up Realm is gone.
 const WARM: u8 = 2;
-/// The warm-up failed or was interrupted; a claim gets a new engine.
-const COLD: u8 = 3;
+/// The worker has released its engine and closed its receiver.
+const STOPPED: u8 = 3;
 /// A navigation owns this spare.
 const CLAIMED: u8 = 4;
 
@@ -52,7 +52,7 @@ fn state_name(state: u8) -> &'static str {
         PREPARING => "preparing",
         WARMING => "warming",
         WARM => "warm",
-        COLD => "cold",
+        STOPPED => "stopped",
         _ => "claimed",
     }
 }
@@ -68,6 +68,22 @@ pub(super) struct SpareEngine {
 impl SpareEngine {
     /// Start a spare actor thread; it warms its engine immediately.
     pub(super) fn spawn() -> Option<Self> {
+        Self::spawn_with(warm)
+    }
+
+    fn spawn_with(
+        warm_up: impl FnOnce(&mut trust_js::Engine, &'static [u8]) -> Result<(), String>
+        + Send
+        + 'static,
+    ) -> Option<Self> {
+        struct StopOnExit<'a>(&'a AtomicU8);
+        impl Drop for StopOnExit<'_> {
+            fn drop(&mut self) {
+                crate::release_allocator_memory();
+                self.0.store(STOPPED, Ordering::Release);
+            }
+        }
+
         let interrupt = Arc::new(trust_js::RuntimeInterrupt::default());
         let state = Arc::new(AtomicU8::new(PREPARING));
         let (claims, receiver) = mpsc::channel();
@@ -78,8 +94,10 @@ impl SpareEngine {
             interrupt.clone(),
             None,
             move || {
-                run(receiver, actor_interrupt, actor_state);
-                crate::release_allocator_memory();
+                // run owns both the receiver and the engine. Its return or
+                // unwind releases them before this guard publishes STOPPED.
+                let _stop_on_exit = StopOnExit(&actor_state);
+                run(receiver, actor_interrupt, &actor_state, warm_up);
             },
         )
         .ok()?;
@@ -95,14 +113,13 @@ impl SpareEngine {
         self.interrupt.clone()
     }
 
-    /// Reserve this spare for one navigation unless it is mid-bootstrap,
-    /// where waiting would cost more than a cold engine. Returns the state
-    /// it was reserved in.
-    fn reserve(&self) -> Option<u8> {
+    /// Reserve a preparing or warm spare for one navigation. Returns the
+    /// state at the reservation attempt.
+    fn reserve(&self) -> Result<u8, u8> {
         let mut current = self.state.load(Ordering::Acquire);
         loop {
-            if matches!(current, WARMING | CLAIMED) {
-                return None;
+            if !matches!(current, PREPARING | WARM) {
+                return Err(current);
             }
             match self.state.compare_exchange_weak(
                 current,
@@ -110,10 +127,14 @@ impl SpareEngine {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return Some(current),
+                Ok(_) => return Ok(current),
                 Err(actual) => current = actual,
             }
         }
+    }
+
+    fn stopped(&self) -> bool {
+        self.state.load(Ordering::Acquire) == STOPPED
     }
 
     /// Hand one document to this reserved spare. On success the caller's page
@@ -139,21 +160,9 @@ impl SpareEngine {
 fn run(
     claims: mpsc::Receiver<desktop::PageStart>,
     interrupt: Arc<trust_js::RuntimeInterrupt>,
-    state: Arc<AtomicU8>,
+    state: &AtomicU8,
+    warm_up: impl FnOnce(&mut trust_js::Engine, &'static [u8]) -> Result<(), String>,
 ) {
-    // A spare whose thread ends without a claim (a panic, or shutdown) must
-    // not look like one still warming: navigations would skip it forever.
-    struct ColdOnExit(Arc<AtomicU8>);
-    impl Drop for ColdOnExit {
-        fn drop(&mut self) {
-            for from in [PREPARING, WARMING] {
-                let _ = self
-                    .0
-                    .compare_exchange(from, COLD, Ordering::AcqRel, Ordering::Acquire);
-            }
-        }
-    }
-    let _cold_on_exit = ColdOnExit(state.clone());
     let trace = std::env::var_os("TRUST_NET_TRACE").is_some();
     let started = Instant::now();
     let mut engine = trust_js::Engine::new_with_interrupt(interrupt.clone());
@@ -167,30 +176,22 @@ fn run(
     let warming = state
         .compare_exchange(PREPARING, WARMING, Ordering::AcqRel, Ordering::Acquire)
         .is_ok();
-    let engine = if !warming {
-        Some(engine)
-    } else {
-        match snapshot.and_then(|snapshot| warm(&mut engine, snapshot)) {
-            Ok(()) => {
-                // Return the warm-up Realm's freed pages before idling.
-                crate::release_allocator_memory();
-                state.store(WARM, Ordering::Release);
-                Some(engine)
+    if warming {
+        if let Err(error) = snapshot.and_then(|snapshot| warm_up(&mut engine, snapshot)) {
+            // Shutdown cancels a warming spare; that needs no report.
+            let cancelled = matches!(
+                interrupt.current_reason(),
+                Some(trust_js::InterruptReason::Cancelled)
+            );
+            if !cancelled && (trace || std::env::var_os("TRUST_JS_TRACE").is_some()) {
+                eprintln!("trust-js: spare page engine discarded: {error}");
             }
-            Err(error) => {
-                state.store(COLD, Ordering::Release);
-                // Shutdown cancels a warming spare; that needs no report.
-                let cancelled = matches!(
-                    interrupt.current_reason(),
-                    Some(trust_js::InterruptReason::Cancelled)
-                );
-                if !cancelled && (trace || std::env::var_os("TRUST_JS_TRACE").is_some()) {
-                    eprintln!("trust-js: spare page engine discarded: {error}");
-                }
-                None
-            }
+            return;
         }
-    };
+        // Return the warm-up Realm's freed pages before idling.
+        crate::release_allocator_memory();
+        state.store(WARM, Ordering::Release);
+    }
     if trace {
         eprintln!(
             "js : @{:>6}ms spare page engine {} after {} ms (engine {engine_ms} ms, snapshot {snapshot_ms} ms)",
@@ -203,12 +204,33 @@ fn run(
             started.elapsed().as_millis(),
         );
     }
-    let Ok(start) = claims.recv() else {
+    let Some(start) = wait_for_claim(&mut engine, &claims) else {
         return;
     };
     drop(claims);
-    let engine = engine.unwrap_or_else(|| trust_js::Engine::new_with_interrupt(interrupt.clone()));
     desktop::page_actor(start, interrupt, Some(engine));
+}
+
+/// Release the GC's spare pages when their timer expires. The engine can also
+/// schedule incremental marking. Once maintenance finishes, park until a
+/// navigation claims the worker or its sender closes.
+fn wait_for_claim(
+    engine: &mut trust_js::Engine,
+    claims: &mpsc::Receiver<desktop::PageStart>,
+) -> Option<desktop::PageStart> {
+    loop {
+        let mut wait = None;
+        run_memory_reducer(engine, &mut wait, || {});
+        advance_idle_marking(engine, &mut wait, || {});
+        let Some(wait) = wait else {
+            return claims.recv().ok();
+        };
+        match claims.recv_timeout(wait) {
+            Ok(start) => return Some(start),
+            Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
 }
 
 /// Upper bound on warm-up jobs. The prelude queues a handful; a runaway
@@ -219,6 +241,27 @@ const MAX_WARM_UP_JOBS: usize = 100_000;
 /// in a throwaway `about:blank` Window Realm, then remove every trace of that
 /// Realm. The default Realm is not touched.
 fn warm(engine: &mut trust_js::Engine, snapshot: &'static [u8]) -> Result<(), String> {
+    let warm_up_global = bootstrap_spare_realm(engine, snapshot)?;
+    engine.collect_garbage_at_idle();
+    if !warm_up_global.is_cleared() {
+        return Err(String::from(
+            "spare engine warm-up Realm outlived its collection",
+        ));
+    }
+    if engine.has_pending_jobs() || !engine.take_unhandled_rejections_full().is_empty() {
+        return Err(String::from("spare engine warm-up left pending jobs"));
+    }
+    Ok(())
+}
+
+/// Return only a weak handle from the bootstrap frame. TRust JS uses the
+/// conservative liveness approximation permitted by ECMA-262 #sec-liveness.
+/// Unwind the frame so a stale Realm address in it cannot act as a root.
+#[inline(never)]
+fn bootstrap_spare_realm(
+    engine: &mut trust_js::Engine,
+    snapshot: &'static [u8],
+) -> Result<WeakHandle, String> {
     let blank = url::Url::parse("about:blank").expect("about:blank parses");
     let dom = Rc::new(RefCell::new(Dom::parse_document("")));
     let mut state = HostState::new(dom, Rc::new(RealmClock::new()));
@@ -269,29 +312,19 @@ fn warm(engine: &mut trust_js::Engine, snapshot: &'static [u8]) -> Result<(), St
     engine
         .with_embed_realm(&realm, |engine| {
             drain_jobs(engine)?;
-            // The Agent keeps the last successful RegExpBuiltinExec's match,
-            // and with it that Realm's %RegExp%, until a legacy static
-            // accessor of that Realm materializes it. Read one here, so the
-            // warm-up's own regular expressions do not retain its Realm.
+            // Materialize the last match's lazy legacy RegExp statics while
+            // their Realm is active. A pending record can otherwise keep
+            // the throwaway Realm live during the collection below.
             eval(engine, "void RegExp.input;", "spare engine RegExp statics")
         })
         .map_err(unavailable)??;
 
-    // Remove every owner of the warm-up Realm, collect it, and prove it gone.
+    // Release the Realm's host roots before collecting from the caller.
     drop(realm);
     drop(engine.op_state().take::<HostState>());
     drop(task_rx);
-    let _ = engine.take_unhandled_rejections_full();
-    engine.collect_garbage_at_idle();
-    if !warm_up_global.is_cleared() {
-        return Err(String::from(
-            "spare engine warm-up Realm outlived its collection",
-        ));
-    }
-    if engine.has_pending_jobs() || !engine.take_unhandled_rejections_full().is_empty() {
-        return Err(String::from("spare engine warm-up left pending jobs"));
-    }
-    Ok(())
+    drop(engine.take_unhandled_rejections_full());
+    Ok(warm_up_global)
 }
 
 fn drain_jobs(engine: &mut trust_js::Engine) -> Result<(), String> {
@@ -316,6 +349,14 @@ struct Slot {
     /// client warms only the one it requests.
     refill: bool,
     spare: Option<SpareEngine>,
+}
+
+impl Slot {
+    fn prewarm(&mut self) {
+        if self.spare.as_ref().is_none_or(SpareEngine::stopped) {
+            self.spare = SpareEngine::spawn();
+        }
+    }
 }
 
 static SLOT: Mutex<Slot> = Mutex::new(Slot {
@@ -353,16 +394,16 @@ pub(crate) fn set_enabled(enabled: bool, refill: bool) -> bool {
 /// the work happens on the spare's own thread.
 pub(crate) fn prewarm() {
     let mut slot = slot();
-    if slot.enabled && slot.spare.is_none() {
-        slot.spare = SpareEngine::spawn();
+    if slot.enabled {
+        slot.prewarm();
     }
 }
 
 /// A navigation has rendered: warm the next navigation's engine.
 pub(crate) fn refill() {
     let mut slot = slot();
-    if slot.enabled && slot.refill && slot.spare.is_none() {
-        slot.spare = SpareEngine::spawn();
+    if slot.enabled && slot.refill {
+        slot.prewarm();
     }
 }
 
@@ -377,12 +418,22 @@ pub(super) fn take() -> Option<SpareEngine> {
             "js : @{:>6}ms {}",
             crate::http::trace_ms(),
             match reserved {
-                Some(state) => format!("claimed spare page engine ({})", state_name(state)),
-                None => String::from("spare page engine still warming; this navigation runs cold"),
+                Ok(state) => format!("claimed spare page engine ({})", state_name(state)),
+                Err(state) => format!(
+                    "spare page engine {}; this navigation runs cold",
+                    state_name(state)
+                ),
             }
         );
     }
-    reserved.and_then(|_| slot.spare.take())
+    match reserved {
+        Ok(_) => slot.spare.take(),
+        Err(STOPPED) => {
+            slot.spare = None;
+            None
+        }
+        Err(_) => None,
+    }
 }
 
 /// Process shutdown: no new spare, and a waiting one ends before its thread
@@ -406,7 +457,7 @@ impl SpareEngine {
 
     /// Reserve as `take` does, for tests that hold their own spare.
     pub(super) fn reserved(self) -> Option<Self> {
-        self.reserve().map(|_| self)
+        self.reserve().ok().map(|_| self)
     }
 }
 
@@ -692,6 +743,40 @@ mod tests {
         assert!(interrupt.current_reason().is_none());
     }
 
+    #[tokio::test]
+    async fn a_failed_spare_releases_its_engine_before_a_navigation_claims_it() {
+        struct OnDrop(mpsc::Sender<()>);
+        impl Drop for OnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+
+        let (report, dropped) = mpsc::channel();
+        let spare = SpareEngine::spawn_with(move |engine, _| {
+            engine.op_state().put(OnDrop(report));
+            Err(String::from("injected warm-up failure"))
+        })
+        .unwrap();
+
+        dropped
+            .recv_timeout(Duration::from_secs(30))
+            .expect("failed spare must release its engine while the slot still owns its sender");
+        assert!(!spare.wait_until_warm(Duration::from_secs(30)));
+        assert_eq!(spare.reserve(), Err(STOPPED));
+
+        // A caller holding the old sender can still recover its navigation.
+        let (_handle, mut events) = desktop::spawn_page_with(
+            Some(spare),
+            r#"<p id="result"></p><script>
+            document.getElementById("result").textContent = "cold";
+            </script>"#
+                .into(),
+            PageEnv::bare(URL),
+        );
+        rendered(&mut events, r#"<p id="result">cold</p>"#).await;
+    }
+
     #[test]
     fn a_bootstrapping_spare_is_left_for_the_next_navigation() {
         let spare_in = |state| SpareEngine {
@@ -703,13 +788,13 @@ mod tests {
             (PREPARING, true),
             (WARMING, false),
             (WARM, true),
-            (COLD, true),
+            (STOPPED, false),
             (CLAIMED, false),
         ] {
             let spare = spare_in(state);
             assert_eq!(
                 spare.reserve(),
-                claimable.then_some(state),
+                if claimable { Ok(state) } else { Err(state) },
                 "{}",
                 state_name(state)
             );
@@ -724,10 +809,12 @@ mod tests {
     fn only_web_start_addresses_warm_a_spare_at_startup() {
         for address in [
             "example.org",
+            "example.org:80",
             "https://example.org/",
             "HTTP://example.org/",
             "file:///tmp/page.html",
             "page.html",
+            "gopher://example.org/h/page.html",
         ] {
             assert!(
                 crate::js::start_address_may_use_page_engine(address),
@@ -735,7 +822,13 @@ mod tests {
             );
         }
         for address in [
+            "",
+            "about:gemini",
+            "about:bookmarks",
+            "example.org:70",
+            "example.org:1965",
             "gopher://example.org/",
+            "gopher://example.org/0/plain.txt",
             "gemini://example.org/",
             "telnet://bbs",
         ] {

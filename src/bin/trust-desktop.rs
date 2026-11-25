@@ -10858,6 +10858,14 @@ struct DesktopOptions {
     help: bool,
 }
 
+impl DesktopOptions {
+    fn may_need_page_engine(&self) -> bool {
+        self.address
+            .as_deref()
+            .is_some_and(trust::js::start_address_may_use_page_engine)
+    }
+}
+
 fn parse_desktop_args(args: impl IntoIterator<Item = String>) -> Result<DesktopOptions, String> {
     let mut options = DesktopOptions::default();
     let mut args = args.into_iter();
@@ -10919,13 +10927,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     if let Err(error) = trust::site_storage::initialize() {
         eprintln!("trust: {error}; using temporary site storage");
     }
-    // Keep one pre-warmed page engine for the next navigation (and, later,
-    // the next tab); the first is warmed while the window and first fetch start.
-    let web_start = options
-        .address
-        .as_deref()
-        .is_none_or(trust::js::start_address_may_use_page_engine);
-    if trust::js::enable_spare_page_engine(true) && web_start {
+    // A scripted startup document can use a spare while the window and first
+    // fetch start. An empty launch waits until its first page actor renders.
+    if trust::js::enable_spare_page_engine(true) && options.may_need_page_engine() {
         trust::js::prewarm_page_engine();
     }
     let event_loop = EventLoop::<AppEvent>::with_user_event().build()?;
@@ -13727,6 +13731,21 @@ mod tests {
                 FocusTarget::for_startup(options.address.as_deref()),
                 expected
             );
+        }
+    }
+
+    #[test]
+    fn desktop_startup_only_prewarms_for_addresses_that_can_run_scripts() {
+        for (address, warm) in [
+            (None, false),
+            (Some("about:gemini"), false),
+            (Some("gopher://example.test/1/menu"), false),
+            (Some("example.test:70"), false),
+            (Some("https://example.test/"), true),
+            (Some("gopher://example.test/h/document.html"), true),
+        ] {
+            let options = parse_desktop_args(address.into_iter().map(str::to_owned)).unwrap();
+            assert_eq!(options.may_need_page_engine(), warm, "{address:?}");
         }
     }
 
