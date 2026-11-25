@@ -3862,11 +3862,7 @@ impl DesktopWindow {
                             .first()
                             .copied();
                         if selected.is_some() {
-                            layout = trust::render::documents::paint_doc_selected(
-                                &document,
-                                viewport.width,
-                                selected,
-                            );
+                            trust::render::documents::select(&mut layout, &document, selected);
                         }
                     }
                     Some(ProtocolPageCache {

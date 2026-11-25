@@ -39,7 +39,8 @@ pub struct ProtocolPaint {
 #[derive(Clone, Debug)]
 struct RowColors {
     normal: PaintColor,
-    foregrounds: Vec<Option<[u8; 3]>>,
+    /// Shared original for rows whose ANSI run colors selection can override.
+    colored_text: Option<text::ShapedText>,
     backgrounds: Vec<(CssRect, PaintColor)>,
 }
 
@@ -283,7 +284,11 @@ pub fn paint_doc_selected(
             };
             row_colors.push(RowColors {
                 normal: color,
-                foregrounds: shaped.runs.iter().map(|run| run.color).collect(),
+                colored_text: shaped
+                    .runs
+                    .iter()
+                    .any(|run| run.color.is_some())
+                    .then(|| shaped.clone()),
                 backgrounds,
             });
             paragraph_offset += shaped.text.len();
@@ -431,8 +436,14 @@ pub fn select(layout: &mut ProtocolPaint, _doc: &Doc, selected: Option<usize>) {
             && let Some(row) = colors.next()
         {
             let is_selected = selected == node.checked_sub(1) && link.is_some();
-            for (run, original) in shaped.runs.iter_mut().zip(&row.foregrounds) {
-                run.color = if is_selected { None } else { *original };
+            if let Some(original) = &row.colored_text {
+                if !is_selected {
+                    shaped.clone_from(original);
+                } else if shaped.runs.iter().any(|run| run.color.is_some()) {
+                    for run in &mut shaped.runs {
+                        run.color = None;
+                    }
+                }
             }
             if is_selected {
                 *color = theme_color(crate::theme::BG);
@@ -659,6 +670,15 @@ mod tests {
         select(&mut layout, &doc, None);
         assert_eq!(layout.paint.primitives, original.primitives);
         assert_eq!(layout.paint.lines, original.lines);
+        for (restored, previous) in layout.paint.primitives.iter().zip(&original.primitives) {
+            if let (
+                DisplayCommand::GlyphRun { shaped: a, .. },
+                DisplayCommand::GlyphRun { shaped: b, .. },
+            ) = (restored, previous)
+            {
+                assert!(std::ptr::eq(&**a, &**b), "restore the shared colored text");
+            }
+        }
     }
 
     #[test]
@@ -883,6 +903,13 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(before, after);
+        assert!(
+            before
+                .iter()
+                .zip(&after)
+                .all(|(a, b)| std::ptr::eq(&**a, &**b)),
+            "highlighting plain links must retain their shared glyphs and clusters"
+        );
     }
 
     use super::*;
