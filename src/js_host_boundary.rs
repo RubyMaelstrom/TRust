@@ -198,6 +198,7 @@ pub(crate) const HOST_BOUNDARY_SIGNATURES: &[(&str, usize)] = &[
     ("__cookie_set", 4),
     ("__clock_now", 0),
     ("__clock_set", 1),
+    ("__clock_sample_animation", 1),
     ("__storage_allowed", 1),
     ("__storage_get", 2),
     ("__storage_cas", 4),

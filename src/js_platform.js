@@ -38567,16 +38567,33 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }}.cancelAnimationFrame;
     pristineAnimationFrameMethods = animationFrameMethods();
     topAnimationFrameMethods = pristineAnimationFrameMethods;
-    // The time value of the last "update animations and send events", in
-    // this realm's clock, shared by rAF callbacks and document.timeline.
+    // Web Animations 1 #document-timelines: the last "update animations and
+    // send events" provides the time shared by rAF and document.timeline.
     let documentTimelineFrame = null;
     trust.documentTimelineTime = function () {
-        const time = documentTimelineFrame === null ? currentTime() : documentTimelineFrame;
-        return trust.performanceTimestamp ? trust.performanceTimestamp(time) : time;
+        if (documentTimelineFrame === null) return 0;
+        return trust.performanceTimestamp ? trust.performanceTimestamp(documentTimelineFrame) : documentTimelineFrame;
+    };
+    trust.sampleDocumentTimeline = function (frameTime) {
+        documentTimelineFrame = frameTime - __epoch0;
+    };
+    function sampleDocumentTimelines(frameTime, records) {
+        if (!records.length) return;
+        __clock_sample_animation(frameTime);
+        for (const [documentTrust, active] of records)
+            if (active()) documentTrust.sampleDocumentTimeline(frameTime);
+    }
+    trust.sampleDocumentTimelines = function () {
+        const records = [];
+        trust.collectRenderingDocuments(records, () => true);
+        sampleDocumentTimelines(__epoch0 + currentTime(), records);
     };
     function runAnimationFrameCallbacks(now, runScroll = true) {
         if (runScroll) {
             trust.runScrollSteps();
+            const frameTime = __epoch0 + now;
+            __clock_sample_animation(frameTime);
+            trust.sampleDocumentTimeline(frameTime);
             trust.updateCssTransitions();
         }
         // HTML "run the animation frame callbacks": snapshot the callback-map
@@ -38625,6 +38642,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             trust.runScrollSteps();
             // HTML #update-the-rendering / Web Animations #animation-frame-loop:
             // sample effects and dispatch their events before invoking rAF.
+            sampleDocumentTimelines(frameTime, records);
             trust.updateCssTransitions();
             let count = 0;
             for (const [documentTrust, active] of records)
@@ -38642,9 +38660,6 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // HTML #update-the-rendering: the context lost steps run after the
         // fullscreen steps and before the animation frame callbacks.
         canvasContextLostSteps();
-        // Web Animations 1 #update-animations-and-send-events: the document
-        // timeline takes this rendering update's time.
-        documentTimelineFrame = frameTime;
         return runAnimationFrameCallbacks(frameTime, false);
     };
     // Background fetch (dispatch/at-rest, resident actor): the request runs OFF

@@ -1054,6 +1054,8 @@ struct HostState {
     dom: Rc<RefCell<Dom>>,
     dom_gc: DomGcRegistry,
     clock: Rc<RealmClock>,
+    /// Last rendering update's time in seconds on the CSS animation timeline.
+    animation_sample: f64,
     base: url::Url,
     storage: crate::js::WebStorage,
     blobs: crate::js::BlobMap,
@@ -1266,6 +1268,7 @@ struct CreatedTraversable {
 /// slots) stays in HostState for every traversable.
 struct TraversableHost {
     dom: Rc<RefCell<Dom>>,
+    animation_sample: f64,
     base: url::Url,
     viewport: Cell<crate::layout2::Viewport>,
     device_pixel_ratio: Cell<f32>,
@@ -1304,6 +1307,7 @@ impl TraversableHost {
     ) -> Self {
         Self {
             dom,
+            animation_sample: 0.,
             base,
             viewport: Cell::new(viewport),
             device_pixel_ratio: Cell::new(device_pixel_ratio),
@@ -1340,6 +1344,7 @@ impl TraversableHost {
         }
         swap!(
             dom,
+            animation_sample,
             base,
             viewport,
             device_pixel_ratio,
@@ -1415,6 +1420,7 @@ impl HostState {
             dom,
             dom_gc: DomGcRegistry::default(),
             clock,
+            animation_sample: 0.,
             base: url::Url::parse(DEFAULT_URL).expect("static default URL parses"),
             storage: Default::default(),
             blobs: Default::default(),
@@ -2024,6 +2030,7 @@ impl RetainedMemory for HostState {
             dom,
             dom_gc,
             clock,
+            animation_sample: _,
             base,
             storage,
             blobs,
@@ -2993,7 +3000,6 @@ impl HostGc for HostState {
 struct RealmClock {
     origin_ms: f64,
     offset_ms: Cell<f64>,
-    animation_sample: Cell<Option<f64>>,
 }
 
 impl RealmClock {
@@ -3001,7 +3007,6 @@ impl RealmClock {
         Self {
             origin_ms: crate::performance::now_ms(),
             offset_ms: Cell::new(0.0),
-            animation_sample: Cell::new(None),
         }
     }
 
@@ -3018,31 +3023,6 @@ impl RealmClock {
             let offset = epoch_ms - crate::performance::now_ms();
             self.offset_ms.set(self.offset_ms.get().max(offset));
         }
-    }
-}
-
-/// Web Animations #document-timelines / HTML #update-the-rendering: callbacks,
-/// CSSOM, ResizeObserver and paint share one animation sample in this frame.
-/// Nested geometry flushes must not advance time and invalidate layout again.
-struct CssAnimationSample {
-    clock: Rc<RealmClock>,
-    previous: Option<f64>,
-}
-impl CssAnimationSample {
-    fn new<'s>(ctx: &mut Ctx<'s>) -> Self {
-        let clock = ctx.host_mut::<HostState>().expect("DOM host").clock.clone();
-        let previous = clock.animation_sample.get();
-        if previous.is_none() {
-            clock
-                .animation_sample
-                .set(Some((clock.now_ms() - clock.origin_ms) / 1000.));
-        }
-        Self { clock, previous }
-    }
-}
-impl Drop for CssAnimationSample {
-    fn drop(&mut self) {
-        self.clock.animation_sample.set(self.previous);
     }
 }
 
@@ -3434,7 +3414,7 @@ mod desktop {
             }
         }
         if trust_bool(&mut page, "hasRenderingUpdate") {
-            let _ = render_with_observers(&mut page);
+            let _ = render_for_frontend(&mut page);
         }
         page.outcome.elapsed = page.started.elapsed();
         let output = {
@@ -4789,6 +4769,7 @@ mod desktop {
                 select_traversable(page, index);
             }
         }
+        sample_composited_timeline(page);
         if let Err(error) = dispatch_host_task(&mut page.engine, task) {
             page.outcome.errors.push(error);
         }
@@ -5239,6 +5220,7 @@ mod desktop {
                     select_traversable(page, index);
                     handled = Some(index);
                     prepare_interaction(page, interrupt);
+                    sample_composited_timeline(page);
                     run_pointer_button(page, node, false, x, y, 0, metadata);
                     checkpoint(page, "pointer button");
                     let mut next = take_interaction(page, index);
@@ -5319,6 +5301,7 @@ mod desktop {
                     handled = Some(index);
                     prefer_platform = false;
                     prepare_unbounded_task(interrupt);
+                    sample_composited_timeline(page);
                     if page.task_trace.is_some() {
                         let queues = call_trust_read(
                             page,
@@ -5349,6 +5332,7 @@ mod desktop {
                     select_traversable(page, index);
                     handled = Some(index);
                     prepare_unbounded_task(interrupt);
+                    sample_composited_timeline(page);
                     let _ = call_trust(
                         page,
                         "startIdlePeriod",
@@ -5373,8 +5357,6 @@ mod desktop {
                     prepare_unbounded_task(interrupt);
                     let real_now = virtual_origin + wall_origin.elapsed().as_secs_f64() * 1000.0;
                     let animation_frame = trust_bool(page, "nextDeadlineIsAnimationFrame");
-                    let _animation_sample =
-                        animation_frame.then(|| page.engine.scope(CssAnimationSample::new));
                     if page.task_trace.is_some() {
                         let queues = call_trust_read(
                             page,
@@ -5446,6 +5428,7 @@ mod desktop {
                     handled = Some(index);
                     page.lifecycle_complete = true;
                     prepare_unbounded_task(interrupt);
+                    sample_composited_timeline(page);
                     let _ = call_trust(page, "completeDocumentLoad", &[], "load event");
                     checkpoint(page, "load event");
                     // HTML §13.2.7 runs the readiness/load steps as their own task. It can
@@ -5465,7 +5448,6 @@ mod desktop {
                     let render_started = Instant::now();
                     page.render_deadline = None;
                     prepare_unbounded_task(interrupt);
-                    let _animation_sample = page.engine.scope(CssAnimationSample::new);
                     let now = virtual_origin + wall_origin.elapsed().as_secs_f64() * 1000.0;
                     let _ = call_trust(
                         page,
@@ -6974,6 +6956,7 @@ mod desktop {
     }
 
     fn dispatch_timer_task(page: &mut TrustJsPage, deadline: f64, label: &str) -> bool {
+        sample_composited_timeline(page);
         let dispatched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             page.engine.scope(|cx| {
                 dispatch_timer_task_to(cx, deadline)
@@ -7438,6 +7421,7 @@ mod desktop {
     /// resources it names, so the page is complete when shown.
     fn render_for_frontend(page: &mut TrustJsPage) -> (String, crate::http::RenderedPage, bool) {
         if !page.hidden {
+            sample_document_timelines(page);
             return render_with_observers(page);
         }
         let rendered = extract_live(page);
@@ -7449,7 +7433,6 @@ mod desktop {
     }
 
     fn render_with_observers(page: &mut TrustJsPage) -> (String, crate::http::RenderedPage, bool) {
-        let _animation_sample = page.engine.scope(CssAnimationSample::new);
         // HTML #update-the-rendering: style and layout, then the resize
         // observation rounds (each relayouts what its callbacks changed, as
         // the observers read geometry), and only then paint. The geometry
@@ -7483,6 +7466,28 @@ mod desktop {
         start_document_image_fetches(page, &rendered.1);
         largest_contentful_paint::report(&mut page.engine, &rendered.1.layout.paint);
         rendered
+    }
+
+    fn sample_document_timelines(page: &mut TrustJsPage) {
+        let _ = call_trust(page, "sampleDocumentTimelines", &[], "animation timeline");
+    }
+
+    /// The frontend samples retained CSS effects independently. Synchronize
+    /// the document timeline before an already scheduled task, then hold the
+    /// sample through that task and its microtask checkpoint.
+    fn sample_composited_timeline(page: &mut TrustJsPage) {
+        if page.hidden
+            || page.terminal_presentation
+            || !page.dom.borrow().has_playing_composited_animation()
+        {
+            return;
+        }
+        if page.engine.host::<HostState>().is_some_and(|state| {
+            let now = (state.clock.now_ms() - state.clock.origin_ms) / 1000.;
+            now - state.animation_sample >= RENDER_INTERVAL.as_secs_f64()
+        }) {
+            sample_document_timelines(page);
+        }
     }
 
     /// CSS Images 4 #fetching-images ("fetch an external image for a
@@ -8182,6 +8187,7 @@ mod desktop {
         events: &tokio::sync::mpsc::Sender<PageEvt>,
         interrupt: &Arc<trust_js::RuntimeInterrupt>,
     ) -> bool {
+        sample_composited_timeline(page);
         match command {
             PageCmd::PointerLockResult { request, error } => {
                 prepare_interaction(page, interrupt);
@@ -9319,7 +9325,6 @@ mod desktop {
         // for a rendering opportunity it gets only once shown.
         let render_now = render_now && !page.hidden;
         let run_scroll_steps = run_scroll_steps && !page.hidden;
-        let _animation_sample = render_now.then(|| page.engine.scope(CssAnimationSample::new));
         if page.outcome.panicked {
             let errors = std::mem::take(&mut page.outcome.errors);
             let _ = events.blocking_send(PageEvt::Trouble(errors));
@@ -9336,6 +9341,7 @@ mod desktop {
             // The regular rAF path dispatches these before its callbacks.
             // Immediate interaction rendering has no rAF callback phase, but
             // still follows HTML's scroll -> animation event ordering.
+            sample_document_timelines(page);
             let _ = call_trust(page, "updateCssTransitions", &[], "CSS transition events");
             checkpoint(page, "CSS transition events");
         }
@@ -11512,6 +11518,45 @@ mod desktop {
                 terminal_frames > 0,
                 "the cell compositor retains actor-driven animation"
             );
+        }
+
+        #[tokio::test]
+        async fn composited_animation_timeline_advances_between_timer_tasks() {
+            let html = r#"<!doctype html><style>body{margin:0}
+                #box{width:50px;height:30px;transform:translateX(10px);animation:move 2s linear infinite;animation-composition:add}
+                @keyframes move{from{transform:translateX(0)}to{transform:translateX(100px)}}
+                </style><div id=box>moving</div><output id=result>pending</output><script>
+                setTimeout(() => {
+                    const before = document.timeline.currentTime;
+                    setTimeout(() => {
+                        const after = document.timeline.currentTime;
+                        const left = document.getElementById('box').getBoundingClientRect().left;
+                        document.getElementById('result').textContent = 'DONE:' +
+                            [after > before, left > 10, document.timeline.currentTime === after].join(':');
+                    }, 120);
+                }, 120);
+                </script>"#;
+            let mut env = PageEnv::bare(DEFAULT_URL);
+            env.terminal_presentation = false;
+            let (_handle, mut events) = spawn_page(html.into(), env);
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Updated { html, outcome }) => {
+                            assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                            if let Some((_, result)) = html.split_once(">DONE:") {
+                                assert!(result.starts_with("true:true:true</output>"), "{html}");
+                                break;
+                            }
+                        }
+                        Some(PageEvt::Trouble(errors)) => panic!("{errors:?}"),
+                        None => panic!("page ended before sampling its composited animation"),
+                        Some(_) => {}
+                    }
+                }
+            })
+            .await
+            .expect("timed out sampling the composited animation");
         }
 
         #[tokio::test]
@@ -15295,6 +15340,7 @@ host_functions! {
     ("__cookie_set", 4, host_cookie_set, []),
     ("__clock_now", 0, host_clock_now, []),
     ("__clock_set", 1, host_clock_set, []),
+    ("__clock_sample_animation", 1, host_clock_sample_animation, []),
     ("__storage_allowed", 1, host_storage_allowed, []),
     ("__storage_get", 2, host_storage_get, []),
     ("__storage_cas", 4, host_storage_cas, []),
@@ -25940,6 +25986,23 @@ fn host_clock_now<'s>(
     ))
 }
 
+fn host_clock_sample_animation<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
+    if let Some(timestamp) = args
+        .first()
+        .and_then(Value::as_num_opt)
+        .filter(|time| time.is_finite())
+        && let Some(state) = ctx.host_mut::<HostState>()
+    {
+        let seconds = (timestamp - state.clock.origin_ms) / 1000.;
+        state.animation_sample = state.animation_sample.max(seconds);
+    }
+    Ok(Value::Undefined)
+}
+
 fn host_node_type<'s>(
     ctx: &mut Ctx<'s>,
     _this: Value<'s>,
@@ -28101,11 +28164,7 @@ fn sync_css_transitions_for<'s>(ctx: &mut Ctx<'s>, geometry_read: bool) {
         let state = ctx.host_mut::<HostState>().expect("DOM host");
         (
             state.dom.clone(),
-            state
-                .clock
-                .animation_sample
-                .get()
-                .unwrap_or_else(|| (state.clock.now_ms() - state.clock.origin_ms) / 1000.),
+            state.animation_sample,
             // The timeline's zero on the shared `performance::now_ms` clock,
             // where frontends sample paint-composited animations.
             state.clock.origin_ms - state.clock.offset_ms.get(),
@@ -28118,8 +28177,9 @@ fn sync_css_transitions_for<'s>(ctx: &mut Ctx<'s>, geometry_read: bool) {
     // After a broad invalidation, compute the styles that the transition
     // update and box-tree construction are about to read, in parallel.
     dom.prepare_styles(viewport, &base);
-    // CSS Animations 1 #animations shares the document timeline sample, so
-    // CSSOM, observers and paint see one animation-origin value per frame.
+    // Web Animations 1 #document-timelines and #animation-frame-loop: CSSOM
+    // flushes pending style changes at the last rendering update's time.
+    // Reading layout cannot advance the animation timeline by itself.
     if geometry_read {
         dom.update_css_transitions(seconds);
         dom.update_css_animations(seconds);
@@ -32300,8 +32360,7 @@ mod tests {
         let _ = dom.borrow_mut().take_dirty();
         let _ = dom.borrow_mut().take_css_animation_updates();
         clock.set_epoch_ms(clock.now_ms() + 400.);
-        let second = color(&mut engine);
-        assert_ne!(first, second, "the animation origin did not advance");
+        assert_eq!(first, color(&mut engine));
         // CSS Animations 1 #events, HTML #update-the-rendering: animation
         // events dispatch before animation frame callbacks.
         assert_eq!(
@@ -32317,6 +32376,11 @@ mod tests {
         })()"#
             ),
             "animationstart:c:0:true,raf"
+        );
+        assert_ne!(
+            first,
+            color(&mut engine),
+            "the animation origin did not advance"
         );
         // A color frame repaints: neither the DOM nor geometry changed.
         assert_eq!(dom.borrow_mut().take_css_animation_updates(), (true, false));
@@ -32359,11 +32423,12 @@ mod tests {
             &mut engine,
             "document.getElementById('box').style.height='100px';getComputedStyle(document.getElementById('box')).height",
         );
-        let sample = engine.scope(CssAnimationSample::new);
         let before = string_value(
             &mut engine,
             "document.getElementById('box').getBoundingClientRect().height",
         );
+        let passes = crate::layout2::layout_pass_count();
+        let time = string_value(&mut engine, "String(document.timeline.currentTime)");
         clock.set_epoch_ms(clock.now_ms() + 500.);
         let during = string_value(
             &mut engine,
@@ -32371,12 +32436,24 @@ mod tests {
         );
         assert_eq!(
             before, during,
-            "CSSOM must not resample time inside the frame"
+            "CSSOM must not resample time between rendering updates"
         );
-        drop(sample);
+        assert_eq!(crate::layout2::layout_pass_count(), passes);
+        assert_eq!(
+            time,
+            string_value(&mut engine, "String(document.timeline.currentTime)")
+        );
+        // The same animation time still incorporates synchronous layout mutations.
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "const box = document.getElementById('box'); box.style.width = '42px'; String(box.getBoundingClientRect().width)",
+            ),
+            "42"
+        );
         let after = string_value(
             &mut engine,
-            "document.getElementById('box').getBoundingClientRect().height",
+            "__trust.runRenderingFrame(__trust.now()); document.getElementById('box').getBoundingClientRect().height",
         );
         assert!(
             after.parse::<f64>().unwrap() > before.parse::<f64>().unwrap() + 40.,
@@ -40653,7 +40730,7 @@ mod tests {
     #[test]
     fn trust_js_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 272, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 273, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -40664,7 +40741,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(trust_js_registry_matches_canonical_boundary());
-        assert_eq!(TRUST_JS_HOST_FUNCTIONS.len(), 272);
+        assert_eq!(TRUST_JS_HOST_FUNCTIONS.len(), canonical.len());
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(

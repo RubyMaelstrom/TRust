@@ -1509,6 +1509,27 @@ impl Dom {
             .collect()
     }
 
+    /// A retained paint group can advance independently of the page actor.
+    pub(crate) fn has_playing_composited_animation(&self) -> bool {
+        self.animations.composited.borrow().iter().any(|&node| {
+            self.animations
+                .elements
+                .get(&(node, None))
+                .is_some_and(|element| {
+                    element.animations.iter().any(|animation| {
+                        animation.hold.is_none()
+                            && animation.phase == Phase::Active
+                            && animation.tracks.iter().any(|track| {
+                                matches!(
+                                    PROPS[usize::from(track.property)].name,
+                                    "transform" | "opacity"
+                                )
+                            })
+                    })
+                })
+        })
+    }
+
     /// Gecko `KeyframeEffect::CanThrottleIfNotVisible` for a paint-only
     /// animated element: nothing it paints can currently be seen, because
     /// it is in a `visibility: hidden` subtree without visible descendants,
