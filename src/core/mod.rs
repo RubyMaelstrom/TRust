@@ -575,6 +575,14 @@ impl BrowserPage {
     pub fn target(&self) -> &Link {
         &self.target
     }
+
+    /// HTML #meta-referrer: use the document's latest policy for actions
+    /// initiated by the frontend.
+    fn update_referrer_policy(&mut self, policy: Option<crate::referrer_policy::ReferrerPolicy>) {
+        if let (FetchedDocument::Http(response), Some(policy)) = (&mut self.document, policy) {
+            response.referrer_policy = Some(policy);
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -827,6 +835,7 @@ pub struct BrowserController {
     /// a resident actor will deliver another render for it. See
     /// [`BrowserController::page_render_is_final`].
     render_is_final: bool,
+    awaiting_dom_content_loaded: bool,
     pending_live_submit: Option<(crate::doc::Form, Option<usize>)>,
     /// Default-action results for keyboard events delivered to the resident
     /// page. Native frontends consume these after the actor runs `keydown`.
@@ -994,6 +1003,7 @@ impl BrowserController {
             live_task: None,
             live_page: None,
             render_is_final: false,
+            awaiting_dom_content_loaded: false,
             pending_live_submit: None,
             page_key_defaults: VecDeque::new(),
             page_text_control_state: None,
@@ -1822,6 +1832,12 @@ impl BrowserController {
 
     pub fn page_render_is_final(&self) -> bool {
         self.render_is_final
+    }
+
+    /// Whether the actor has presented the document and is still processing
+    /// its deferred scripts and `DOMContentLoaded` task.
+    pub fn page_awaiting_dom_content_loaded(&self) -> bool {
+        self.awaiting_dom_content_loaded
     }
 
     /// Take the next resident-page keyboard default result. `true` suppresses
@@ -3834,11 +3850,18 @@ impl BrowserController {
                     }
                     _ => (None, None),
                 };
-                let initial_rendered = match &document {
-                    FetchedDocument::Http(response) => response.rendered.as_deref().cloned(),
-                    _ => None,
+                let (initial_rendered, before_dom_content_loaded) = match &document {
+                    FetchedDocument::Http(response) => (
+                        response.rendered.as_deref().cloned(),
+                        response
+                            .js
+                            .as_ref()
+                            .is_some_and(|outcome| outcome.before_dom_content_loaded),
+                    ),
+                    _ => (None, false),
                 };
                 self.drop_live_page();
+                self.awaiting_dom_content_loaded = live.is_some() && before_dom_content_loaded;
                 let page = BrowserPage {
                     status: fetched_status(&pending.target, &document),
                     target: pending.target.clone(),
@@ -4214,6 +4237,7 @@ impl BrowserController {
     }
 
     fn end_live_page(&mut self, end: PageEnd) {
+        self.awaiting_dom_content_loaded = false;
         // A traversable that shares its browsing context group keeps its
         // place in it for the Document that replaces this one.
         if let Some(page) = &self.live_page
@@ -4435,6 +4459,7 @@ impl BrowserController {
                     );
                 }
                 if let Some(page) = &mut self.current {
+                    page.update_referrer_policy(outcome.referrer_policy);
                     if let Some(rendered) = rendered {
                         page.rendered = Some(*rendered);
                     }
@@ -4442,6 +4467,7 @@ impl BrowserController {
                     page.rendered_revision = page.revision;
                 }
                 self.render_is_final = false;
+                self.awaiting_dom_content_loaded = outcome.before_dom_content_loaded;
                 self.status = if outcome.errors.is_empty() {
                     String::from("Page updated · JS")
                 } else {
@@ -4454,13 +4480,7 @@ impl BrowserController {
                 self.page_text_control_state = None;
                 let rendered = outcome.rendered.take();
                 if let Some(page) = &mut self.current {
-                    // HTML #meta-referrer: navigations this controller starts
-                    // from the retired Document use its final policy.
-                    if let (FetchedDocument::Http(response), Some(policy)) =
-                        (&mut page.document, outcome.referrer_policy)
-                    {
-                        response.referrer_policy = Some(policy);
-                    }
+                    page.update_referrer_policy(outcome.referrer_policy);
                     // The actor has classified this document as inert and is
                     // about to exit.  Preserve its settled serialization as
                     // the static document source: later viewport/image
@@ -4499,6 +4519,7 @@ impl BrowserController {
                 let rendered = outcome.rendered.take();
                 let _ = patches;
                 if let Some(page) = &mut self.current {
+                    page.update_referrer_policy(outcome.referrer_policy);
                     if let Some(rendered) = rendered {
                         page.rendered = Some(*rendered);
                         page.revision = page.revision.wrapping_add(1);
@@ -8024,6 +8045,7 @@ mod tests {
                 console: vec!["console line".into()],
                 rendered: Some(Box::new(rendered)),
                 animation_frame: true,
+                before_dom_content_loaded: false,
                 referrer_policy: Some(crate::referrer_policy::ReferrerPolicy::Origin),
             };
             let event = match kind {
@@ -8089,6 +8111,10 @@ mod tests {
                     .layout
             )
         ));
+        assert_eq!(
+            browser.link_initiator().unwrap().referrer_policy,
+            crate::referrer_policy::ReferrerPolicy::Origin
+        );
     }
 
     #[test]

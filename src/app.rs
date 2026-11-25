@@ -6736,6 +6736,7 @@ impl App {
             crate::js::Outcome,
         )> = None;
         let mut trouble: Vec<String> = Vec::new();
+        let mut referrer_policy = None;
         let mut navigate: Option<(String, bool, bool, Option<Box<http::NavigationInitiator>>)> =
             None;
         // History API URL writes are same-document updates, not fetch
@@ -6769,13 +6770,9 @@ impl App {
             drains += 1;
             answered |= pending.as_ref().is_some_and(|event| !informational(event));
             match pending {
-                Some(PageEvt::Updated { html, mut outcome }) => {
+                Some(PageEvt::Updated { html, mut outcome } | PageEvt::Static { html, mut outcome }) => {
                     tally_evt(0);
-                    let rendered = outcome.rendered.take().map(|rendered| *rendered);
-                    latest_update = Some((rendered, html, outcome));
-                }
-                Some(PageEvt::Static { html, mut outcome }) => {
-                    tally_evt(0);
+                    referrer_policy = outcome.referrer_policy.or(referrer_policy);
                     let rendered = outcome.rendered.take().map(|rendered| *rendered);
                     latest_update = Some((rendered, html, outcome));
                 }
@@ -6785,6 +6782,7 @@ impl App {
                 }) => {
                     tally_evt(1);
                     let _ = ps;
+                    referrer_policy = outcome.referrer_policy.or(referrer_policy);
                     let rendered = outcome.rendered.take().map(|rendered| *rendered);
                     latest_update = Some((rendered, String::new(), outcome));
                 }
@@ -6924,7 +6922,7 @@ impl App {
             }
             // HTML #meta-referrer: navigations the terminal starts from this
             // Document (a retired page's links) use its current policy.
-            if let (Some(policy), Some(g)) = (outcome.referrer_policy, self.browser.as_mut()) {
+            if let (Some(policy), Some(g)) = (referrer_policy, self.browser.as_mut()) {
                 g.doc.referrer_policy = policy;
             }
             rendered = true;

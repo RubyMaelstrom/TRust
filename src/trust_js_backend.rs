@@ -3364,7 +3364,7 @@ mod desktop {
         };
         set_one_shot(&mut page);
         let mut lifecycle_complete = false;
-        let mut tasks = ParserTasks::new(&mut host_rx, None, &mut page);
+        let mut tasks = ParserTasks::new(&mut host_rx, None, &mut page, false);
 
         // A one-shot document has no future rendering opportunity, so advance
         // its task sources until they are quiescent. The cap is a diagnostic
@@ -3942,10 +3942,9 @@ mod desktop {
             events: events.clone(),
         });
 
-        // HTML's parser task has completed through DOMContentLoaded. Expose a
-        // rendering opportunity before the separately queued load task; slow
-        // dynamically prepared resources can therefore delay load without
-        // hiding the interactive document shell.
+        // HTML's parser task has completed through DOMContentLoaded. Present
+        // that state before the separately queued load task, including any
+        // changes since a rendering opportunity during the deferred scripts.
         let (mut shell, mut rendered, mut has_interaction) = render_for_frontend(&mut page);
         page.last_render = Some(rendered.clone());
         #[cfg(test)]
@@ -6132,7 +6131,8 @@ mod desktop {
             .host::<HostState>()
             .and_then(|state| service_worker_host::fetch::for_context(state, state.top_context));
         crate::http::prefetch_page_scripts(html, env, service_worker, report);
-        let mut tasks = ParserTasks::new(host_rx, events, page);
+        let html_document = env.content_type.eq_ignore_ascii_case("text/html");
+        let mut tasks = ParserTasks::new(host_rx, events, page, html_document);
         let mut deferred = Vec::new();
         // HTML #active-parser: the Document has one until "the end" (or until
         // window.stop() aborts it, `abort_active_parser`).
@@ -6300,6 +6300,9 @@ mod desktop {
             let asynchronous = page.dom.borrow().attr(node, "async").is_some();
             let defer =
                 !asynchronous && (module || page.dom.borrow().attr(node, "defer").is_some());
+            if html_document {
+                tasks.note_render_blocking_script(page, node);
+            }
             if defer {
                 tasks.deferred.insert(node);
                 deferred.push(node);
@@ -6376,10 +6379,16 @@ mod desktop {
         }
         let _ = call_trust(page, "parserFinished", &[], "parser EOF");
         checkpoint(page, "parser EOF");
+        if !deferred.is_empty() && !env.resume_static {
+            tasks.first_render_at = Some(page.started + RENDER_INTERVAL);
+        }
         for node in deferred {
             if !tasks.execute_when_ready(page, node) {
                 return false;
             }
+        }
+        if !tasks.maybe_publish_first_render(page) {
+            return false;
         }
         let _ = call_trust(page, "fireDOMContentLoaded", &[], "DOMContentLoaded");
         checkpoint(page, "DOMContentLoaded");
@@ -6583,6 +6592,9 @@ mod desktop {
         events: Option<&'a tokio::sync::mpsc::Sender<PageEvt>>,
         deferred: HashSet<usize>,
         ready: HashMap<usize, TrustJsHostTask>,
+        render_blocking_scripts: HashSet<usize>,
+        first_render_at: Option<Instant>,
+        html_document: bool,
         runtime: Option<tokio::runtime::Runtime>,
         wall_origin: Instant,
         virtual_origin: f64,
@@ -6594,17 +6606,107 @@ mod desktop {
             receiver: &'a mut tokio::sync::mpsc::UnboundedReceiver<TrustJsHostTask>,
             events: Option<&'a tokio::sync::mpsc::Sender<PageEvt>>,
             page: &mut TrustJsPage,
+            html_document: bool,
         ) -> Self {
             Self {
                 receiver,
                 events,
                 deferred: HashSet::new(),
                 ready: HashMap::new(),
+                render_blocking_scripts: HashSet::new(),
+                first_render_at: None,
+                html_document,
                 runtime: None,
                 wall_origin: Instant::now(),
                 virtual_origin: trust_number(page, "now").unwrap_or(0.0),
                 prefer_page_task: false,
             }
+        }
+
+        /// HTML #prepare-the-script-element and #render-blocking-mechanism
+        /// (local snapshot c4aab9ee): a script with the render token can
+        /// block rendering when prepared before the body exists. The arena
+        /// tree builder already created the body, so check its parser-order
+        /// identity against the current insertion position.
+        fn note_render_blocking_script(&mut self, page: &TrustJsPage, node: usize) {
+            let dom = page.dom.borrow();
+            if !Self::has_render_token(&dom, node) {
+                return;
+            }
+            let Some(state) = page.engine.host::<HostState>() else {
+                return;
+            };
+            if Self::body(&dom).is_none_or(|body| {
+                state
+                    .parser
+                    .position
+                    .is_some_and(|position| body > position && body < state.parser.watermark)
+            }) {
+                self.render_blocking_scripts.insert(node);
+            }
+        }
+
+        fn body(dom: &Dom) -> Option<usize> {
+            let root = dom.document_element()?;
+            dom.child_iter(root)
+                .find(|&node| matches!(dom.tag_name(node), Some("body" | "frameset")))
+        }
+
+        fn has_render_token(dom: &Dom, node: usize) -> bool {
+            dom.attr(node, "blocking").is_some_and(|tokens| {
+                tokens
+                    .split_ascii_whitespace()
+                    .any(|token| token.eq_ignore_ascii_case("render"))
+            })
+        }
+
+        fn first_render_deadline(&self, page: &TrustJsPage) -> Option<Instant> {
+            let deadline = self.first_render_at?;
+            if self.events.is_none() || page.hidden || page.last_render.is_some() {
+                return None;
+            }
+            let dom = page.dom.borrow();
+            if self.html_document && Self::body(&dom).is_none() {
+                return None;
+            }
+            let still_blocked = self.render_blocking_scripts.iter().any(|&node| {
+                dom.is_valid(node) && dom.is_connected(node) && Self::has_render_token(&dom, node)
+            });
+            (!still_blocked).then_some(deadline)
+        }
+
+        /// HTML #execute-the-deferred-scripts can spin the event loop after
+        /// the parser reaches EOF. The rendering task source can present the
+        /// completed tree during that wait, or between ready deferred scripts
+        /// and the DOMContentLoaded task (#update-the-rendering). Give fast
+        /// navigations one rendering interval to reach DOMContentLoaded.
+        fn maybe_publish_first_render(&self, page: &mut TrustJsPage) -> bool {
+            let Some(events) = self.events else {
+                return true;
+            };
+            if events.is_closed() {
+                return false;
+            }
+            if self
+                .first_render_deadline(page)
+                .is_none_or(|deadline| Instant::now() < deadline)
+            {
+                return true;
+            }
+            let (html, rendered, _) = render_for_frontend(page);
+            page.last_render = Some(rendered.clone());
+            #[cfg(test)]
+            {
+                page.last_diagnostic_render = Some(crate::js::render_canonical(&html));
+            }
+            let mut outcome = std::mem::take(&mut page.outcome);
+            outcome.elapsed = page.started.elapsed();
+            outcome.rendered = Some(Box::new(rendered));
+            outcome.before_dom_content_loaded = true;
+            outcome.referrer_policy = top_level_referrer_policy(page);
+            events
+                .blocking_send(PageEvt::Updated { html, outcome })
+                .is_ok()
         }
 
         /// Run a host task while the parser waits. It may belong to another
@@ -6617,10 +6719,25 @@ mod desktop {
             select_traversable(page, parsing);
         }
 
+        fn dispatch_parser_task(&mut self, page: &mut TrustJsPage, task: TrustJsHostTask) {
+            if let TrustJsHostTask::ResourceDone {
+                node_id,
+                kind: TrustJsResourceKind::ClassicScript | TrustJsResourceKind::ModuleScript,
+                ..
+            } = &task
+            {
+                self.render_blocking_scripts.remove(node_id);
+            }
+            Self::dispatch(page, task);
+        }
+
         fn execute_when_ready(&mut self, page: &mut TrustJsPage, node: usize) -> bool {
+            if !self.maybe_publish_first_render(page) {
+                return false;
+            }
             if let Some(task) = self.ready.remove(&node) {
                 self.deferred.remove(&node);
-                Self::dispatch(page, task);
+                self.dispatch_parser_task(page, task);
                 return true;
             }
             while let Some(task) = self.next(page) {
@@ -6631,7 +6748,7 @@ mod desktop {
                             // Its parser was aborted: the script never runs.
                             abandon_parser_scripts(page, std::iter::once(node));
                         }
-                        Self::dispatch(page, task);
+                        self.dispatch_parser_task(page, task);
                         return true;
                     }
                     if self.deferred.contains(node_id) {
@@ -6639,7 +6756,7 @@ mod desktop {
                         continue;
                     }
                 }
-                Self::dispatch(page, task);
+                self.dispatch_parser_task(page, task);
                 // A task the parser ran while it waited aborted it
                 // (window.stop()): stop waiting for this script.
                 if parser_aborted(page) {
@@ -6652,9 +6769,7 @@ mod desktop {
 
         fn next(&mut self, page: &mut TrustJsPage) -> Option<TrustJsHostTask> {
             loop {
-                if self.events.is_some_and(|events| events.is_closed())
-                    || !has_pending_host_work(page)
-                {
+                if !self.maybe_publish_first_render(page) || !has_pending_host_work(page) {
                     return None;
                 }
                 let elapsed = self.wall_origin.elapsed().as_secs_f64() * 1000.0;
@@ -6691,6 +6806,10 @@ mod desktop {
                 if let Some(deadline) = page.engine.next_atomics_wait_deadline() {
                     let atomics_wait = deadline.saturating_duration_since(Instant::now());
                     wait = Some(wait.map_or(atomics_wait, |wait| wait.min(atomics_wait)));
+                }
+                if let Some(deadline) = self.first_render_deadline(page) {
+                    let render_wait = deadline.saturating_duration_since(Instant::now());
+                    wait = Some(wait.map_or(render_wait, |wait| wait.min(render_wait)));
                 }
                 let runtime = self.runtime.get_or_insert_with(|| {
                     tokio::runtime::Builder::new_current_thread()
@@ -10174,7 +10293,8 @@ mod desktop {
         page: &mut TrustJsPage,
     ) -> Option<crate::referrer_policy::ReferrerPolicy> {
         let state = page.engine.host_mut::<HostState>()?;
-        Some(environment_referrer_policy(state, 0))
+        let context = state.top_context;
+        Some(environment_referrer_policy(state, context))
     }
 
     fn take_form_submit(

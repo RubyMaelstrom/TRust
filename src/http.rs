@@ -15882,7 +15882,11 @@ mod tests {
                      <script src=/legacy.js></script>\
                      <script src=/gone.js></script>\
                      <script type=module src=/wrong-module.js></script>\
-                     <script>document.getElementById('out').textContent += '-inline';</script></body>"
+                     <script>\
+                     const out = document.getElementById('out');\
+                     out.textContent += '-inline';\
+                     document.addEventListener('DOMContentLoaded', () => { out.textContent += '-ready'; });\
+                     </script></body>"
                         .to_string()
                 } else if text.starts_with("GET /nosniff.js ") {
                     "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n\
@@ -15910,16 +15914,29 @@ mod tests {
 
         let url = parse_url(&format!("http://127.0.0.1:{port}/page")).unwrap();
         let response = fetch(&Request::get(url)).await.unwrap();
-        let response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
-        let body = String::from_utf8_lossy(&response.body).into_owned();
-        assert!(body.contains("start-legacy-inline"), "{body}");
+        let mut response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
+        let mut body = String::from_utf8_lossy(&response.body).into_owned();
+        let outcome = response.js.as_ref().expect("js ran");
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let mut modules_skipped = outcome.modules_skipped;
+        // HTML #the-end: DOMContentLoaded follows the parser module's
+        // completion. Its MIME failure may arrive after the initial render.
+        if !body.contains("-ready</div>") {
+            let live = response
+                .live
+                .as_mut()
+                .expect("parser module keeps the actor live");
+            body = live_render_snapshot_after(live, "-ready</div>", |outcome| {
+                modules_skipped += outcome.modules_skipped;
+            })
+            .await;
+        }
+        assert!(body.contains("start-legacy-inline-ready</div>"), "{body}");
         assert!(
             !body.contains("BAD-"),
             "forbidden response body ran: {body}"
         );
-        let outcome = response.js.as_ref().expect("js ran");
-        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
-        assert_eq!(outcome.modules_skipped, 1);
+        assert_eq!(modules_skipped, 1);
         server.abort();
     }
 
@@ -16861,8 +16878,20 @@ mod tests {
             execute_js(response, (80, 24), (8, 16), Default::default()),
         )
         .await
-        .expect("async script blocked parsing or DOMContentLoaded");
-        let initial = String::from_utf8_lossy(&response.body);
+        .expect("async script blocked parsing or first paint");
+        let mut live = response
+            .live
+            .take()
+            .expect("async resources retain the actor");
+        assert!(
+            response.js.as_ref().unwrap().errors.is_empty(),
+            "{:?}",
+            response.js
+        );
+        let mut initial = String::from_utf8_lossy(&response.body).into_owned();
+        if !initial.contains("|module-resumed") {
+            initial = live_render_snapshot_after(&mut live, "|module-resumed", |_| ()).await;
+        }
         assert!(initial.contains("start|fast|fast-micro|blocking:loading|inline:loading|inline-micro|defer1:interactive|defer2:interactive|module:interactive|DOM:interactive|module-resumed"), "{initial}");
         assert!(
             !initial.contains("slow:interactive") && !initial.contains("load:complete"),
@@ -16875,42 +16904,8 @@ mod tests {
             initial.contains("data-script-errors=\"empty,bad-module\""),
             "{initial}"
         );
-        assert!(
-            response.js.as_ref().unwrap().errors.is_empty(),
-            "{:?}",
-            response.js
-        );
-        let mut live = response
-            .live
-            .take()
-            .expect("async resources retain the actor");
         release_slow.send(true).unwrap();
-        let final_html = tokio::time::timeout(Duration::from_secs(20), async {
-            while let Some(event) = live.events.recv().await {
-                let (html, outcome) = match event {
-                    crate::js::PageEvt::Updated { html, outcome }
-                    | crate::js::PageEvt::Static { html, outcome } => (html, outcome),
-                    crate::js::PageEvt::Patched {
-                        patches, outcome, ..
-                    } => (
-                        patches
-                            .into_iter()
-                            .map(|patch| patch.html)
-                            .collect::<Vec<_>>()
-                            .join(""),
-                        outcome,
-                    ),
-                    _ => continue,
-                };
-                assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
-                if html.contains("load:complete") {
-                    return html;
-                }
-            }
-            panic!("page closed before load");
-        })
-        .await
-        .expect("load never followed async completion");
+        let final_html = live_render_snapshot_after(&mut live, "load:complete", |_| ()).await;
         assert!(final_html.contains("slow:interactive"), "{final_html}");
         assert!(
             final_html.contains("async-module:interactive"),
@@ -16922,6 +16917,116 @@ mod tests {
             "{final_html}"
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn deferred_script_wait_allows_first_paint_before_dom_content_loaded() {
+        // HTML #the-end, #execute-the-deferred-scripts and #update-the-rendering
+        // (local snapshot c4aab9ee4477). The wait for a deferred script is a
+        // rendering opportunity while the document is interactive.
+        assert_first_render_during_deferred_script_wait("", "").await;
+    }
+
+    #[tokio::test]
+    async fn deferred_script_blocks_first_paint_until_its_blocking_attribute_is_removed() {
+        // HTML #render-blocking-mechanism resumes rendering when a script
+        // ceases to have the blocking=render token, even before it runs.
+        assert_first_render_during_deferred_script_wait(
+            "blocking=render",
+            "|unblocked:interactive",
+        )
+        .await;
+    }
+
+    async fn assert_first_render_during_deferred_script_wait(
+        blocking: &str,
+        before_deferred: &str,
+    ) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let html = r#"<!doctype html><head><script id="deferred" defer DEFERRED_BLOCKING src="/deferred.js"></script></head>
+            <body><p id="out">Shell</p><script>
+                const output = document.getElementById('out');
+                const record = phase => output.textContent += '|' + phase + ':' + document.readyState;
+                document.addEventListener('readystatechange', () => {
+                    record('ready');
+                    const script = document.getElementById('deferred');
+                    if (document.readyState === 'interactive' && script.hasAttribute('blocking')) {
+                        setTimeout(() => {
+                            record('unblocked');
+                            script.removeAttribute('blocking');
+                        }, 100);
+                    }
+                });
+                document.addEventListener('DOMContentLoaded', () => record('dom'));
+                window.addEventListener('load', () => record('load'));
+            </script></body>"#
+            .replace("DEFERRED_BLOCKING", blocking);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (release_script, mut script_gate) = tokio::sync::watch::channel(false);
+        let server = tokio::spawn(async move {
+            for (path, mime, body) in [
+                ("/page", "text/html", html.as_str()),
+                ("/deferred.js", "text/javascript", "record('deferred');"),
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0; 2048];
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let count = socket.read(&mut buffer).await.unwrap();
+                    assert_ne!(count, 0);
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                assert!(request.starts_with(format!("GET {path} ").as_bytes()));
+                if path == "/deferred.js" {
+                    script_gate.wait_for(|ready| *ready).await.unwrap();
+                }
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+
+        let url = parse_url(&format!("http://{address}/page")).unwrap();
+        let response = fetch(&Request::get(url)).await.unwrap();
+        let mut response = tokio::time::timeout(
+            Duration::from_secs(20),
+            execute_js(response, (80, 24), (8, 16), Default::default()),
+        )
+        .await
+        .expect("first rendering waited for the deferred script response");
+        assert!(
+            response.rendered.as_ref().is_some_and(|page| {
+                page.direct_actor_nodes
+                    && page.layout.paint.primitives.iter().any(|command| {
+                        matches!(command, crate::render::DisplayCommand::GlyphRun { shaped, .. }
+                            if shaped.text.starts_with("Shell"))
+                    })
+            }),
+            "first rendering must paint the live document's shell"
+        );
+        assert!(
+            response.js.as_ref().unwrap().errors.is_empty(),
+            "{:?}",
+            response.js
+        );
+        let shell = String::from_utf8_lossy(&response.body);
+        assert!(
+            shell.contains(&format!(">Shell|ready:interactive{before_deferred}</p>")),
+            "{shell}"
+        );
+        let mut live = response.live.take().expect("first page actor is live");
+
+        release_script.send(true).unwrap();
+        let html = live_render_snapshot_after(&mut live, "|load:complete</p>", |_| ()).await;
+        assert!(
+            html.contains(&format!(">Shell|ready:interactive{before_deferred}|deferred:interactive|dom:interactive|ready:complete|load:complete</p>")),
+            "{html}"
+        );
+        server.await.unwrap();
     }
 
     // CDN compile cache (Phase 2): the SAME page (an external IIFE "library"
@@ -17987,8 +18092,6 @@ mod tests {
         let response = fetch(&Request::get(url)).await.unwrap();
         let started = std::time::Instant::now();
         let mut response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
-        let elapsed = started.elapsed();
-        let peak = peak.load(Relaxed);
         let mut body = String::from_utf8_lossy(&response.body).into_owned();
         // A rendering opportunity may expose the interactive shell while the entry module is
         // suspended at top-level await. The module script still delays `load`; observe the actor's
@@ -18001,9 +18104,10 @@ mod tests {
             body = tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
                     match live.events.recv().await {
-                        Some(crate::js::PageEvt::Updated { html, .. })
-                            if html.contains(&format!("got {N}")) =>
-                        {
+                        Some(
+                            crate::js::PageEvt::Updated { html, .. }
+                            | crate::js::PageEvt::Static { html, .. },
+                        ) if html.contains(&format!("got {N}")) => {
                             break html;
                         }
                         Some(_) => {}
@@ -18014,6 +18118,8 @@ mod tests {
             .await
             .expect("module evaluation render timed out");
         }
+        let elapsed = started.elapsed();
+        let peak = peak.load(Relaxed);
         eprintln!(
             "static_module_graph_prefetches_concurrently: {N}@{DELAY_MS}ms, peak in-flight {peak}, took {elapsed:?}"
         );
@@ -18120,7 +18226,6 @@ mod tests {
         let response = fetch(&Request::get(url)).await.unwrap();
         let started = std::time::Instant::now();
         let mut response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
-        let elapsed = started.elapsed();
         let mut body = String::from_utf8_lossy(&response.body).into_owned();
         // A rendering opportunity may expose the interactive shell while the entry module is
         // suspended at top-level await. The module script still delays `load`; observe the actor's
@@ -18133,9 +18238,10 @@ mod tests {
             body = tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
                     match live.events.recv().await {
-                        Some(crate::js::PageEvt::Updated { html, .. })
-                            if html.contains(&format!("got {N}")) =>
-                        {
+                        Some(
+                            crate::js::PageEvt::Updated { html, .. }
+                            | crate::js::PageEvt::Static { html, .. },
+                        ) if html.contains(&format!("got {N}")) => {
                             break html;
                         }
                         Some(_) => {}
@@ -18146,6 +18252,7 @@ mod tests {
             .await
             .expect("module evaluation render timed out");
         }
+        let elapsed = started.elapsed();
         let peak = peak.load(Relaxed);
         eprintln!(
             "dynamic_sibling_imports_load_concurrently: {N}@{DELAY_MS}ms, peak in-flight {peak}, took {elapsed:?}"
@@ -20834,9 +20941,10 @@ mod tests {
             body = tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
                     match live.events.recv().await {
-                        Some(crate::js::PageEvt::Updated { html, .. })
-                            if html.contains("modules drive TRust — dynamically") =>
-                        {
+                        Some(
+                            crate::js::PageEvt::Updated { html, .. }
+                            | crate::js::PageEvt::Static { html, .. },
+                        ) if html.contains("modules drive TRust — dynamically") => {
                             break html;
                         }
                         Some(_) => {}
@@ -20918,15 +21026,23 @@ mod tests {
 
         let url = parse_url(&format!("http://127.0.0.1:{port}/page")).unwrap();
         let response = fetch(&Request::get(url)).await.unwrap();
-        // Reaching past this line at all is half the test: the old race
-        // could stack-overflow and abort the whole test binary.
-        let response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
-        let body = String::from_utf8_lossy(&response.body);
+        let mut response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
+        let mut body = String::from_utf8_lossy(&response.body).into_owned();
         let outcome = response.js.as_ref().expect("js ran");
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
         assert_eq!(outcome.modules_skipped, 0);
+        if !body.contains(">shared=") {
+            let live = response
+                .live
+                .as_mut()
+                .expect("pending module graph keeps the page actor live");
+            body = live_render_snapshot_after(live, ">shared=", |outcome| {
+                assert_eq!(outcome.modules_skipped, 0);
+            })
+            .await;
+        }
         assert!(
-            body.contains("shared=1"),
+            body.contains(">shared=1</div>"),
             "shared module ran exactly once: {body}"
         );
         server.abort();
@@ -22385,6 +22501,14 @@ customElements.define('lit-counter', LitCounter);
             .live
             .take()
             .expect("pending timing tasks retain their page actor");
+        live_render_snapshot_after(&mut live, marker, |_| ()).await
+    }
+
+    async fn live_render_snapshot_after(
+        live: &mut LivePage,
+        marker: &str,
+        mut observe_outcome: impl FnMut(&crate::js::Outcome),
+    ) -> String {
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 match live.events.recv().await {
@@ -22394,9 +22518,10 @@ customElements.define('lit-counter', LitCounter);
                     ) => {
                         assert!(
                             outcome.errors.is_empty(),
-                            "timing actor errors: {:?}",
+                            "page actor errors: {:?}",
                             outcome.errors
                         );
+                        observe_outcome(&outcome);
                         if html.contains(marker) {
                             break html;
                         }
@@ -22404,9 +22529,10 @@ customElements.define('lit-counter', LitCounter);
                     Some(crate::js::PageEvt::Patched { patches, outcome }) => {
                         assert!(
                             outcome.errors.is_empty(),
-                            "timing actor errors: {:?}",
+                            "page actor errors: {:?}",
                             outcome.errors
                         );
+                        observe_outcome(&outcome);
                         if let Some(patch) = patches
                             .into_iter()
                             .find(|patch| patch.html.contains(marker))
@@ -22415,15 +22541,15 @@ customElements.define('lit-counter', LitCounter);
                         }
                     }
                     Some(crate::js::PageEvt::Trouble(errors)) => {
-                        panic!("timing task failed: {errors:?}")
+                        panic!("page actor task failed: {errors:?}")
                     }
                     Some(_) => {}
-                    None => panic!("timing page closed before {marker}; initial {initial}"),
+                    None => panic!("page actor closed before {marker}"),
                 }
             }
         })
         .await
-        .expect("timing lifecycle completion timed out")
+        .unwrap_or_else(|_| panic!("page actor timed out before {marker}"))
     }
 
     #[tokio::test]

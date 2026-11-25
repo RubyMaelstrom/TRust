@@ -19,6 +19,9 @@ pub struct Outcome {
     /// This presentation only advanced style-origin CSS animations; no DOM,
     /// resource or environment change contributed to it.
     pub(crate) animation_frame: bool,
+    /// The first presentation arrived before the parser finished running its
+    /// deferred scripts and firing `DOMContentLoaded`.
+    pub(crate) before_dom_content_loaded: bool,
     /// The top-level Document's policy container referrer policy, after its
     /// `<meta name=referrer>` elements (HTML #meta-referrer), for navigations
     /// the frontend starts from this presentation.

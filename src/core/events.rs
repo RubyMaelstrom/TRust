@@ -106,6 +106,9 @@ impl Sender {
                 ) = (&*previous, event.as_mut())
                 {
                     new.animation_frame &= old.animation_frame;
+                    // A paint can omit the document's policy. Preserve the
+                    // last supplied policy while replacing the old layout.
+                    new.referrer_policy = new.referrer_policy.or(old.referrer_policy);
                 }
                 (
                     false,
@@ -492,6 +495,39 @@ mod tests {
             flags,
             [("frame".to_string(), false), ("frame 3".to_string(), true)]
         );
+    }
+
+    #[tokio::test]
+    async fn coalescing_retains_the_latest_document_referrer_policy() {
+        use crate::referrer_policy::ReferrerPolicy::{NoReferrer, Origin};
+
+        let (tx, mut rx, _) = counted_channel(1);
+        let frame = rendered();
+        for (html, policy) in [
+            ("first paint", Some(Origin)),
+            ("deferred script completed", Some(NoReferrer)),
+            ("latest paint", None),
+        ] {
+            let mut event = paint(1, html, frame.clone());
+            if let CoreEvent::Page {
+                event: PageEvt::Updated { outcome, .. },
+                ..
+            } = &mut event
+            {
+                outcome.referrer_policy = policy;
+            }
+            tx.send(event).await.unwrap();
+        }
+        let Some(CoreEvent::Page {
+            event: PageEvt::Updated { html, outcome },
+            ..
+        }) = rx.pop()
+        else {
+            panic!("missing latest paint");
+        };
+        assert_eq!(html, "latest paint");
+        assert_eq!(outcome.referrer_policy, Some(NoReferrer));
+        assert!(rx.pop().is_none());
     }
 
     #[tokio::test]

@@ -289,7 +289,19 @@ fn try_run(options: Options) -> Result<bool, Box<dyn Error>> {
         .enable_all()
         .thread_name("trust-headless-net")
         .build()?;
-    let outcome = runtime.block_on(navigate_and_settle(&options));
+    let outcome = runtime.block_on(async {
+        let mut controller = BrowserController::new(
+            tokio::runtime::Handle::current(),
+            || {},
+            CssSize::new(options.width, options.height),
+        );
+        let outcome = navigate_and_settle(&mut controller, &options).await;
+        // Close the actor's event receiver before joining the page thread.
+        // A parser waiting on a deferred fetch can otherwise stay parked
+        // after the snapshot's hard timeout.
+        controller.handle_action(UserAction::Kill);
+        outcome
+    });
     trust::js::shutdown_page_threads();
     outcome
 }
@@ -332,10 +344,12 @@ async fn settle_page(
             break;
         }
         // A page that keeps its actor open (timers, workers, hover, fetches)
-        // never goes final, so fall back to a quiet period and accept that it
-        // only means "stopped changing", not "done".
+        // can settle after a quiet period. HTML #the-end runs deferred
+        // scripts before DOMContentLoaded. Wait for those initialization
+        // steps even when the actor has already presented a frame.
         if options.settle > Duration::ZERO
             && !snapshot.loading
+            && !controller.page_awaiting_dom_content_loaded()
             && snapshot.page_revision > 0
             && now - last_change >= options.settle
         {
@@ -429,29 +443,26 @@ fn replay_click(controller: &mut BrowserController, options: &Options, point: Cs
 }
 
 /// Drive one navigation to a settled page and print it.
-async fn navigate_and_settle(options: &Options) -> Result<bool, Box<dyn Error>> {
-    let mut controller = BrowserController::new(
-        tokio::runtime::Handle::current(),
-        || {},
-        CssSize::new(options.width, options.height),
-    );
-
+async fn navigate_and_settle(
+    controller: &mut BrowserController,
+    options: &Options,
+) -> Result<bool, Box<dyn Error>> {
     controller.handle_action(UserAction::Navigate(options.address.clone()));
 
     let started = Instant::now();
     // Web Animations #document-timelines: like the desktop frontend, the
     // timeline starts once the navigation has produced its document.
     let mut timeline_origin: Option<Instant> = None;
-    let mut settled = settle_page(&mut controller, options, started, &mut timeline_origin).await;
+    let mut settled = settle_page(controller, options, started, &mut timeline_origin).await;
     for &point in &options.clicks {
-        let target = replay_click(&mut controller, options, point);
+        let target = replay_click(controller, options, point);
         eprintln!("[click] {},{} hit {target}", point.x, point.y);
         let clicked = Instant::now();
         let after = Options {
             settle: options.click_settle.unwrap_or(options.settle),
             ..options.clone()
         };
-        settled = settle_page(&mut controller, &after, clicked, &mut timeline_origin).await;
+        settled = settle_page(controller, &after, clicked, &mut timeline_origin).await;
         let address = controller
             .current_page()
             .map_or_else(|| String::from("(no page)"), BrowserPage::address);
@@ -599,7 +610,7 @@ async fn navigate_and_settle(options: &Options) -> Result<bool, Box<dyn Error>> 
     let _ = out.flush();
     if let Some(path) = std::env::var_os("TRUST_HEADLESS_PNG")
         && let Some((layout, store, loaded, failed)) =
-            snapshot_with_images(&mut controller, options).await
+            snapshot_with_images(controller, options).await
     {
         // A document that went final at once would otherwise be captured
         // at the first frame of its CSS animations. Let animated pages run
@@ -1201,10 +1212,138 @@ fn semantic_text(tree: &SemanticTree, links: &mut Vec<String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Run, cap_to_chars, describe_fetch, finish_lines, lines_of_runs, reported_link,
-        resolve_reference, snapshot_image_sources,
+        BrowserController, CssSize, Duration, Format, Instant, Options, Run, Settle, UserAction,
+        cap_to_chars, collect_runs, describe_fetch, finish_lines, lines_of_runs, reported_link,
+        resolve_reference, settle_page, snapshot_image_sources,
     };
     use trust::core::FetchedDocument;
+
+    #[tokio::test]
+    async fn headless_quiet_period_waits_for_deferred_script() {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+        use trust::referrer_policy::ReferrerPolicy;
+
+        // HTML #the-end (local c4aab9ee4477): initial presentation can
+        // precede deferred scripts and DOMContentLoaded. The quiet period
+        // must still let their DOM and policy updates reach headless capture.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = format!("http://{}/page", listener.local_addr().unwrap());
+        let (release_script, script_gate) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            for (path, mime, body, gate) in [
+                (
+                    "/page",
+                    "text/html",
+                    r#"<!doctype html><meta name=referrer content=unsafe-url>
+                    <script defer src="/deferred.js"></script>
+                    <button id="message">Shell</button><script>
+                        const button = document.getElementById("message");
+                        button.addEventListener("click", () => {});
+                        document.addEventListener("DOMContentLoaded", () => {
+                            button.textContent = window.deferredText;
+                        });
+                    </script>"#,
+                    None,
+                ),
+                (
+                    "/deferred.js",
+                    "text/javascript",
+                    r#"window.deferredText = "Deferred content";
+                    document.querySelector("meta").content = "no-referrer";"#,
+                    Some(script_gate),
+                ),
+            ] {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut socket = BufReader::new(socket);
+                let mut line = String::new();
+                socket.read_line(&mut line).await.unwrap();
+                assert!(line.starts_with(&format!("GET {path} ")), "{line}");
+                loop {
+                    line.clear();
+                    assert_ne!(socket.read_line(&mut line).await.unwrap(), 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                if let Some(gate) = gate {
+                    gate.await.unwrap();
+                }
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let options = Options {
+            address,
+            width: 640.0,
+            height: 480.0,
+            timeout: Duration::from_secs(20),
+            settle: Duration::from_millis(50),
+            format: Format::Text,
+            list_links: false,
+            max_chars: 0,
+            js_diagnostics: false,
+            site_data: false,
+            clicks: Vec::new(),
+            click_settle: None,
+        };
+        let mut controller = BrowserController::new(
+            tokio::runtime::Handle::current(),
+            || {},
+            CssSize::new(options.width, options.height),
+        );
+        controller.handle_action(UserAction::Navigate(options.address.clone()));
+        tokio::time::timeout(options.timeout, async {
+            while controller.current_page().is_none() {
+                controller.process_async_events();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the shell should appear while the deferred response is held");
+        assert!(controller.page_awaiting_dom_content_loaded());
+        assert_eq!(
+            controller.link_initiator().unwrap().referrer_policy,
+            ReferrerPolicy::UnsafeUrl
+        );
+
+        let mut timeline_origin = None;
+        let settled = {
+            let capture = settle_page(
+                &mut controller,
+                &options,
+                Instant::now(),
+                &mut timeline_origin,
+            );
+            tokio::pin!(capture);
+            assert!(
+                tokio::time::timeout(options.settle * 5, &mut capture)
+                    .await
+                    .is_err(),
+                "headless reported a quiet page while a deferred script was pending"
+            );
+            release_script.send(()).unwrap();
+            capture.await
+        };
+        assert!(settled == Settle::Quiet);
+        assert!(!controller.page_awaiting_dom_content_loaded());
+        assert_eq!(
+            controller.link_initiator().unwrap().referrer_policy,
+            ReferrerPolicy::NoReferrer
+        );
+        let page = controller.current_page().unwrap().rendered_page().unwrap();
+        let runs = collect_runs(&page.layout.paint, None);
+        assert!(lines_of_runs(&runs).join("\n").contains("Deferred content"));
+        server.await.unwrap();
+    }
 
     #[test]
     fn snapshots_present_lazy_images_only_inside_the_documents_lazy_margin() {
