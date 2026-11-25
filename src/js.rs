@@ -211,7 +211,7 @@ pub struct PageEnv {
     /// screen coordinates (CSSOM View #dom-window-screenx).
     pub screen_position: (i32, i32),
     pub externals: Vec<(String, Option<std::sync::Arc<Vec<u8>>>)>,
-    pub sheets: Vec<crate::http::PageSheet>,
+    pub sheets: std::sync::Arc<[crate::http::PageSheet]>,
     pub cache: std::sync::Arc<crate::http::PageCache>,
     pub net: Option<tokio::runtime::Handle>,
     pub storage: Option<WebStorage>,
@@ -309,7 +309,7 @@ impl PageEnv {
             terminal_presentation: true,
             screen_position: (0, 0),
             externals: Vec::new(),
-            sheets: Vec::new(),
+            sheets: Default::default(),
             cache: Default::default(),
             net: None,
             storage: None,

@@ -7475,7 +7475,7 @@ async fn execute_js_with_presentation(
                 viewport,
                 cell_px,
                 device_pixel_ratio,
-                sheets,
+                sheets.into(),
                 frames,
                 terminal_presentation,
                 Some(frames::DeferredOptions {
@@ -7642,14 +7642,9 @@ async fn execute_js_with_presentation(
         match kind {
             Kind::Script | Kind::Preload => unreachable!("scripts belong to the page scheduler"),
             Kind::Sheet => {
-                // A failed sheet is simply absent: fail-open, nothing
-                // gets hidden.
-                if let (Some(url), Some(r)) = (
-                    resolved,
-                    resp.filter(|r| {
-                        stylesheet_response_allowed(r.status, &r.content_type, &r.headers)
-                    }),
-                ) {
+                if let (Some(url), Some((r, opaque))) =
+                    (resolved, resp.and_then(Response::filter_link_stylesheet))
+                {
                     // HTML #link-type-stylesheet: the environment encoding
                     // is the link's charset, else the document's encoding.
                     let environment = job
@@ -7682,7 +7677,7 @@ async fn execute_js_with_presentation(
                         url: url.to_string(),
                         base: fetched.base,
                         text: fetched.text,
-                        cors_same_origin: fetched.cors_same_origin,
+                        cors_same_origin: !opaque && fetched.cors_same_origin,
                         referrer_policy: sheet_policy,
                     });
                     push_imported_sheets(&mut sheets, fetched.imports);
@@ -7717,6 +7712,7 @@ async fn execute_js_with_presentation(
     // The page actor owns the document's image requests; frontends present
     // its responses from this store (HTML #updating-the-image-data).
     response.images = Some(cache.images());
+    let sheets: std::sync::Arc<[PageSheet]> = sheets.into();
     let env = crate::js::PageEnv {
         referrer_policy: response_referrer_policy(&response),
         referrer: response.referrer.clone(),
@@ -7730,7 +7726,7 @@ async fn execute_js_with_presentation(
         screen_position,
         terminal_presentation,
         externals: Vec::new(),
-        sheets,
+        sheets: sheets.clone(),
         cache,
         net: Some(tokio::runtime::Handle::current()),
         storage: Some(storage),
@@ -7774,64 +7770,46 @@ async fn execute_js_with_presentation(
     };
     let first = tokio::time::timeout(Duration::from_secs(60), events.recv()).await;
     if std::env::var_os("TRUST_NET_TRACE").is_some() {
-        eprintln!(
-            "js : @{:>6}ms first PageEvt received (page rendered)",
-            trace_ms()
-        );
+        let state = match &first {
+            Ok(Some(
+                crate::js::PageEvt::Static { outcome, .. }
+                | crate::js::PageEvt::Updated { outcome, .. },
+            )) if outcome.rendered.is_some() => "first PageEvt received (page rendered)",
+            Ok(Some(_)) => "first PageEvt contained no rendering (CSS fallback)",
+            Ok(None) => "page actor closed before first rendering (CSS fallback)",
+            Err(_) => "page actor timed out before first rendering (CSS fallback)",
+        };
+        eprintln!("js : @{:>6}ms {state}", trace_ms());
     }
-    // This navigation has its first rendering; warm the next one's engine
-    // off the critical path (a no-op unless the frontend enabled spares).
+    // Warm the next navigation's engine after the first event or before the
+    // CSS fallback (a no-op unless the frontend enabled spares).
     crate::js::refill_spare_page_engine();
-    let (out, rendered, outcome, live) = match first {
-        Ok(Some(crate::js::PageEvt::Static { html, mut outcome })) => {
-            let Some(rendered) = outcome.rendered.take() else {
-                return css_only_for_device(
-                    response,
-                    viewport,
-                    cell_px,
-                    device_pixel_ratio,
-                    terminal_presentation,
-                )
-                .await;
-            };
-            (html, rendered, outcome, None)
-        }
-        Ok(Some(crate::js::PageEvt::Updated { html, mut outcome })) => {
-            let Some(rendered) = outcome.rendered.take() else {
-                return css_only_for_device(
-                    response,
-                    viewport,
-                    cell_px,
-                    device_pixel_ratio,
-                    terminal_presentation,
-                )
-                .await;
-            };
-            (
-                html,
-                rendered,
-                outcome,
-                Some(LivePage {
-                    handle,
-                    events,
-                    traversable,
-                }),
-            )
-        }
-        // Died, hung, or spoke out of turn (most often: the page's JS is too
-        // slow to first-paint within the timeout — a big GitHub code file).
-        // Fall back to a CSS-only render so it still lays out per its own
-        // stylesheets (flex gutter, collapsed menus) instead of UA defaults.
-        _ => {
-            return css_only_for_device(
-                response,
-                viewport,
-                cell_px,
-                device_pixel_ratio,
-                terminal_presentation,
-            )
-            .await;
-        }
+    let first_render = match first {
+        Ok(Some(crate::js::PageEvt::Static { html, outcome })) => Some((html, outcome, false)),
+        Ok(Some(crate::js::PageEvt::Updated { html, outcome })) => Some((html, outcome, true)),
+        _ => None,
+    };
+    let Some((out, rendered, outcome, is_live)) =
+        first_render.and_then(|(html, mut outcome, is_live)| {
+            Some((html, outcome.rendered.take()?, outcome, is_live))
+        })
+    else {
+        // HTML #link-type-stylesheet: the original document's link fetches
+        // and their @imports already completed. Present those same results
+        // while the failed actor and its remaining work are released.
+        drop(handle);
+        drop(events);
+        return css_only_with_sheets(
+            response,
+            viewport,
+            cell_px,
+            device_pixel_ratio,
+            sheets,
+            None,
+            terminal_presentation,
+            None,
+        )
+        .await;
     };
     // Keep source bytes for diagnostics/history. Presentation uses `rendered`
     // directly, so neither frontend reparses this body. Tests and an explicit
@@ -7847,7 +7825,11 @@ async fn execute_js_with_presentation(
         response.referrer_policy = Some(policy);
     }
     response.js = Some(outcome);
-    response.live = live;
+    response.live = is_live.then_some(LivePage {
+        handle,
+        events,
+        traversable,
+    });
     response
 }
 
@@ -8152,10 +8134,7 @@ async fn fetch_page_sheets_for_client(
                         Some(&page_url),
                         job.referrer_policy.unwrap_or(referrer_policy),
                     );
-                    fetch(&request).await.ok().map(|mut response| {
-                        response.unfilter();
-                        response
-                    })
+                    fetch(&request).await.ok()
                 }
                 None => None,
             };
@@ -8168,7 +8147,7 @@ async fn fetch_page_sheets_for_client(
     .into_iter()
     .filter_map(|(raw, charset, resolved, resp, cors_mode)| {
         let url = resolved?;
-        let response = resp?.filter_stylesheet()?;
+        let (response, opaque) = resp?.filter_link_stylesheet()?;
         let environment = charset
             .as_deref()
             .and_then(|label| encoding_rs::Encoding::for_label(label.as_bytes()))
@@ -8180,7 +8159,8 @@ async fn fetch_page_sheets_for_client(
         );
         let sheet = PageSheet {
             link_href: Some(raw),
-            cors_same_origin: sheet_cors_same_origin(&origin, &url, &response.url, cors_mode),
+            cors_same_origin: !opaque
+                && sheet_cors_same_origin(&origin, &url, &response.url, cors_mode),
             text: absolutize_css_urls(&css, &response.url),
             url: url.to_string(),
             base: response.url.to_string(),
@@ -8273,15 +8253,22 @@ async fn fetch_inline_style_imports_for_client(
     sheets
 }
 
-trait StylesheetResponseExt {
-    fn filter_stylesheet(self) -> Option<Self>
-    where
-        Self: Sized;
-}
-
-impl StylesheetResponseExt for Response {
+impl Response {
     fn filter_stylesheet(self) -> Option<Self> {
         stylesheet_response_allowed(self.status, &self.content_type, &self.headers).then_some(self)
+    }
+
+    /// HTML #cors-cross-origin and #link-type-stylesheet: opaque responses
+    /// can supply the CSS parser with bytes while their origin-clean flag
+    /// stays unset, even if the response URL is same-origin with the link.
+    /// Return the response and whether it was opaque before unfiltering.
+    fn filter_link_stylesheet(mut self) -> Option<(Self, bool)> {
+        let opaque = self
+            .internal
+            .as_ref()
+            .is_some_and(|internal| matches!(internal.kind, "opaque" | "opaqueredirect"));
+        self.unfilter();
+        self.filter_stylesheet().map(|response| (response, opaque))
     }
 }
 
@@ -8410,7 +8397,7 @@ pub(crate) fn fetch_imported_sheet(
         let Some(response) = fetch(&request)
             .await
             .ok()
-            .and_then(StylesheetResponseExt::filter_stylesheet)
+            .and_then(Response::filter_stylesheet)
         else {
             return Vec::new();
         };
@@ -9554,7 +9541,7 @@ async fn css_only_for_device(
         viewport,
         cell_px,
         device_pixel_ratio,
-        sheets,
+        sheets.into(),
         None,
         terminal_presentation,
         None,
@@ -9562,16 +9549,15 @@ async fn css_only_for_device(
     .await
 }
 
-/// Complete the script-less CSS path after its stylesheet fetches are already
-/// available. Keeping this separate lets a CSS-only page that contains a
-/// render-affecting `:hover` rule promote to the resident actor without
-/// downloading every stylesheet a second time.
+/// Present a document using its completed stylesheet requests. The same
+/// results can pass to a deferred realm or remain available after an actor
+/// fails before first rendering.
 async fn css_only_with_sheets(
     mut response: Response,
     viewport: (u16, u16),
     cell_px: (u16, u16),
     device_pixel_ratio: f32,
-    sheets: Vec<PageSheet>,
+    sheets: std::sync::Arc<[PageSheet]>,
     frames: Option<FrameDocuments>,
     terminal_presentation: bool,
     deferred: Option<frames::DeferredOptions>,
@@ -12363,6 +12349,91 @@ mod tests {
             referrer: String::new(),
             referrer_policy: None,
         }
+    }
+
+    #[test]
+    fn link_stylesheet_unwraps_opaque_bytes_and_retains_taint() {
+        // HTML #cors-cross-origin and #link-type-stylesheet: a Service
+        // Worker can supply an opaque response ending at a same-origin URL.
+        let url = Url::parse("https://example.test/sheet.css").unwrap();
+        let source = "p { color: red }";
+        for filtered in [false, true] {
+            let mut response = html_response(&url, Vec::new(), source);
+            response.content_type = "text/css".to_string();
+            if filtered {
+                response.filter("opaque");
+                assert!(response.body.is_empty());
+            }
+            let (sheet, opaque) = response.filter_link_stylesheet().unwrap();
+            assert_eq!(sheet.url, url);
+            assert_eq!(sheet.body, source.as_bytes());
+            assert_eq!(opaque, filtered);
+        }
+    }
+
+    #[tokio::test]
+    async fn css_fallback_reuses_completed_stylesheet_requests() {
+        // HTML #link-type-stylesheet and CSS Cascade 5 #at-import: use the
+        // original load results when the document's actor cannot render.
+        let server = referer_server::Server::start(|path| {
+            let (mime, headers, body) = match path {
+                "/sheet.css" => ("text/css", "", "@import '/import.css';"),
+                "/import.css" => ("text/css", "", "p { color: rgb(1,2,3) }"),
+                "/rejected.css" => (
+                    "text/plain",
+                    "X-Content-Type-Options: nosniff\r\n",
+                    "p { color: red }",
+                ),
+                other => panic!("unexpected request {other}"),
+            };
+            (mime.into(), headers.into(), body.as_bytes().to_vec())
+        })
+        .await;
+        let page = Url::parse(&format!("{}/page", server.base)).unwrap();
+        let html = "<!doctype html><link rel=stylesheet href=/sheet.css>
+            <link rel=stylesheet href=/rejected.css><body><p>Fallback</p><script>void 0</script>";
+        // This link's receiver is already closed. Exercise production's
+        // actor-failure path without a wall-clock timeout or a script hook.
+        let closed_group = crate::js::TraversableLink::for_test(Default::default());
+        let response = execute_js_for_window(
+            html_response(&page, Vec::new(), html),
+            (640, 384),
+            (1, 1),
+            1.0,
+            (0, 0),
+            Default::default(),
+            true,
+            crate::js::TraversableState::SHOWN,
+            Some(closed_group),
+        )
+        .await;
+        assert!(response.live.is_none());
+        let rendered = response
+            .rendered
+            .expect("CSS fallback produced a rendering");
+        let color = rendered
+            .layout
+            .paint
+            .primitives
+            .iter()
+            .find_map(|command| match command {
+                crate::render::DisplayCommand::GlyphRun { shaped, color, .. }
+                    if shaped.text == "Fallback" =>
+                {
+                    Some(*color)
+                }
+                _ => None,
+            });
+        assert_eq!(color, Some(crate::render::PaintColor::Rgba(1, 2, 3, 255)));
+        let mut requests: Vec<_> = server
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect();
+        requests.sort_unstable();
+        assert_eq!(requests, ["/import.css", "/rejected.css", "/sheet.css"]);
     }
 
     #[tokio::test]
