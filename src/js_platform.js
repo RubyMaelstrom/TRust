@@ -6536,13 +6536,13 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // backs `onload`/`onerror` with the same listener registry, so dispatch
     // invokes it exactly once; calling the property again here would violate
     // DOM dispatch and double-settle script/style loaders.
-    trust.scriptEvent = function (id, type) {
+    trust.scriptEvent = function (id, type, stylesheet) {
         const t = wrap(id);
         if (!t) return;
         internalsFor(t).trustResourceSettled = String(type);
         const ev = new Event(type);
         dispatch(t, ev, false);
-        if (t.localName === "link" && trust.refreshFontSources) trust.refreshFontSources();
+        if (stylesheet) trust.fontStylesheetSettled();
     };
     trust.clickables = function () {
         if (clickableListenerIds === null) {
@@ -9901,21 +9901,22 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (fontAdapter) fontAdapter.fire(set, FontFaceSetLoadEvent, type, {fontfaces:present});
         else dispatch(set, createTrustedEvent(FontFaceSetLoadEvent, type, {fontfaces:present}), false);
     }
-    function fontSetLoaded(set) {
+    function fontSetLoaded(set, discovered = false) {
         const own = fontSetState(set);
-        if (own.syncing || own.checking) {own.stuck = true; return;}
-        if (loadUsedFonts(set)) {own.stuck = true; return;}
-        if (own.loading.size) return;
+        if (own.readyDone || own.syncing || own.checking || own.loading.size) return;
+        // CSS Font Loading 3 #pending-on-the-environment and
+        // #switch-the-fontfaceset-to-loaded (CSSWG 5e83e63e7561). A pending
+        // document or stylesheet already prevents settlement, so a readiness
+        // check at that point does not need to bring layout up to date.
         if (!fontAdapter && own.document && (own.document.readyState !== "complete" ||
                 nativeFontQuery("pending",fontDocumentId(own.document),"","") === "true" ||
                 Array.from(styleSheetWaits).some(([element,wait]) => !wait.queued &&
-                    element.ownerDocument === own.document && criticalSubresourceState(element) === "pending"))) {
-            own.stuck = true; return;
-        }
-        own.stuck = false;
+                    element.ownerDocument === own.document && criticalSubresourceState(element) === "pending"))) return;
+        if (!discovered && loadUsedFonts(set)) return;
         const transitioned = own.status === "loading";
         own.status = "loaded";
-        if (!own.readyDone) { own.readyDone = true; own.resolveReady(set); }
+        own.readyDone = true;
+        own.resolveReady(set);
         if (transitioned) fontTask(() => {
             const loaded = Array.from(own.loaded), failed = Array.from(own.failed);
             own.loaded.clear(); own.failed.clear();
@@ -9925,7 +9926,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     function initFontSet(set, document) {
         const own = {document, members:new Map(), css:new Map(), loading:new Set(), loaded:new Set(), failed:new Set(),
-            status:"loaded", ready:null, resolveReady:null, readyDone:false, stuck:false, syncing:false, epoch:-1,
+            status:"loaded", ready:null, resolveReady:null, readyDone:false, syncing:false, epoch:-1,
             installed:"", sentBytes:new Map(), checking:false, handlers:{}, realm:fontRealm,
             sync:() => syncFontSet(set), use:() => loadUsedFonts(set)};
         fontSlots(set).fontFaceSet = own;
@@ -10068,11 +10069,15 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         for (const reference of fontSources) {
             const set = reference.deref();
             if (!set) {fontSources.delete(reference); continue;}
-            syncFontSet(set);
-            const own = fontSetState(set);
-            loadUsedFonts(set);
-            if (own.stuck || !own.readyDone) fontSetLoaded(set);
+            if (!loadUsedFonts(set)) fontSetLoaded(set, true);
         }
+    };
+    fontControl.fontStylesheetSettled = function () {
+        // Only a stylesheet completing can clear this readiness condition
+        // (HTML #link-type-stylesheet and #link-type-preload). Rendering
+        // independently discovers fonts when it needs them.
+        const set = fontRead(g.document).fonts;
+        if (set) fontSetLoaded(set);
     };
     function fontMatches(set, font, text) {
         syncFontSet(set);
@@ -10139,7 +10144,15 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             for (const face of this.values()) callback.call(thisArg,face,face,this);
         }
         get status() {syncFontSet(this); return fontSetState(this).status;}
-        get ready() {syncFontSet(this); fontControl.refreshFontSources(); fontSetLoaded(this); return fontSetState(this).ready;}
+        get ready() {
+            const own = fontSetState(this);
+            // #font-face-set-ready: a pending promise already covers further
+            // font discovery. If it fulfilled, layout may now use an unloaded
+            // face and start the next loading cycle.
+            if (own.readyDone) loadUsedFonts(this);
+            else fontSetLoaded(this);
+            return own.ready;
+        }
         load(font, text = " ") {
             try {
                 fontSetState(this);
@@ -23307,7 +23320,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (internalsOf(rule).sheet) cssChanged(rule);
         }
         checkStyleSheetWaits();
-        if (trust.refreshFontSources) trust.refreshFontSources();
+        trust.fontStylesheetSettled();
     };
     // ---- Style sheet loads (HTML #the-style-element, #link-type-stylesheet
     // and #critical-subresources; local whatwg/html e5071a20) ----

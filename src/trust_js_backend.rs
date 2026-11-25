@@ -20160,6 +20160,15 @@ fn host_push_injected_error<'s>(ctx: &mut Ctx<'s>, message: impl Into<String>) {
 }
 
 fn host_fire_script_event<'s>(ctx: &mut Ctx<'s>, node_id: usize, event_type: &str) {
+    host_fire_resource_event(ctx, node_id, event_type, false);
+}
+
+fn host_fire_resource_event<'s>(
+    ctx: &mut Ctx<'s>,
+    node_id: usize,
+    event_type: &str,
+    stylesheet: bool,
+) {
     let _ = host_call_trust(ctx, "bindFrameForNode", &[Value::Num(node_id as f64)]);
     let _ = host_call_trust(
         ctx,
@@ -20167,6 +20176,7 @@ fn host_fire_script_event<'s>(ctx: &mut Ctx<'s>, node_id: usize, event_type: &st
         &[
             Value::Num(node_id as f64),
             ctx.string(event_type.to_string()),
+            Value::Bool(stylesheet),
         ],
     );
     let _ = host_call_trust(ctx, "restoreFrame", &[]);
@@ -20746,7 +20756,7 @@ fn queue_resource_error<'s>(
     name: String,
 ) {
     if !send_resource_completion(ctx, node_id, name, kind, None, true) {
-        host_fire_script_event(ctx, node_id, "error");
+        host_fire_resource_event(ctx, node_id, "error", kind.is_stylesheet());
     }
 }
 
@@ -21068,7 +21078,7 @@ fn host_load_injected_stylesheet<'s>(
             result,
             true,
         ) {
-            host_fire_script_event(ctx, node_id, "error");
+            host_fire_resource_event(ctx, node_id, "error", true);
         }
         return Ok(Value::Undefined);
     }
@@ -23712,6 +23722,16 @@ fn run_resource_task(
     sheet: Option<Box<crate::http::FetchedStyleSheet>>,
     external: bool,
 ) -> Result<(), String> {
+    let fire_link_event = |engine: &mut trust_js::Engine, loaded| {
+        engine.scope(|cx| {
+            host_fire_resource_event(
+                cx,
+                node_id,
+                if loaded { "load" } else { "error" },
+                kind.is_stylesheet(),
+            );
+        });
+    };
     match kind {
         TrustJsResourceKind::ClassicScript => match result {
             Some((status, content_type, body, headers))
@@ -23814,23 +23834,17 @@ fn run_resource_task(
                 let imports = sheet.imports.into_iter().map(to_engine).collect();
                 dom.borrow_mut()
                     .attach_sheet_to_link(node_id, link, imports);
-                fire_engine_script_event(engine, node_id, "load");
+                fire_link_event(engine, true);
             }
-            _ => fire_engine_script_event(engine, node_id, "error"),
+            _ => fire_link_event(engine, false),
         },
         // HTML #link-type-stylesheet "process the linked resource": the sheet
         // is already attached; only the element's event remains.
         TrustJsResourceKind::ParsedStylesheet { obtained } => {
-            fire_engine_script_event(engine, node_id, if obtained { "load" } else { "error" });
+            fire_link_event(engine, obtained);
         }
         // HTML #link-type-preload: `error` only for a network error.
-        TrustJsResourceKind::Preload => {
-            fire_engine_script_event(
-                engine,
-                node_id,
-                if result.is_some() { "load" } else { "error" },
-            );
-        }
+        TrustJsResourceKind::Preload => fire_link_event(engine, result.is_some()),
     }
     Ok(())
 }

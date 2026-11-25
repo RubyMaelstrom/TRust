@@ -2762,6 +2762,53 @@ fn blob_worker_font_loading_uses_its_settings_origin_and_still_enforces_cors() {
 }
 
 #[test]
+fn pending_font_ready_does_not_measure_layout_during_preload_completion() {
+    // CSS Font Loading 3 #pending-on-the-environment and HTML
+    // #link-type-preload. A preloaded stylesheet never joins the cascade.
+    let runtime = runtime();
+    let (listener, base) = listen(&runtime);
+    let server = serve_each(&runtime, listener, 1, |head| {
+        assert!(head.starts_with("get /preload.css "));
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/css\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            .to_vec()
+    });
+    let (mut engine, mut tasks) = page(&runtime, &format!("{base}/page"));
+    let before = crate::layout2::layout_pass_count();
+    eval(
+        &mut engine,
+        r#"
+            const root = document.createElement('html');
+            document.append(root);
+            root.innerHTML = '<body><p>Font readiness</p></body>';
+            const preload = document.createElement('link');
+            preload.rel = 'preload'; preload.as = 'style'; preload.href = '/preload.css';
+            preload.onload = () => {
+                root.style.width = '180px';
+                log.push(fonts.ready === ready ? 'preload' : 'replaced');
+            };
+            root.append(preload);
+            const fonts = document.fonts, ready = fonts.ready;
+            ready.then(set => log.push(set === fonts ? 'ready' : 'wrong set'));
+        "#,
+        "font ready during preload",
+    )
+    .unwrap();
+    run_until(&runtime, &mut engine, &mut tasks, "log.length > 0");
+    assert_eq!(log(&mut engine), "preload");
+    assert_eq!(crate::layout2::layout_pass_count(), before);
+
+    eval(
+        &mut engine,
+        "__trust.setDocumentReadiness('complete')",
+        "complete document",
+    )
+    .unwrap();
+    run_until(&runtime, &mut engine, &mut tasks, "log.length > 1");
+    assert_eq!(log(&mut engine), "preload|ready");
+    assert_eq!(runtime.block_on(server).unwrap().len(), 1);
+}
+
+#[test]
 fn font_ready_waits_for_pending_stylesheets_and_their_fonts() {
     // CSS Font Loading #font-face-set-ready: completing document loading
     // does not settle ready while a stylesheet can still discover fonts.
